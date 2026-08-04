@@ -146,6 +146,19 @@ class TestSelectLipMarkets:
         out = select_lip_markets(_client(programs), kalshi_data=data, max_markets=3)
         assert len(out) == 3
 
+    def test_carries_market_title_and_dynamic_price_ranges(self):
+        programs = [_prog("GRID", 100.0)]
+        ranges = [{"start": "0.00", "end": "1.00", "step": "0.02"}]
+        data = _data({"EV": [{
+            "ticker": "GRID",
+            "title": None,
+            "close_time": FUTURE,
+            "price_ranges": ranges,
+        }]})
+        out = select_lip_markets(_client(programs), kalshi_data=data)
+        assert out[0]["title"] == "GRID"
+        assert out[0]["price_ranges"] == ranges
+
 
 if __name__ == "__main__":
     import unittest

@@ -1,14 +1,111 @@
 """Liquidity rewards scan for Polymarket and Kalshi reward programs."""
 
+import json
 import logging
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 
-from polymarket_api import get_clob_prices
 from fees import polymarket_maker_rebate
-from scans.helpers import _fetch_clob_for_market, filter_dust
+from scans.helpers import _fetch_clob_for_market
 
 logger = logging.getLogger(__name__)
+
+
+def _active_reward_allocations(allocations: object, today: date | None = None) -> list[dict]:
+    """Return current Polymarket CLOB reward allocations.
+
+    Gamma exposes reward allocations at ``clobRewards`` with ISO date fields.
+    Malformed allocations fail closed so an old or ambiguous program cannot be
+    surfaced as current economics.
+    """
+    if not isinstance(allocations, list):
+        return []
+    current = today or date.today()
+    active = []
+    for allocation in allocations:
+        if not isinstance(allocation, dict):
+            continue
+        try:
+            start = date.fromisoformat(str(allocation["startDate"])[:10])
+            end = date.fromisoformat(str(allocation["endDate"])[:10])
+            daily_rate = float(allocation.get("rewardsDailyRate") or 0)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if start <= current <= end and daily_rate > 0:
+            active.append(allocation)
+    return active
+
+
+def _extract_polymarket_reward_metadata(market: dict) -> dict:
+    """Normalize current Gamma reward fields into the scanner schema.
+
+    The current API uses top-level ``rewardsMinSize``,
+    ``rewardsMaxSpread`` (cents), and ``clobRewards``. Older fixtures and
+    callers use the scanner's nested ``incentives`` representation, so both
+    are accepted during migration.
+    """
+    legacy = market.get("incentives")
+    if isinstance(legacy, dict) and legacy:
+        return dict(legacy)
+
+    allocations = _active_reward_allocations(market.get("clobRewards"))
+    if not allocations:
+        return {}
+    try:
+        min_size = float(market.get("rewardsMinSize"))
+        max_spread = float(market.get("rewardsMaxSpread")) / 100.0
+        daily_rate = sum(float(a.get("rewardsDailyRate") or 0) for a in allocations)
+    except (TypeError, ValueError):
+        return {}
+    return {
+        "min_incentive_size": min_size,
+        "max_incentive_spread": max_spread,
+        "pool_size_usdc": daily_rate,
+        "reward_daily_rate_usdc": daily_rate,
+        "allocations": allocations,
+    }
+
+
+def _parse_yes_price(market: dict) -> float | None:
+    """Parse the first Gamma outcome price from list or JSON-string form."""
+    raw = market.get("outcomePrices")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(raw, list) or len(raw) < 2:
+        return None
+    try:
+        price = float(raw[0])
+    except (TypeError, ValueError):
+        return None
+    return price if 0 < price < 1 else None
+
+
+def _quantize_kalshi_price(price: float, price_ranges: list[dict], *, round_up: bool) -> float | None:
+    """Round a Kalshi quote onto the market-specific dynamic price grid."""
+    ranges = price_ranges or [{"start": "0.00", "end": "1.00", "step": "0.01"}]
+    try:
+        candidate = Decimal(str(price))
+    except InvalidOperation:
+        return None
+    for price_range in ranges:
+        try:
+            start = Decimal(str(price_range["start"]))
+            end = Decimal(str(price_range["end"]))
+            step = Decimal(str(price_range["step"]))
+        except (InvalidOperation, KeyError, TypeError):
+            continue
+        if step <= 0 or not (start <= candidate <= end):
+            continue
+        rounding = ROUND_CEILING if round_up else ROUND_FLOOR
+        units = ((candidate - start) / step).to_integral_value(rounding=rounding)
+        quantized = start + units * step
+        if start <= quantized <= end and Decimal("0") < quantized < Decimal("1"):
+            return float(quantized)
+    return None
 
 
 def _validate_reward_metadata(reward_dict: dict) -> bool:
@@ -176,7 +273,8 @@ def scan_polymarket_rewards(markets: list[dict], reward_tracker, min_pool_usdc: 
     Args:
         markets: List of Polymarket market objects from Markets API.
         reward_tracker: RewardTracker instance for calculating optimal spreads.
-        min_pool_usdc: Minimum reward pool size to include market (default $10).
+        min_pool_usdc: Minimum daily reward rate in USDC for current Gamma
+            markets (or legacy pool size for nested ``incentives`` callers).
         price_cache: Optional WS price cache for faster lookup.
 
     Returns:
@@ -197,7 +295,7 @@ def scan_polymarket_rewards(markets: list[dict], reward_tracker, min_pool_usdc: 
             continue
 
         # Stage 1: Check for active reward program
-        incentives = market.get("incentives", {})
+        incentives = _extract_polymarket_reward_metadata(market)
         if not incentives:
             filtered_no_incentives += 1
             continue
@@ -226,11 +324,8 @@ def scan_polymarket_rewards(markets: list[dict], reward_tracker, min_pool_usdc: 
 
         # Fall back to market mid-price
         if mid_price is None:
-            prices = market.get("outcomePrices", [])
-            if prices and len(prices) >= 2:
-                yes_price = prices[0]
-                mid_price = yes_price
-            else:
+            mid_price = _parse_yes_price(market)
+            if mid_price is None:
                 continue
 
         # Calculate optimal quotes using reward tracker
@@ -244,6 +339,8 @@ def scan_polymarket_rewards(markets: list[dict], reward_tracker, min_pool_usdc: 
         # the taker rate and the rebate share (25%, crypto 20%).
         category = market.get("category") or ""
         rebate_per_contract = polymarket_maker_rebate(optimal["bid"], 1, category=category)
+        min_size_rebate = rebate_per_contract * min_size
+        min_size_cost = optimal["bid"] * min_size
 
         # Create opportunity
         markets_by_key[market_key] = market
@@ -259,7 +356,16 @@ def scan_polymarket_rewards(markets: list[dict], reward_tracker, min_pool_usdc: 
             "optimal_spread": optimal["spread"],
             "single_sided_ok": single_sided_ok,
             "maker_rebate_per_contract": rebate_per_contract,
+            "estimated_maker_rebate_at_min_size": min_size_rebate,
+            "total_cost": f"${min_size_cost:.4f}",
+            # Passive maker rebates depend on a future fill, so they are not
+            # executable arbitrage profit and must not enter shared ranking.
+            "net_profit": 0.0,
+            "net_roi": 0.0,
+            "reward_daily_rate_usdc": incentives.get("reward_daily_rate_usdc", pool_size),
+            "_execution_eligible": False,
             "_category": category,
+            "_reward_allocations": incentives.get("allocations", []),
             "_market_key": market_key,
             "_market_volume": float(market.get("volume", 0) or 0),
         })
@@ -274,23 +380,23 @@ def scan_polymarket_rewards(markets: list[dict], reward_tracker, min_pool_usdc: 
     # Stage 2: Refine with CLOB depth check
     opportunities = _refine_rewards_with_clob(opportunities, markets_by_key, price_cache=price_cache)
 
-    # Filter dust (unlikely on rewards, but consistent with other scans)
-    opportunities = filter_dust(opportunities, min_amount=0.01)
-
     logger.info("Found %d Polymarket reward opportunities.", len(opportunities))
     return opportunities
 
 
-def scan_kalshi_rewards(kalshi_client, reward_tracker, min_pool_usdc: float = 10.0) -> list[dict]:
+def scan_kalshi_rewards(kalshi_client, reward_tracker, min_pool_usdc: float = 10.0,
+                        kalshi_data: tuple | None = None) -> list[dict]:
     """Scan for Kalshi reward-eligible markets and generate resting order opportunities.
 
-    Kalshi has no public reward API, so we generate opportunities for high-volume markets
-    where the reward tracker can log qualifying orders.
+    Uses Kalshi's public ``/incentive_programs`` endpoint through the canonical
+    LIP selector. Volume is not evidence that a market has a reward program.
 
     Args:
         kalshi_client: KalshiClient instance.
-        reward_tracker: KalshiRewardTracker instance for logging orders.
-        min_pool_usdc: Minimum pool size (Kalshi doesn't expose this; kept for API compatibility).
+        reward_tracker: Retained for interface compatibility; this discovery
+            function does not record or place orders.
+        min_pool_usdc: Minimum active reward pool in dollars.
+        kalshi_data: Optional already-fetched Kalshi events/markets tuple.
 
     Returns:
         List of reward opportunity dicts for Kalshi markets.
@@ -300,69 +406,49 @@ def scan_kalshi_rewards(kalshi_client, reward_tracker, min_pool_usdc: float = 10
     logger.info("Scanning Kalshi markets for reward-eligible opportunities...")
 
     try:
-        # Fetch active Kalshi markets via events → markets
-        if not hasattr(kalshi_client, "fetch_all_events"):
-            logger.warning("Kalshi client missing fetch_all_events; skipping reward scan")
-            return opportunities
-        events = kalshi_client.fetch_all_events() or []
-        kalshi_markets = []
-        for ev in events[:50]:  # Limit to top 50 events for reward scan
-            ticker = ev.get("event_ticker", "")
-            if ticker:
-                try:
-                    markets = kalshi_client.fetch_markets_for_event(ticker)
-                    kalshi_markets.extend(markets or [])
-                except Exception:
-                    pass
-        if not kalshi_markets:
-            logger.info("No Kalshi markets returned.")
-            return opportunities
+        from scans.lip_select import select_lip_markets
 
-        logger.info("Scanning %d Kalshi markets for liquidity incentive program eligibility...",
-                    len(kalshi_markets))
+        selected = select_lip_markets(kalshi_client, kalshi_data=kalshi_data)
+        for market in selected:
+            try:
+                pool = float(market.get("pool_dollars") or 0)
+                if pool < min_pool_usdc:
+                    continue
+                ticker = market.get("ticker")
+                mid_price = market.get("mid")
+                if not ticker or not isinstance(mid_price, (int, float)):
+                    continue
+                target_spread = max(0.02, min(0.05, mid_price * 0.03))
+                price_ranges = market.get("price_ranges") or []
+                bid = _quantize_kalshi_price(
+                    max(0.01, mid_price - target_spread / 2), price_ranges, round_up=False)
+                ask = _quantize_kalshi_price(
+                    min(0.99, mid_price + target_spread / 2), price_ranges, round_up=True)
+                if bid is None or ask is None or bid >= ask:
+                    logger.debug("LIP candidate %s has no valid quote pair on price_ranges", ticker)
+                    continue
 
-        filtered_low_volume = 0
-
-        for market in kalshi_markets:
-            ticker = market.get("ticker")
-            if not ticker:
-                continue
-
-            # Filter by daily volume (minimum $1000 for reward eligibility)
-            min_daily_volume = 1000.0
-            volume = float(market.get("volume_24h", 0) or 0)
-            if volume < min_daily_volume:
-                filtered_low_volume += 1
-                continue
-
-            # Get current mid-price from market order book
-            last_price = market.get("last_price")
-            if last_price is None or last_price <= 0 or last_price >= 1:
-                continue
-
-            mid_price = last_price
-
-            # Generate resting order opportunity
-            # Kalshi spreads: use 3% of mid as target (conservative)
-            target_spread = max(0.02, min(0.05, mid_price * 0.03))
-            bid = max(0.01, mid_price - target_spread / 2)
-            ask = min(0.99, mid_price + target_spread / 2)
-
-            opportunities.append({
-                "type": "KalshiRewards",
-                "_layer": 3,  # Layer 3: market making
-                "market": market.get("title", ticker)[:60],
-                "platform": "kalshi",
-                "ticker": ticker,
-                "optimal_bid": round(bid, 4),
-                "optimal_ask": round(ask, 4),
-                "optimal_spread": round(ask - bid, 4),
-                "_market_key": ticker,
-                "_market_volume": volume,
-            })
-
-        if filtered_low_volume:
-            logger.info("Filtered %d Kalshi markets with volume < $%.0f.", filtered_low_volume, min_daily_volume)
+                opportunities.append({
+                    "type": "KalshiRewards",
+                    "_layer": 3,  # Layer 3: market making
+                    "market": (market.get("title") or ticker)[:60],
+                    "platform": "kalshi",
+                    "ticker": ticker,
+                    "market_ticker": ticker,
+                    "reward_pool_usdc": pool,
+                    "optimal_bid": round(bid, 4),
+                    "optimal_ask": round(ask, 4),
+                    "optimal_spread": round(ask - bid, 4),
+                    "discount_factor_bps": market.get("discount_factor_bps"),
+                    "program_end": market.get("program_end"),
+                    "competition_depth": market.get("competition_depth"),
+                    "selection_score": market.get("score"),
+                    "_execution_eligible": False,
+                    "_market_key": ticker,
+                    "_price_ranges": price_ranges,
+                })
+            except (AttributeError, TypeError, ValueError) as exc:
+                logger.debug("Skipping malformed LIP candidate: %s", exc)
 
     except Exception as e:
         logger.error("Kalshi reward scan failed: %s", e)

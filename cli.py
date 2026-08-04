@@ -149,7 +149,7 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
             fetch_futures["poly_markets"] = pool.submit(fetch_all_markets)
         if args.mode in ("all", "negrisk", "negrisk-no"):
             fetch_futures["poly_events"] = pool.submit(fetch_events)
-        if args.mode in ("all", "kalshi", "cross", "spread") and kalshi_client:
+        if args.mode in ("all", "kalshi", "cross", "spread", "rewards") and kalshi_client:
             fetch_futures["kalshi_data"] = pool.submit(_fetch_kalshi_data, kalshi_client)
 
         for key, future in fetch_futures.items():
@@ -839,7 +839,8 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
                 from market_maker import KalshiRewardTracker
                 kalshi_reward_tracker = KalshiRewardTracker()
                 k_reward_opps = scan_kalshi_rewards(
-                    kalshi_client, kalshi_reward_tracker, min_pool_usdc=10.0
+                    kalshi_client, kalshi_reward_tracker, min_pool_usdc=10.0,
+                    kalshi_data=kalshi_data,
                 )
                 all_opportunities.extend(k_reward_opps)
                 logger.info("Found %d Kalshi reward opportunities.", len(k_reward_opps))
@@ -877,13 +878,16 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
     dashboard_state.daily_pnl = db.get_daily_pnl()
 
     # Execute opportunities if not display-only
-    if all_opportunities and (executor.dry_run or executor.exec_mode in ("semi-auto", "full-auto")):
+    execution_opportunities = [
+        opp for opp in all_opportunities if opp.get("_execution_eligible", True)
+    ]
+    if execution_opportunities and (executor.dry_run or executor.exec_mode in ("semi-auto", "full-auto")):
         logger.info("--- Execution Pass ---")
         executed = 0
-        for opp in all_opportunities:
+        for opp in execution_opportunities:
             if executor.execute(opp):
                 executed += 1
-        logger.info("Executed: %d/%d", executed, len(all_opportunities))
+        logger.info("Executed: %d/%d", executed, len(execution_opportunities))
 
 
 def _run_report(json_output: bool = False):

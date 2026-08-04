@@ -402,6 +402,19 @@ class TestRunOneshotFilteringAndExecution:
 
     @patch.object(_cli_mod, "display_results")
     @patch.object(_cli_mod, "dashboard_state")
+    @patch.object(_cli_mod, "scan_binary_internal")
+    @patch.object(_cli_mod, "fetch_all_markets", return_value=[{"question": "test"}])
+    def test_monitoring_only_opportunity_is_not_executed(self, mock_fetch, mock_scan, mock_dash, mock_display):
+        mock_scan.return_value = [
+            {"type": "BinaryInternal", "net_profit": 0.05},
+            {"type": "PolymarketRewards", "net_profit": 0.0, "_execution_eligible": False},
+        ]
+        executor = _make_executor(dry_run=True)
+        _cli_mod._run_oneshot(_make_args(), 0.01, None, executor, _make_db())
+        executor.execute.assert_called_once_with(mock_scan.return_value[0])
+
+    @patch.object(_cli_mod, "display_results")
+    @patch.object(_cli_mod, "dashboard_state")
     @patch.object(_cli_mod, "scan_binary_internal", return_value=[])
     @patch.object(_cli_mod, "fetch_all_markets", return_value=[{"question": "test"}])
     def test_no_opps_means_no_execution(self, mock_fetch, mock_scan, mock_dash, mock_display):

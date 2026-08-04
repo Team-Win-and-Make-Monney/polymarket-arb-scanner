@@ -109,6 +109,11 @@ def _wake_asyncio_selector(loop, event) -> bool:
     return True
 
 
+def _is_execution_eligible(opp: dict) -> bool:
+    """Return whether an opportunity may enter any execution path."""
+    return opp.get("_execution_eligible", True) is not False
+
+
 class OpportunityIndex:
     """Maps (platform, ticker/token) to opportunities for fast lookup on WS updates."""
 
@@ -120,6 +125,8 @@ class OpportunityIndex:
         """Rebuild the index from a list of opportunities."""
         new_index: dict[tuple[str, str], list[dict]] = {}
         for opp in opportunities:
+            if not _is_execution_eligible(opp):
+                continue
             keys = self._extract_keys(opp)
             for key in keys:
                 new_index.setdefault(key, []).append(opp)
@@ -1290,6 +1297,8 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
         if not affected:
             return
         for opp in affected:
+            if not _is_execution_eligible(opp):
+                continue
             # Recalculate profit using fresh WS price instead of stale value
             with _price_cache_lock:
                 cached = price_cache.get((platform, ticker), {})
@@ -1488,6 +1497,9 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                     continue
 
                 _priority_val, _seq, opp = item
+                if not _is_execution_eligible(opp):
+                    _priority_queue.task_done()
+                    continue
                 market_name = opp.get("market", "?")
                 profit = opp.get("net_profit", 0)
 
@@ -1675,7 +1687,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                             fetch_futures["poly_markets"] = pool.submit(fetch_all_markets)
                         if args.mode in ("all", "negrisk", "multi-cross"):
                             fetch_futures["poly_events"] = pool.submit(fetch_events)
-                        if args.mode in ("all", "kalshi", "cross", "spread", "multi-cross") and kalshi_client:
+                        if args.mode in ("all", "kalshi", "cross", "spread", "multi-cross", "rewards") and kalshi_client:
                             fetch_futures["kalshi_data"] = pool.submit(_fetch_kalshi_data, kalshi_client)
 
                         for key, future in fetch_futures.items():
@@ -1977,6 +1989,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                             k_reward_opps = scan_kalshi_rewards(
                                 kalshi_client=kalshi_client,
                                 reward_tracker=_kalshi_reward_tracker,
+                                kalshi_data=kalshi_data,
                             )
                             all_opportunities.extend(k_reward_opps)
 
@@ -2374,19 +2387,22 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
 
                 # Execute opportunities sequentially (balance must be rechecked between trades)
                 if all_opportunities:
+                    execution_opportunities = [
+                        opp for opp in all_opportunities if _is_execution_eligible(opp)
+                    ]
                     # Apply execution budget cap (selectivity control).
                     # Opportunities are already sorted by _execution_priority
                     # (weight * capital_efficiency_score), so slicing [:N]
                     # keeps the top N highest-priority candidates per cycle.
                     budget = getattr(config, "EXECUTION_BUDGET_PER_SCAN", 0)
                     exec_queue = (
-                        all_opportunities[:budget]
-                        if budget > 0 else all_opportunities
+                        execution_opportunities[:budget]
+                        if budget > 0 else execution_opportunities
                     )
-                    if budget > 0 and len(all_opportunities) > budget:
+                    if budget > 0 and len(execution_opportunities) > budget:
                         logger.info(
                             "Execution budget: top %d of %d opportunities selected",
-                            budget, len(all_opportunities),
+                            budget, len(execution_opportunities),
                         )
                     logger.info("--- Execution Pass ---")
                     executed = 0
@@ -2591,7 +2607,9 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                         pass
 
                 # Rebuild opportunity index for WS-triggered execution
-                opp_index.rebuild(all_opportunities)
+                opp_index.rebuild([
+                    opp for opp in all_opportunities if _is_execution_eligible(opp)
+                ])
 
                 # Subscribe to WebSocket feeds for discovered markets.
                 # We subscribe to opportunity tokens AND also to broader

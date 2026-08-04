@@ -1010,6 +1010,23 @@ class TestFetchIncentivePrograms:
         # Second call must carry the cursor
         assert req.call_args_list[1][1]["params"]["cursor"] == "abc"
 
+    def test_default_cap_covers_current_program_volume(self):
+        """Current active LIP inventory exceeds the old 20-page cap."""
+        c = self._client()
+        pages = []
+        for index in range(22):
+            pages.append(_mock_response(200, {
+                "incentive_programs": [{
+                    "market_ticker": f"M{index}",
+                    "period_reward": 10000,
+                }],
+                "next_cursor": f"cursor-{index}" if index < 21 else None,
+            }))
+        with patch.object(c, "_request", side_effect=pages) as req:
+            progs = c.fetch_incentive_programs()
+        assert len(progs) == 22
+        assert req.call_count == 22
+
     def test_passes_status_and_type_filters(self):
         c = self._client()
         page = {"incentive_programs": [], "next_cursor": None}

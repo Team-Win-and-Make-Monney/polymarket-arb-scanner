@@ -86,8 +86,8 @@ def select_lip_markets(kalshi_client, kalshi_data: tuple | None = None,
          pool / (1 + depth) so thin books rank higher
 
     Returns list of dicts sorted by score desc:
-        {ticker, pool_dollars, category, mid, competition_depth, score,
-         discount_factor_bps, program_end, market_close_hours}
+        {ticker, title, pool_dollars, category, mid, competition_depth, score,
+         discount_factor_bps, program_end, market_close_hours, price_ranges}
     """
     if not kalshi_client:
         return []
@@ -164,7 +164,7 @@ def select_lip_markets(kalshi_client, kalshi_data: tuple | None = None,
             continue
         candidates.append({
             "ticker": ticker,
-            "title": market.get("title", ticker),
+            "title": market.get("title") or ticker,
             "pool_dollars": round(pool["pool_dollars"], 2),
             "category": category,
             "mid": mid,

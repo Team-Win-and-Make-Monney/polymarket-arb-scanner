@@ -2,7 +2,6 @@
 
 import json
 import logging
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
@@ -274,7 +273,8 @@ def scan_polymarket_rewards(markets: list[dict], reward_tracker, min_pool_usdc: 
     Args:
         markets: List of Polymarket market objects from Markets API.
         reward_tracker: RewardTracker instance for calculating optimal spreads.
-        min_pool_usdc: Minimum reward pool size to include market (default $10).
+        min_pool_usdc: Minimum daily reward rate in USDC for current Gamma
+            markets (or legacy pool size for nested ``incentives`` callers).
         price_cache: Optional WS price cache for faster lookup.
 
     Returns:
@@ -358,9 +358,12 @@ def scan_polymarket_rewards(markets: list[dict], reward_tracker, min_pool_usdc: 
             "maker_rebate_per_contract": rebate_per_contract,
             "estimated_maker_rebate_at_min_size": min_size_rebate,
             "total_cost": f"${min_size_cost:.4f}",
-            "net_profit": min_size_rebate,
-            "net_roi": min_size_rebate / min_size_cost if min_size_cost > 0 else 0.0,
+            # Passive maker rebates depend on a future fill, so they are not
+            # executable arbitrage profit and must not enter shared ranking.
+            "net_profit": 0.0,
+            "net_roi": 0.0,
             "reward_daily_rate_usdc": incentives.get("reward_daily_rate_usdc", pool_size),
+            "_execution_eligible": False,
             "_category": category,
             "_reward_allocations": incentives.get("allocations", []),
             "_market_key": market_key,
@@ -390,7 +393,8 @@ def scan_kalshi_rewards(kalshi_client, reward_tracker, min_pool_usdc: float = 10
 
     Args:
         kalshi_client: KalshiClient instance.
-        reward_tracker: KalshiRewardTracker instance for logging orders.
+        reward_tracker: Retained for interface compatibility; this discovery
+            function does not record or place orders.
         min_pool_usdc: Minimum active reward pool in dollars.
         kalshi_data: Optional already-fetched Kalshi events/markets tuple.
 
@@ -406,41 +410,45 @@ def scan_kalshi_rewards(kalshi_client, reward_tracker, min_pool_usdc: float = 10
 
         selected = select_lip_markets(kalshi_client, kalshi_data=kalshi_data)
         for market in selected:
-            pool = float(market.get("pool_dollars") or 0)
-            if pool < min_pool_usdc:
-                continue
-            ticker = market.get("ticker")
-            mid_price = market.get("mid")
-            if not ticker or not isinstance(mid_price, (int, float)):
-                continue
-            target_spread = max(0.02, min(0.05, mid_price * 0.03))
-            price_ranges = market.get("price_ranges") or []
-            bid = _quantize_kalshi_price(
-                max(0.01, mid_price - target_spread / 2), price_ranges, round_up=False)
-            ask = _quantize_kalshi_price(
-                min(0.99, mid_price + target_spread / 2), price_ranges, round_up=True)
-            if bid is None or ask is None or bid >= ask:
-                logger.debug("LIP candidate %s has no valid quote pair on price_ranges", ticker)
-                continue
+            try:
+                pool = float(market.get("pool_dollars") or 0)
+                if pool < min_pool_usdc:
+                    continue
+                ticker = market.get("ticker")
+                mid_price = market.get("mid")
+                if not ticker or not isinstance(mid_price, (int, float)):
+                    continue
+                target_spread = max(0.02, min(0.05, mid_price * 0.03))
+                price_ranges = market.get("price_ranges") or []
+                bid = _quantize_kalshi_price(
+                    max(0.01, mid_price - target_spread / 2), price_ranges, round_up=False)
+                ask = _quantize_kalshi_price(
+                    min(0.99, mid_price + target_spread / 2), price_ranges, round_up=True)
+                if bid is None or ask is None or bid >= ask:
+                    logger.debug("LIP candidate %s has no valid quote pair on price_ranges", ticker)
+                    continue
 
-            opportunities.append({
-                "type": "KalshiRewards",
-                "_layer": 3,  # Layer 3: market making
-                "market": market.get("title", ticker)[:60],
-                "platform": "kalshi",
-                "ticker": ticker,
-                "market_ticker": ticker,
-                "reward_pool_usdc": pool,
-                "optimal_bid": round(bid, 4),
-                "optimal_ask": round(ask, 4),
-                "optimal_spread": round(ask - bid, 4),
-                "discount_factor_bps": market.get("discount_factor_bps"),
-                "program_end": market.get("program_end"),
-                "competition_depth": market.get("competition_depth"),
-                "selection_score": market.get("score"),
-                "_market_key": ticker,
-                "_price_ranges": price_ranges,
-            })
+                opportunities.append({
+                    "type": "KalshiRewards",
+                    "_layer": 3,  # Layer 3: market making
+                    "market": (market.get("title") or ticker)[:60],
+                    "platform": "kalshi",
+                    "ticker": ticker,
+                    "market_ticker": ticker,
+                    "reward_pool_usdc": pool,
+                    "optimal_bid": round(bid, 4),
+                    "optimal_ask": round(ask, 4),
+                    "optimal_spread": round(ask - bid, 4),
+                    "discount_factor_bps": market.get("discount_factor_bps"),
+                    "program_end": market.get("program_end"),
+                    "competition_depth": market.get("competition_depth"),
+                    "selection_score": market.get("score"),
+                    "_execution_eligible": False,
+                    "_market_key": ticker,
+                    "_price_ranges": price_ranges,
+                })
+            except (AttributeError, TypeError, ValueError) as exc:
+                logger.debug("Skipping malformed LIP candidate: %s", exc)
 
     except Exception as e:
         logger.error("Kalshi reward scan failed: %s", e)

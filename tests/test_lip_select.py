@@ -151,12 +151,12 @@ class TestSelectLipMarkets:
         ranges = [{"start": "0.00", "end": "1.00", "step": "0.02"}]
         data = _data({"EV": [{
             "ticker": "GRID",
-            "title": "Dynamic grid market",
+            "title": None,
             "close_time": FUTURE,
             "price_ranges": ranges,
         }]})
         out = select_lip_markets(_client(programs), kalshi_data=data)
-        assert out[0]["title"] == "Dynamic grid market"
+        assert out[0]["title"] == "GRID"
         assert out[0]["price_ranges"] == ranges
 
 

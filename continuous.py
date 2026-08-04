@@ -1675,7 +1675,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                             fetch_futures["poly_markets"] = pool.submit(fetch_all_markets)
                         if args.mode in ("all", "negrisk", "multi-cross"):
                             fetch_futures["poly_events"] = pool.submit(fetch_events)
-                        if args.mode in ("all", "kalshi", "cross", "spread", "multi-cross") and kalshi_client:
+                        if args.mode in ("all", "kalshi", "cross", "spread", "multi-cross", "rewards") and kalshi_client:
                             fetch_futures["kalshi_data"] = pool.submit(_fetch_kalshi_data, kalshi_client)
 
                         for key, future in fetch_futures.items():
@@ -2375,19 +2375,22 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
 
                 # Execute opportunities sequentially (balance must be rechecked between trades)
                 if all_opportunities:
+                    execution_opportunities = [
+                        opp for opp in all_opportunities if opp.get("_execution_eligible", True)
+                    ]
                     # Apply execution budget cap (selectivity control).
                     # Opportunities are already sorted by _execution_priority
                     # (weight * capital_efficiency_score), so slicing [:N]
                     # keeps the top N highest-priority candidates per cycle.
                     budget = getattr(config, "EXECUTION_BUDGET_PER_SCAN", 0)
                     exec_queue = (
-                        all_opportunities[:budget]
-                        if budget > 0 else all_opportunities
+                        execution_opportunities[:budget]
+                        if budget > 0 else execution_opportunities
                     )
-                    if budget > 0 and len(all_opportunities) > budget:
+                    if budget > 0 and len(execution_opportunities) > budget:
                         logger.info(
                             "Execution budget: top %d of %d opportunities selected",
-                            budget, len(all_opportunities),
+                            budget, len(execution_opportunities),
                         )
                     logger.info("--- Execution Pass ---")
                     executed = 0

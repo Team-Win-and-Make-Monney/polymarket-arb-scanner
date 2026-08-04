@@ -145,7 +145,7 @@ class TestRewardsContinuousMode:
             "rewardsMaxSpread": 3.5,
             "clobRewards": [{
                 "id": "reward-1",
-                "rewardsDailyRate": 10,
+                "rewardsDailyRate": 25,
                 "startDate": (today - timedelta(days=1)).isoformat(),
                 "endDate": (today + timedelta(days=1)).isoformat(),
             }],
@@ -159,8 +159,10 @@ class TestRewardsContinuousMode:
         assert len(opps) == 1
         assert opps[0]["min_size"] == pytest.approx(200.0)
         assert opps[0]["optimal_spread"] < 0.035
-        assert opps[0]["reward_daily_rate_usdc"] == pytest.approx(10.0)
-        assert opps[0]["net_profit"] > 0
+        assert opps[0]["reward_daily_rate_usdc"] == pytest.approx(25.0)
+        assert opps[0]["estimated_maker_rebate_at_min_size"] > 0
+        assert opps[0]["net_profit"] == 0
+        assert opps[0]["_execution_eligible"] is False
 
     def test_polymarket_expired_reward_allocation_is_excluded(self, reward_tracker):
         """Expired allocation rows must fail closed."""
@@ -206,6 +208,7 @@ class TestRewardsContinuousMode:
         assert opps[0]["optimal_bid"] == pytest.approx(0.50)
         assert opps[0]["optimal_ask"] == pytest.approx(0.52)
         assert opps[0]["_price_ranges"] == selected[0]["price_ranges"]
+        assert opps[0]["_execution_eligible"] is False
 
     def test_polymarket_rewards_integration(self, reward_tracker):
         """Mock Polymarket API and verify rewards scan called."""

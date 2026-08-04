@@ -1977,6 +1977,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                             k_reward_opps = scan_kalshi_rewards(
                                 kalshi_client=kalshi_client,
                                 reward_tracker=_kalshi_reward_tracker,
+                                kalshi_data=kalshi_data,
                             )
                             all_opportunities.extend(k_reward_opps)
 

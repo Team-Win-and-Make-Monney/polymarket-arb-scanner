@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch, AsyncMock
 import asyncio
 import sys
 import os
+from datetime import date, timedelta
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -129,6 +130,82 @@ class TestRewardsContinuousMode:
         # Politics taker at the optimal bid b: 0.04 * b * (1-b); rebate = 25%.
         b = opp["optimal_bid"]
         assert opp["maker_rebate_per_contract"] == pytest.approx(0.25 * 0.04 * b * (1 - b))
+
+    def test_polymarket_current_gamma_reward_schema_is_normalized(self, reward_tracker):
+        """Current top-level Gamma fields must not be mistaken for no program."""
+        from scans import scan_polymarket_rewards
+        from scans import rewards as rewards_mod
+
+        today = date.today()
+        market = {
+            "conditionId": "cond-current-schema",
+            "question": "Current reward schema",
+            "category": "politics",
+            "rewardsMinSize": 200,
+            "rewardsMaxSpread": 3.5,
+            "clobRewards": [{
+                "id": "reward-1",
+                "rewardsDailyRate": 10,
+                "startDate": (today - timedelta(days=1)).isoformat(),
+                "endDate": (today + timedelta(days=1)).isoformat(),
+            }],
+            "outcomePrices": '["0.42", "0.58"]',
+            "volume": "1000",
+        }
+
+        with patch.object(rewards_mod, "_refine_rewards_with_clob", side_effect=lambda opps, *_a, **_k: opps):
+            opps = scan_polymarket_rewards([market], reward_tracker, min_pool_usdc=10.0)
+
+        assert len(opps) == 1
+        assert opps[0]["min_size"] == pytest.approx(200.0)
+        assert opps[0]["optimal_spread"] < 0.035
+        assert opps[0]["reward_daily_rate_usdc"] == pytest.approx(10.0)
+        assert opps[0]["net_profit"] > 0
+
+    def test_polymarket_expired_reward_allocation_is_excluded(self, reward_tracker):
+        """Expired allocation rows must fail closed."""
+        from scans import scan_polymarket_rewards
+
+        yesterday = date.today() - timedelta(days=1)
+        market = {
+            "conditionId": "expired",
+            "rewardsMinSize": 10,
+            "rewardsMaxSpread": 3,
+            "clobRewards": [{
+                "rewardsDailyRate": 100,
+                "startDate": (yesterday - timedelta(days=10)).isoformat(),
+                "endDate": yesterday.isoformat(),
+            }],
+            "outcomePrices": [0.5, 0.5],
+        }
+        assert scan_polymarket_rewards([market], reward_tracker) == []
+
+    def test_kalshi_rewards_use_canonical_lip_selection_and_dynamic_grid(self, kalshi_reward_tracker):
+        """LIP programs, not volume, drive candidates and quotes honor price_ranges."""
+        from scans import scan_kalshi_rewards
+
+        selected = [{
+            "ticker": "KXTEST",
+            "title": "Test LIP market",
+            "pool_dollars": 25.0,
+            "mid": 0.51,
+            "discount_factor_bps": 5000,
+            "program_end": "2099-01-01T00:00:00Z",
+            "competition_depth": 12,
+            "score": 1.9,
+            "price_ranges": [{"start": "0.00", "end": "1.00", "step": "0.02"}],
+        }]
+        client = MagicMock()
+        with patch("scans.lip_select.select_lip_markets", return_value=selected) as selector:
+            opps = scan_kalshi_rewards(client, kalshi_reward_tracker, kalshi_data=([], {}, {}))
+
+        selector.assert_called_once_with(client, kalshi_data=([], {}, {}))
+        assert len(opps) == 1
+        assert opps[0]["market_ticker"] == "KXTEST"
+        assert opps[0]["reward_pool_usdc"] == pytest.approx(25.0)
+        assert opps[0]["optimal_bid"] == pytest.approx(0.50)
+        assert opps[0]["optimal_ask"] == pytest.approx(0.52)
+        assert opps[0]["_price_ranges"] == selected[0]["price_ranges"]
 
     def test_polymarket_rewards_integration(self, reward_tracker):
         """Mock Polymarket API and verify rewards scan called."""

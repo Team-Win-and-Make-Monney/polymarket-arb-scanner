@@ -571,7 +571,7 @@ class KalshiClient:
 
     def fetch_incentive_programs(self, status: str = "active",
                                  incentive_type: str = "liquidity",
-                                 max_pages: int = 20) -> list[dict]:
+                                 max_pages: int = 50) -> list[dict]:
         """Fetch Kalshi incentive programs (the per-market LIP pool list).
 
         GET /incentive_programs with cursor pagination. Each program dict

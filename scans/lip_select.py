@@ -6,10 +6,9 @@ SELECTION: large pools, thin competition, non-sports categories, far enough
 from resolution to quote safely.
 
 Pool data comes from GET /incentive_programs (KalshiClient.
-fetch_incentive_programs, verified live 2026-06-11). This module supersedes
-the Kalshi half of scans/rewards.py:scan_kalshi_rewards, which selected by
-24h volume only and read the retired cent-integer ``last_price`` field
-(rejecting every market) — retirement is tracked as Phase B hygiene.
+fetch_incentive_programs, verified live 2026-08-04). The Kalshi reward scanner
+delegates market selection here so discovery and continuous-mode quoting use
+the same current incentive-program data and eligibility filters.
 """
 
 import logging
@@ -165,12 +164,14 @@ def select_lip_markets(kalshi_client, kalshi_data: tuple | None = None,
             continue
         candidates.append({
             "ticker": ticker,
+            "title": market.get("title", ticker),
             "pool_dollars": round(pool["pool_dollars"], 2),
             "category": category,
             "mid": mid,
             "discount_factor_bps": pool["discount_factor_bps"],
             "program_end": pool["program_end"],
             "market_close_hours": round(close_hours, 1) if close_hours is not None else None,
+            "price_ranges": market.get("price_ranges") or [],
         })
 
     # Competition probe only for the richest pools — book fetches are the

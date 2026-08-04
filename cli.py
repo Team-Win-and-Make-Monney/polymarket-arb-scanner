@@ -839,7 +839,8 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
                 from market_maker import KalshiRewardTracker
                 kalshi_reward_tracker = KalshiRewardTracker()
                 k_reward_opps = scan_kalshi_rewards(
-                    kalshi_client, kalshi_reward_tracker, min_pool_usdc=10.0
+                    kalshi_client, kalshi_reward_tracker, min_pool_usdc=10.0,
+                    kalshi_data=kalshi_data,
                 )
                 all_opportunities.extend(k_reward_opps)
                 logger.info("Found %d Kalshi reward opportunities.", len(k_reward_opps))

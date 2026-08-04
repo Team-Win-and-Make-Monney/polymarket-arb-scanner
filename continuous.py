@@ -109,6 +109,11 @@ def _wake_asyncio_selector(loop, event) -> bool:
     return True
 
 
+def _is_execution_eligible(opp: dict) -> bool:
+    """Return whether an opportunity may enter any execution path."""
+    return opp.get("_execution_eligible", True) is not False
+
+
 class OpportunityIndex:
     """Maps (platform, ticker/token) to opportunities for fast lookup on WS updates."""
 
@@ -120,6 +125,8 @@ class OpportunityIndex:
         """Rebuild the index from a list of opportunities."""
         new_index: dict[tuple[str, str], list[dict]] = {}
         for opp in opportunities:
+            if not _is_execution_eligible(opp):
+                continue
             keys = self._extract_keys(opp)
             for key in keys:
                 new_index.setdefault(key, []).append(opp)
@@ -1290,6 +1297,8 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
         if not affected:
             return
         for opp in affected:
+            if not _is_execution_eligible(opp):
+                continue
             # Recalculate profit using fresh WS price instead of stale value
             with _price_cache_lock:
                 cached = price_cache.get((platform, ticker), {})
@@ -1488,6 +1497,9 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                     continue
 
                 _priority_val, _seq, opp = item
+                if not _is_execution_eligible(opp):
+                    _priority_queue.task_done()
+                    continue
                 market_name = opp.get("market", "?")
                 profit = opp.get("net_profit", 0)
 
@@ -2376,7 +2388,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                 # Execute opportunities sequentially (balance must be rechecked between trades)
                 if all_opportunities:
                     execution_opportunities = [
-                        opp for opp in all_opportunities if opp.get("_execution_eligible", True)
+                        opp for opp in all_opportunities if _is_execution_eligible(opp)
                     ]
                     # Apply execution budget cap (selectivity control).
                     # Opportunities are already sorted by _execution_priority
@@ -2595,7 +2607,9 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                         pass
 
                 # Rebuild opportunity index for WS-triggered execution
-                opp_index.rebuild(all_opportunities)
+                opp_index.rebuild([
+                    opp for opp in all_opportunities if _is_execution_eligible(opp)
+                ])
 
                 # Subscribe to WebSocket feeds for discovered markets.
                 # We subscribe to opportunity tokens AND also to broader

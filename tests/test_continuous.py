@@ -37,7 +37,15 @@ sys.modules["dashboard"] = mock_dashboard
 sys.modules["display"] = MagicMock()
 sys.modules["recovery"] = MagicMock()
 
-from continuous import OpportunityIndex, _recalc_profit, _get_market_lock, _calc_realized_pnl, _StageTimer, _format_stage_timings
+from continuous import (
+    OpportunityIndex,
+    _StageTimer,
+    _calc_realized_pnl,
+    _format_stage_timings,
+    _get_market_lock,
+    _is_execution_eligible,
+    _recalc_profit,
+)
 from db import TradeDB
 
 # Restore original modules so other test files are not affected
@@ -182,6 +190,21 @@ class TestOpportunityIndexRebuild:
         idx.rebuild(opps)
         assert idx.lookup("polymarket", "") == []
         assert idx.lookup("kalshi", "") == []
+
+    def test_monitoring_only_opp_cannot_reach_ws_index(self):
+        idx = OpportunityIndex()
+        idx.rebuild([{
+            "_token_ids": ["reward-token"],
+            "net_profit": 10.0,
+            "_execution_eligible": False,
+        }])
+        assert idx.lookup("polymarket", "reward-token") == []
+        assert idx.get_subscription_tokens() == ([], [])
+
+    def test_execution_eligibility_defaults_true_and_honors_false(self):
+        assert _is_execution_eligible({}) is True
+        assert _is_execution_eligible({"_execution_eligible": True}) is True
+        assert _is_execution_eligible({"_execution_eligible": False}) is False
 
 
 # ---------------------------------------------------------------------------

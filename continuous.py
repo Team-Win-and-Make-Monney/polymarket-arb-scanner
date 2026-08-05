@@ -146,6 +146,29 @@ def _ws_tracking_probability(platform: str, entry: dict | None) -> float | None:
     return _cache_probability(entry, "price", "yes_price", "yes")
 
 
+def _ws_opportunity_probability(opp: dict, platform: str, entry: dict | None) -> float | None:
+    """Extract the executable WS price for the opportunity's platform side."""
+    if platform != "kalshi":
+        return _ws_tracking_probability(platform, entry)
+
+    side = None
+    if opp.get("_platform_a") == "kalshi":
+        side = opp.get("_side_a")
+    elif opp.get("_platform_b") == "kalshi":
+        side = opp.get("_side_b")
+
+    if side is None:
+        opp_type = opp.get("type", "").upper()
+        if "K_NO" in opp_type:
+            side = "no"
+        elif "K_YES" in opp_type:
+            side = "yes"
+
+    if side == "no":
+        return _cache_probability(entry, "no_ask", "no_price", "no")
+    return _cache_probability(entry, "yes_ask", "yes_price", "yes", "price")
+
+
 class _WSTriggerDeduper:
     """Thread-safe short cooldown for identical WS-triggered opportunities."""
 
@@ -1384,12 +1407,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
             # Recalculate profit using fresh WS price instead of stale value
             with _price_cache_lock:
                 cached = price_cache.get((platform, ticker), {})
-            if platform == "polymarket":
-                new_price = _cache_probability(cached, "best_ask", "ask", "price")
-            elif platform == "kalshi":
-                new_price = _cache_probability(cached, "yes_ask", "yes_price", "yes", "price")
-            else:
-                new_price = _cache_probability(cached, "price")
+            new_price = _ws_opportunity_probability(opp, platform, cached)
             if new_price is None:
                 continue
             recalculated_profit = _recalc_profit(opp, platform, ticker, new_price, price_cache)

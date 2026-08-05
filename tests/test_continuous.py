@@ -45,6 +45,7 @@ from continuous import (
     _get_market_lock,
     _is_execution_eligible,
     _recalc_profit,
+    _ws_opportunity_probability,
     _ws_tracking_probability,
 )
 from db import TradeDB
@@ -496,6 +497,24 @@ class TestWSTrackingProbability:
         entry = {"yes": [[40, 10]], "no": [[60, 10]], "price": 45}
 
         assert _ws_tracking_probability("kalshi", entry) is None
+
+    def test_opportunity_selects_kalshi_no_side_from_metadata(self):
+        opp = {
+            "type": "FeePromo",
+            "_platform_a": "polymarket",
+            "_platform_b": "kalshi",
+            "_side_a": "yes",
+            "_side_b": "no",
+        }
+        entry = {"yes_ask": "0.41", "no_ask": "0.62"}
+
+        assert _ws_opportunity_probability(opp, "kalshi", entry) == pytest.approx(0.62)
+
+    def test_opportunity_infers_kalshi_no_side_from_cross_type(self):
+        opp = {"type": "Cross(PM_YES + K_NO)"}
+        entry = {"yes_ask": "0.41", "no_ask": "0.62"}
+
+        assert _ws_opportunity_probability(opp, "kalshi", entry) == pytest.approx(0.62)
 
 
 # ---------------------------------------------------------------------------

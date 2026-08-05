@@ -228,6 +228,10 @@ class SXBetClient:
         logger.info("SX Bet: fetched %d unique active markets", len(all_markets))
         return all_markets
 
+    def health_check(self) -> dict | None:
+        """Probe the cheap public sports endpoint for service reachability."""
+        return self._request("GET", "/sports")
+
     def get_market_price(self, market: dict) -> tuple[float | None, float | None]:
         """Extract best back/lay prices as YES/NO probabilities.
 

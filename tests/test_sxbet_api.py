@@ -226,6 +226,11 @@ class TestSXBetFetchData:
         with patch.object(client, "_request", return_value=None):
             assert client.fetch_all_markets() == []
 
+    def test_health_check_uses_cheap_sports_endpoint(self, client):
+        with patch.object(client, "_request", return_value={"data": []}) as request:
+            assert client.health_check() == {"data": []}
+        request.assert_called_once_with("GET", "/sports")
+
     def test_list_runners(self, client):
         # SX Bet binary markets have synthetic outcome names baked in;
         # list_runners no longer hits the API.

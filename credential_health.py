@@ -17,7 +17,7 @@ HEALTH_ENDPOINTS = {
     "kalshi": {"method": "fetch_all_events", "args": {"limit": 1}},
     "betfair": {"method": "list_event_types", "args": {}},
     "smarkets": {"method": "fetch_all_markets", "args": {}},
-    "sxbet": {"method": "fetch_all_markets", "args": {}},
+    "sxbet": {"method": "health_check", "args": {}},
     "matchbook": {"method": "fetch_all_events", "args": {}},
     "gemini": {"method": "fetch_all_markets", "args": {"status": "active"}},
     "ibkr": {"method": "fetch_all_markets", "args": {}},

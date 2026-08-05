@@ -45,6 +45,7 @@ def require_kalshi_or_exit(kalshi_client) -> None:
 from polymarket_api import (
     fetch_all_markets,
     fetch_events,
+    fetch_reward_markets,
     PolymarketTrader,
 )
 from kalshi_api import build_client_from_env, kalshi_creds_configured
@@ -141,14 +142,20 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
     # Stage 1: Fetch data from all platforms in parallel
     poly_markets = None
     poly_events = None
+    poly_reward_markets = None
     kalshi_data = None
 
     fetch_futures = {}
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        if args.mode not in ("kalshi", "betfair", "smarkets", "sxbet", "matchbook", "gemini", "ibkr", "triangular"):
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        if args.mode not in (
+            "kalshi", "betfair", "smarkets", "sxbet", "matchbook", "gemini",
+            "ibkr", "triangular", "rewards",
+        ):
             fetch_futures["poly_markets"] = pool.submit(fetch_all_markets)
         if args.mode in ("all", "negrisk", "negrisk-no"):
             fetch_futures["poly_events"] = pool.submit(fetch_events)
+        if args.mode in ("all", "rewards") and CONFIG_REWARDS_ENABLED:
+            fetch_futures["poly_reward_markets"] = pool.submit(fetch_reward_markets)
         if args.mode in ("all", "kalshi", "cross", "spread", "rewards") and kalshi_client:
             fetch_futures["kalshi_data"] = pool.submit(_fetch_kalshi_data, kalshi_client)
 
@@ -165,6 +172,8 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
                     poly_events = result
                     if poly_events:
                         logger.info("Fetched %d events.", len(poly_events))
+                elif key == "poly_reward_markets":
+                    poly_reward_markets = result
                 elif key == "kalshi_data":
                     kalshi_data = result
             except Exception as e:
@@ -822,11 +831,11 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
         logger.info("--- Rewards Scan ---")
         try:
             # Polymarket rewards scan
-            if poly_markets:
+            if poly_reward_markets:
                 from market_maker import RewardTracker
                 reward_tracker = RewardTracker()
                 pm_reward_opps = scan_polymarket_rewards(
-                    poly_markets, reward_tracker, min_pool_usdc=10.0
+                    poly_reward_markets, reward_tracker, min_pool_usdc=10.0
                 )
                 all_opportunities.extend(pm_reward_opps)
                 logger.info("Found %d Polymarket reward opportunities.", len(pm_reward_opps))

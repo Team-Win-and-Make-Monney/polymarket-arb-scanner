@@ -123,73 +123,150 @@ def _get_with_retry(url: str, params: dict = None, timeout: int = 30) -> request
         raise
 
 
-def fetch_all_markets(limit: int = 500, max_pages: int = 20) -> list[dict]:
-    """Fetch all active markets from the Gamma API with pagination."""
-    all_markets = []
-    offset = 0
+def _fetch_gamma_keyset(resource: str, order: str, limit: int, max_pages: int) -> list[dict]:
+    """Fetch a volume-ranked, bounded Gamma universe with opaque cursors."""
+    rows_by_id: dict[str, dict] = {}
+    cursor = None
 
     for _ in range(max_pages):
         params = {
             "limit": limit,
-            "offset": offset,
             "active": "true",
             "closed": "false",
+            "order": order,
+            "ascending": "false",
         }
+        if cursor:
+            params["after_cursor"] = cursor
         try:
-            resp = _get_with_retry(f"{GAMMA_BASE}/markets", params=params)
-            markets = resp.json()
-        except (requests.RequestException, json.JSONDecodeError, _RateLimitError) as e:
-            logger.warning("Polymarket markets request failed at offset %s: %s", offset, e)
+            resp = _get_with_retry(f"{GAMMA_BASE}/{resource}/keyset", params=params)
+            payload = resp.json()
+        except (requests.RequestException, json.JSONDecodeError, _RateLimitError) as exc:
+            logger.warning("Polymarket %s keyset request failed: %s", resource, exc)
             break
 
-        if not markets:
+        if not isinstance(payload, dict):
+            logger.warning("Polymarket %s keyset returned non-object payload", resource)
             break
+        page = payload.get(resource)
+        if not isinstance(page, list):
+            logger.warning("Polymarket %s keyset payload missing %s list", resource, resource)
+            break
+        for row in page:
+            if isinstance(row, dict):
+                row_id = row.get("id")
+                key = str(row_id if row_id is not None else row.get("conditionId") or "")
+                if key:
+                    rows_by_id[key] = row
 
-        all_markets.extend(markets)
-        # Gamma silently caps the page size (limit=500 returns 100 rows), so
-        # advance by the actual page length and stop only on an empty page —
-        # `len(markets) < limit` would end pagination after the first page.
-        offset += len(markets)
+        cursor = payload.get("next_cursor")
+        if not page or not cursor:
+            break
     else:
-        logger.warning(
-            "Polymarket markets pagination hit max_pages=%d (%d markets fetched) — universe may be truncated",
-            max_pages, len(all_markets))
+        logger.info(
+            "Polymarket %s universe bounded at %d pages (%d unique rows, order=%s desc)",
+            resource, max_pages, len(rows_by_id), order,
+        )
 
-    return all_markets
+    return list(rows_by_id.values())
+
+
+def fetch_all_markets(limit: int = 500, max_pages: int = 20) -> list[dict]:
+    """Fetch the top active markets by numeric lifetime volume.
+
+    Gamma rejects deep offset pagination and the active universe exceeds
+    25,000 rows. The scanner intentionally bounds each cycle to ``max_pages``
+    economically relevant markets using the official keyset cursor.
+    """
+    return _fetch_gamma_keyset("markets", "volumeNum", limit, max_pages)
 
 
 def fetch_events(limit: int = 500, max_pages: int = 20) -> list[dict]:
-    """Fetch events from the Gamma API (for grouping multi-outcome markets)."""
-    all_events = []
-    offset = 0
+    """Fetch the top active events by numeric lifetime volume."""
+    return _fetch_gamma_keyset("events", "volume", limit, max_pages)
+
+
+def _normalize_sampling_market(market: dict) -> dict | None:
+    """Convert a CLOB sampling-market row to the scanner's Gamma shape."""
+    condition_id = market.get("condition_id")
+    rewards = market.get("rewards")
+    tokens = market.get("tokens")
+    if not condition_id or not isinstance(rewards, dict) or not isinstance(tokens, list):
+        return None
+    try:
+        min_size = float(rewards["min_size"])
+        max_spread = float(rewards["max_spread"]) / 100.0
+        daily_rate = sum(
+            float(rate.get("rewards_daily_rate") or 0)
+            for rate in (rewards.get("rates") or [])
+            if isinstance(rate, dict)
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    if min_size <= 0 or max_spread <= 0 or daily_rate <= 0:
+        return None
+
+    outcome_order = {"yes": 0, "no": 1}
+    normalized_tokens = sorted(
+        (token for token in tokens if isinstance(token, dict) and token.get("token_id")),
+        key=lambda token: outcome_order.get(str(token.get("outcome", "")).lower(), 2),
+    )
+    if len(normalized_tokens) < 2:
+        return None
+    tags = market.get("tags") or []
+    category = str(tags[0]).lower() if isinstance(tags, list) and tags else ""
+    return {
+        "conditionId": condition_id,
+        "question": market.get("question") or condition_id,
+        "category": category,
+        "active": bool(market.get("active", True)),
+        "closed": bool(market.get("closed", False)),
+        "acceptingOrders": bool(market.get("accepting_orders", True)),
+        "outcomePrices": [token.get("price") for token in normalized_tokens[:2]],
+        "clobTokenIds": json.dumps([token["token_id"] for token in normalized_tokens[:2]]),
+        "incentives": {
+            "min_incentive_size": min_size,
+            "max_incentive_spread": max_spread,
+            "pool_size_usdc": daily_rate,
+            "reward_daily_rate_usdc": daily_rate,
+        },
+        "_sampling_market": True,
+    }
+
+
+def fetch_reward_markets(max_pages: int = 20) -> list[dict]:
+    """Fetch and normalize the complete current CLOB reward-market feed."""
+    markets_by_condition: dict[str, dict] = {}
+    cursor = None
 
     for _ in range(max_pages):
-        params = {
-            "limit": limit,
-            "offset": offset,
-            "active": "true",
-            "closed": "false",
-        }
+        params = {"next_cursor": cursor} if cursor else None
         try:
-            resp = _get_with_retry(f"{GAMMA_BASE}/events", params=params)
-            events = resp.json()
-        except (requests.RequestException, json.JSONDecodeError, _RateLimitError) as e:
-            logger.warning("Polymarket events request failed at offset %s: %s", offset, e)
+            resp = _get_with_retry(f"{CLOB_BASE}/sampling-markets", params=params)
+            payload = resp.json()
+        except (requests.RequestException, json.JSONDecodeError, _RateLimitError) as exc:
+            logger.warning("Polymarket sampling-markets request failed: %s", exc)
             break
-
-        if not events:
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            logger.warning("Polymarket sampling-markets returned an invalid payload")
             break
-
-        all_events.extend(events)
-        # Same server-side page cap as fetch_all_markets: advance by the
-        # actual page length; only an empty page means the end.
-        offset += len(events)
+        for raw_market in payload["data"]:
+            if not isinstance(raw_market, dict):
+                continue
+            market = _normalize_sampling_market(raw_market)
+            if market:
+                markets_by_condition[market["conditionId"]] = market
+        cursor = payload.get("next_cursor")
+        if not payload["data"] or not cursor or cursor == "LTE=":
+            break
     else:
         logger.warning(
-            "Polymarket events pagination hit max_pages=%d (%d events fetched) — universe may be truncated",
-            max_pages, len(all_events))
+            "Polymarket sampling-markets hit max_pages=%d (%d unique markets)",
+            max_pages, len(markets_by_condition),
+        )
 
-    return all_events
+    logger.info("Fetched %d current Polymarket reward markets.", len(markets_by_condition))
+    return list(markets_by_condition.values())
 
 
 def fetch_order_book(token_id: str) -> dict | None:

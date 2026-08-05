@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 
+from config import REWARDS_MAX_MARKETS
 from fees import polymarket_maker_rebate
 from scans.helpers import _fetch_clob_for_market
 
@@ -263,7 +264,8 @@ def _refine_rewards_with_clob(opportunities: list[dict], markets_by_key: dict,
 
 
 def scan_polymarket_rewards(markets: list[dict], reward_tracker, min_pool_usdc: float = 10.0,
-                            price_cache: dict | None = None) -> list[dict]:
+                            price_cache: dict | None = None,
+                            max_candidates: int | None = None) -> list[dict]:
     """Scan for Polymarket reward-eligible markets and generate resting order opportunities.
 
     Two-stage scan:
@@ -276,6 +278,7 @@ def scan_polymarket_rewards(markets: list[dict], reward_tracker, min_pool_usdc: 
         min_pool_usdc: Minimum daily reward rate in USDC for current Gamma
             markets (or legacy pool size for nested ``incentives`` callers).
         price_cache: Optional WS price cache for faster lookup.
+        max_candidates: Maximum reward markets to refine against the CLOB.
 
     Returns:
         List of reward opportunity dicts.
@@ -341,6 +344,8 @@ def scan_polymarket_rewards(markets: list[dict], reward_tracker, min_pool_usdc: 
         rebate_per_contract = polymarket_maker_rebate(optimal["bid"], 1, category=category)
         min_size_rebate = rebate_per_contract * min_size
         min_size_cost = optimal["bid"] * min_size
+        reward_daily_rate = incentives.get("reward_daily_rate_usdc", pool_size)
+        reward_density = reward_daily_rate / max(min_size_cost, 1.0)
 
         # Create opportunity
         markets_by_key[market_key] = market
@@ -362,7 +367,8 @@ def scan_polymarket_rewards(markets: list[dict], reward_tracker, min_pool_usdc: 
             # executable arbitrage profit and must not enter shared ranking.
             "net_profit": 0.0,
             "net_roi": 0.0,
-            "reward_daily_rate_usdc": incentives.get("reward_daily_rate_usdc", pool_size),
+            "reward_daily_rate_usdc": reward_daily_rate,
+            "reward_density_score": reward_density,
             "_execution_eligible": False,
             "_category": category,
             "_reward_allocations": incentives.get("allocations", []),
@@ -376,6 +382,15 @@ def scan_polymarket_rewards(markets: list[dict], reward_tracker, min_pool_usdc: 
         logger.info("Filtered %d markets with reward pool < $%.2f.", filtered_small_pool, min_pool_usdc)
     if filtered_invalid_metadata:
         logger.info("Filtered %d markets with invalid reward metadata.", filtered_invalid_metadata)
+
+    candidate_limit = REWARDS_MAX_MARKETS if max_candidates is None else max_candidates
+    opportunities.sort(key=lambda opp: opp.get("reward_density_score", 0), reverse=True)
+    if candidate_limit > 0 and len(opportunities) > candidate_limit:
+        logger.info(
+            "Selected top %d of %d Polymarket reward candidates by reward density.",
+            candidate_limit, len(opportunities),
+        )
+        opportunities = opportunities[:candidate_limit]
 
     # Stage 2: Refine with CLOB depth check
     opportunities = _refine_rewards_with_clob(opportunities, markets_by_key, price_cache=price_cache)

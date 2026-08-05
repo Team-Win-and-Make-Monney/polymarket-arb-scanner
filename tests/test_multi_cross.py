@@ -62,6 +62,42 @@ class TestMatchEventsByTitle:
         assert _match_events_by_title([], {}, {}) == []
         assert _match_events_by_title([{"title": "test"}], {}, {}) == []
 
+    def test_matcher_preserves_entity_overlap_gate(self):
+        from scans.multi_cross import _match_events_by_title
+
+        pm_events = [{"title": "Who will win the Michigan governor election in 2026?", "markets": []}]
+        kalshi_events = {
+            "MI-GOV": [{"ticker": "MI-GOV-DEM"}],
+            "GOLD": [{"ticker": "GOLD-PRICE"}],
+            "WEATHER": [{"ticker": "WEATHER-NYC"}],
+        }
+        kalshi_titles = {
+            "MI-GOV": "Who will win the Michigan governor election in 2026?",
+            "GOLD": "Price of gold above 3000 in 2026?",
+            "WEATHER": "New York City snowfall in December?",
+        }
+
+        matches = _match_events_by_title(pm_events, kalshi_events, kalshi_titles)
+
+        assert [match[1] for match in matches] == ["MI-GOV"]
+
+    def test_tied_scores_preserve_first_kalshi_event(self):
+        from scans.multi_cross import _match_events_by_title
+
+        pm_events = [{"title": "Michigan governor election in 2026", "markets": []}]
+        kalshi_events = {
+            "FIRST": [{"ticker": "FIRST"}],
+            "SECOND": [{"ticker": "SECOND"}],
+        }
+        kalshi_titles = {
+            "FIRST": "Michigan governor election in 2026",
+            "SECOND": "Michigan governor election in 2026",
+        }
+
+        matches = _match_events_by_title(pm_events, kalshi_events, kalshi_titles)
+
+        assert [match[1] for match in matches] == ["FIRST"]
+
 
 # ---------------------------------------------------------------------------
 # Outcome matching tests

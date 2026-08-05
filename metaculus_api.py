@@ -22,6 +22,10 @@ _rate_lock = threading.Lock()
 MIN_REQUEST_INTERVAL = 1.0
 
 
+# ---------------------------------------------------------------------------
+# Response normalization
+# ---------------------------------------------------------------------------
+
 def _rate_limit():
     """Enforce the minimum request interval in a thread-safe way."""
     global _last_request_time
@@ -71,6 +75,10 @@ def _normalize_post(post: dict) -> dict | None:
 
     return normalized
 
+
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
 
 class MetaculusClient:
     """Authenticated Metaculus community-prediction client (read-only)."""
@@ -218,9 +226,13 @@ class MetaculusClient:
         """Fetch and normalize the post containing a question."""
         post_id = self._post_ids.get(question_id)
         if post_id is None:
+            for question in self.fetch_active_questions(limit=200):
+                if question.get("id") == question_id:
+                    post_id = question.get("_post_id")
+                    break
+        if not isinstance(post_id, int):
             logger.warning(
-                "Metaculus post ID is unknown for question %s; fetch the active "
-                "question feed before requesting details.",
+                "Metaculus post ID could not be resolved for question %s.",
                 question_id,
             )
             return None

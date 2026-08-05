@@ -9,6 +9,7 @@ import argparse
 import csv
 import datetime as dt
 import json
+import logging
 import sys
 import urllib.parse
 import urllib.request
@@ -20,6 +21,13 @@ PERIOD_REWARD_DOLLAR_DIVISOR = 10000.0
 DEFAULT_OUTPUT = Path("data/kalshi-rewards/latest.md")
 DEFAULT_CSV_OUTPUT = Path("data/kalshi-rewards/latest.csv")
 MAX_INCENTIVE_PAGES = 1000
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Public API retrieval
+# ---------------------------------------------------------------------------
 
 
 def _utc_now() -> dt.datetime:
@@ -90,6 +98,10 @@ def fetch_active_incentive_type_counts() -> Counter:
     payload = _fetch_json("/incentive_programs", {"status": "active", "type": "all", "limit": 10000})
     return Counter(row.get("incentive_type") or "unknown" for row in payload.get("incentive_programs", []))
 
+
+# ---------------------------------------------------------------------------
+# Grouping and scoring
+# ---------------------------------------------------------------------------
 
 def _group_key(ticker: str, base_counts: Counter) -> str:
     """Derive a stable event-like key from market tickers.
@@ -254,6 +266,10 @@ def summarize_incentives(incentives: list[dict], now: dt.datetime | None = None)
     )
 
 
+# ---------------------------------------------------------------------------
+# Markdown rendering
+# ---------------------------------------------------------------------------
+
 def _why(summary: dict) -> str:
     notes = []
     if summary["avg_target"] <= 300:
@@ -333,8 +349,15 @@ def _render_table(title: str, rows: list[dict], limit: int) -> list[str]:
     return lines
 
 
-def render_digest(summaries: list[dict], now: dt.datetime | None = None, limit: int = 12) -> str:
+def render_digest(
+    summaries: list[dict],
+    now: dt.datetime | None = None,
+    limit: int = 12,
+    source_reviewed_at: dt.datetime | None = None,
+) -> str:
+    """Render a read-only digest with explicit source provenance."""
     now = now or _utc_now()
+    source_reviewed_at = source_reviewed_at or now
     active = [row for row in summaries if row["hours_left"] > 0]
     largest = sorted(active, key=lambda row: row["total_reward"], reverse=True)
     small_target = sorted(
@@ -351,8 +374,9 @@ def render_digest(summaries: list[dict], now: dt.datetime | None = None, limit: 
     lines = [
         "# Kalshi Rewards Read-Only Digest",
         "",
-        f"Generated: {now.isoformat(timespec='seconds')}",
-        "Source: Kalshi public `/trade-api/v2/incentive_programs?status=active&type=liquidity`.",
+        f"Generated: {now.isoformat()}",
+        f"Official source reviewed: {source_reviewed_at.isoformat()}",
+        "Source: Kalshi public `/trade-api/v2/incentive_programs?status=active&type=all`.",
         "",
         "Safety boundary: this digest is read-only. It does not use Kalshi credentials, place orders, cancel orders, copy referral links, or complete account actions.",
         "",
@@ -360,7 +384,7 @@ def render_digest(summaries: list[dict], now: dt.datetime | None = None, limit: 
         "",
         "- Liquidity rewards are market-making contests. You earn only by providing qualifying resting liquidity during the listed window; the pool is split by Kalshi's program rules, so the displayed reward is not guaranteed.",
         "- Liquidity rewards do not require your order to fill, but you must place real resting orders. If another trader takes your order, you now have a live position and inventory risk.",
-        "- Volume rewards are different: they require actual eligible trades. The current active public feed is liquidity-only unless the type count below changes.",
+        "- Volume rewards are different: they require actual eligible trades. This digest requests all active incentive types and labels each group below.",
         "- `target_size_fp` is the posted-liquidity size target shown by the API. A 1000 target is much harder for a small account than a 300 target.",
         "- Competition matters. The public API gives reward size, target size, and timing, but not the UI's exact Competition label, so the competition column below is a proxy.",
         "- Manual gate before any trade: open the incentive row, confirm exact terms, verify the order book, define max inventory loss, then place only orders you personally approve.",
@@ -383,9 +407,23 @@ def render_digest(summaries: list[dict], now: dt.datetime | None = None, limit: 
     return "\n".join(lines)
 
 
-def write_csv(summaries: list[dict], output: Path) -> None:
+# ---------------------------------------------------------------------------
+# CSV export
+# ---------------------------------------------------------------------------
+
+def write_csv(
+    summaries: list[dict],
+    output: Path,
+    generated_at: dt.datetime | None = None,
+    source_reviewed_at: dt.datetime | None = None,
+) -> None:
+    """Write the full reward summary with explicit source provenance."""
     output.parent.mkdir(parents=True, exist_ok=True)
+    generated_at = generated_at or _utc_now()
+    source_reviewed_at = source_reviewed_at or generated_at
     fields = [
+        "generated_at",
+        "source_reviewed_at",
         "group_key",
         "incentive_types",
         "category",
@@ -403,10 +441,12 @@ def write_csv(summaries: list[dict], output: Path) -> None:
         "sample_tickers",
     ]
     with output.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
+        writer = csv.DictWriter(f, fieldnames=fields, lineterminator="\n")
         writer.writeheader()
         for row in summaries:
             writer.writerow({
+                "generated_at": generated_at.isoformat(),
+                "source_reviewed_at": source_reviewed_at.isoformat(),
                 "group_key": row["group_key"],
                 "incentive_types": ",".join(sorted(row.get("incentive_types", []))),
                 "category": row["category"],
@@ -425,6 +465,10 @@ def write_csv(summaries: list[dict], output: Path) -> None:
             })
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate a read-only Kalshi rewards digest.")
     parser.add_argument("--limit", type=int, default=12, help="Rows per table.")
@@ -436,16 +480,27 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
-    now = _utc_now()
-    incentives = fetch_incentives()
-    summaries = summarize_incentives(incentives, now)
-    digest = render_digest(summaries, now, args.limit)
+    incentives = fetch_incentives(incentive_type="all")
+    source_reviewed_at = _utc_now()
+    generated_at = _utc_now()
+    summaries = summarize_incentives(incentives, generated_at)
+    digest = render_digest(
+        summaries,
+        generated_at,
+        args.limit,
+        source_reviewed_at=source_reviewed_at,
+    )
 
     print(digest)
     if not args.stdout_only:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(digest + "\n", encoding="utf-8")
-        write_csv(summaries, args.csv_output)
+        write_csv(
+            summaries,
+            args.csv_output,
+            generated_at=generated_at,
+            source_reviewed_at=source_reviewed_at,
+        )
         print(f"\nWrote {args.output}")
         print(f"Wrote {args.csv_output}")
 

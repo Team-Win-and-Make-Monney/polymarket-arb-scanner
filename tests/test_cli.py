@@ -809,6 +809,16 @@ class TestOptionalClientStartup:
         assert result is None
         client_cls.assert_not_called()
 
+    def test_metaculus_approved_access_still_requires_token(self):
+        with patch.object(_cli_mod, "CONFIG_EVENT_MONITOR", True):
+            with patch.object(_cli_mod, "CONFIG_METACULUS_COMMERCIAL_USE_APPROVED", True):
+                with patch.dict(os.environ, {}, clear=True):
+                    with patch.object(_cli_mod, "MetaculusClient") as client_cls:
+                        result = _cli_mod._initialize_metaculus_client()
+
+        assert result is None
+        client_cls.assert_not_called()
+
     def test_metaculus_initializes_after_both_access_gates(self):
         client = MagicMock()
         client.login.return_value = True

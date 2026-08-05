@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-05T04:08:25+00:00",
+  "generated_at": "2026-08-05T04:20:38+00:00",
   "records": [
     {
       "automation_mode": "monitor_rank_and_manual_wallet_ticket",
@@ -25,25 +25,26 @@
       "why_not_autonomous": "Capturing requires wallet signatures and onchain LP, lending, borrowing, holding, or claim transactions."
     },
     {
-      "automation_mode": "monitor_and_paper_score",
+      "automation_mode": "monitor_and_approval_ticket",
       "can_codex_capture": "No",
       "capital_intensity": "medium",
       "category": "prediction_market",
-      "competition": "Medium-high; depends on category fee rates and fill quality.",
+      "competition": "High in large pools, medium in smaller target-size markets.",
       "execution_risk": "high",
       "monitorability": "public_api",
       "official_urls": [
-        "https://docs.polymarket.com/market-makers/maker-rebates"
+        "https://help.kalshi.com/en/articles/13823851-liquidity-incentive-program",
+        "https://external-api.kalshi.com/trade-api/v2/incentive_programs"
       ],
-      "platform": "Polymarket",
-      "program": "Maker Rebates",
-      "required_work": "Place maker orders that add liquidity and later fill on markets with fees enabled.",
-      "reward_timing": "Paid daily in pUSD when accrued rebate is at least $1.",
-      "reward_type": "maker_rebate",
+      "platform": "Kalshi",
+      "program": "Liquidity Incentive Program",
+      "required_work": "Eligible members post qualifying resting limit orders. Random snapshots score order size, uptime, and proximity to the best bid/ask; pools are split pro rata.",
+      "reward_timing": "Daily program pools; minimum payout disclosed as $1.",
+      "reward_type": "liquidity_pool",
       "safe_automation_score": 67,
-      "safe_next_action": "Estimate rebate minus adverse-selection loss from public market data.",
+      "safe_next_action": "Keep the existing Kalshi public API monitor, rank pools, and draft manual order tickets.",
       "source_status": "primary_verified",
-      "why_not_autonomous": "Maker rebates require live filled orders and position risk."
+      "why_not_autonomous": "Capturing requires live resting orders that can fill and create regulated-market inventory risk."
     },
     {
       "automation_mode": "monitor_and_paper_score",
@@ -67,26 +68,25 @@
       "why_not_autonomous": "Requires live CLOB orders, possible fills, wallet/account access, and geographic eligibility checks."
     },
     {
-      "automation_mode": "monitor_and_approval_ticket",
+      "automation_mode": "monitor_and_paper_score",
       "can_codex_capture": "No",
       "capital_intensity": "medium",
       "category": "prediction_market",
-      "competition": "High in large pools, medium in smaller target-size markets.",
+      "competition": "Medium-high; depends on category fee rates and fill quality.",
       "execution_risk": "high",
       "monitorability": "public_api",
       "official_urls": [
-        "https://help.kalshi.com/en/articles/13823851-liquidity-incentive-program",
-        "https://external-api.kalshi.com/trade-api/v2/incentive_programs"
+        "https://docs.polymarket.com/market-makers/maker-rebates"
       ],
-      "platform": "Kalshi",
-      "program": "Liquidity Incentive Program",
-      "required_work": "Eligible members post qualifying resting limit orders. Random snapshots score order size, uptime, and proximity to the best bid/ask; pools are split pro rata.",
-      "reward_timing": "Daily program pools; minimum payout disclosed as $1.",
-      "reward_type": "liquidity_pool",
+      "platform": "Polymarket",
+      "program": "Maker Rebates",
+      "required_work": "Place maker orders that add liquidity and later fill on markets with fees enabled.",
+      "reward_timing": "Paid daily in pUSD when accrued rebate is at least $1.",
+      "reward_type": "maker_rebate",
       "safe_automation_score": 67,
-      "safe_next_action": "Keep the existing Kalshi public API monitor, rank pools, and draft manual order tickets.",
+      "safe_next_action": "Estimate rebate minus adverse-selection loss from public market data.",
       "source_status": "primary_verified",
-      "why_not_autonomous": "Capturing requires live resting orders that can fill and create regulated-market inventory risk."
+      "why_not_autonomous": "Maker rebates require live filled orders and position risk."
     },
     {
       "automation_mode": "rate_watch_and_manual_ticket",
@@ -173,6 +173,27 @@
       "why_not_autonomous": "Requires brokerage account enrollment and accepts SIPC, voting, dividend-tax, and borrower-default tradeoffs."
     },
     {
+      "automation_mode": "monitor_and_manual_review",
+      "can_codex_capture": "No",
+      "capital_intensity": "high",
+      "category": "prediction_market",
+      "competition": "High; favors traders with real flow and a reason to cross spreads.",
+      "execution_risk": "high",
+      "monitorability": "public_docs",
+      "official_urls": [
+        "https://docs.polymarket.com/trading/taker-rebates"
+      ],
+      "platform": "Polymarket",
+      "program": "Taker Rebates",
+      "required_work": "Generate eligible weighted taker volume by category and tier while avoiding abusive or wash activity.",
+      "reward_timing": "Daily pUSD rebates and tier updates.",
+      "reward_type": "taker_rebate",
+      "safe_automation_score": 49,
+      "safe_next_action": "Only evaluate after true expected-value trades are found; never trade just to earn rebates.",
+      "source_status": "primary_verified",
+      "why_not_autonomous": "Requires intentional taker trading and could incentivize uneconomic volume."
+    },
+    {
       "automation_mode": "monitor_and_approval_ticket",
       "can_codex_capture": "No",
       "capital_intensity": "high",
@@ -194,25 +215,25 @@
       "why_not_autonomous": "Requires live orders and venue eligibility; reward pools do not remove inventory loss risk."
     },
     {
-      "automation_mode": "monitor_and_manual_review",
+      "automation_mode": "watchlist_only",
       "can_codex_capture": "No",
-      "capital_intensity": "high",
-      "category": "prediction_market",
-      "competition": "High; favors traders with real flow and a reason to cross spreads.",
+      "capital_intensity": "medium",
+      "category": "defi_protocol",
+      "competition": "Medium; rewards are usually arbitraged down by professional DeFi capital.",
       "execution_risk": "high",
       "monitorability": "public_docs",
       "official_urls": [
-        "https://docs.polymarket.com/trading/taker-rebates"
+        "https://aave.com/docs/aave-v3/concepts/incentives"
       ],
-      "platform": "Polymarket",
-      "program": "Taker Rebates",
-      "required_work": "Generate eligible weighted taker volume by category and tier while avoiding abusive or wash activity.",
-      "reward_timing": "Daily pUSD rebates and tier updates.",
-      "reward_type": "taker_rebate",
-      "safe_automation_score": 49,
-      "safe_next_action": "Only evaluate after true expected-value trades are found; never trade just to earn rebates.",
+      "platform": "Aave",
+      "program": "Liquidity Incentives, Safety Module, and Merit",
+      "required_work": "Supply, borrow, stake, or perform Aave-aligned actions eligible for DAO or external incentives.",
+      "reward_timing": "Continuous or periodic depending on reserve, controller, and Merit campaign.",
+      "reward_type": "supply_borrow_staking_airdrop",
+      "safe_automation_score": 42,
+      "safe_next_action": "Monitor via Merkl and official Aave incentive pages, then calculate net APR after borrow, liquidation, and gas risk.",
       "source_status": "primary_verified",
-      "why_not_autonomous": "Requires intentional taker trading and could incentivize uneconomic volume."
+      "why_not_autonomous": "Requires onchain transactions, smart-contract risk, liquidation risk, and governance-specific terms."
     },
     {
       "automation_mode": "watchlist_only",
@@ -235,27 +256,6 @@
       "safe_next_action": "Track candidate pools only when APR beats impermanent-loss and gas-adjusted thresholds.",
       "source_status": "primary_verified",
       "why_not_autonomous": "LP and ve-locking actions create impermanent loss, lockup, and smart-contract risk."
-    },
-    {
-      "automation_mode": "watchlist_only",
-      "can_codex_capture": "No",
-      "capital_intensity": "medium",
-      "category": "defi_protocol",
-      "competition": "Medium; rewards are usually arbitraged down by professional DeFi capital.",
-      "execution_risk": "high",
-      "monitorability": "public_docs",
-      "official_urls": [
-        "https://aave.com/docs/aave-v3/concepts/incentives"
-      ],
-      "platform": "Aave",
-      "program": "Liquidity Incentives, Safety Module, and Merit",
-      "required_work": "Supply, borrow, stake, or perform Aave-aligned actions eligible for DAO or external incentives.",
-      "reward_timing": "Continuous or periodic depending on reserve, controller, and Merit campaign.",
-      "reward_type": "supply_borrow_staking_airdrop",
-      "safe_automation_score": 42,
-      "safe_next_action": "Monitor via Merkl and official Aave incentive pages, then calculate net APR after borrow, liquidation, and gas risk.",
-      "source_status": "primary_verified",
-      "why_not_autonomous": "Requires onchain transactions, smart-contract risk, liquidation risk, and governance-specific terms."
     },
     {
       "automation_mode": "eligibility_watch_only",
@@ -284,28 +284,6 @@
       "can_codex_capture": "No",
       "capital_intensity": "high",
       "category": "crypto_perp_dex",
-      "competition": "Very high; leaderboard and taker-volume rewards favor sophisticated traders.",
-      "execution_risk": "high",
-      "monitorability": "public_docs",
-      "official_urls": [
-        "https://www.dydx.xyz/rewards",
-        "https://www.dydx.xyz/blog/dydx-surge"
-      ],
-      "platform": "dYdX",
-      "program": "Rewards Directory and Surge",
-      "required_work": "Execute eligible taker trades, use eligible interfaces, stake DYDX, trade boosted markets, or join listed campaigns.",
-      "reward_timing": "Seasonal campaigns and monthly/weekly competitions.",
-      "reward_type": "trading_competition_fee_rebate_referral",
-      "safe_automation_score": 35,
-      "safe_next_action": "Monitor rewards pages for research only; do not automate participation from a U.S. account.",
-      "source_status": "primary_verified",
-      "why_not_autonomous": "dYdX states it is not available in the U.S. or to restricted persons, and capture requires leveraged trading."
-    },
-    {
-      "automation_mode": "watchlist_only",
-      "can_codex_capture": "No",
-      "capital_intensity": "high",
-      "category": "crypto_perp_dex",
       "competition": "Very high; maker rebate thresholds start at meaningful share of venue maker volume.",
       "execution_risk": "high",
       "monitorability": "public_docs",
@@ -324,26 +302,26 @@
       "why_not_autonomous": "Requires active leveraged trading, wallet/account actions, and jurisdiction checks; app shows restricted-jurisdiction gating."
     },
     {
-      "automation_mode": "eligibility_watch_only",
+      "automation_mode": "watchlist_only",
       "can_codex_capture": "No",
-      "capital_intensity": "institutional",
-      "category": "crypto_exchange",
-      "competition": "Institutional.",
+      "capital_intensity": "high",
+      "category": "crypto_perp_dex",
+      "competition": "Very high; leaderboard and taker-volume rewards favor sophisticated traders.",
       "execution_risk": "high",
       "monitorability": "public_docs",
       "official_urls": [
-        "https://www.kraken.com/institutions/market-participation-program",
-        "https://www.kraken.com/institutions/market-makers"
+        "https://www.dydx.xyz/rewards",
+        "https://www.dydx.xyz/blog/dydx-surge"
       ],
-      "platform": "Kraken",
-      "program": "Market Participation Program and Market Maker Incentives",
-      "required_work": "Qualify as an institution/professional/accredited participant and reach volume/share thresholds.",
-      "reward_timing": "Weekly calculation/allocation and end-of-program distribution for MPP.",
-      "reward_type": "institutional_fee_rebate_equity_linked_incentive",
-      "safe_automation_score": 31,
-      "safe_next_action": "Track as a future institutional venue; not a small-account reward capture lane.",
+      "platform": "dYdX",
+      "program": "Rewards Directory and Surge",
+      "required_work": "Execute eligible taker trades, use eligible interfaces, stake DYDX, trade boosted markets, or join listed campaigns.",
+      "reward_timing": "Seasonal campaigns and monthly/weekly competitions.",
+      "reward_type": "trading_competition_fee_rebate_referral",
+      "safe_automation_score": 35,
+      "safe_next_action": "Monitor rewards pages for research only; do not automate participation from a U.S. account.",
       "source_status": "primary_verified",
-      "why_not_autonomous": "Requires institutional eligibility and live spot/futures market participation."
+      "why_not_autonomous": "dYdX states it is not available in the U.S. or to restricted persons, and capture requires leveraged trading."
     },
     {
       "automation_mode": "eligibility_watch_only",
@@ -354,39 +332,17 @@
       "execution_risk": "high",
       "monitorability": "public_docs",
       "official_urls": [
-        "https://help.coinbase.com/en/international-exchange/trading-deposits-withdrawals/international-exchange-liquidity-program"
+        "https://www.binance.com/en/square/post/326807011037522"
       ],
-      "platform": "Coinbase International Exchange",
-      "program": "Liquidity Program",
-      "required_work": "Meet prior-month adjusted volume, open-interest, or USDC-balance thresholds for perps or spot tiers.",
-      "reward_timing": "Monthly evaluation; rebates reflected on fills.",
-      "reward_type": "institutional_liquidity_rebate",
+      "platform": "Binance",
+      "program": "Fiat Liquidity Provider Promotion",
+      "required_work": "Newly enrolled market makers qualify by maker volume share in eligible fiat markets.",
+      "reward_timing": "Weekly review and hourly rebate updates during the promotion window.",
+      "reward_type": "institutional_maker_rebate",
       "safe_automation_score": 31,
-      "safe_next_action": "Track only if an eligible non-U.S. institutional account exists.",
+      "safe_next_action": "Track program changes and preserve as future institutional path, not current retail automation.",
       "source_status": "primary_verified",
-      "why_not_autonomous": "Eligibility is jurisdiction/account dependent and capture requires active exchange trading."
-    },
-    {
-      "automation_mode": "eligibility_watch_only",
-      "can_codex_capture": "No",
-      "capital_intensity": "institutional",
-      "category": "crypto_exchange",
-      "competition": "Institutional.",
-      "execution_risk": "high",
-      "monitorability": "public_docs",
-      "official_urls": [
-        "https://www.coinbase.com/exchange/liquidity-program",
-        "https://www.coinbase.com/developer-platform/products/exchange-api"
-      ],
-      "platform": "Coinbase Exchange",
-      "program": "Liquidity Program",
-      "required_work": "Operate as a large liquidity provider through Coinbase Exchange and API infrastructure.",
-      "reward_timing": "Program-specific.",
-      "reward_type": "large_liquidity_provider_discount",
-      "safe_automation_score": 31,
-      "safe_next_action": "Catalog for strategic awareness and future API-readiness only.",
-      "source_status": "primary_verified",
-      "why_not_autonomous": "Requires exchange account eligibility, high volume, and live trading."
+      "why_not_autonomous": "Requires exchange approval, major trading volume, and live market making."
     },
     {
       "automation_mode": "eligibility_watch_only",
@@ -418,17 +374,61 @@
       "execution_risk": "high",
       "monitorability": "public_docs",
       "official_urls": [
-        "https://www.binance.com/en/square/post/326807011037522"
+        "https://www.coinbase.com/exchange/liquidity-program",
+        "https://www.coinbase.com/developer-platform/products/exchange-api"
       ],
-      "platform": "Binance",
-      "program": "Fiat Liquidity Provider Promotion",
-      "required_work": "Newly enrolled market makers qualify by maker volume share in eligible fiat markets.",
-      "reward_timing": "Weekly review and hourly rebate updates during the promotion window.",
-      "reward_type": "institutional_maker_rebate",
+      "platform": "Coinbase Exchange",
+      "program": "Liquidity Program",
+      "required_work": "Operate as a large liquidity provider through Coinbase Exchange and API infrastructure.",
+      "reward_timing": "Program-specific.",
+      "reward_type": "large_liquidity_provider_discount",
       "safe_automation_score": 31,
-      "safe_next_action": "Track program changes and preserve as future institutional path, not current retail automation.",
+      "safe_next_action": "Catalog for strategic awareness and future API-readiness only.",
       "source_status": "primary_verified",
-      "why_not_autonomous": "Requires exchange approval, major trading volume, and live market making."
+      "why_not_autonomous": "Requires exchange account eligibility, high volume, and live trading."
+    },
+    {
+      "automation_mode": "eligibility_watch_only",
+      "can_codex_capture": "No",
+      "capital_intensity": "institutional",
+      "category": "crypto_exchange",
+      "competition": "Institutional.",
+      "execution_risk": "high",
+      "monitorability": "public_docs",
+      "official_urls": [
+        "https://help.coinbase.com/en/international-exchange/trading-deposits-withdrawals/international-exchange-liquidity-program"
+      ],
+      "platform": "Coinbase International Exchange",
+      "program": "Liquidity Program",
+      "required_work": "Meet prior-month adjusted volume, open-interest, or USDC-balance thresholds for perps or spot tiers.",
+      "reward_timing": "Monthly evaluation; rebates reflected on fills.",
+      "reward_type": "institutional_liquidity_rebate",
+      "safe_automation_score": 31,
+      "safe_next_action": "Track only if an eligible non-U.S. institutional account exists.",
+      "source_status": "primary_verified",
+      "why_not_autonomous": "Eligibility is jurisdiction/account dependent and capture requires active exchange trading."
+    },
+    {
+      "automation_mode": "eligibility_watch_only",
+      "can_codex_capture": "No",
+      "capital_intensity": "institutional",
+      "category": "crypto_exchange",
+      "competition": "Institutional.",
+      "execution_risk": "high",
+      "monitorability": "public_docs",
+      "official_urls": [
+        "https://www.kraken.com/institutions/market-participation-program",
+        "https://www.kraken.com/institutions/market-makers"
+      ],
+      "platform": "Kraken",
+      "program": "Market Participation Program and Market Maker Incentives",
+      "required_work": "Qualify as an institution/professional/accredited participant and reach volume/share thresholds.",
+      "reward_timing": "Weekly calculation/allocation and end-of-program distribution for MPP.",
+      "reward_type": "institutional_fee_rebate_equity_linked_incentive",
+      "safe_automation_score": 31,
+      "safe_next_action": "Track as a future institutional venue; not a small-account reward capture lane.",
+      "source_status": "primary_verified",
+      "why_not_autonomous": "Requires institutional eligibility and live spot/futures market participation."
     },
     {
       "automation_mode": "verification_queue_only",

@@ -12,7 +12,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts import kalshi_rewards_monitor as monitor
 
 
+# ---------------------------------------------------------------------------
+# Read-only reward monitor
+# ---------------------------------------------------------------------------
+
 class TestKalshiRewardsMonitor:
+    def test_main_requests_all_active_incentive_types(self, capsys):
+        """The digest must include both liquidity and volume programs."""
+        with patch.object(monitor, "fetch_incentives", return_value=[]) as fetch:
+            assert monitor.main(["--stdout-only"]) == 0
+
+        fetch.assert_called_once_with(incentive_type="all")
+        assert "type=all" in capsys.readouterr().out
+
     def test_fetch_incentives_uses_only_next_cursor_and_stops(self):
         """Pagination must not reuse a response cursor or run without a cap."""
         pages = [
@@ -106,9 +118,32 @@ class TestKalshiRewardsMonitor:
         summaries = monitor.summarize_incentives(incentives, now)
         output = tmp_path / "rewards.csv"
 
-        monitor.write_csv(summaries, output)
+        generated = dt.datetime(2026, 6, 13, 12, 1, tzinfo=dt.timezone.utc)
+        reviewed = dt.datetime(2026, 6, 13, 12, 0, tzinfo=dt.timezone.utc)
+        monitor.write_csv(
+            summaries,
+            output,
+            generated_at=generated,
+            source_reviewed_at=reviewed,
+        )
 
         text = output.read_text(encoding="utf-8")
         assert "required_action" in text
+        assert "generated_at,source_reviewed_at" in text.splitlines()[0]
+        assert "2026-06-13T12:01:00+00:00" in text
+        assert "2026-06-13T12:00:00+00:00" in text
         assert "Post qualifying resting limit orders" in text
         assert "live orders require human approval" in text
+
+    def test_render_digest_preserves_distinct_provenance_times(self):
+        """Generation time must not masquerade as source-review time."""
+        generated = dt.datetime(2026, 6, 13, 12, 1, tzinfo=dt.timezone.utc)
+        reviewed = dt.datetime(2026, 6, 13, 12, 0, tzinfo=dt.timezone.utc)
+
+        digest = monitor.render_digest(
+            [], generated, source_reviewed_at=reviewed
+        )
+
+        assert "Generated: 2026-06-13T12:01:00+00:00" in digest
+        assert "Official source reviewed: 2026-06-13T12:00:00+00:00" in digest
+        assert "type=all" in digest

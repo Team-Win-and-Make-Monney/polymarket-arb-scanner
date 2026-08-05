@@ -37,6 +37,10 @@ def _binary_post(post_id: int = 10, question_id: int = 20, probability: float = 
     }
 
 
+# ---------------------------------------------------------------------------
+# Authentication and requests
+# ---------------------------------------------------------------------------
+
 class TestMetaculusLogin:
     def test_uses_current_posts_endpoint_and_token(self):
         client = MetaculusClient()
@@ -134,6 +138,10 @@ class TestMetaculusRequest:
                 assert client._request("GET", "/posts/") is None
 
 
+# ---------------------------------------------------------------------------
+# Response normalization and lookup
+# ---------------------------------------------------------------------------
+
 class TestPostNormalization:
     def test_normalizes_binary_question_for_existing_consumers(self):
         question = _normalize_post(_binary_post())
@@ -202,13 +210,25 @@ class TestFetchActiveQuestions:
 
 
 class TestQuestionLookup:
-    def test_details_requires_question_to_post_mapping(self):
+    def test_details_returns_none_when_feed_cannot_resolve_post(self):
         client = MetaculusClient()
 
-        with patch.object(client, "_request") as request:
-            assert client.get_question_details(20) is None
+        with patch.object(client, "fetch_active_questions", return_value=[]):
+            with patch.object(client, "_request") as request:
+                assert client.get_question_details(20) is None
 
         request.assert_not_called()
+
+    def test_details_resolves_uncached_question_through_posts_feed(self):
+        client = MetaculusClient()
+        normalized = _normalize_post(_binary_post(post_id=10, question_id=20))
+
+        with patch.object(client, "fetch_active_questions", return_value=[normalized]):
+            with patch.object(client, "_request", return_value=_binary_post()) as request:
+                result = client.get_question_details(20)
+
+        assert result["id"] == 20
+        request.assert_called_once_with("GET", "/posts/10/")
 
     def test_details_uses_known_post_id(self):
         client = MetaculusClient()
@@ -245,6 +265,10 @@ class TestQuestionLookup:
         assert result == [first]
         fetch.assert_called_once_with(limit=200)
 
+
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
 
 class TestRateLimit:
     def test_interval_is_one_second(self):

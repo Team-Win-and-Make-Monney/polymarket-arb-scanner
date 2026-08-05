@@ -10,8 +10,11 @@ import argparse
 import csv
 import datetime as dt
 import json
+import logging
 import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_OUTPUT = Path("data/rewards-platforms/latest.md")
 DEFAULT_CSV_OUTPUT = Path("data/rewards-platforms/latest.csv")
@@ -23,6 +26,10 @@ SAFETY_BOUNDARY = (
     "claiming, referral spam, account creation, or KYC/account actions."
 )
 
+
+# ---------------------------------------------------------------------------
+# Catalog data
+# ---------------------------------------------------------------------------
 
 def _utc_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
@@ -482,6 +489,10 @@ def platform_catalog() -> list[dict]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# Scoring and ranking
+# ---------------------------------------------------------------------------
+
 def score_record(record: dict) -> int:
     """Score how useful the record is for safe monitoring and approval workflows."""
     source_score = {
@@ -511,6 +522,14 @@ def score_record(record: dict) -> int:
 
 
 def ranked_catalog(records: list[dict]) -> list[dict]:
+    """Rank records by safe value, source quality, and stable name order.
+
+    Args:
+        records: Catalog records from ``platform_catalog``.
+
+    Returns:
+        New records with scores, ordered best-first.
+    """
     ranked = []
     for record in records:
         row = dict(record)
@@ -518,10 +537,18 @@ def ranked_catalog(records: list[dict]) -> list[dict]:
         ranked.append(row)
     return sorted(
         ranked,
-        key=lambda row: (row["safe_automation_score"], row["source_status"], row["platform"], row["program"]),
-        reverse=True,
+        key=lambda row: (
+            -row["safe_automation_score"],
+            row["source_status"] != "primary_verified",
+            row["platform"],
+            row["program"],
+        ),
     )
 
+
+# ---------------------------------------------------------------------------
+# Markdown rendering
+# ---------------------------------------------------------------------------
 
 def _format_urls(urls: list[str]) -> str:
     if not urls:
@@ -541,6 +568,17 @@ def render_digest(
     limit: int = 12,
     source_reviewed_at: dt.date | None = None,
 ) -> str:
+    """Render the catalog as a read-only Markdown digest.
+
+    Args:
+        records: Catalog records from ``platform_catalog``.
+        now: Generation timestamp, defaulting to current UTC time.
+        limit: Maximum rows in the highest-value table.
+        source_reviewed_at: Date the official sources were checked.
+
+    Returns:
+        Markdown without a trailing newline.
+    """
     now = now or _utc_now()
     ranked = ranked_catalog(records)
     top = ranked[:limit]
@@ -625,11 +663,25 @@ def render_digest(
     return "\n".join(lines).rstrip()
 
 
+# ---------------------------------------------------------------------------
+# Machine-readable exports
+# ---------------------------------------------------------------------------
+
 def write_csv(
     records: list[dict],
     output: Path,
     source_reviewed_at: dt.date | None = None,
 ) -> None:
+    """Write the catalog as CSV.
+
+    Args:
+        records: Catalog records from ``platform_catalog``.
+        output: Destination CSV path.
+        source_reviewed_at: Date the official sources were checked.
+
+    Returns:
+        None.
+    """
     output.parent.mkdir(parents=True, exist_ok=True)
     fields = [
         "source_reviewed_at",
@@ -681,16 +733,33 @@ def write_json(
     records: list[dict],
     output: Path,
     source_reviewed_at: dt.date | None = None,
+    now: dt.datetime | None = None,
 ) -> None:
+    """Write the catalog as JSON with explicit provenance.
+
+    Args:
+        records: Catalog records from ``platform_catalog``.
+        output: Destination JSON path.
+        source_reviewed_at: Date the official sources were checked.
+        now: Generation timestamp, defaulting to current UTC time.
+
+    Returns:
+        None.
+    """
     output.parent.mkdir(parents=True, exist_ok=True)
+    now = now or _utc_now()
     payload = {
-        "generated_at": _utc_now().isoformat(timespec="seconds"),
+        "generated_at": now.isoformat(timespec="seconds"),
         "source_reviewed_at": source_reviewed_at.isoformat() if source_reviewed_at else None,
         "safety_boundary": SAFETY_BOUNDARY,
         "records": ranked_catalog(records),
     }
     output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def _review_date(value: str) -> dt.date:
     """Parse an explicit official-source review date."""
@@ -701,6 +770,14 @@ def _review_date(value: str) -> dt.date:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
+    """Parse catalog CLI arguments.
+
+    Args:
+        argv: Command-line arguments excluding the executable.
+
+    Returns:
+        Parsed arguments.
+    """
     parser = argparse.ArgumentParser(description="Generate a read-only market rewards platform catalog.")
     parser.add_argument("--limit", type=int, default=12, help="Rows in the highest-value table.")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="Markdown output path.")
@@ -717,10 +794,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
+    if not args.stdout_only and args.source_reviewed_at is None:
+        print(
+            "Refusing to overwrite catalog artifacts without --source-reviewed-at. "
+            "Pass the date official sources were checked, or use --stdout-only.",
+            file=sys.stderr,
+        )
+        return 2
     records = platform_catalog()
+    now = _utc_now()
     digest = render_digest(
         records,
-        _utc_now(),
+        now,
         args.limit,
         source_reviewed_at=args.source_reviewed_at,
     )
@@ -730,7 +815,12 @@ def main(argv: list[str] | None = None) -> int:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(digest + "\n", encoding="utf-8")
         write_csv(records, args.csv_output, source_reviewed_at=args.source_reviewed_at)
-        write_json(records, args.json_output, source_reviewed_at=args.source_reviewed_at)
+        write_json(
+            records,
+            args.json_output,
+            source_reviewed_at=args.source_reviewed_at,
+            now=now,
+        )
         print(f"\nWrote {args.output}")
         print(f"Wrote {args.csv_output}")
         print(f"Wrote {args.json_output}")

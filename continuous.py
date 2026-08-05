@@ -132,6 +132,20 @@ def _cache_probability(entry: dict | None, *keys: str) -> float | None:
     return None
 
 
+def _ws_tracking_probability(platform: str, entry: dict | None) -> float | None:
+    """Extract one executable scalar probability for WS-driven trackers."""
+    if platform == "polymarket":
+        return _cache_probability(entry, "best_ask", "ask", "price")
+    if platform == "kalshi":
+        return _cache_probability(
+            entry,
+            "yes_ask", "yes_price", "yes",
+            "no_ask", "no_price", "no",
+            "price",
+        )
+    return _cache_probability(entry, "price", "yes_price", "yes")
+
+
 class _WSTriggerDeduper:
     """Thread-safe short cooldown for identical WS-triggered opportunities."""
 
@@ -1294,27 +1308,23 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
         with _price_cache_lock:
             price_cache[(platform, ticker)] = data
 
+        tracking_price = _ws_tracking_probability(platform, data)
+
         # Feed PriceTracker for stale price detection
-        if _price_tracker:
-            price_val = data.get("price") or data.get("yes") or data.get("yes_price")
-            if price_val is not None:
-                _price_tracker.update(platform, ticker, float(price_val))
+        if _price_tracker and tracking_price is not None:
+            _price_tracker.update(platform, ticker, tracking_price)
 
         # Update MarketMaker mid-price for registered markets
-        if _market_maker:
-            price_val = data.get("price") or data.get("yes") or data.get("yes_price")
-            if price_val is not None:
-                _market_maker.update_price(ticker, float(price_val))
+        if _market_maker and tracking_price is not None:
+            _market_maker.update_price(ticker, tracking_price)
 
         # Plan 10: feed the Kalshi MM pilot's book freshness + VolatilityTracker
         # with orderbook_delta ticks for subscribed pilot tickers.
-        if _mm_pilot and platform == "kalshi":
-            price_val = data.get("price") or data.get("yes") or data.get("yes_price")
-            if price_val is not None:
-                try:
-                    _mm_pilot.on_ws_price(ticker, float(price_val))
-                except Exception as exc:
-                    logger.debug("MM pilot WS feed failed: %s", exc)
+        if _mm_pilot and platform == "kalshi" and tracking_price is not None:
+            try:
+                _mm_pilot.on_ws_price(ticker, tracking_price)
+            except Exception as exc:
+                logger.debug("MM pilot WS feed failed: %s", exc)
 
         # Sprint 3: Feed VolatilityTracker + LeadLagMM with per-tick prices
         _feed_sprint3_trackers(platform, ticker, data)

@@ -45,6 +45,7 @@ from continuous import (
     _get_market_lock,
     _is_execution_eligible,
     _recalc_profit,
+    _ws_tracking_probability,
 )
 from db import TradeDB
 
@@ -478,6 +479,23 @@ class TestRecalcProfit:
         opp = {"type": "Binary", "_token_ids": []}
         result = _recalc_profit(opp, "polymarket", "tok", 0.5, {})
         assert result is None
+
+
+class TestWSTrackingProbability:
+    def test_kalshi_prefers_normalized_ask_over_raw_ladder(self):
+        entry = {
+            "yes": [[40, 10]],
+            "no": [[60, 10]],
+            "yes_ask": "0.41",
+            "no_ask": "0.61",
+        }
+
+        assert _ws_tracking_probability("kalshi", entry) == pytest.approx(0.41)
+
+    def test_kalshi_raw_ladder_and_cent_delta_are_not_probabilities(self):
+        entry = {"yes": [[40, 10]], "no": [[60, 10]], "price": 45}
+
+        assert _ws_tracking_probability("kalshi", entry) is None
 
 
 # ---------------------------------------------------------------------------

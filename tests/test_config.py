@@ -13,7 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import (
     setup_logging, LOG_LEVEL, DASHBOARD_PORT, WEBHOOK_URL,
-    _env_float, _env_int, _env_bool, ConfigError, validate_config,
+    _env_float, _env_non_negative_float, _env_int, _env_bool,
+    ConfigError, validate_config,
 )
 
 
@@ -110,6 +111,20 @@ class TestEnvFloat:
         monkeypatch.setenv("TEST_FLOAT", "")
         with pytest.raises(ConfigError, match="TEST_FLOAT.*not a valid float"):
             _env_float("TEST_FLOAT", "0")
+
+
+class TestEnvNonNegativeFloat:
+    def test_accepts_zero_and_positive_values(self, monkeypatch):
+        monkeypatch.setenv("TEST_NON_NEGATIVE_FLOAT", "0")
+        assert _env_non_negative_float("TEST_NON_NEGATIVE_FLOAT", "5") == 0.0
+        monkeypatch.setenv("TEST_NON_NEGATIVE_FLOAT", "5.5")
+        assert _env_non_negative_float("TEST_NON_NEGATIVE_FLOAT", "5") == 5.5
+
+    @pytest.mark.parametrize("raw", ["-0.01", "nan", "inf", "-inf"])
+    def test_rejects_negative_and_non_finite_values(self, monkeypatch, raw):
+        monkeypatch.setenv("TEST_NON_NEGATIVE_FLOAT", raw)
+        with pytest.raises(ConfigError, match="must be finite and >= 0"):
+            _env_non_negative_float("TEST_NON_NEGATIVE_FLOAT", "5")
 
 
 # ---------------------------------------------------------------------------

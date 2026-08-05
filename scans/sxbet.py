@@ -13,7 +13,7 @@ def _fetch_sxbet_snapshot(sxbet_client: SXBetClient) -> tuple[list[dict], dict[s
     """Fetch one market and order-book snapshot for all SX Bet strategies."""
     markets = sxbet_client.fetch_all_markets()
     market_hashes = [market.get("marketHash", "") for market in markets if market.get("marketHash")]
-    orderbooks = sxbet_client.get_orderbooks_batch(market_hashes, batch_size=1000) if market_hashes else {}
+    orderbooks = sxbet_client.get_orderbooks_batch(market_hashes, batch_size=200) if market_hashes else {}
     return markets, orderbooks
 
 

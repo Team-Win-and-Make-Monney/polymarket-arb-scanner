@@ -1749,6 +1749,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
 
             _scan_start = time.time()
             _stage_timings: dict[str, float] = {}
+            _stage_display_start: float | None = None
 
             # Self-heal a degraded Kalshi start (e.g. boot during the venue's
             # daily maintenance window): re-auth on a cooldown until it works.
@@ -2808,7 +2809,8 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
             # the scan cycle (target: total <2 min for arb-quality reaction time).
             try:
                 _scan_total = time.time() - _scan_start
-                _stage_timings.setdefault("display_exec", time.time() - _stage_display_start)
+                if _stage_display_start is not None:
+                    _stage_timings.setdefault("display_exec", time.time() - _stage_display_start)
                 logger.info(
                     "Scan #%d stage timings — %s",
                     scan_count,

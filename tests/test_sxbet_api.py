@@ -287,6 +287,22 @@ class TestSXBetFetchData:
         assert yes_price == pytest.approx(0.4)
         assert no_price is None
 
+    def test_orderbook_batches_stay_below_live_uri_limit(self, client):
+        hashes = [f"0x{index:064x}" for index in range(401)]
+        with patch.object(client, "_request", return_value={"data": []}) as request:
+            client.get_orderbooks_batch(hashes, batch_size=1000)
+
+        assert request.call_count == 3
+        requested_counts = [
+            len(call.kwargs["params"]["marketHashes"].split(","))
+            for call in request.call_args_list
+        ]
+        assert requested_counts == [200, 200, 1]
+
+    def test_orderbook_batch_circuit_breaker_fails_closed(self, client):
+        with patch.object(client, "_request", side_effect=sxbet_api._RateLimitError("circuit open")):
+            assert client.get_orderbooks_batch(["0xabc"]) == {}
+
     def test_get_market_status(self, client):
         with patch.object(client, "_request", return_value={"status": "active"}):
             assert client.get_market_status("0xabc")["status"] == "active"

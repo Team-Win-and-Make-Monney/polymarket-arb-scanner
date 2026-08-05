@@ -22,6 +22,11 @@ _rate_lock = threading.Lock()
 # HARDEN-04: circuit breaker — opens after 3 consecutive failures, resets after 30s
 _circuit = PlatformCircuitBreaker("sxbet", fail_limit=3, reset_timeout=30.0)
 
+# The API accepts up to 1,000 hashes semantically, but its HTTP edge returns
+# 414 once the encoded request URI approaches 16 KiB. Two hundred 32-byte
+# hashes stay below that live-verified limit with room for query overhead.
+_MAX_ORDER_MARKETS_PER_REQUEST = 200
+
 
 class _RateLimitError(Exception):
     """Raised when circuit is open — prevents further requests during backoff."""
@@ -282,17 +287,22 @@ class SXBetClient:
         orders = data["data"]
         return _orders_to_taker_book(orders)
 
-    def get_orderbooks_batch(self, market_hashes: list[str], batch_size: int = 1000) -> dict[str, dict]:
+    def get_orderbooks_batch(self, market_hashes: list[str], batch_size: int = 200) -> dict[str, dict]:
         """Fetch order books for multiple markets in batched API calls.
 
         Sends comma-separated marketHashes to GET /orders to minimize API calls.
         Returns a dict mapping market_hash → orderbook (bids/asks).
         """
         result: dict[str, dict] = {}
-        for i in range(0, len(market_hashes), batch_size):
-            batch = market_hashes[i:i + batch_size]
+        safe_batch_size = min(max(1, batch_size), _MAX_ORDER_MARKETS_PER_REQUEST)
+        for i in range(0, len(market_hashes), safe_batch_size):
+            batch = market_hashes[i:i + safe_batch_size]
             hashes_param = ",".join(batch)
-            data = self._request("GET", "/orders", params={"marketHashes": hashes_param})
+            try:
+                data = self._request("GET", "/orders", params={"marketHashes": hashes_param})
+            except _RateLimitError as exc:
+                logger.warning("SX Bet order-book batch fetch stopped: %s", exc)
+                break
             if not data or "data" not in data:
                 continue
 

@@ -14,7 +14,7 @@ from scans.kalshi import scan_kalshi_binary, scan_kalshi_multi, _fetch_kalshi_da
 from scans.spread import scan_spread_polymarket
 from scans.betfair import scan_betfair_backall, scan_betfair_backlay
 from scans.smarkets import scan_smarkets_backall, scan_smarkets_backlay
-from scans.sxbet import scan_sxbet_backall, scan_sxbet_backlay
+from scans.sxbet import scan_sxbet, scan_sxbet_backall, scan_sxbet_backlay
 from scans.matchbook import scan_matchbook_backall, scan_matchbook_backlay
 from scans.gemini import scan_gemini_binary, scan_gemini_multi
 from scans.ibkr import scan_ibkr_binary
@@ -53,6 +53,7 @@ __all__ = [
     "scan_betfair_backlay",
     "scan_smarkets_backall",
     "scan_smarkets_backlay",
+    "scan_sxbet",
     "scan_sxbet_backall",
     "scan_sxbet_backlay",
     "scan_matchbook_backall",

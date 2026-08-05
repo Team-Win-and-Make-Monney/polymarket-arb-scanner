@@ -34,7 +34,7 @@ from scans.kalshi import scan_kalshi_binary, scan_kalshi_multi, _fetch_kalshi_da
 from scans.spread import scan_spread_polymarket  # noqa: F401
 from scans.betfair import scan_betfair_backall, scan_betfair_backlay  # noqa: F401
 from scans.smarkets import scan_smarkets_backall, scan_smarkets_backlay  # noqa: F401
-from scans.sxbet import scan_sxbet_backall, scan_sxbet_backlay  # noqa: F401
+from scans.sxbet import scan_sxbet, scan_sxbet_backall, scan_sxbet_backlay  # noqa: F401
 from scans.matchbook import scan_matchbook_backall, scan_matchbook_backlay  # noqa: F401
 from scans.gemini import scan_gemini_binary, scan_gemini_multi  # noqa: F401
 from scans.ibkr import scan_ibkr_binary  # noqa: F401

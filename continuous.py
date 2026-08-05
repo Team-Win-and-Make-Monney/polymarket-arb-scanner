@@ -1982,6 +1982,8 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                 # Layer 3: Liquidity Rewards
                 if args.mode in ("all", "rewards") and CONFIG_REWARDS_ENABLED:
                     try:
+                        pm_reward_opps = []
+                        k_reward_opps = []
                         if poly_reward_markets and _reward_tracker:
                             pm_reward_opps = scan_polymarket_rewards(
                                 markets=poly_reward_markets,
@@ -2000,8 +2002,8 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
 
                         logger.debug(
                             "Rewards scan complete: %d Polymarket + %d Kalshi opps",
-                            len(pm_reward_opps) if poly_markets and _reward_tracker else 0,
-                            len(k_reward_opps) if kalshi_client and _kalshi_reward_tracker else 0,
+                            len(pm_reward_opps),
+                            len(k_reward_opps),
                         )
                     except Exception as exc:
                         logger.debug("Rewards scanning error: %s", exc)

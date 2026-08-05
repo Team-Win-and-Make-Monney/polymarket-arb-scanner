@@ -124,7 +124,17 @@ def _get_with_retry(url: str, params: dict = None, timeout: int = 30) -> request
 
 
 def _fetch_gamma_keyset(resource: str, order: str, limit: int, max_pages: int) -> list[dict]:
-    """Fetch a volume-ranked, bounded Gamma universe with opaque cursors."""
+    """Fetch a volume-ranked, bounded Gamma universe with opaque cursors.
+
+    Args:
+        resource: Gamma collection name (``markets`` or ``events``).
+        order: API field used for descending economic ranking.
+        limit: Requested page size; Gamma may apply a lower server cap.
+        max_pages: Maximum number of cursor pages to fetch.
+
+    Returns:
+        Unique response rows in keyset order.
+    """
     rows_by_id: dict[str, dict] = {}
     cursor = None
 
@@ -177,17 +187,39 @@ def fetch_all_markets(limit: int = 500, max_pages: int = 20) -> list[dict]:
     Gamma rejects deep offset pagination and the active universe exceeds
     25,000 rows. The scanner intentionally bounds each cycle to ``max_pages``
     economically relevant markets using the official keyset cursor.
+
+    Args:
+        limit: Requested Gamma page size.
+        max_pages: Maximum cursor pages per scan cycle.
+
+    Returns:
+        Active market dicts ranked by descending numeric lifetime volume.
     """
     return _fetch_gamma_keyset("markets", "volumeNum", limit, max_pages)
 
 
 def fetch_events(limit: int = 500, max_pages: int = 20) -> list[dict]:
-    """Fetch the top active events by numeric lifetime volume."""
+    """Fetch the top active events by numeric lifetime volume.
+
+    Args:
+        limit: Requested Gamma page size.
+        max_pages: Maximum cursor pages per scan cycle.
+
+    Returns:
+        Active event dicts ranked by descending lifetime volume.
+    """
     return _fetch_gamma_keyset("events", "volume", limit, max_pages)
 
 
 def _normalize_sampling_market(market: dict) -> dict | None:
-    """Convert a CLOB sampling-market row to the scanner's Gamma shape."""
+    """Convert a CLOB sampling-market row to the scanner's Gamma shape.
+
+    Args:
+        market: Raw row from the CLOB ``/sampling-markets`` endpoint.
+
+    Returns:
+        Normalized market dict, or ``None`` when reward metadata is unusable.
+    """
     condition_id = market.get("condition_id")
     rewards = market.get("rewards")
     tokens = market.get("tokens")
@@ -235,7 +267,14 @@ def _normalize_sampling_market(market: dict) -> dict | None:
 
 
 def fetch_reward_markets(max_pages: int = 20) -> list[dict]:
-    """Fetch and normalize the complete current CLOB reward-market feed."""
+    """Fetch and normalize the complete current CLOB reward-market feed.
+
+    Args:
+        max_pages: Safety cap for 1,000-row CLOB cursor pages.
+
+    Returns:
+        Unique normalized reward-market dicts keyed by condition ID.
+    """
     markets_by_condition: dict[str, dict] = {}
     cursor = None
 

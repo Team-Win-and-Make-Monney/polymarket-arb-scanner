@@ -83,13 +83,13 @@ class TestSXBetLogin:
 # ---------------------------------------------------------------------------
 
 class TestSXBetMarketPrice:
-    """get_market_price — extracts YES/NO from /orders response.
+    """get_market_price — extracts executable taker prices from orders.
 
     SX Bet has no dedicated orderbook endpoint. get_market_price calls
     GET /orders?marketHashes={hash} and parses raw orders. Each order has:
-      - percentageOdds: 18-decimal int (e.g. "65000000000000000000" = 0.65)
-      - isMakerBettingOutcomeOne: True for YES side, False for NO side
-    Best YES = highest YES-side prob; best NO = highest NO-side prob.
+      - percentageOdds: maker odds in 10^20 protocol units
+      - isMakerBettingOutcomeOne: the maker's outcome
+    The taker receives complementary odds on the opposite outcome.
     """
 
     @staticmethod
@@ -104,28 +104,26 @@ class TestSXBetMarketPrice:
 
     def test_prices_from_bids_and_asks(self, client):
         orders_resp = {"data": [
-            self._order(0.65, is_outcome_one=True),   # YES at 0.65
-            self._order(0.30, is_outcome_one=False),  # NO at 0.30
+            self._order(0.65, is_outcome_one=True),   # Taker NO at 0.35
+            self._order(0.30, is_outcome_one=False),  # Taker YES at 0.70
         ]}
         with patch.object(client, "_request", return_value=orders_resp):
             yes, no = client.get_market_price({"marketHash": "0xabc"})
-        assert yes == pytest.approx(0.65)
-        assert no == pytest.approx(0.30)
+        assert yes == pytest.approx(0.70)
+        assert no == pytest.approx(0.35)
 
-    def test_bid_only_infers_no(self, client):
-        # Only YES-side orders → no_price inferred as 1 - yes_price
+    def test_maker_outcome_one_only_exposes_taker_outcome_two(self, client):
         orders_resp = {"data": [self._order(0.60, is_outcome_one=True)]}
         with patch.object(client, "_request", return_value=orders_resp):
             yes, no = client.get_market_price({"marketHash": "0xabc"})
-        assert yes == pytest.approx(0.60)
+        assert yes is None
         assert no == pytest.approx(0.40)
 
-    def test_ask_only_infers_yes(self, client):
-        # Only NO-side orders → yes_price inferred as 1 - no_price
+    def test_maker_outcome_two_only_exposes_taker_outcome_one(self, client):
         orders_resp = {"data": [self._order(0.80, is_outcome_one=False)]}
         with patch.object(client, "_request", return_value=orders_resp):
             yes, no = client.get_market_price({"marketHash": "0xabc"})
-        assert no == pytest.approx(0.80)
+        assert no is None
         assert yes == pytest.approx(0.20)
 
     def test_empty_market_hash_returns_none(self, client):
@@ -249,6 +247,45 @@ class TestSXBetFetchData:
         # bids/asks. Empty orders list yields an empty book.
         with patch.object(client, "_request", return_value={"data": []}):
             assert client.get_orderbook("0xabc") == {"bids": [], "asks": []}
+
+    def test_get_orderbook_converts_maker_odds_to_taker_prices_and_sizes(self, client):
+        orders = [
+            {
+                "percentageOdds": "47375000000000000000",
+                "isMakerBettingOutcomeOne": False,
+                "totalBetSize": "645730000",
+                "fillAmount": "0",
+                "pendingFillAmount": "0",
+            },
+            {
+                "percentageOdds": "42000000000000000000",
+                "isMakerBettingOutcomeOne": True,
+                "totalBetSize": "579620000",
+                "fillAmount": "0",
+                "pendingFillAmount": "0",
+            },
+        ]
+
+        with patch.object(client, "_request", return_value={"data": orders}):
+            book = client.get_orderbook("0xabc")
+
+        assert book["bids"][0]["price"] == pytest.approx(0.52625)
+        assert book["asks"][0]["price"] == pytest.approx(0.58)
+        assert book["bids"][0]["size"] == pytest.approx(717.28847, rel=1e-5)
+
+    def test_get_market_price_does_not_invent_missing_taker_side(self, client):
+        order = {
+            "percentageOdds": "60000000000000000000",
+            "isMakerBettingOutcomeOne": False,
+            "totalBetSize": "1000000",
+            "fillAmount": "0",
+            "pendingFillAmount": "0",
+        }
+        with patch.object(client, "_request", return_value={"data": [order]}):
+            yes_price, no_price = client.get_market_price({"marketHash": "0xabc"})
+
+        assert yes_price == pytest.approx(0.4)
+        assert no_price is None
 
     def test_get_market_status(self, client):
         with patch.object(client, "_request", return_value={"status": "active"}):

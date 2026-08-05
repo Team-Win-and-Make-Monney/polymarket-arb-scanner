@@ -198,10 +198,10 @@ class TestSXBetBackLayScan:
         mock_client.fetch_all_markets.return_value = [
             {"marketHash": "0xabc123", "title": "Winner"}
         ]
-        # Normal: bid (0.30) < ask (0.50) -> no cross
+        # Normal: executable outcome prices sum above one, so lay <= back.
         mock_client.get_orderbooks_batch.return_value = {
             "0xabc123": {
-                "bids": [{"price": 0.30, "size": 50}],
+                "bids": [{"price": 0.60, "size": 50}],
                 "asks": [{"price": 0.50, "size": 50}],
             }
         }
@@ -232,3 +232,27 @@ class TestSXBetBackLayScan:
 
         opps = scan_sxbet_backlay(mock_client, min_profit=0.001)
         assert len(opps) == 0
+
+
+class TestSXBetCombinedScan:
+    def test_reuses_one_snapshot_for_both_strategies(self):
+        from scans.sxbet import scan_sxbet
+
+        mock_client = MagicMock()
+        mock_client.authenticated = True
+        mock_client.fetch_all_markets.return_value = [
+            {"marketHash": "0xabc123", "teamOneName": "A", "teamTwoName": "B"}
+        ]
+        mock_client.get_orderbooks_batch.return_value = {
+            "0xabc123": {
+                "bids": [{"price": 0.50, "size": 50}],
+                "asks": [{"price": 0.30, "size": 50}],
+            }
+        }
+
+        backall, backlay = scan_sxbet(mock_client, min_profit=0.001)
+
+        assert len(backall) == 1
+        assert len(backlay) == 0
+        mock_client.fetch_all_markets.assert_called_once_with()
+        mock_client.get_orderbooks_batch.assert_called_once_with(["0xabc123"], batch_size=1000)

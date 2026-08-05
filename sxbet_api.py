@@ -27,6 +27,43 @@ class _RateLimitError(Exception):
     """Raised when circuit is open — prevents further requests during backoff."""
 
 
+def _orders_to_taker_book(orders: list[dict]) -> dict[str, list[dict]]:
+    """Normalize maker orders into the prices and sizes available to a taker.
+
+    SX Bet reports ``percentageOdds`` from the maker's perspective. A taker
+    receives the complementary odds and bets the opposite outcome.
+    """
+    outcome_one = []
+    outcome_two = []
+
+    for order in orders:
+        odds_raw = int(order.get("percentageOdds", 0))
+        if odds_raw <= 0:
+            continue
+
+        maker_prob = odds_raw / 1e20
+        if maker_prob <= 0 or maker_prob >= 1:
+            continue
+
+        remaining_maker = max(
+            0,
+            int(order.get("totalBetSize", 0))
+            - int(order.get("fillAmount", 0))
+            - int(order.get("pendingFillAmount", 0)),
+        )
+        taker_size = remaining_maker * (1 / maker_prob - 1) / 1e6
+        entry = {"price": 1 - maker_prob, "size": taker_size}
+
+        if order.get("isMakerBettingOutcomeOne", True):
+            outcome_two.append(entry)
+        else:
+            outcome_one.append(entry)
+
+    outcome_one.sort(key=lambda entry: entry["price"])
+    outcome_two.sort(key=lambda entry: entry["price"])
+    return {"bids": outcome_one, "asks": outcome_two}
+
+
 def _rate_limit():
     global _last_request_time
     with _rate_lock:
@@ -201,36 +238,12 @@ class SXBetClient:
         if not market_hash:
             return None, None
 
-        # Fetch active orders for market (SX Bet has no dedicated orderbook endpoint)
-        data = self._request("GET", "/orders", params={"marketHashes": market_hash})
-        if not data or "data" not in data:
+        orderbook = self.get_orderbook(market_hash)
+        if not orderbook:
             return None, None
 
-        orders = data["data"]
-        if not orders:
-            return None, None
-
-        # Parse orders into YES/NO best prices
-        # percentageOdds is 18-decimal (e.g. "60000000000000000000" = 60% = 0.60)
-        best_yes = None
-        best_no = None
-        for order in orders:
-            odds_raw = int(order.get("percentageOdds", 0))
-            prob = odds_raw / 1e18 / 100  # 18-decimal percentage → 0-1 probability
-            is_outcome_one = order.get("isMakerBettingOutcomeOne", True)
-            if is_outcome_one and (best_yes is None or prob > best_yes):
-                best_yes = prob
-            elif not is_outcome_one and (best_no is None or prob > best_no):
-                best_no = prob
-
-        yes_price = best_yes
-        no_price = best_no
-
-        if yes_price is not None and no_price is None:
-            no_price = 1.0 - yes_price
-        elif no_price is not None and yes_price is None:
-            yes_price = 1.0 - no_price
-
+        yes_price = orderbook["bids"][0]["price"] if orderbook["bids"] else None
+        no_price = orderbook["asks"][0]["price"] if orderbook["asks"] else None
         return yes_price, no_price
 
     def list_runners(self, market_hash: str) -> list[dict]:
@@ -267,29 +280,9 @@ class SXBetClient:
             return None
 
         orders = data["data"]
-        bids = []  # YES side (isMakerBettingOutcomeOne=true)
-        asks = []  # NO side (isMakerBettingOutcomeOne=false)
+        return _orders_to_taker_book(orders)
 
-        for order in orders:
-            odds_raw = int(order.get("percentageOdds", 0))
-            prob = odds_raw / 1e18 / 100  # 18-decimal percentage → 0-1
-            total_size = int(order.get("totalBetSize", 0))
-            fill_amount = int(order.get("fillAmount", 0))
-            remaining = (total_size - fill_amount) / 1e6  # USDC 6 decimals
-
-            entry = {"price": prob, "size": remaining}
-            if order.get("isMakerBettingOutcomeOne", True):
-                bids.append(entry)
-            else:
-                asks.append(entry)
-
-        # Sort: bids highest first, asks lowest first
-        bids.sort(key=lambda x: x["price"], reverse=True)
-        asks.sort(key=lambda x: x["price"])
-
-        return {"bids": bids, "asks": asks}
-
-    def get_orderbooks_batch(self, market_hashes: list[str], batch_size: int = 20) -> dict[str, dict]:
+    def get_orderbooks_batch(self, market_hashes: list[str], batch_size: int = 1000) -> dict[str, dict]:
         """Fetch order books for multiple markets in batched API calls.
 
         Sends comma-separated marketHashes to GET /orders to minimize API calls.
@@ -311,24 +304,9 @@ class SXBetClient:
                     by_market[mh] = []
                 by_market[mh].append(order)
 
-            # Parse each market's orders into bids/asks
+            # Parse each market's maker orders into executable taker prices.
             for mh, orders in by_market.items():
-                bids = []
-                asks = []
-                for order in orders:
-                    odds_raw = int(order.get("percentageOdds", 0))
-                    prob = odds_raw / 1e18 / 100  # 18-decimal percentage → 0-1
-                    total_size = int(order.get("totalBetSize", 0))
-                    fill_amount = int(order.get("fillAmount", 0))
-                    remaining = (total_size - fill_amount) / 1e6
-                    entry = {"price": prob, "size": remaining}
-                    if order.get("isMakerBettingOutcomeOne", True):
-                        bids.append(entry)
-                    else:
-                        asks.append(entry)
-                bids.sort(key=lambda x: x["price"], reverse=True)
-                asks.sort(key=lambda x: x["price"])
-                result[mh] = {"bids": bids, "asks": asks}
+                result[mh] = _orders_to_taker_book(orders)
 
             # Markets with no orders get empty books
             for mh in batch:

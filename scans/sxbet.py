@@ -9,7 +9,48 @@ from scans.helpers import filter_dust
 logger = logging.getLogger(__name__)
 
 
-def scan_sxbet_backall(sxbet_client: SXBetClient, min_profit: float) -> list[dict]:
+def _fetch_sxbet_snapshot(sxbet_client: SXBetClient) -> tuple[list[dict], dict[str, dict]]:
+    """Fetch one market and order-book snapshot for all SX Bet strategies."""
+    markets = sxbet_client.fetch_all_markets()
+    market_hashes = [market.get("marketHash", "") for market in markets if market.get("marketHash")]
+    orderbooks = sxbet_client.get_orderbooks_batch(market_hashes, batch_size=1000) if market_hashes else {}
+    return markets, orderbooks
+
+
+def scan_sxbet(
+    sxbet_client: SXBetClient,
+    min_profit: float,
+) -> tuple[list[dict], list[dict]]:
+    """Run both SX Bet strategies against a single consistent snapshot.
+
+    Returns:
+        A tuple containing back-all and back-lay opportunities.
+    """
+    if not sxbet_client or not sxbet_client.authenticated:
+        return [], []
+
+    markets, orderbooks = _fetch_sxbet_snapshot(sxbet_client)
+    if not markets:
+        logger.warning("No SX Bet markets fetched.")
+        return [], []
+
+    backall = scan_sxbet_backall(sxbet_client, min_profit, markets=markets, orderbooks=orderbooks)
+    backlay = scan_sxbet_backlay(sxbet_client, min_profit, markets=markets, orderbooks=orderbooks)
+    backall_hashes = {opportunity["_sx_market_hash"] for opportunity in backall}
+    deduplicated_backlay = [
+        opportunity for opportunity in backlay
+        if opportunity["_sx_market_hash"] not in backall_hashes
+    ]
+    return backall, deduplicated_backlay
+
+
+def scan_sxbet_backall(
+    sxbet_client: SXBetClient,
+    min_profit: float,
+    *,
+    markets: list[dict] | None = None,
+    orderbooks: dict[str, dict] | None = None,
+) -> list[dict]:
     """Scan for SX Bet back-all arbitrage (under-round books).
 
     SX Bet markets are binary (outcomeOne / outcomeTwo). Back-all arb
@@ -23,16 +64,13 @@ def scan_sxbet_backall(sxbet_client: SXBetClient, min_profit: float) -> list[dic
     if not sxbet_client or not sxbet_client.authenticated:
         return opportunities
 
-    markets = sxbet_client.fetch_all_markets()
+    if markets is None or orderbooks is None:
+        markets, orderbooks = _fetch_sxbet_snapshot(sxbet_client)
     if not markets:
         logger.warning("No SX Bet markets fetched.")
         return opportunities
 
     logger.info("Scanning %d SX Bet markets for back-all arbs...", len(markets))
-
-    # Batch fetch all orderbooks (20 per API call instead of 1)
-    market_hashes = [m.get("marketHash", "") for m in markets if m.get("marketHash")]
-    orderbooks = sxbet_client.get_orderbooks_batch(market_hashes, batch_size=20)
 
     for market in markets:
         market_hash = market.get("marketHash", "")
@@ -46,9 +84,8 @@ def scan_sxbet_backall(sxbet_client: SXBetClient, min_profit: float) -> list[dic
         bids = ob.get("bids", [])
         asks = ob.get("asks", [])
 
-        # For binary back-all: need best YES price (from bids) and best NO price (from asks)
-        # bids = YES side (isMakerBettingOutcomeOne=true), sorted highest first
-        # asks = NO side (isMakerBettingOutcomeOne=false), sorted lowest first
+        # The normalized book contains the best executable taker prices:
+        # bids = outcome one; asks = outcome two; both sorted cheapest first.
         if not bids or not asks:
             continue
 
@@ -87,6 +124,10 @@ def scan_sxbet_backall(sxbet_client: SXBetClient, min_profit: float) -> list[dic
                 "net_roi": f"{result['net_profit'] / total * 100:.2f}%" if total > 0 else "0%",
                 "_sx_market_hash": market_hash,
                 "_sx_prices": implied_probs,
+                "_sx_outcome_ids": [
+                    market.get("outcomeOneName", "Outcome 1"),
+                    market.get("outcomeTwoName", "Outcome 2"),
+                ],
                 "_clob_depth": min(bid_size, ask_size),
             })
 
@@ -95,7 +136,13 @@ def scan_sxbet_backall(sxbet_client: SXBetClient, min_profit: float) -> list[dic
     return opportunities
 
 
-def scan_sxbet_backlay(sxbet_client: SXBetClient, min_profit: float) -> list[dict]:
+def scan_sxbet_backlay(
+    sxbet_client: SXBetClient,
+    min_profit: float,
+    *,
+    markets: list[dict] | None = None,
+    orderbooks: dict[str, dict] | None = None,
+) -> list[dict]:
     """Scan for SX Bet back-lay arbitrage (crossed books on same outcome).
 
     Same outcome has best bid > best ask (crossed book).
@@ -108,15 +155,12 @@ def scan_sxbet_backlay(sxbet_client: SXBetClient, min_profit: float) -> list[dic
     if not sxbet_client or not sxbet_client.authenticated:
         return opportunities
 
-    markets = sxbet_client.fetch_all_markets()
+    if markets is None or orderbooks is None:
+        markets, orderbooks = _fetch_sxbet_snapshot(sxbet_client)
     if not markets:
         return opportunities
 
     logger.info("Scanning %d SX Bet markets for back-lay arbs...", len(markets))
-
-    # Batch fetch all orderbooks
-    market_hashes = [m.get("marketHash", "") for m in markets if m.get("marketHash")]
-    orderbooks = sxbet_client.get_orderbooks_batch(market_hashes, batch_size=20)
 
     for market in markets:
         market_hash = market.get("marketHash", "")
@@ -133,18 +177,16 @@ def scan_sxbet_backlay(sxbet_client: SXBetClient, min_profit: float) -> list[dic
         if not bids or not asks:
             continue
 
-        best_bid = float(bids[0]["price"])
-        best_ask = float(asks[0]["price"])
+        back_prob = float(bids[0]["price"])
+        opposing_back_prob = float(asks[0]["price"])
+        lay_prob = 1.0 - opposing_back_prob
 
-        if best_bid <= 0 or best_ask <= 0:
+        if back_prob <= 0 or opposing_back_prob <= 0:
             continue
 
-        # Crossed book: bid > ask means we can buy at ask and sell at bid
-        if best_bid <= best_ask:
+        # Laying outcome one is economically equivalent to backing outcome two.
+        if lay_prob <= back_prob:
             continue
-
-        back_prob = best_ask
-        lay_prob = best_bid
 
         result = net_profit_sxbet_backlay(back_prob, lay_prob)
         if result["net_profit"] >= min_profit:
@@ -173,6 +215,7 @@ def scan_sxbet_backlay(sxbet_client: SXBetClient, min_profit: float) -> list[dic
                 "_sx_market_hash": market_hash,
                 "_sx_back_price": back_prob,
                 "_sx_lay_price": lay_prob,
+                "_sx_outcome_id": market.get("outcomeOneName", "Outcome 1"),
                 "_clob_depth": min(bid_size, ask_size),
             })
 

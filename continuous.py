@@ -76,8 +76,7 @@ from scans import (
     scan_betfair_backlay,
     scan_smarkets_backall,
     scan_smarkets_backlay,
-    scan_sxbet_backall,
-    scan_sxbet_backlay,
+    scan_sxbet,
     scan_matchbook_backall,
     scan_matchbook_backlay,
     scan_gemini_binary,
@@ -1933,9 +1932,8 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                 if args.mode in ("all", "sxbet"):
                     sxbet = extra_clients.get("sxbet")
                     if sxbet:
-                        sx_backall = scan_sxbet_backall(sxbet, min_profit)
+                        sx_backall, sx_backlay = scan_sxbet(sxbet, min_profit)
                         all_opportunities.extend(sx_backall)
-                        sx_backlay = scan_sxbet_backlay(sxbet, min_profit)
                         all_opportunities.extend(sx_backlay)
 
                 if args.mode in ("all", "matchbook"):

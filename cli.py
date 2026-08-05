@@ -80,8 +80,7 @@ from scans import (
     scan_betfair_backlay,
     scan_smarkets_backall,
     scan_smarkets_backlay,
-    scan_sxbet_backall,
-    scan_sxbet_backlay,
+    scan_sxbet,
     scan_matchbook_backall,
     scan_matchbook_backlay,
     scan_gemini_binary,
@@ -339,10 +338,9 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
         sxbet = extra_clients.get("sxbet")
         if sxbet:
             logger.info("--- SX Bet Scan ---")
-            sx_backall = scan_sxbet_backall(sxbet, min_profit)
+            sx_backall, sx_backlay = scan_sxbet(sxbet, min_profit)
             all_opportunities.extend(sx_backall)
             logger.info("Found %d SX Bet back-all opportunities.", len(sx_backall))
-            sx_backlay = scan_sxbet_backlay(sxbet, min_profit)
             all_opportunities.extend(sx_backlay)
             logger.info("Found %d SX Bet back-lay opportunities.", len(sx_backlay))
 

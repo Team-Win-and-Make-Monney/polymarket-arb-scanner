@@ -182,6 +182,36 @@ class TestRewardsContinuousMode:
         }
         assert scan_polymarket_rewards([market], reward_tracker) == []
 
+    def test_polymarket_reward_refinement_is_capped_by_reward_density(self, reward_tracker):
+        """The complete reward feed must not trigger thousands of CLOB calls."""
+        from scans import scan_polymarket_rewards
+        from scans import rewards as rewards_mod
+
+        def market(condition_id, daily_rate, min_size):
+            return {
+                "conditionId": condition_id,
+                "question": condition_id,
+                "incentives": {
+                    "min_incentive_size": min_size,
+                    "max_incentive_spread": 0.03,
+                    "pool_size_usdc": daily_rate,
+                    "reward_daily_rate_usdc": daily_rate,
+                },
+                "outcomePrices": [0.5, 0.5],
+            }
+
+        markets = [
+            market("LOW", daily_rate=20, min_size=100),
+            market("HIGH", daily_rate=50, min_size=10),
+            market("MID", daily_rate=30, min_size=10),
+        ]
+        with patch.object(rewards_mod, "_refine_rewards_with_clob", side_effect=lambda opps, *_a, **_k: opps):
+            opps = scan_polymarket_rewards(
+                markets, reward_tracker, min_pool_usdc=10, max_candidates=2,
+            )
+
+        assert [opp["_market_key"] for opp in opps] == ["HIGH", "MID"]
+
     def test_kalshi_rewards_use_canonical_lip_selection_and_dynamic_grid(self, kalshi_reward_tracker):
         """LIP programs, not volume, drive candidates and quotes honor price_ranges."""
         from scans import scan_kalshi_rewards

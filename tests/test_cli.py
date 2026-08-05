@@ -347,6 +347,22 @@ class TestRunOneshotModeRouting:
                               extra_clients={"ibkr": ibkr_client})
         mock_ibkr.assert_called_once()
 
+    @patch.object(_cli_mod, "display_results")
+    @patch.object(_cli_mod, "dashboard_state")
+    @patch.object(_cli_mod, "scan_polymarket_rewards", return_value=[])
+    @patch.object(_cli_mod, "fetch_reward_markets", return_value=[{"conditionId": "reward"}])
+    @patch.object(_cli_mod, "fetch_all_markets")
+    def test_rewards_mode_uses_dedicated_reward_feed(
+        self, mock_fetch_all, mock_fetch_rewards, mock_scan, mock_dash, mock_display,
+    ):
+        with patch.object(_cli_mod, "CONFIG_REWARDS_ENABLED", True):
+            _cli_mod._run_oneshot(
+                _make_args(mode="rewards"), 0.01, None, _make_executor(), _make_db(),
+            )
+        mock_fetch_all.assert_not_called()
+        mock_fetch_rewards.assert_called_once_with()
+        assert mock_scan.call_args.args[0] == [{"conditionId": "reward"}]
+
 
 # ---------------------------------------------------------------------------
 # _run_oneshot — filtering and execution

@@ -13,7 +13,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from polymarket_api import fetch_all_markets, fetch_events
+from polymarket_api import fetch_all_markets, fetch_events, fetch_reward_markets
 from ws_feeds import FeedManager, get_feed_health_tracker
 from db import TradeDB
 from display import display_results
@@ -1675,18 +1675,21 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                 # Stage 1: Fetch data from all platforms in parallel
                 poly_markets = []
                 poly_events = None
+                poly_reward_markets = []
                 kalshi_data = None
 
                 with _StageTimer("fetch", _stage_timings):
                     fetch_futures = {}
-                    with ThreadPoolExecutor(max_workers=3) as pool:
+                    with ThreadPoolExecutor(max_workers=4) as pool:
                         if args.mode not in (
                             "kalshi", "betfair", "smarkets", "sxbet", "matchbook",
-                            "gemini", "ibkr", "triangular", "mm-pilot",
+                            "gemini", "ibkr", "triangular", "mm-pilot", "rewards",
                         ):
                             fetch_futures["poly_markets"] = pool.submit(fetch_all_markets)
                         if args.mode in ("all", "negrisk", "multi-cross"):
                             fetch_futures["poly_events"] = pool.submit(fetch_events)
+                        if args.mode in ("all", "rewards") and CONFIG_REWARDS_ENABLED:
+                            fetch_futures["poly_reward_markets"] = pool.submit(fetch_reward_markets)
                         if args.mode in ("all", "kalshi", "cross", "spread", "multi-cross", "rewards") and kalshi_client:
                             fetch_futures["kalshi_data"] = pool.submit(_fetch_kalshi_data, kalshi_client)
 
@@ -1697,6 +1700,8 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                                     poly_markets = result or []
                                 elif key == "poly_events":
                                     poly_events = result
+                                elif key == "poly_reward_markets":
+                                    poly_reward_markets = result or []
                                 elif key == "kalshi_data":
                                     kalshi_data = result
                             except Exception as e:
@@ -1977,9 +1982,11 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                 # Layer 3: Liquidity Rewards
                 if args.mode in ("all", "rewards") and CONFIG_REWARDS_ENABLED:
                     try:
-                        if poly_markets and _reward_tracker:
+                        pm_reward_opps = []
+                        k_reward_opps = []
+                        if poly_reward_markets and _reward_tracker:
                             pm_reward_opps = scan_polymarket_rewards(
-                                markets=poly_markets,
+                                markets=poly_reward_markets,
                                 reward_tracker=_reward_tracker,
                                 price_cache=price_cache,
                             )
@@ -1995,8 +2002,8 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
 
                         logger.debug(
                             "Rewards scan complete: %d Polymarket + %d Kalshi opps",
-                            len(pm_reward_opps) if poly_markets and _reward_tracker else 0,
-                            len(k_reward_opps) if kalshi_client and _kalshi_reward_tracker else 0,
+                            len(pm_reward_opps),
+                            len(k_reward_opps),
                         )
                     except Exception as exc:
                         logger.debug("Rewards scanning error: %s", exc)

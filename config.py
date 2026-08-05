@@ -441,6 +441,7 @@ REWARDS_MIN_SIZE = _env_float("REWARDS_MIN_SIZE", "5.0")
 REWARDS_MAX_SPREAD = _env_float("REWARDS_MAX_SPREAD", "0.05")
 REWARDS_POLL_INTERVAL = _env_int("REWARDS_POLL_INTERVAL", "60")
 REWARDS_MIN_RESTING_TIME = _env_int("REWARDS_MIN_RESTING_TIME", "300")
+REWARDS_MAX_MARKETS = _env_int("REWARDS_MAX_MARKETS", "100")
 
 # Kalshi Liquidity Incentive Program (LIP) — snapshot scoring of resting orders.
 KALSHI_LIP_ENABLED = _env_bool("KALSHI_LIP_ENABLED", "false")

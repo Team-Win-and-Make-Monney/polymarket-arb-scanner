@@ -37,6 +37,7 @@ from config import (
     WS_SUBSCRIPTION_LIMIT as CONFIG_WS_SUBSCRIPTION_LIMIT,
     WS_TRIGGER_ENABLED as CONFIG_WS_TRIGGER_ENABLED,
     WS_TRIGGER_THRESHOLD as CONFIG_WS_TRIGGER_THRESHOLD,
+    WS_TRIGGER_DEDUPE_SECONDS as CONFIG_WS_TRIGGER_DEDUPE_SECONDS,
     HEDGE_ENABLED as CONFIG_HEDGE_ENABLED,
     SNAPSHOT_ENABLED as CONFIG_SNAPSHOT_ENABLED,
     SNAPSHOT_INTERVAL as CONFIG_SNAPSHOT_INTERVAL,
@@ -112,6 +113,63 @@ def _wake_asyncio_selector(loop, event) -> bool:
 def _is_execution_eligible(opp: dict) -> bool:
     """Return whether an opportunity may enter any execution path."""
     return opp.get("_execution_eligible", True) is not False
+
+
+def _cache_probability(entry: dict | None, *keys: str) -> float | None:
+    """Return the first scalar 0..1 probability from a WS cache entry."""
+    if not entry:
+        return None
+    for key in keys:
+        value = entry.get(key)
+        if value is None or isinstance(value, (dict, list, tuple)):
+            continue
+        try:
+            probability = float(value)
+        except (TypeError, ValueError):
+            continue
+        if 0.0 <= probability <= 1.0:
+            return probability
+    return None
+
+
+class _WSTriggerDeduper:
+    """Thread-safe short cooldown for identical WS-triggered opportunities."""
+
+    def __init__(self, cooldown_seconds: float):
+        self.cooldown_seconds = max(0.0, float(cooldown_seconds))
+        self._last_queued: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _key(opp: dict) -> str:
+        market_key = (
+            opp.get("_market_key")
+            or opp.get("_kalshi_ticker")
+            or opp.get("market", "?")
+        )
+        return f"{opp.get('_source', '')}:{opp.get('type', '')}:{market_key}"
+
+    def admit(self, opp: dict, now: float | None = None) -> bool:
+        """Claim a cooldown slot, returning False for a recent duplicate."""
+        now = time.monotonic() if now is None else now
+        key = self._key(opp)
+        with self._lock:
+            if now - self._last_queued.get(key, float("-inf")) < self.cooldown_seconds:
+                return False
+            self._last_queued[key] = now
+            if len(self._last_queued) > 10_000:
+                cutoff = now - max(self.cooldown_seconds * 2, 60.0)
+                self._last_queued = {
+                    existing_key: queued_at
+                    for existing_key, queued_at in self._last_queued.items()
+                    if queued_at >= cutoff
+                }
+            return True
+
+    def forget(self, opp: dict) -> None:
+        """Release a claim when queue insertion fails."""
+        with self._lock:
+            self._last_queued.pop(self._key(opp), None)
 
 
 class OpportunityIndex:
@@ -659,8 +717,9 @@ def _recalc_profit(opp: dict, platform: str, ticker: str, new_price: float, pric
                     prices.append(new_price)
                 else:
                     cached = price_cache.get((platform, tid))
-                    if cached and cached.get("price") is not None:
-                        prices.append(cached["price"])
+                    cached_ask = _cache_probability(cached, "best_ask", "ask", "price")
+                    if cached_ask is not None:
+                        prices.append(cached_ask)
                     else:
                         return None
             result = net_profit_binary_internal(prices[0], prices[1])
@@ -675,8 +734,9 @@ def _recalc_profit(opp: dict, platform: str, ticker: str, new_price: float, pric
                     prices.append(new_price)
                 else:
                     cached = price_cache.get((platform, tid))
-                    if cached and cached.get("price") is not None:
-                        prices.append(cached["price"])
+                    cached_ask = _cache_probability(cached, "best_ask", "ask", "price")
+                    if cached_ask is not None:
+                        prices.append(cached_ask)
                     else:
                         return None
             result = net_profit_negrisk_internal(prices)
@@ -686,8 +746,12 @@ def _recalc_profit(opp: dict, platform: str, ticker: str, new_price: float, pric
             cached = price_cache.get(("kalshi", k_ticker))
             if not cached:
                 return None
-            k_yes = cached.get("yes_price", opp.get("_kalshi_yes"))
-            k_no = cached.get("no_price", opp.get("_kalshi_no"))
+            k_yes = _cache_probability(cached, "yes_ask", "yes_price", "yes")
+            k_no = _cache_probability(cached, "no_ask", "no_price", "no")
+            if k_yes is None:
+                k_yes = _cache_probability(opp, "_kalshi_yes")
+            if k_no is None:
+                k_no = _cache_probability(opp, "_kalshi_no")
             if k_yes is None or k_no is None:
                 return None
             result = net_profit_kalshi_binary(k_yes, k_no)
@@ -704,6 +768,8 @@ def _recalc_profit(opp: dict, platform: str, ticker: str, new_price: float, pric
             side_b = opp.get("_side_b", "no")
             if price_a is None or price_b is None or not pa or not pb:
                 return None
+            price_a = float(price_a)
+            price_b = float(price_b)
 
             # Determine which side the WS update applies to
             if platform == pa:
@@ -1003,6 +1069,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
     opp_index = OpportunityIndex()
     ws_trigger_enabled = CONFIG_WS_TRIGGER_ENABLED
     ws_trigger_threshold = CONFIG_WS_TRIGGER_THRESHOLD
+    ws_trigger_deduper = _WSTriggerDeduper(CONFIG_WS_TRIGGER_DEDUPE_SECONDS)
     ws_sub_limit = CONFIG_WS_SUBSCRIPTION_LIMIT
     _price_cache_lock = threading.Lock()
     _execution_semaphore = threading.Semaphore(CONFIG_MAX_CONCURRENT_WS_EXECUTIONS)
@@ -1272,6 +1339,10 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                     continue
                 if _metrics:
                     _metrics.inc("cross_pair_eval_hits")
+                if not ws_trigger_deduper.admit(opp):
+                    if _metrics:
+                        _metrics.inc("cross_pair_trigger_duplicates")
+                    continue
                 market_name = opp.get("market", "?")
                 logger.info(
                     "WS Cross trigger: %s profit=$%.4f (%s)",
@@ -1288,6 +1359,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                     if _metrics:
                         _metrics.inc("cross_pair_triggers")
                 except Exception as exc:
+                    ws_trigger_deduper.forget(opp)
                     logger.debug("Cross priority push failed, skipping: %s", exc)
 
         # Event-driven execution: check if this update affects a tracked opportunity
@@ -1302,7 +1374,12 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
             # Recalculate profit using fresh WS price instead of stale value
             with _price_cache_lock:
                 cached = price_cache.get((platform, ticker), {})
-            new_price = cached.get("price")
+            if platform == "polymarket":
+                new_price = _cache_probability(cached, "best_ask", "ask", "price")
+            elif platform == "kalshi":
+                new_price = _cache_probability(cached, "yes_ask", "yes_price", "yes", "price")
+            else:
+                new_price = _cache_probability(cached, "price")
             if new_price is None:
                 continue
             recalculated_profit = _recalc_profit(opp, platform, ticker, new_price, price_cache)
@@ -1313,6 +1390,8 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                 # Time-sensitive opps (stale, resolution) get higher priority (lower value = dequeues first)
                 opp_copy = dict(opp)
                 opp_copy["net_profit"] = profit
+                if not ws_trigger_deduper.admit(opp_copy):
+                    continue
                 priority = -_execution_priority(opp_copy)
                 seq = _seq_counter
                 _seq_counter += 1
@@ -1322,6 +1401,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                         _priority_queue.put((priority, seq, opp_copy)), loop
                     )
                 except Exception as exc:
+                    ws_trigger_deduper.forget(opp_copy)
                     # Fallback: execute directly if queue push fails
                     logger.debug("Priority queue push failed, executing directly: %s", exc)
                     if not _execution_semaphore.acquire(blocking=False):

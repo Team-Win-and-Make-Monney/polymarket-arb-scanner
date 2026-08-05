@@ -423,6 +423,22 @@ class TestRecalcProfit:
         # gross = 1.0 - 0.82 = 0.18, should be positive
         assert result > 0
 
+    def test_recalc_binary_uses_normalized_string_asks(self):
+        opp = {
+            "type": "Binary",
+            "_token_ids": ["tok_yes", "tok_no"],
+        }
+        cache = {
+            ("polymarket", "tok_yes"): {"best_ask": "0.40", "price": "0.39"},
+            ("polymarket", "tok_no"): {"best_ask": "0.42", "price": "0.41"},
+        }
+
+        with patch("continuous.net_profit_binary_internal", return_value={"net_profit": 0.18}) as profit:
+            result = _recalc_profit(opp, "polymarket", "tok_yes", 0.40, cache)
+
+        assert result == pytest.approx(0.18)
+        profit.assert_called_once_with(0.40, 0.42)
+
     def test_recalc_binary_missing_other_token(self):
         """Should return None when other token not in cache."""
         opp = {

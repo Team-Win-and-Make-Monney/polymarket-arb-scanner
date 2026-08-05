@@ -25,6 +25,28 @@ class _RevalidationAPIError(Exception):
     """Raised when revalidation fails due to an API/network error, not price movement."""
     pass
 
+
+def _cached_probability(entry: dict | None, *keys: str) -> float | None:
+    """Return the first scalar 0..1 probability from a cache entry.
+
+    WebSocket payloads retain raw string fields and, for Kalshi snapshots,
+    raw price ladders. Revalidation must consume normalized executable asks,
+    never concatenate a raw string with a float or treat a ladder as a price.
+    """
+    if not entry:
+        return None
+    for key in keys:
+        value = entry.get(key)
+        if value is None or isinstance(value, (dict, list, tuple)):
+            continue
+        try:
+            probability = float(value)
+        except (TypeError, ValueError):
+            continue
+        if 0.0 <= probability <= 1.0:
+            return probability
+    return None
+
 # Conditional metrics import — never breaks if metrics.py is missing
 try:
     from config import METRICS_ENABLED as _METRICS_ENABLED
@@ -863,8 +885,8 @@ class ArbitrageExecutor:
             return False, 0.0, "feed_stale"
 
         if cached_yes and cached_no:
-            yes_ask = cached_yes.get("price")
-            no_ask = cached_no.get("price")
+            yes_ask = _cached_probability(cached_yes, "best_ask", "ask", "price")
+            no_ask = _cached_probability(cached_no, "best_ask", "ask", "price")
 
         if yes_ask is None or no_ask is None:
             yes_book = fetch_order_book(token_ids[0])
@@ -916,8 +938,9 @@ class ArbitrageExecutor:
                 logger.info("Skipping revalidation: polymarket token %s stale for >30s", tid)
                 return False, 0.0, "feed_stale"
 
-            if cached and cached.get("price") is not None:
-                yes_asks.append(cached["price"])
+            cached_ask = _cached_probability(cached, "best_ask", "ask", "price")
+            if cached_ask is not None:
+                yes_asks.append(cached_ask)
             else:
                 book = fetch_order_book(tid)
                 if not book:
@@ -964,8 +987,9 @@ class ArbitrageExecutor:
                 logger.info("Skipping revalidation: polymarket token %s stale for >30s", tid)
                 return False, 0.0, "feed_stale"
 
-            if cached and cached.get("price") is not None:
-                no_asks.append(cached["price"])
+            cached_ask = _cached_probability(cached, "best_ask", "ask", "price")
+            if cached_ask is not None:
+                no_asks.append(cached_ask)
             else:
                 book = fetch_order_book(tid)
                 if not book:
@@ -1012,11 +1036,12 @@ class ArbitrageExecutor:
                     logger.info("Skipping revalidation: polymarket token %s stale for >30s", tid)
                     return False, 0.0, "feed_stale"
 
-                if cached and cached.get("price") is not None:
+                cached_ask = _cached_probability(cached, "best_ask", "ask", "price")
+                if cached_ask is not None:
                     if i == 0:
-                        pm_yes = cached["price"]
+                        pm_yes = cached_ask
                     else:
-                        pm_no = cached["price"]
+                        pm_no = cached_ask
             if pm_yes is None or pm_no is None:
                 yes_book = fetch_order_book(token_ids[0])
                 no_book = fetch_order_book(token_ids[1])
@@ -1038,8 +1063,8 @@ class ArbitrageExecutor:
                 return False, 0.0, "feed_stale"
 
             if cached_k:
-                k_yes = cached_k.get("yes_price")
-                k_no = cached_k.get("no_price")
+                k_yes = _cached_probability(cached_k, "yes_ask", "yes_price", "yes")
+                k_no = _cached_probability(cached_k, "no_ask", "no_price", "no")
             if k_yes is None or k_no is None:
                 book = self.kalshi_client.fetch_order_book(kalshi_ticker)
                 if not book:
@@ -1290,10 +1315,13 @@ class ArbitrageExecutor:
                 return False, 0.0, "feed_stale"
 
             if cached:
-                fresh_price = cached.get("yes_ask") or cached.get("yes", price)
-                prices.append(fresh_price)
+                if platform == "polymarket":
+                    fresh_price = _cached_probability(cached, "best_ask", "ask", "price")
+                else:
+                    fresh_price = _cached_probability(cached, "yes_ask", "yes_price", "yes")
+                prices.append(fresh_price if fresh_price is not None else float(price))
             else:
-                prices.append(price)
+                prices.append(float(price))
             platforms.append(platform)
 
         result = net_profit_multi_cross(prices, platforms)
@@ -1426,8 +1454,9 @@ class ArbitrageExecutor:
                     logger.info("Skipping price refetch: polymarket %s stale for >30s", tid)
                     return None
 
-                if cached and cached.get("price") is not None:
-                    return cached["price"]
+                cached_ask = _cached_probability(cached, "best_ask", "ask", "price")
+                if cached_ask is not None:
+                    return cached_ask
                 book = fetch_order_book(tid)
                 if book:
                     data = get_best_bid_ask(book)
@@ -1442,8 +1471,11 @@ class ArbitrageExecutor:
                     logger.info("Skipping price refetch: kalshi %s stale for >30s", ticker)
                     return None
 
-                if cached and cached.get(f"{side}_price") is not None:
-                    return cached[f"{side}_price"]
+                cached_ask = _cached_probability(
+                    cached, f"{side}_ask", f"{side}_price", side,
+                )
+                if cached_ask is not None:
+                    return cached_ask
                 book = self.kalshi_client.fetch_order_book(ticker)
                 if book:
                     from kalshi_api import parse_orderbook, best_yes_ask, best_no_ask, _audit_raw_orderbook

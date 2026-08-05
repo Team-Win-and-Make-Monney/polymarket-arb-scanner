@@ -206,7 +206,7 @@ Each `*_api.py` wraps a platform's REST API with auth, retries (`tenacity`), and
 - **Matchbook**: Username/password session auth (0% commission on predictions)
 - **Gemini Predictions**: HMAC-SHA384 signed headers (API key + secret), 1.75% maker / 7% taker fees (`GEMINI_MAKER_RATE` / `GEMINI_TAKER_RATE`), full buy+sell. Fee formula per the CFTC 40.6 filing effective 2026-03-09: `roundup(rate × C × P × (1 − P))` — *not* the legacy `min(P, 1−P) × rate`. The old single `GEMINI_FEE_RATE=0.05` constant is superseded (slated for removal).
 - **IBKR ForecastEx**: TWS API via `ib_insync` (IB Gateway socket), BUY-only (no sell), LMT-only, $0.00 commission, 5s order rate limit
-- **Metaculus**: Public REST API (optional API key), read-only signal source
+- **Metaculus**: Authenticated `/api/posts` REST API, read-only signal source; requires an API token, access tier, and written commercial-use permission
 
 ### Supporting Modules
 
@@ -288,11 +288,11 @@ Run a specific test: `pytest tests/test_fees.py::TestPolymarketFee::test_zero_wh
 ## Environment Variables
 
 All env vars are defined in `config.py` with defaults. Key groups:
-- Platform credentials: `POLYMARKET_PRIVATE_KEY`, `KALSHI_API_KEY_ID`/`KALSHI_PRIVATE_KEY_PATH` (or `_BASE64`), `BETFAIR_*`, `SMARKETS_API_KEY`, `SXBET_API_KEY`, `MATCHBOOK_USERNAME`/`MATCHBOOK_PASSWORD`, `GEMINI_API_KEY`/`GEMINI_API_SECRET`, `IBKR_HOST`/`IBKR_PORT`/`IBKR_CLIENT_ID` (IB Gateway), `METACULUS_API_KEY` (optional)
+- Platform credentials: `POLYMARKET_PRIVATE_KEY`, `KALSHI_API_KEY_ID`/`KALSHI_PRIVATE_KEY_PATH` (or `_BASE64`), `BETFAIR_*`, `SMARKETS_API_KEY`, `SXBET_API_KEY`, `MATCHBOOK_USERNAME`/`MATCHBOOK_PASSWORD`, `GEMINI_API_KEY`/`GEMINI_API_SECRET`, explicit `IBKR_HOST`/`IBKR_PORT`/`IBKR_CLIENT_ID` (IB Gateway), and `METACULUS_API_KEY` plus `METACULUS_COMMERCIAL_USE_APPROVED=true` after written commercial API permission
 - Execution: `DRY_RUN` (default: true), `EXECUTION_MODE`, `MAX_TRADE_SIZE`
 - Risk: `DAILY_LOSS_LIMIT`, `MAX_OPEN_POSITIONS`, `MIN_LIQUIDITY`, `MIN_NET_ROI`
 - Dynamic fees: `DYNAMIC_FEE_ENABLED`, `POLYGON_RPC_URL`, `GAS_PRICE_CACHE_TTL`
-- Event monitor: `EVENT_MONITOR_ENABLED`, `EVENT_DIVERGENCE_THRESHOLD`
+- Event monitor: `EVENT_MONITOR_ENABLED`, `EVENT_DIVERGENCE_THRESHOLD`, `METACULUS_COMMERCIAL_USE_APPROVED`
 - Tuning: `RESCAN_INTERVAL`, `WS_TRIGGER_THRESHOLD`, `WS_SUBSCRIPTION_LIMIT`, `FUZZY_MATCH_THRESHOLD`, `RESOLUTION_SNIPE_WINDOW_HOURS` (default `48`)
 - Infra: `WEBHOOK_URL`, `DASHBOARD_PORT`, `DASHBOARD_HOST` (default `127.0.0.1`; production must set `0.0.0.0` + `DASHBOARD_PASS`), `DASHBOARD_PASS`, `DATA_DIR`, `LOG_LEVEL`, `LOG_FILE`
 - Proxies: `POLYMARKET_PROXY_URL`, `KALSHI_PROXY_URL`
@@ -305,7 +305,7 @@ The following env vars should be set in Railway for production deployment (Railw
 - `MM_ENABLED=true` — Enable market making engine
 - `SNAPSHOT_ENABLED=true` — Enable price snapshot recording for backtesting
 - `DYNAMIC_FEE_ENABLED=true` — Enable real-time Polygon gas monitoring
-- `EVENT_MONITOR_ENABLED=true` — Enable Metaculus/Manifold signal aggregation
+- `EVENT_MONITOR_ENABLED=true` — Enable signal aggregation; Metaculus also requires its API key and explicit commercial-use approval flag
 
 **Market Making Tuning:**
 - `MM_MIN_SPREAD=0.02` — 2% minimum spread width

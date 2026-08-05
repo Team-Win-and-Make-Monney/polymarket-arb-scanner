@@ -187,8 +187,8 @@ class TestStrategyDryRun:
     # -- Layer 2: Near-Arbitrage -----------------------------------------------
 
     def test_event_dry_run(self):
-        """Event divergence scan (Metaculus public API — no auth required)."""
-        # Metaculus API key is optional; test runs without creds
+        """Event divergence scan using synthetic Metaculus-shaped data."""
+        # This integration test is local-only; the live API requires approved access.
         code, stdout, stderr = _run_scanner("event")
         assert code == 0, f"event mode exited {code}\n--- stderr ---\n{stderr}"
         assert "Traceback" not in stderr, f"Traceback in stderr:\n{stderr}"

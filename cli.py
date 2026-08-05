@@ -122,6 +122,7 @@ from config import (
     GAS_PRICE_CACHE_TTL as CONFIG_GAS_CACHE_TTL,
     EVENT_DIVERGENCE_THRESHOLD as CONFIG_EVENT_DIVERGENCE,
     EVENT_MONITOR_ENABLED as CONFIG_EVENT_MONITOR,
+    METACULUS_COMMERCIAL_USE_APPROVED as CONFIG_METACULUS_COMMERCIAL_USE_APPROVED,
     CONCURRENT_EXECUTION as CONFIG_CONCURRENT_EXECUTION,
     REWARDS_ENABLED as CONFIG_REWARDS_ENABLED,
 )
@@ -129,6 +130,59 @@ from config import (
 # Project-local .env only — never merge personal/global env files (e.g.
 # ~/.claude/.env) into the bot environment.
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+
+
+def _initialize_ibkr_client(mode: str):
+    """Initialize IBKR only when its gateway host is explicitly configured."""
+    if mode not in ("all", "cross-all", "ibkr"):
+        return None
+
+    ibkr_host = os.getenv("IBKR_HOST")
+    if not ibkr_host:
+        log = logger.warning if mode == "ibkr" else logger.info
+        log("IBKR disabled: set IBKR_HOST when an IB Gateway or TWS endpoint is available.")
+        return None
+
+    ibkr_port = int(os.getenv("IBKR_PORT", "4001"))
+    ibkr_cid = int(os.getenv("IBKR_CLIENT_ID", "1"))
+    client = IBKRClient()
+    if not client.login(ibkr_host, ibkr_port, ibkr_cid):
+        logger.warning(
+            "IBKR connection failed (is IB Gateway running at %s:%d?).",
+            ibkr_host,
+            ibkr_port,
+        )
+        return None
+
+    logger.info("IBKR connected successfully.")
+    return client
+
+
+def _initialize_metaculus_client():
+    """Initialize Metaculus only after its access and commercial-use gates."""
+    if not CONFIG_EVENT_MONITOR:
+        return None
+
+    api_key = os.getenv("METACULUS_API_KEY")
+    if not api_key:
+        logger.warning(
+            "Metaculus disabled: EVENT_MONITOR_ENABLED requires METACULUS_API_KEY."
+        )
+        return None
+    if not CONFIG_METACULUS_COMMERCIAL_USE_APPROVED:
+        logger.warning(
+            "Metaculus disabled: set METACULUS_COMMERCIAL_USE_APPROVED=true only after "
+            "Metaculus grants written commercial API/data permission."
+        )
+        return None
+
+    client = MetaculusClient()
+    if not client.login(api_key=api_key):
+        logger.warning("Metaculus authentication or API-access verification failed.")
+        return None
+
+    logger.info("Metaculus client initialized with approved API access.")
+    return client
 
 
 def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=None,
@@ -1386,27 +1440,11 @@ def main():
             else:
                 logger.info("Gemini authenticated successfully.")
 
-    ibkr_client = None
-    if args.mode in ("all", "cross-all", "ibkr"):
-        ibkr_host = os.getenv("IBKR_HOST", "127.0.0.1")
-        ibkr_port = int(os.getenv("IBKR_PORT", "4001"))
-        ibkr_cid = int(os.getenv("IBKR_CLIENT_ID", "1"))
-        ibkr_client = IBKRClient()
-        if not ibkr_client.login(ibkr_host, ibkr_port, ibkr_cid):
-            ibkr_client = None
-            logger.warning("IBKR connection failed (is IB Gateway running at %s:%d?).",
-                           ibkr_host, ibkr_port)
-        else:
-            logger.info("IBKR connected successfully.")
+    ibkr_client = _initialize_ibkr_client(args.mode)
 
-    # Initialize Metaculus client (read-only signal source, public API works without key)
-    metaculus_client = None
-    mc_key = os.getenv("METACULUS_API_KEY")
-    metaculus_client = MetaculusClient()
-    if metaculus_client.login(api_key=mc_key):
-        logger.info("Metaculus client initialized%s.", " (with API key)" if mc_key else " (public)")
-    else:
-        metaculus_client = None
+    # Metaculus is read-only, but authentication and written commercial API
+    # permission are both required by its current terms.
+    metaculus_client = _initialize_metaculus_client()
 
     # Initialize GasMonitor for dynamic fee thresholds
     gas_monitor = None
@@ -1429,7 +1467,8 @@ def main():
             metaculus_client=metaculus_client,
             manifold_client=manifold_client,
         )
-        logger.info("Multi-source signal aggregator enabled (Metaculus + Manifold).")
+        sources = "Metaculus + Manifold" if metaculus_client else "Manifold"
+        logger.info("Signal aggregator enabled (%s).", sources)
     except Exception as exc:
         logger.debug("Signal aggregator not available: %s", exc)
 
@@ -1442,6 +1481,8 @@ def main():
             signal_aggregator=sig_aggregator,
         )
         logger.info("Event-driven speed trading enabled (EventMonitor active).")
+    elif CONFIG_EVENT_MONITOR:
+        logger.warning("EventMonitor disabled because approved Metaculus access is unavailable.")
 
     # Price cache updated by WebSocket feeds (shared with executor for revalidation)
     price_cache = {}

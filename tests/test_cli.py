@@ -761,3 +761,73 @@ class TestPhase9CLIModes:
         captured = capsys.readouterr()
         assert "logical-arb" in captured.out or "logical-arb" in captured.err
         assert "whale-copy" in captured.out or "whale-copy" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Optional external-source startup gates
+# ---------------------------------------------------------------------------
+
+class TestOptionalClientStartup:
+    def test_ibkr_does_not_probe_localhost_without_explicit_host(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with patch.object(_cli_mod, "IBKRClient") as client_cls:
+                result = _cli_mod._initialize_ibkr_client("all")
+
+        assert result is None
+        client_cls.assert_not_called()
+
+    def test_ibkr_connects_to_explicit_gateway(self):
+        client = MagicMock()
+        client.login.return_value = True
+
+        with patch.dict(
+            os.environ,
+            {"IBKR_HOST": "gateway.internal", "IBKR_PORT": "4002", "IBKR_CLIENT_ID": "7"},
+            clear=True,
+        ):
+            with patch.object(_cli_mod, "IBKRClient", return_value=client):
+                result = _cli_mod._initialize_ibkr_client("ibkr")
+
+        assert result is client
+        client.login.assert_called_once_with("gateway.internal", 4002, 7)
+
+    def test_metaculus_requires_event_monitor(self):
+        with patch.object(_cli_mod, "CONFIG_EVENT_MONITOR", False):
+            with patch.object(_cli_mod, "MetaculusClient") as client_cls:
+                result = _cli_mod._initialize_metaculus_client()
+
+        assert result is None
+        client_cls.assert_not_called()
+
+    def test_metaculus_requires_token_and_commercial_approval(self):
+        with patch.object(_cli_mod, "CONFIG_EVENT_MONITOR", True):
+            with patch.object(_cli_mod, "CONFIG_METACULUS_COMMERCIAL_USE_APPROVED", False):
+                with patch.dict(os.environ, {"METACULUS_API_KEY": "token"}, clear=True):
+                    with patch.object(_cli_mod, "MetaculusClient") as client_cls:
+                        result = _cli_mod._initialize_metaculus_client()
+
+        assert result is None
+        client_cls.assert_not_called()
+
+    def test_metaculus_approved_access_still_requires_token(self):
+        with patch.object(_cli_mod, "CONFIG_EVENT_MONITOR", True):
+            with patch.object(_cli_mod, "CONFIG_METACULUS_COMMERCIAL_USE_APPROVED", True):
+                with patch.dict(os.environ, {}, clear=True):
+                    with patch.object(_cli_mod, "MetaculusClient") as client_cls:
+                        result = _cli_mod._initialize_metaculus_client()
+
+        assert result is None
+        client_cls.assert_not_called()
+
+    def test_metaculus_initializes_after_both_access_gates(self):
+        client = MagicMock()
+        client.login.return_value = True
+
+        with patch.object(_cli_mod, "CONFIG_EVENT_MONITOR", True):
+            with patch.object(_cli_mod, "CONFIG_METACULUS_COMMERCIAL_USE_APPROVED", True):
+                with patch.dict(os.environ, {"METACULUS_API_KEY": "token"}, clear=True):
+                    with patch.object(_cli_mod, "MetaculusClient", return_value=client):
+                        result = _cli_mod._initialize_metaculus_client()
+
+        assert result is client
+        client.login.assert_called_once_with(api_key="token")

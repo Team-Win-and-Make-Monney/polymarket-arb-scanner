@@ -467,6 +467,51 @@ class TestCheckWsCache:
 # ---------------------------------------------------------------------------
 
 class TestCrossRevalidationStrategy:
+    def test_uses_normalized_ws_asks_and_coerces_strings(self, executor):
+        """Production WS payloads contain string prices and raw Kalshi ladders."""
+        from unittest.mock import call, patch as mpatch
+
+        opp = {
+            "type": "Cross(PM_NO + K_YES)",
+            "net_profit": 0.10,
+            "prices": "PM_N=0.690 K_Y=0.410",
+            "total_cost": "$1.1000",
+            "_token_ids": ["tok_yes", "tok_no"],
+            "_kalshi_ticker": "TICKER-XYZ",
+        }
+        now = time.time()
+        price_cache = {
+            ("polymarket", "tok_yes"): {
+                "best_ask": "0.310", "price": "0.300", "_ts": now,
+            },
+            ("polymarket", "tok_no"): {
+                "best_ask": "0.690", "price": "0.680", "_ts": now,
+            },
+            ("kalshi", "TICKER-XYZ"): {
+                "yes": [[40, 10]],
+                "no": [[60, 10]],
+                "yes_ask": "0.410",
+                "no_ask": "0.360",
+                "_ts": now,
+            },
+        }
+
+        with mpatch(
+            "executor.net_profit_cross_platform",
+            side_effect=[{"net_profit": 0.05}, {"net_profit": 0.11}],
+        ) as profit:
+            passed, reval_profit, reason = executor._revalidate_cross(
+                opp, 0.10, price_cache,
+            )
+
+        assert passed is True
+        assert reval_profit == pytest.approx(0.11)
+        assert reason == "passed"
+        assert profit.call_args_list == [
+            call(0.31, 0.36, "yes", "no"),
+            call(0.69, 0.41, "no", "yes"),
+        ]
+
     def test_strategy1_remains_best(self, executor):
         """When strategy 1 (PM_YES + K_NO) stays best, prices should contain PM_Y= and K_N=."""
         from unittest.mock import patch as mpatch

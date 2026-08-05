@@ -1,6 +1,7 @@
 """Centralized configuration — all constants backed by environment variables."""
 
 import logging
+import math
 import os
 import sys
 from pathlib import Path
@@ -31,6 +32,16 @@ def _env_float(name: str, default: str) -> float:
         raise ConfigError(
             f"Environment variable {name}={raw!r} is not a valid float"
         )
+
+
+def _env_non_negative_float(name: str, default: str) -> float:
+    """Read a finite non-negative float, raising ConfigError otherwise."""
+    value = _env_float(name, default)
+    if not math.isfinite(value) or value < 0:
+        raise ConfigError(
+            f"Environment variable {name}={value!r} must be finite and >= 0"
+        )
+    return value
 
 
 def _env_int(name: str, default: str) -> int:
@@ -92,6 +103,7 @@ FUZZY_MATCH_THRESHOLD = _env_int("FUZZY_MATCH_THRESHOLD", "72")
 WS_SUBSCRIPTION_LIMIT = _env_int("WS_SUBSCRIPTION_LIMIT", "2000")
 WS_TRIGGER_ENABLED = _env_bool("WS_TRIGGER_ENABLED", "true")
 WS_TRIGGER_THRESHOLD = _env_float("WS_TRIGGER_THRESHOLD", "0.03")
+WS_TRIGGER_DEDUPE_SECONDS = _env_non_negative_float("WS_TRIGGER_DEDUPE_SECONDS", "5.0")
 PARALLEL_WORKERS = _env_int("PARALLEL_WORKERS", "4")
 RESCAN_INTERVAL = _env_int("RESCAN_INTERVAL", "30")
 MAX_RESOLUTION_DAYS = _env_int("MAX_RESOLUTION_DAYS", "7")

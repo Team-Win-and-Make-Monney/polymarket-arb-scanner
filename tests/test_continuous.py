@@ -45,6 +45,8 @@ from continuous import (
     _get_market_lock,
     _is_execution_eligible,
     _recalc_profit,
+    _ws_opportunity_probability,
+    _ws_tracking_probability,
 )
 from db import TradeDB
 
@@ -423,6 +425,22 @@ class TestRecalcProfit:
         # gross = 1.0 - 0.82 = 0.18, should be positive
         assert result > 0
 
+    def test_recalc_binary_uses_normalized_string_asks(self):
+        opp = {
+            "type": "Binary",
+            "_token_ids": ["tok_yes", "tok_no"],
+        }
+        cache = {
+            ("polymarket", "tok_yes"): {"best_ask": "0.40", "price": "0.39"},
+            ("polymarket", "tok_no"): {"best_ask": "0.42", "price": "0.41"},
+        }
+
+        with patch("continuous.net_profit_binary_internal", return_value={"net_profit": 0.18}) as profit:
+            result = _recalc_profit(opp, "polymarket", "tok_yes", 0.40, cache)
+
+        assert result == pytest.approx(0.18)
+        profit.assert_called_once_with(0.40, 0.42)
+
     def test_recalc_binary_missing_other_token(self):
         """Should return None when other token not in cache."""
         opp = {
@@ -462,6 +480,41 @@ class TestRecalcProfit:
         opp = {"type": "Binary", "_token_ids": []}
         result = _recalc_profit(opp, "polymarket", "tok", 0.5, {})
         assert result is None
+
+
+class TestWSTrackingProbability:
+    def test_kalshi_prefers_normalized_ask_over_raw_ladder(self):
+        entry = {
+            "yes": [[40, 10]],
+            "no": [[60, 10]],
+            "yes_ask": "0.41",
+            "no_ask": "0.61",
+        }
+
+        assert _ws_tracking_probability("kalshi", entry) == pytest.approx(0.41)
+
+    def test_kalshi_raw_ladder_and_cent_delta_are_not_probabilities(self):
+        entry = {"yes": [[40, 10]], "no": [[60, 10]], "price": 45}
+
+        assert _ws_tracking_probability("kalshi", entry) is None
+
+    def test_opportunity_selects_kalshi_no_side_from_metadata(self):
+        opp = {
+            "type": "FeePromo",
+            "_platform_a": "polymarket",
+            "_platform_b": "kalshi",
+            "_side_a": "yes",
+            "_side_b": "no",
+        }
+        entry = {"yes_ask": "0.41", "no_ask": "0.62"}
+
+        assert _ws_opportunity_probability(opp, "kalshi", entry) == pytest.approx(0.62)
+
+    def test_opportunity_infers_kalshi_no_side_from_cross_type(self):
+        opp = {"type": "Cross(PM_YES + K_NO)"}
+        entry = {"yes_ask": "0.41", "no_ask": "0.62"}
+
+        assert _ws_opportunity_probability(opp, "kalshi", entry) == pytest.approx(0.62)
 
 
 # ---------------------------------------------------------------------------

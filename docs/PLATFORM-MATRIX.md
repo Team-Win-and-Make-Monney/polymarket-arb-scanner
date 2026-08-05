@@ -16,7 +16,7 @@
 | Matchbook | Trade | Username/password session | ✅ | ✅ | ✅ | ❌ | 0% commission on predictions | — | BUILT |
 | Gemini Predictions | Trade | HMAC-SHA384 (API key + secret) | ✅ | ✅ | ✅ | ❌ | **1.75% maker / 7% taker**, `roundup(rate×C×P×(1−P))` (CFTC 40.6 filing eff. 2026-03-09) | — | BUILT |
 | IBKR ForecastEx | Trade | TWS API via `ib_insync` (IB Gateway socket) | ✅ | ✅ | ❌ | ❌ | $0.00 commission | — | **BUILT — BUY-only, LMT-only**, 5s order rate limit |
-| Metaculus | Signal | Public REST (optional `METACULUS_API_KEY`) | ✅ | — | — | ❌ | n/a | `EVENT_MONITOR_ENABLED` | BUILT (read-only; anon works, key raises rate limit) |
+| Metaculus | Signal | Current `/api/posts` REST (`METACULUS_API_KEY` + approved commercial access) | ✅ | — | — | ❌ | n/a | `EVENT_MONITOR_ENABLED` + `METACULUS_COMMERCIAL_USE_APPROVED` | BUILT (read-only; disabled unless both access gates are explicit) |
 | Manifold | Signal | Public REST | ✅ | — | — | ❌ | n/a | `EVENT_MONITOR_ENABLED` | BUILT (read-only) |
 
 ## Authz / custody / access (security review columns)

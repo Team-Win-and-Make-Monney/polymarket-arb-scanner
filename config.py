@@ -392,14 +392,20 @@ SMARKETS_RATE_LIMIT = _env_float("SMARKETS_RATE_LIMIT", "0.2")  # 5/s
 SXBET_RATE_LIMIT = _env_float("SXBET_RATE_LIMIT", "0.2")        # 5/s
 MATCHBOOK_RATE_LIMIT = _env_float("MATCHBOOK_RATE_LIMIT", "0.2")  # 5/s
 
-# IBKR ForecastEx (via IB Gateway / TWS socket)
-IBKR_HOST = os.getenv("IBKR_HOST", "127.0.0.1")
+# IBKR ForecastEx (via IB Gateway / TWS socket).  Host is intentionally
+# opt-in: a cloud deployment must not probe its own localhost on every boot.
+IBKR_HOST = os.getenv("IBKR_HOST")
 IBKR_PORT = _env_int("IBKR_PORT", "4001")
 IBKR_CLIENT_ID = _env_int("IBKR_CLIENT_ID", "1")
 IBKR_ORDER_RATE_LIMIT = _env_float("IBKR_ORDER_RATE_LIMIT", "5.0")
 
-# Metaculus (read-only signal source, works without API key)
+# Metaculus (read-only signal source).  The current API requires a token, and
+# any commercial use requires a separate written agreement.  Both gates must
+# be satisfied explicitly before the client is initialized.
 METACULUS_API_KEY = os.getenv("METACULUS_API_KEY")
+METACULUS_COMMERCIAL_USE_APPROVED = _env_bool(
+    "METACULUS_COMMERCIAL_USE_APPROVED", "false"
+)
 METACULUS_CACHE_TTL = _env_float("METACULUS_CACHE_TTL", "300")
 
 # ---------------------------------------------------------------------------

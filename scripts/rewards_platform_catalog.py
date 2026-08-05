@@ -535,7 +535,12 @@ def _shorten(value: str, limit: int = 170) -> str:
     return value[: limit - 3].rstrip() + "..."
 
 
-def render_digest(records: list[dict], now: dt.datetime | None = None, limit: int = 12) -> str:
+def render_digest(
+    records: list[dict],
+    now: dt.datetime | None = None,
+    limit: int = 12,
+    source_reviewed_at: dt.date | None = None,
+) -> str:
     now = now or _utc_now()
     ranked = ranked_catalog(records)
     top = ranked[:limit]
@@ -547,6 +552,7 @@ def render_digest(records: list[dict], now: dt.datetime | None = None, limit: in
         "# Market Rewards Platform Catalog",
         "",
         f"Generated: {now.isoformat(timespec='seconds')}",
+        f"Official sources reviewed: {source_reviewed_at.isoformat() if source_reviewed_at else 'not supplied'}",
         f"Safety boundary: {SAFETY_BOUNDARY}",
         "",
         "## Thesis",
@@ -616,12 +622,17 @@ def render_digest(records: list[dict], now: dt.datetime | None = None, limit: in
         "5. Execution gate: no live orders, account changes, wallet signatures, claims, or trades unless you explicitly do them yourself.",
         "",
     ])
-    return "\n".join(lines)
+    return "\n".join(lines).rstrip()
 
 
-def write_csv(records: list[dict], output: Path) -> None:
+def write_csv(
+    records: list[dict],
+    output: Path,
+    source_reviewed_at: dt.date | None = None,
+) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     fields = [
+        "source_reviewed_at",
         "platform",
         "program",
         "category",
@@ -641,10 +652,11 @@ def write_csv(records: list[dict], output: Path) -> None:
         "official_urls",
     ]
     with output.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
+        writer = csv.DictWriter(f, fieldnames=fields, lineterminator="\n")
         writer.writeheader()
         for row in ranked_catalog(records):
             writer.writerow({
+                "source_reviewed_at": source_reviewed_at.isoformat() if source_reviewed_at else "",
                 "platform": row["platform"],
                 "program": row["program"],
                 "category": row["category"],
@@ -665,14 +677,27 @@ def write_csv(records: list[dict], output: Path) -> None:
             })
 
 
-def write_json(records: list[dict], output: Path) -> None:
+def write_json(
+    records: list[dict],
+    output: Path,
+    source_reviewed_at: dt.date | None = None,
+) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "generated_at": _utc_now().isoformat(timespec="seconds"),
+        "source_reviewed_at": source_reviewed_at.isoformat() if source_reviewed_at else None,
         "safety_boundary": SAFETY_BOUNDARY,
         "records": ranked_catalog(records),
     }
     output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _review_date(value: str) -> dt.date:
+    """Parse an explicit official-source review date."""
+    try:
+        return dt.date.fromisoformat(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected YYYY-MM-DD") from exc
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -681,6 +706,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="Markdown output path.")
     parser.add_argument("--csv-output", type=Path, default=DEFAULT_CSV_OUTPUT, help="CSV output path.")
     parser.add_argument("--json-output", type=Path, default=DEFAULT_JSON_OUTPUT, help="JSON output path.")
+    parser.add_argument(
+        "--source-reviewed-at",
+        type=_review_date,
+        help="Date official source links were actually checked (YYYY-MM-DD).",
+    )
     parser.add_argument("--stdout-only", action="store_true", help="Print only; do not write files.")
     return parser.parse_args(argv)
 
@@ -688,14 +718,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     records = platform_catalog()
-    digest = render_digest(records, _utc_now(), args.limit)
+    digest = render_digest(
+        records,
+        _utc_now(),
+        args.limit,
+        source_reviewed_at=args.source_reviewed_at,
+    )
     print(digest)
 
     if not args.stdout_only:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(digest + "\n", encoding="utf-8")
-        write_csv(records, args.csv_output)
-        write_json(records, args.json_output)
+        write_csv(records, args.csv_output, source_reviewed_at=args.source_reviewed_at)
+        write_json(records, args.json_output, source_reviewed_at=args.source_reviewed_at)
         print(f"\nWrote {args.output}")
         print(f"Wrote {args.csv_output}")
         print(f"Wrote {args.json_output}")

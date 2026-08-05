@@ -255,4 +255,4 @@ class TestSXBetCombinedScan:
         assert len(backall) == 1
         assert len(backlay) == 0
         mock_client.fetch_all_markets.assert_called_once_with()
-        mock_client.get_orderbooks_batch.assert_called_once_with(["0xabc123"], batch_size=1000)
+        mock_client.get_orderbooks_batch.assert_called_once_with(["0xabc123"], batch_size=200)

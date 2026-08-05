@@ -67,21 +67,33 @@ def _match_events_by_title(
         List of (pm_event, kalshi_event_ticker, kalshi_markets) tuples.
     """
     try:
-        from thefuzz import fuzz
+        from thefuzz import fuzz, utils as fuzz_utils
     except ImportError:
         try:
-            from fuzzywuzzy import fuzz
+            from fuzzywuzzy import fuzz, utils as fuzz_utils
         except ImportError:
             logger.warning("thefuzz/fuzzywuzzy not installed — multi-cross matching disabled.")
             return []
 
+    try:
+        from rapidfuzz import fuzz as rapid_fuzz
+        from rapidfuzz import process as rapid_process
+    except ImportError:
+        rapid_fuzz = None
+        rapid_process = None
+
     matches = []
     # Build normalised title -> ticker index for Kalshi
-    kalshi_index: list[tuple[str, str, set]] = []
+    kalshi_index: list[tuple[str, str, set[str]]] = []
     for kticker, ktitle in kalshi_event_titles.items():
         norm = normalize_title(ktitle)
         entities = _extract_entities(norm)
         kalshi_index.append((kticker, norm, entities))
+    kalshi_norms = [entry[1] for entry in kalshi_index]
+    kalshi_score_titles = [
+        fuzz_utils.full_process(title, force_ascii=True)
+        for title in kalshi_norms
+    ]
 
     for pm_event in pm_events:
         pm_title = pm_event.get("title", "")
@@ -91,15 +103,39 @@ def _match_events_by_title(
         best_ticker = None
         best_score = 0
 
-        for kticker, knorm, kentities in kalshi_index:
-            score = fuzz.token_sort_ratio(pm_norm, knorm)
+        # rapidfuzz performs the full-universe score pass in native code. The
+        # previous Python loop made millions of scorer calls per production
+        # scan. Keep the same 70-point cutoff, entity gate, combined score, and
+        # original-index tie break so matching behavior does not change.
+        if rapid_process is not None:
+            scored_candidates = (
+                (index, int(round(score)))
+                for _, score, index in rapid_process.extract_iter(
+                    fuzz_utils.full_process(pm_norm, force_ascii=True),
+                    kalshi_score_titles,
+                    scorer=rapid_fuzz.token_sort_ratio,
+                    # thefuzz rounds native scores to integers; include values
+                    # that round up to the existing 70-point threshold.
+                    score_cutoff=(_EVENT_MATCH_THRESHOLD * 100) - 0.5,
+                )
+            )
+        else:
+            scored_candidates = (
+                (index, fuzz.token_sort_ratio(pm_norm, knorm))
+                for index, (_, knorm, _) in enumerate(kalshi_index)
+            )
+
+        best_index = len(kalshi_index)
+        for index, score in scored_candidates:
+            kticker, _, kentities = kalshi_index[index]
             entity_overlap = len(pm_entities & kentities)
 
             # Require both fuzzy similarity and entity overlap
             if score >= _EVENT_MATCH_THRESHOLD * 100 and entity_overlap >= 1:
                 combined = score + entity_overlap * 5
-                if combined > best_score:
+                if combined > best_score or (combined == best_score and index < best_index):
                     best_score = combined
+                    best_index = index
                     best_ticker = kticker
 
         if best_ticker and best_ticker in kalshi_events:

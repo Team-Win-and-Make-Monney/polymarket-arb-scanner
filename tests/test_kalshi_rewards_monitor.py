@@ -3,6 +3,7 @@
 import datetime as dt
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -12,6 +13,27 @@ from scripts import kalshi_rewards_monitor as monitor
 
 
 class TestKalshiRewardsMonitor:
+    def test_fetch_incentives_uses_only_next_cursor_and_stops(self):
+        """Pagination must not reuse a response cursor or run without a cap."""
+        pages = [
+            {"incentive_programs": [{"market_ticker": "A"}], "next_cursor": "next"},
+            {"incentive_programs": [{"market_ticker": "B"}], "cursor": "legacy"},
+        ]
+
+        with patch.object(monitor, "_fetch_json", side_effect=pages) as fetch:
+            result = monitor.fetch_incentives(limit=10)
+
+        assert [row["market_ticker"] for row in result] == ["A", "B"]
+        assert fetch.call_args_list[1].args[1]["cursor"] == "next"
+
+    def test_fetch_incentives_rejects_repeated_cursor(self):
+        """A malformed server response must fail instead of looping forever."""
+        page = {"incentive_programs": [], "next_cursor": "same"}
+
+        with patch.object(monitor, "_fetch_json", return_value=page):
+            with pytest.raises(RuntimeError, match="repeated a cursor"):
+                monitor.fetch_incentives()
+
     def test_period_reward_dollars(self):
         """Kalshi period_reward values are rendered in dollars."""
         assert monitor.period_reward_dollars(3000000) == pytest.approx(300.0)

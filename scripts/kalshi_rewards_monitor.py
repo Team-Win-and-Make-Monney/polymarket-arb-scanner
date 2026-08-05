@@ -19,6 +19,7 @@ KALSHI_PUBLIC_BASE_URL = "https://external-api.kalshi.com/trade-api/v2"
 PERIOD_REWARD_DOLLAR_DIVISOR = 10000.0
 DEFAULT_OUTPUT = Path("data/kalshi-rewards/latest.md")
 DEFAULT_CSV_OUTPUT = Path("data/kalshi-rewards/latest.csv")
+MAX_INCENTIVE_PAGES = 1000
 
 
 def _utc_now() -> dt.datetime:
@@ -62,17 +63,24 @@ def fetch_incentives(status: str = "active", incentive_type: str = "liquidity", 
     """Fetch incentive programs from Kalshi's public read-only endpoint."""
     incentives = []
     cursor = None
+    seen_cursors = set()
 
-    while True:
+    for _ in range(MAX_INCENTIVE_PAGES):
         params = {"status": status, "type": incentive_type, "limit": limit}
         if cursor:
             params["cursor"] = cursor
 
         payload = _fetch_json("/incentive_programs", params)
         incentives.extend(payload.get("incentive_programs", []))
-        cursor = payload.get("next_cursor") or payload.get("cursor")
-        if not cursor:
+        next_cursor = payload.get("next_cursor")
+        if not next_cursor:
             break
+        if next_cursor in seen_cursors:
+            raise RuntimeError("Kalshi incentive pagination repeated a cursor")
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+    else:
+        raise RuntimeError("Kalshi incentive pagination exceeded its safety cap")
 
     return incentives
 

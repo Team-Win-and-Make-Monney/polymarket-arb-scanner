@@ -216,7 +216,14 @@ class MetaculusClient:
 
     def get_question_details(self, question_id: int) -> dict | None:
         """Fetch and normalize the post containing a question."""
-        post_id = self._post_ids.get(question_id, question_id)
+        post_id = self._post_ids.get(question_id)
+        if post_id is None:
+            logger.warning(
+                "Metaculus post ID is unknown for question %s; fetch the active "
+                "question feed before requesting details.",
+                question_id,
+            )
+            return None
         post = self._request("GET", f"/posts/{post_id}/")
         if not post:
             return None

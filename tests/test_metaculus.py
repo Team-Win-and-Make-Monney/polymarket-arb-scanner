@@ -202,6 +202,14 @@ class TestFetchActiveQuestions:
 
 
 class TestQuestionLookup:
+    def test_details_requires_question_to_post_mapping(self):
+        client = MetaculusClient()
+
+        with patch.object(client, "_request") as request:
+            assert client.get_question_details(20) is None
+
+        request.assert_not_called()
+
     def test_details_uses_known_post_id(self):
         client = MetaculusClient()
         client._post_ids[20] = 10

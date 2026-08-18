@@ -384,6 +384,7 @@ class TestConfigInvariants:
     def test_pilot_without_kalshi_in_allowlist_raises(self, monkeypatch):
         cfg = live_config()
         monkeypatch.setattr(cfg, "MM_KALSHI_PILOT_ENABLED", True)
+        monkeypatch.setattr(cfg, "DRY_RUN", True)
         monkeypatch.setattr(cfg, "ENABLED_EXECUTION_PLATFORMS",
                             frozenset({"polymarket"}))
         with pytest.raises(cfg.ConfigError, match="Kalshi-only"):
@@ -392,6 +393,7 @@ class TestConfigInvariants:
     def test_cap_sanity_warnings(self, monkeypatch):
         cfg = live_config()
         monkeypatch.setattr(cfg, "MM_KALSHI_PILOT_ENABLED", True)
+        monkeypatch.setattr(cfg, "DRY_RUN", True)
         monkeypatch.setattr(cfg, "MM_MAX_GROSS_PER_MARKET_USD", 500.0)
         monkeypatch.setattr(cfg, "MM_MAX_TOTAL_INVENTORY_USD", 400.0)
         warnings = cfg.validate_config()
@@ -730,6 +732,20 @@ class TestLiveEnvelopeOrderGate:
         result = pilot.authorize_order(TICKER, "yes", "buy", 10, 0.50)
         assert result.allowed is False
         assert result.reason == "envelope_pair"
+
+    def test_live_wrong_venue_rejected(self, pilot_env, clock, monkeypatch):
+        monkeypatch.setattr(pilot_env, "DRY_RUN", False)
+        monkeypatch.setattr(pilot_env, "LIVE_ENVELOPE", {
+            "venue": "kraken-live",
+            "pair": "KXTEST",
+            "max_notional_usd": 150,
+            "max_daily_loss_usd": 25,
+            "kill_switch": "quit",
+        })
+        pilot = build_pilot(clock, client=FakeKalshiClient())
+        result = pilot.authorize_order(TICKER, "yes", "buy", 10, 0.50)
+        assert result.allowed is False
+        assert result.reason == "envelope_venue"
 
     def test_live_matching_series_allowed(self, pilot_env, clock, monkeypatch):
         monkeypatch.setattr(pilot_env, "DRY_RUN", False)

@@ -19,7 +19,15 @@ if [[ ! -f "$ENVELOPE" ]]; then
   exit 2
 fi
 
-if ! "$PY" -c "from live_envelope import load_envelope; import json,os; os.environ['LIVE_ENVELOPE_PATH']='$ENVELOPE'; print(json.dumps(load_envelope()))"; then
+if ! "$PY" -c "
+from live_envelope import load_envelope
+import json, os, sys
+os.environ['LIVE_ENVELOPE_PATH'] = sys.argv[1]
+envelope = load_envelope()
+if envelope.get('venue') != 'kalshi-d0':
+    raise SystemExit('launcher is Kalshi D0 only')
+print(json.dumps(envelope))
+" "$ENVELOPE"; then
   echo "[live] BLOCKED: envelope failed validation" >&2
   exit 2
 fi

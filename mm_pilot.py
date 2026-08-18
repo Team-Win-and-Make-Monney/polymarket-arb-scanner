@@ -933,6 +933,8 @@ class KalshiMMPilot:
             envelope = getattr(config, "LIVE_ENVELOPE", None)
             if not envelope:
                 return GateResult(False, "live_envelope_missing")
+            if envelope.get("venue") != "kalshi-d0":
+                return GateResult(False, "envelope_venue")
             from live_envelope import pair_allowed
             if not (reducing or derived_reducing) and not pair_allowed(
                 ticker, envelope["pair"]

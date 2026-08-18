@@ -476,8 +476,12 @@ class TestSXBetQuarantine:
         monkeypatch.setenv("LIVE_ENVELOPE_PATH", str(write_test_envelope(tmp_path)))
         monkeypatch.setenv("ENABLED_EXECUTION_PLATFORMS", "kalshi")
         monkeypatch.setenv("DRY_RUN", "false")
-        cfg = _reload_config()  # must not raise
-        assert cfg.ENABLED_EXECUTION_PLATFORMS == frozenset({"kalshi"})
+        try:
+            cfg = _reload_config()  # must not raise
+            assert cfg.ENABLED_EXECUTION_PLATFORMS == frozenset({"kalshi"})
+        finally:
+            monkeypatch.setenv("DRY_RUN", "true")
+            _reload_config()
 
 
 class TestDashboardHostGuard:

@@ -168,3 +168,11 @@ class TestPublishedReferencePrice:
         share, reason = qualifying_share([(0.50, 50.0)], 200, 0.5, 0.50, 200)
         assert share is None
         assert reason == "below_target"
+
+    def test_malformed_level_does_not_raise(self):
+        levels = [(0.50, 1000.0), ("bad", 10.0), (0.49, 200.0)]
+        ref = reference_price(levels, 200)
+        assert ref == 0.50
+        share, reason = qualifying_share(levels, 200, 0.5, 0.50, 200)
+        assert reason is None
+        assert share is not None

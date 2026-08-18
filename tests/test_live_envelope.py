@@ -59,6 +59,16 @@ class TestLoadEnvelope:
         with pytest.raises(EnvelopeError, match="max_notional_usd"):
             load_envelope(path)
 
+    def test_non_finite_notional_rejected(self, tmp_path):
+        path = tmp_path / "e.json"
+        path.write_text(
+            '{"venue":"kalshi-d0","pair":"KXFED","max_notional_usd":NaN,'
+            '"max_daily_loss_usd":25,"kill_switch":"pause"}',
+            encoding="utf-8",
+        )
+        with pytest.raises(EnvelopeError, match="max_notional_usd"):
+            load_envelope(path)
+
     def test_valid_kalshi_d0(self, tmp_path):
         path = _write(tmp_path / "e.json", {
             "venue": "kalshi-d0",

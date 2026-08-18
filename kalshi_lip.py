@@ -19,6 +19,7 @@ mirrors the published formula to estimate accrual locally.
 
 from __future__ import annotations
 
+import math
 import threading
 
 # Kalshi contract prices move in $0.01 ticks (1 cent).
@@ -27,6 +28,21 @@ KALSHI_TICK = 0.01
 # Program bounds on Target Size, per the LIP help article.
 MIN_TARGET_SIZE = 100
 MAX_TARGET_SIZE = 20000
+
+
+def _normalized_levels(levels: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Drop malformed/non-finite/non-positive size levels before scoring."""
+    cleaned: list[tuple[float, float]] = []
+    for row in levels:
+        try:
+            price, size = row[0], row[1]
+            px, qty = float(price), float(size)
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not math.isfinite(px) or not math.isfinite(qty) or qty <= 0:
+            continue
+        cleaned.append((px, qty))
+    return cleaned
 
 
 def reference_price(levels: list[tuple[float, float]], target_size: float) -> float | None:
@@ -40,13 +56,10 @@ def reference_price(levels: list[tuple[float, float]], target_size: float) -> fl
         return None
     need = target_size / 5.0
     cumulative = 0.0
-    for price, size in sorted(levels, key=lambda row: -row[0]):
-        try:
-            cumulative += float(size)
-        except (TypeError, ValueError):
-            continue
+    for price, size in sorted(_normalized_levels(levels), key=lambda row: -row[0]):
+        cumulative += size
         if cumulative >= need:
-            return float(price)
+            return price
     return None
 
 

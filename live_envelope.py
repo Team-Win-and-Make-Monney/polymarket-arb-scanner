@@ -7,6 +7,7 @@ fields are present in one operator envelope file. Agents do not invent limits.
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 
@@ -45,8 +46,8 @@ def _positive_number(name: str, value: object) -> float:
         number = float(value)
     except (TypeError, ValueError) as exc:
         raise EnvelopeError(f"envelope.{name} must be a number") from exc
-    if number <= 0:
-        raise EnvelopeError(f"envelope.{name} must be > 0, got {number}")
+    if not math.isfinite(number) or number <= 0:
+        raise EnvelopeError(f"envelope.{name} must be a finite number > 0, got {number}")
     return number
 
 

@@ -24,6 +24,41 @@ from kalshi_policy import event_blocked  # noqa: E402
 EVENTS_URL = "https://api.elections.kalshi.com/trade-api/v2/events"
 
 
+def _is_exhaustive_strike_ladder(event_markets: list[dict]) -> bool | None:
+    """Same exhaustiveness rule as scans/kalshi.py complete-set gate.
+
+    mutually_exclusive only means at most one YES pays. Scalar ladders still
+    need open tails. Categorical events (no strike fields) return None.
+    """
+    strikes = [(m.get("floor_strike"), m.get("cap_strike")) for m in event_markets]
+    if all(floor is None and cap is None for floor, cap in strikes):
+        return None
+    has_open_bottom = any(floor is None and cap is not None for floor, cap in strikes)
+    has_open_top = any(floor is not None and cap is None for floor, cap in strikes)
+    if not (has_open_bottom and has_open_top):
+        return False
+    try:
+        bottom_cap = max(
+            float(cap) for floor, cap in strikes if floor is None and cap is not None
+        )
+        top_floor = min(
+            float(floor) for floor, cap in strikes if floor is not None and cap is None
+        )
+        interior = sorted(
+            (float(floor), float(cap))
+            for floor, cap in strikes
+            if floor is not None and cap is not None
+        )
+    except (TypeError, ValueError):
+        return False
+    prev_cap = bottom_cap
+    for floor, cap in interior:
+        if floor - prev_cap > 1:
+            return False
+        prev_cap = max(prev_cap, cap)
+    return top_floor - prev_cap <= 1
+
+
 def _get_json(url: str) -> dict:
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=30) as resp:
@@ -63,7 +98,7 @@ def detect_event(event: dict) -> list[dict]:
         if (
             yes_ask_f is not None
             and hours is not None
-            and hours <= 6
+            and 0 < hours <= 6
             and 0.05 < yes_ask_f < 0.95
         ):
             flags.append({
@@ -75,7 +110,11 @@ def detect_event(event: dict) -> list[dict]:
             })
         if yes_ask_f is not None:
             yes_asks.append(yes_ask_f)
-    if len(yes_asks) >= 2:
+    if (
+        event.get("mutually_exclusive") is True
+        and _is_exhaustive_strike_ladder(markets) is not False
+        and len(yes_asks) >= 2
+    ):
         total = sum(yes_asks)
         if total < 0.98:
             flags.append({

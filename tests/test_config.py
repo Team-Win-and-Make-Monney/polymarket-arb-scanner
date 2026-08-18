@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import (
     setup_logging, LOG_LEVEL, DASHBOARD_PORT, WEBHOOK_URL,
@@ -470,7 +471,9 @@ class TestSXBetQuarantine:
         cfg = _reload_config()  # must not raise
         assert "sxbet" in cfg.ENABLED_EXECUTION_PLATFORMS
 
-    def test_live_trading_without_sxbet_ok(self, monkeypatch):
+    def test_live_trading_without_sxbet_ok(self, monkeypatch, tmp_path):
+        from live_envelope_fixtures import write_test_envelope
+        monkeypatch.setenv("LIVE_ENVELOPE_PATH", str(write_test_envelope(tmp_path)))
         monkeypatch.setenv("ENABLED_EXECUTION_PLATFORMS", "kalshi")
         monkeypatch.setenv("DRY_RUN", "false")
         cfg = _reload_config()  # must not raise

@@ -350,8 +350,10 @@ class TestConfigInvariants:
         "MM_TOXIC_FLOW_ENABLED",
         "MM_VOLATILITY_ADJUSTED_ENABLED",
     ])
-    def test_live_pilot_without_precondition_raises(self, monkeypatch,
+    def test_live_pilot_without_precondition_raises(self, monkeypatch, tmp_path,
                                                     missing_flag):
+        from live_envelope_fixtures import write_test_envelope
+        monkeypatch.setenv("LIVE_ENVELOPE_PATH", str(write_test_envelope(tmp_path)))
         cfg = live_config()
         monkeypatch.setattr(cfg, "MM_KALSHI_PILOT_ENABLED", True)
         monkeypatch.setattr(cfg, "DRY_RUN", False)
@@ -361,7 +363,9 @@ class TestConfigInvariants:
         with pytest.raises(cfg.ConfigError, match=missing_flag):
             cfg.validate_config()
 
-    def test_live_pilot_with_all_preconditions_validates(self, monkeypatch):
+    def test_live_pilot_with_all_preconditions_validates(self, monkeypatch, tmp_path):
+        from live_envelope_fixtures import write_test_envelope
+        monkeypatch.setenv("LIVE_ENVELOPE_PATH", str(write_test_envelope(tmp_path)))
         cfg = live_config()
         monkeypatch.setattr(cfg, "MM_KALSHI_PILOT_ENABLED", True)
         monkeypatch.setattr(cfg, "DRY_RUN", False)

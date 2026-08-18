@@ -1,3 +1,4 @@
+.venv/
 __pycache__/
 *.pyc
 .env
@@ -9,6 +10,12 @@ snapshots.db
 data/discovery/pmarb.db
 decisions.jsonl
 artifacts/mm-d0/
+artifacts/mm-d0-live/
+artifacts/kalshi-reward-share-live.jsonl
+artifacts/kalshi-reward-share-live.csv
+artifacts/kalshi-structural-live.jsonl
+artifacts/live-envelope.json
+!artifacts/live-envelope.example.json
 *.log
 *.code-workspace
 .opencode/

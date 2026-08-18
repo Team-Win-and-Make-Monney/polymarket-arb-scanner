@@ -1,0 +1,30 @@
+name: Kalshi LIP qualifying-share log
+
+# Daily public-data measurement of expected LIP share. No credentials, no orders.
+# Complements the weekly market digest in kalshi-lip-scan.yml.
+
+on:
+  schedule:
+    - cron: '17 12 * * *'
+  workflow_dispatch:
+
+jobs:
+  share:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Log qualifying share
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          python scripts/kalshi_reward_share.py --limit 25 --out artifacts/kalshi-reward-share-live.jsonl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kalshi-reward-share
+          path: artifacts/kalshi-reward-share-live.*
+          retention-days: 30
+          if-no-files-found: warn

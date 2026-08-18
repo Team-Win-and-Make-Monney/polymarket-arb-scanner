@@ -29,6 +29,71 @@ MIN_TARGET_SIZE = 100
 MAX_TARGET_SIZE = 20000
 
 
+def reference_price(levels: list[tuple[float, float]], target_size: float) -> float | None:
+    """Published LIP Reference Price: walk from best until target_size/5 fills.
+
+    Kalshi scores against this depth-weighted reference, not the naked best
+    bid. Penny-bids far below the touch therefore contribute ~zero qualifying
+    depth (measured 2026-08-16).
+    """
+    if target_size <= 0:
+        return None
+    need = target_size / 5.0
+    cumulative = 0.0
+    for price, size in sorted(levels, key=lambda row: -row[0]):
+        try:
+            cumulative += float(size)
+        except (TypeError, ValueError):
+            continue
+        if cumulative >= need:
+            return float(price)
+    return None
+
+
+def ticks_worse(order_price: float, ref_price: float, tick: float = KALSHI_TICK) -> int:
+    """Ticks the order sits worse than the reference (better-than-ref = 0)."""
+    if tick <= 0:
+        raise ValueError(f'tick must be positive, got {tick!r}')
+    return max(0, int(round((ref_price - order_price) / tick)))
+
+
+def qualifying_share(
+    levels: list[tuple[float, float]],
+    target_size: float,
+    discount_factor: float,
+    quote_price: float,
+    quote_size: float,
+    tick: float = KALSHI_TICK,
+) -> tuple[float | None, str | None]:
+    """Share of distance-discounted qualifying depth for one additional quote.
+
+    HTTP/parse failures must be handled by the caller — this function never
+    coerces missing books to zero depth.
+    """
+    if discount_factor < 0.0 or discount_factor > 1.0:
+        raise ValueError(f'discount_factor must be in [0, 1], got {discount_factor!r}')
+    ref = reference_price(levels, target_size)
+    if ref is None:
+        return None, "no_refprice"
+    raw_depth = 0.0
+    others = 0.0
+    for price, size in levels:
+        try:
+            px = float(price)
+            qty = float(size)
+        except (TypeError, ValueError):
+            continue
+        raw_depth += qty
+        others += qty * (discount_factor ** ticks_worse(px, ref, tick))
+    if raw_depth < target_size:
+        return None, "below_target"
+    mine = float(quote_size) * (discount_factor ** ticks_worse(float(quote_price), ref, tick))
+    denom = others + mine
+    if denom <= 0:
+        return None, "zero_qualifying"
+    return mine / denom, None
+
+
 def tick_distance(order_price: float, reference_price: float, tick: float = KALSHI_TICK) -> int:
     """Return the whole-tick distance between an order price and the reference.
 

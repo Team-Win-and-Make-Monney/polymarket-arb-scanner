@@ -702,3 +702,41 @@ class TestBookGates:
         pilot = build_pilot(clock, client=client)
         pilot._selected = None  # PR #43 selector never ran
         assert pilot.refresh_market(TICKER) == []
+
+
+class TestLiveEnvelopeOrderGate:
+    def test_live_without_envelope_rejected(self, pilot_env, clock, monkeypatch):
+        monkeypatch.setattr(pilot_env, "DRY_RUN", False)
+        monkeypatch.setattr(pilot_env, "LIVE_ENVELOPE", None)
+        pilot = build_pilot(clock, client=FakeKalshiClient())
+        result = pilot.authorize_order(TICKER, "yes", "buy", 10, 0.50)
+        assert result.allowed is False
+        assert result.reason == "live_envelope_missing"
+
+    def test_live_wrong_series_rejected(self, pilot_env, clock, monkeypatch):
+        monkeypatch.setattr(pilot_env, "DRY_RUN", False)
+        monkeypatch.setattr(pilot_env, "LIVE_ENVELOPE", {
+            "venue": "kalshi-d0",
+            "pair": "KXFED",
+            "max_notional_usd": 150,
+            "max_daily_loss_usd": 25,
+            "kill_switch": "quit",
+        })
+        pilot = build_pilot(clock, client=FakeKalshiClient())
+        result = pilot.authorize_order(TICKER, "yes", "buy", 10, 0.50)
+        assert result.allowed is False
+        assert result.reason == "envelope_pair"
+
+    def test_live_matching_series_allowed(self, pilot_env, clock, monkeypatch):
+        monkeypatch.setattr(pilot_env, "DRY_RUN", False)
+        monkeypatch.setattr(pilot_env, "LIVE_ENVELOPE", {
+            "venue": "kalshi-d0",
+            "pair": "KXTEST",
+            "max_notional_usd": 150,
+            "max_daily_loss_usd": 25,
+            "kill_switch": "quit",
+        })
+        monkeypatch.setattr(pilot_env, "MM_KALSHI_PILOT_ENABLED", True)
+        pilot = build_pilot(clock, client=FakeKalshiClient())
+        result = pilot.authorize_order(TICKER, "yes", "buy", 10, 0.50)
+        assert result.allowed is True

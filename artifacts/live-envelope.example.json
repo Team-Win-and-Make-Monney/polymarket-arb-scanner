@@ -1,0 +1,7 @@
+{
+  "venue": "kalshi-d0",
+  "pair": "REPLACE_WITH_EXACT_TICKER_OR_SERIES",
+  "max_notional_usd": 0,
+  "max_daily_loss_usd": 0,
+  "kill_switch": "screen -S mm-d0-live -X quit ; POST /api/pause"
+}

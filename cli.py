@@ -97,6 +97,7 @@ from scans import (
 )
 import config
 from config import (
+    polymarket_scan_enabled,
     DEFAULT_MIN_PROFIT,
     MAX_TRADE_SIZE as CONFIG_MAX_TRADE_SIZE,
     DAILY_LOSS_LIMIT as CONFIG_DAILY_LOSS_LIMIT,
@@ -200,12 +201,9 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
 
     fetch_futures = {}
     with ThreadPoolExecutor(max_workers=4) as pool:
-        if args.mode not in (
-            "kalshi", "betfair", "smarkets", "sxbet", "matchbook", "gemini",
-            "ibkr", "triangular", "rewards",
-        ):
+        if polymarket_scan_enabled(args.mode):
             fetch_futures["poly_markets"] = pool.submit(fetch_all_markets)
-        if args.mode in ("all", "negrisk", "negrisk-no"):
+        if polymarket_scan_enabled(args.mode) and args.mode in ("all", "negrisk", "negrisk-no"):
             fetch_futures["poly_events"] = pool.submit(fetch_events)
         if args.mode in ("all", "rewards") and CONFIG_REWARDS_ENABLED:
             fetch_futures["poly_reward_markets"] = pool.submit(fetch_reward_markets)

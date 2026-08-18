@@ -12,8 +12,11 @@ from kalshi_lip import (  # noqa: E402
     MAX_TARGET_SIZE,
     MIN_TARGET_SIZE,
     distance_multiplier,
+    qualifying_share,
+    reference_price,
     snapshot_score,
     tick_distance,
+    ticks_worse,
 )
 
 
@@ -139,3 +142,29 @@ class TestKalshiLipScorer:
     def test_estimate_reward_with_share_zero_without_liquidity(self):
         scorer = KalshiLipScorer('MKT', target_size=200, discount_factor=1.0)
         assert scorer.estimate_reward_with_share(reward_pool=100.0, participation_share=0.5) == 0.0
+
+
+class TestPublishedReferencePrice:
+    def test_walks_until_one_fifth_target(self):
+        levels = [(0.50, 20.0), (0.49, 30.0)]
+        # need = 200/5 = 40; 20 at 0.50 then 30 at 0.49 fills at 0.49
+        assert reference_price(levels, 200) == pytest.approx(0.49)
+
+    def test_none_when_book_too_thin(self):
+        assert reference_price([(0.50, 10.0)], 200) is None
+
+    def test_ticks_worse_floors_at_zero(self):
+        assert ticks_worse(0.51, 0.50) == 0
+        assert ticks_worse(0.48, 0.50) == 2
+
+    def test_qualifying_share_at_reference(self):
+        levels = [(0.50, 200.0)]
+        share, reason = qualifying_share(levels, 200, 0.5, quote_price=0.50, quote_size=200)
+        assert reason is None
+        assert share == pytest.approx(0.5)
+
+    def test_below_target_is_not_zero(self):
+        # Depth enough for a reference (target/5) but below Target Size.
+        share, reason = qualifying_share([(0.50, 50.0)], 200, 0.5, 0.50, 200)
+        assert share is None
+        assert reason == "below_target"

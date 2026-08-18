@@ -160,6 +160,24 @@ ENABLED_EXECUTION_PLATFORMS: frozenset[str] = frozenset(
     p.strip().lower() for p in _raw_enabled.split(",") if p.strip()
 )
 
+# Scan-venue pin (SCAN_VENUES preferred; PAPER_SCAN_VENUES is the legacy name).
+# When set to kalshi / kalshi-only, skip Polymarket fetches even if --mode all.
+# International Polymarket is forbidden to execute from this book.
+_PAPER_SCAN_VENUES = (
+    os.getenv("SCAN_VENUES") or os.getenv("PAPER_SCAN_VENUES") or ""
+).strip().lower()
+_POLYMARKET_SCAN_SKIP_MODES = frozenset({
+    "kalshi", "betfair", "smarkets", "sxbet", "matchbook",
+    "gemini", "ibkr", "triangular", "mm-pilot", "rewards",
+})
+
+
+def polymarket_scan_enabled(mode: str) -> bool:
+    """Whether this run should fetch or scan Polymarket markets."""
+    if _PAPER_SCAN_VENUES in {"kalshi", "kalshi-only"}:
+        return False
+    return mode not in _POLYMARKET_SCAN_SKIP_MODES
+
 # Platform minimum order sizes (USD). Orders below these are rejected
 # client-side to prevent API rejections and costly partial-fill hedging.
 PLATFORM_MIN_ORDER_SIZE: dict[str, float] = {
@@ -439,8 +457,9 @@ MM_MAX_TOTAL_EXPOSURE = _env_float("MM_MAX_TOTAL_EXPOSURE", "500.0")
 MM_REFRESH_INTERVAL = _env_float("MM_REFRESH_INTERVAL", "10.0")
 
 # Kalshi Liquidity Incentive Program (LIP) market making — the MM lead
-# strategy per docs/plans/02-kalshi-lip-mm-scope.md. Program expires
-# 2026-09-01; pools come from GET /incentive_programs.
+# strategy per docs/plans/02-kalshi-lip-mm-scope.md. Retail LIP ends
+# 2027-01-01 (help centre, verified 2026-08-17); pools come from
+# GET /incentive_programs.
 LIP_MIN_POOL = _env_float("LIP_MIN_POOL", "10.0")  # ignore pools under $10/period
 LIP_MAX_MARKETS = _env_int("LIP_MAX_MARKETS", "5")
 LIP_SELECT_INTERVAL = _env_float("LIP_SELECT_INTERVAL", "3600.0")  # re-rank hourly
@@ -655,6 +674,7 @@ MM_TOXIC_FLOW_PAUSE_SECONDS = _env_float("MM_TOXIC_FLOW_PAUSE_SECONDS", "60.0")
 # tranche-1 pilot values from the spec ($2-3K bankroll, <=$300 gross/market).
 # ---------------------------------------------------------------------------
 MM_KALSHI_PILOT_ENABLED = _env_bool("MM_KALSHI_PILOT_ENABLED", "false")
+LIVE_ENVELOPE: dict | None = None
 
 # Fill detection (spec section 3) — REST polling of /portfolio/fills.
 MM_FILL_POLL_SECONDS = _env_float("MM_FILL_POLL_SECONDS", "2.0")
@@ -1167,6 +1187,7 @@ def validate_config() -> list[str]:
     Returns:
         List of non-fatal warning messages (logged but not raised).
     """
+    global LIVE_ENVELOPE, MM_MAX_GROSS_PER_MARKET_USD, MM_MAX_INVENTORY_USD, MM_CANARY_MAX_LOSS_USD
     warnings: list[str] = []
 
     # --- Enum checks ---
@@ -1457,6 +1478,27 @@ def validate_config() -> list[str]:
         warnings.append(
             "EXECUTION_MODE=full-auto but DRY_RUN=true — "
             "no trades will be executed"
+        )
+
+    # --- Live envelope: DRY_RUN=false requires an operator five-item file ---
+    if not DRY_RUN:
+        from live_envelope import EnvelopeError, require_live_envelope
+        try:
+            envelope = require_live_envelope()
+        except EnvelopeError as exc:
+            raise ConfigError(str(exc)) from exc
+        if envelope["venue"] != "kalshi-d0":
+            raise ConfigError(
+                "This scanner live path is Kalshi D0 only; envelope venue is "
+                f"{envelope['venue']!r}. Use the matching launcher for other venues."
+            )
+        LIVE_ENVELOPE = envelope
+        MM_MAX_GROSS_PER_MARKET_USD = min(
+            MM_MAX_GROSS_PER_MARKET_USD, envelope["max_notional_usd"]
+        )
+        MM_MAX_INVENTORY_USD = min(MM_MAX_INVENTORY_USD, envelope["max_notional_usd"])
+        MM_CANARY_MAX_LOSS_USD = min(
+            MM_CANARY_MAX_LOSS_USD, envelope["max_daily_loss_usd"]
         )
 
     # --- Kalshi MM pilot invariants (plan 10, spec sections 4-6) ---

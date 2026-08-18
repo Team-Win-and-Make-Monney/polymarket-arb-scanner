@@ -81,6 +81,16 @@ class TestSelectLipMarkets:
         out = select_lip_markets(_client(programs), kalshi_data=data)
         assert [o["ticker"] for o in out] == ["POLI"]
 
+    def test_excludes_mention_ticker_even_if_category_clean(self):
+        programs = [_prog("KXEARNINGSMENTIONBA", 500.0), _prog("POLI", 50.0)]
+        data = _data(
+            {"KXEARNINGSMENTIONBA": [{"ticker": "KXEARNINGSMENTIONBA", "close_time": FUTURE}],
+             "EVP": [{"ticker": "POLI", "close_time": FUTURE}]},
+            categories={"KXEARNINGSMENTIONBA": "Economics", "EVP": "Politics"},
+        )
+        out = select_lip_markets(_client(programs), kalshi_data=data)
+        assert [o["ticker"] for o in out] == ["POLI"]
+
     def test_excludes_small_pools(self):
         programs = [_prog("DUST", 1.0)]  # below LIP_MIN_POOL=10
         data = _data({"EV": [{"ticker": "DUST", "close_time": FUTURE}]})

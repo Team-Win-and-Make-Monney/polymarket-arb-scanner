@@ -53,6 +53,8 @@ from config import (
     NEWS_SNIPE_ENABLED as CONFIG_NEWS_SNIPE_ENABLED,
     CORRELATED_ENABLED as CONFIG_CORRELATED_ENABLED,
     TIME_DECAY_ENABLED as CONFIG_TIME_DECAY_ENABLED,
+    polymarket_scan_enabled,
+    polymarket_reward_fetch_enabled,
 )
 
 # Conditional metrics import — never breaks if metrics.py is missing
@@ -1789,14 +1791,11 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                 with _StageTimer("fetch", _stage_timings):
                     fetch_futures = {}
                     with ThreadPoolExecutor(max_workers=4) as pool:
-                        if args.mode not in (
-                            "kalshi", "betfair", "smarkets", "sxbet", "matchbook",
-                            "gemini", "ibkr", "triangular", "mm-pilot", "rewards",
-                        ):
+                        if polymarket_scan_enabled(args.mode):
                             fetch_futures["poly_markets"] = pool.submit(fetch_all_markets)
-                        if args.mode in ("all", "negrisk", "multi-cross"):
+                        if polymarket_scan_enabled(args.mode) and args.mode in ("all", "negrisk", "multi-cross"):
                             fetch_futures["poly_events"] = pool.submit(fetch_events)
-                        if args.mode in ("all", "rewards") and CONFIG_REWARDS_ENABLED:
+                        if polymarket_reward_fetch_enabled(args.mode) and CONFIG_REWARDS_ENABLED:
                             fetch_futures["poly_reward_markets"] = pool.submit(fetch_reward_markets)
                         if args.mode in ("all", "kalshi", "cross", "spread", "multi-cross", "rewards") and kalshi_client:
                             fetch_futures["kalshi_data"] = pool.submit(_fetch_kalshi_data, kalshi_client)

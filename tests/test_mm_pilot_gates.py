@@ -350,8 +350,10 @@ class TestConfigInvariants:
         "MM_TOXIC_FLOW_ENABLED",
         "MM_VOLATILITY_ADJUSTED_ENABLED",
     ])
-    def test_live_pilot_without_precondition_raises(self, monkeypatch,
+    def test_live_pilot_without_precondition_raises(self, monkeypatch, tmp_path,
                                                     missing_flag):
+        from live_envelope_fixtures import write_test_envelope
+        monkeypatch.setenv("LIVE_ENVELOPE_PATH", str(write_test_envelope(tmp_path)))
         cfg = live_config()
         monkeypatch.setattr(cfg, "MM_KALSHI_PILOT_ENABLED", True)
         monkeypatch.setattr(cfg, "DRY_RUN", False)
@@ -361,7 +363,9 @@ class TestConfigInvariants:
         with pytest.raises(cfg.ConfigError, match=missing_flag):
             cfg.validate_config()
 
-    def test_live_pilot_with_all_preconditions_validates(self, monkeypatch):
+    def test_live_pilot_with_all_preconditions_validates(self, monkeypatch, tmp_path):
+        from live_envelope_fixtures import write_test_envelope
+        monkeypatch.setenv("LIVE_ENVELOPE_PATH", str(write_test_envelope(tmp_path)))
         cfg = live_config()
         monkeypatch.setattr(cfg, "MM_KALSHI_PILOT_ENABLED", True)
         monkeypatch.setattr(cfg, "DRY_RUN", False)
@@ -380,6 +384,7 @@ class TestConfigInvariants:
     def test_pilot_without_kalshi_in_allowlist_raises(self, monkeypatch):
         cfg = live_config()
         monkeypatch.setattr(cfg, "MM_KALSHI_PILOT_ENABLED", True)
+        monkeypatch.setattr(cfg, "DRY_RUN", True)
         monkeypatch.setattr(cfg, "ENABLED_EXECUTION_PLATFORMS",
                             frozenset({"polymarket"}))
         with pytest.raises(cfg.ConfigError, match="Kalshi-only"):
@@ -388,6 +393,7 @@ class TestConfigInvariants:
     def test_cap_sanity_warnings(self, monkeypatch):
         cfg = live_config()
         monkeypatch.setattr(cfg, "MM_KALSHI_PILOT_ENABLED", True)
+        monkeypatch.setattr(cfg, "DRY_RUN", True)
         monkeypatch.setattr(cfg, "MM_MAX_GROSS_PER_MARKET_USD", 500.0)
         monkeypatch.setattr(cfg, "MM_MAX_TOTAL_INVENTORY_USD", 400.0)
         warnings = cfg.validate_config()
@@ -702,3 +708,55 @@ class TestBookGates:
         pilot = build_pilot(clock, client=client)
         pilot._selected = None  # PR #43 selector never ran
         assert pilot.refresh_market(TICKER) == []
+
+
+class TestLiveEnvelopeOrderGate:
+    def test_live_without_envelope_rejected(self, pilot_env, clock, monkeypatch):
+        monkeypatch.setattr(pilot_env, "DRY_RUN", False)
+        monkeypatch.setattr(pilot_env, "LIVE_ENVELOPE", None)
+        pilot = build_pilot(clock, client=FakeKalshiClient())
+        result = pilot.authorize_order(TICKER, "yes", "buy", 10, 0.50)
+        assert result.allowed is False
+        assert result.reason == "live_envelope_missing"
+
+    def test_live_wrong_series_rejected(self, pilot_env, clock, monkeypatch):
+        monkeypatch.setattr(pilot_env, "DRY_RUN", False)
+        monkeypatch.setattr(pilot_env, "LIVE_ENVELOPE", {
+            "venue": "kalshi-d0",
+            "pair": "KXFED",
+            "max_notional_usd": 150,
+            "max_daily_loss_usd": 25,
+            "kill_switch": "quit",
+        })
+        pilot = build_pilot(clock, client=FakeKalshiClient())
+        result = pilot.authorize_order(TICKER, "yes", "buy", 10, 0.50)
+        assert result.allowed is False
+        assert result.reason == "envelope_pair"
+
+    def test_live_wrong_venue_rejected(self, pilot_env, clock, monkeypatch):
+        monkeypatch.setattr(pilot_env, "DRY_RUN", False)
+        monkeypatch.setattr(pilot_env, "LIVE_ENVELOPE", {
+            "venue": "kraken-live",
+            "pair": "KXTEST",
+            "max_notional_usd": 150,
+            "max_daily_loss_usd": 25,
+            "kill_switch": "quit",
+        })
+        pilot = build_pilot(clock, client=FakeKalshiClient())
+        result = pilot.authorize_order(TICKER, "yes", "buy", 10, 0.50)
+        assert result.allowed is False
+        assert result.reason == "envelope_venue"
+
+    def test_live_matching_series_allowed(self, pilot_env, clock, monkeypatch):
+        monkeypatch.setattr(pilot_env, "DRY_RUN", False)
+        monkeypatch.setattr(pilot_env, "LIVE_ENVELOPE", {
+            "venue": "kalshi-d0",
+            "pair": "KXTEST",
+            "max_notional_usd": 150,
+            "max_daily_loss_usd": 25,
+            "kill_switch": "quit",
+        })
+        monkeypatch.setattr(pilot_env, "MM_KALSHI_PILOT_ENABLED", True)
+        pilot = build_pilot(clock, client=FakeKalshiClient())
+        result = pilot.authorize_order(TICKER, "yes", "buy", 10, 0.50)
+        assert result.allowed is True

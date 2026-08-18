@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import (
     setup_logging, LOG_LEVEL, DASHBOARD_PORT, WEBHOOK_URL,
@@ -451,6 +452,19 @@ class TestPlatformWhitelistConfig:
             assert PLATFORM_MIN_ORDER_SIZE[plat] >= 0
 
 
+class TestPolymarketRewardFetch:
+    def test_rewards_mode_fetches_unless_kalshi_only(self):
+        from config import polymarket_reward_fetch_enabled, polymarket_scan_enabled
+        assert polymarket_reward_fetch_enabled("rewards") is True
+        assert polymarket_scan_enabled("rewards") is False
+
+    def test_kalshi_only_skips_polymarket_reward_fetch(self, monkeypatch):
+        monkeypatch.setenv("SCAN_VENUES", "kalshi")
+        cfg = _reload_config()
+        assert cfg.polymarket_reward_fetch_enabled("rewards") is False
+        assert cfg.polymarket_reward_fetch_enabled("all") is False
+
+
 # ---------------------------------------------------------------------------
 # validate_config — Phase 1 quick-win guards (PR #18)
 # ---------------------------------------------------------------------------
@@ -470,11 +484,17 @@ class TestSXBetQuarantine:
         cfg = _reload_config()  # must not raise
         assert "sxbet" in cfg.ENABLED_EXECUTION_PLATFORMS
 
-    def test_live_trading_without_sxbet_ok(self, monkeypatch):
+    def test_live_trading_without_sxbet_ok(self, monkeypatch, tmp_path):
+        from live_envelope_fixtures import write_test_envelope
+        monkeypatch.setenv("LIVE_ENVELOPE_PATH", str(write_test_envelope(tmp_path)))
         monkeypatch.setenv("ENABLED_EXECUTION_PLATFORMS", "kalshi")
         monkeypatch.setenv("DRY_RUN", "false")
-        cfg = _reload_config()  # must not raise
-        assert cfg.ENABLED_EXECUTION_PLATFORMS == frozenset({"kalshi"})
+        try:
+            cfg = _reload_config()  # must not raise
+            assert cfg.ENABLED_EXECUTION_PLATFORMS == frozenset({"kalshi"})
+        finally:
+            monkeypatch.setenv("DRY_RUN", "true")
+            _reload_config()
 
 
 class TestDashboardHostGuard:

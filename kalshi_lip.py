@@ -19,6 +19,7 @@ mirrors the published formula to estimate accrual locally.
 
 from __future__ import annotations
 
+import math
 import threading
 
 # Kalshi contract prices move in $0.01 ticks (1 cent).
@@ -27,6 +28,83 @@ KALSHI_TICK = 0.01
 # Program bounds on Target Size, per the LIP help article.
 MIN_TARGET_SIZE = 100
 MAX_TARGET_SIZE = 20000
+
+
+def _normalized_levels(levels: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Drop malformed/non-finite/non-positive size levels before scoring."""
+    cleaned: list[tuple[float, float]] = []
+    for row in levels:
+        try:
+            price, size = row[0], row[1]
+            px, qty = float(price), float(size)
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not math.isfinite(px) or not math.isfinite(qty) or qty <= 0:
+            continue
+        cleaned.append((px, qty))
+    return cleaned
+
+
+def reference_price(levels: list[tuple[float, float]], target_size: float) -> float | None:
+    """Published LIP Reference Price: walk from best until target_size/5 fills.
+
+    Kalshi scores against this depth-weighted reference, not the naked best
+    bid. Penny-bids far below the touch therefore contribute ~zero qualifying
+    depth (measured 2026-08-16).
+    """
+    if target_size <= 0:
+        return None
+    need = target_size / 5.0
+    cumulative = 0.0
+    for price, size in sorted(_normalized_levels(levels), key=lambda row: -row[0]):
+        cumulative += size
+        if cumulative >= need:
+            return price
+    return None
+
+
+def ticks_worse(order_price: float, ref_price: float, tick: float = KALSHI_TICK) -> int:
+    """Ticks the order sits worse than the reference (better-than-ref = 0)."""
+    if tick <= 0:
+        raise ValueError(f'tick must be positive, got {tick!r}')
+    return max(0, int(round((ref_price - order_price) / tick)))
+
+
+def qualifying_share(
+    levels: list[tuple[float, float]],
+    target_size: float,
+    discount_factor: float,
+    quote_price: float,
+    quote_size: float,
+    tick: float = KALSHI_TICK,
+) -> tuple[float | None, str | None]:
+    """Share of distance-discounted qualifying depth for one additional quote.
+
+    HTTP/parse failures must be handled by the caller — this function never
+    coerces missing books to zero depth.
+    """
+    if discount_factor < 0.0 or discount_factor > 1.0:
+        raise ValueError(f'discount_factor must be in [0, 1], got {discount_factor!r}')
+    ref = reference_price(levels, target_size)
+    if ref is None:
+        return None, "no_refprice"
+    raw_depth = 0.0
+    others = 0.0
+    for price, size in levels:
+        try:
+            px = float(price)
+            qty = float(size)
+        except (TypeError, ValueError):
+            continue
+        raw_depth += qty
+        others += qty * (discount_factor ** ticks_worse(px, ref, tick))
+    if raw_depth < target_size:
+        return None, "below_target"
+    mine = float(quote_size) * (discount_factor ** ticks_worse(float(quote_price), ref, tick))
+    denom = others + mine
+    if denom <= 0:
+        return None, "zero_qualifying"
+    return mine / denom, None
 
 
 def tick_distance(order_price: float, reference_price: float, tick: float = KALSHI_TICK) -> int:

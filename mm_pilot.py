@@ -929,6 +929,17 @@ class KalshiMMPilot:
             and (signed > 0) != (net_ct > 0)
             and count <= abs(net_ct)
         )
+        if not config.DRY_RUN:
+            envelope = getattr(config, "LIVE_ENVELOPE", None)
+            if not envelope:
+                return GateResult(False, "live_envelope_missing")
+            if envelope.get("venue") != "kalshi-d0":
+                return GateResult(False, "envelope_venue")
+            from live_envelope import pair_allowed
+            if not (reducing or derived_reducing) and not pair_allowed(
+                ticker, envelope["pair"]
+            ):
+                return GateResult(False, "envelope_pair")
         # 4. Halted flags. Caller-provided ``reducing=True`` never bypasses
         # a market halt unless direction and size prove it reduces inventory.
         if self.halted:

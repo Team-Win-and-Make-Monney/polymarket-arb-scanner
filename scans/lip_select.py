@@ -23,6 +23,7 @@ from config import (
     LIP_MIN_HOURS_REMAINING,
     LIP_DEPTH_PROBE_LIMIT,
 )
+from kalshi_policy import event_blocked
 from .kalshi import _fetch_kalshi_data
 
 logger = logging.getLogger(__name__)
@@ -134,11 +135,11 @@ def select_lip_markets(kalshi_client, kalshi_data: tuple | None = None,
         for m in markets:
             t = m.get("ticker")
             if t:
-                market_meta[t] = (m, cat)
+                market_meta[t] = (m, cat, event_ticker)
 
     excluded = {c.strip().lower() for c in LIP_EXCLUDED_CATEGORIES if c.strip()}
     candidates = []
-    skipped = {"pool": 0, "category": 0, "duration": 0, "band": 0, "unknown": 0}
+    skipped = {"pool": 0, "category": 0, "policy": 0, "duration": 0, "band": 0, "unknown": 0}
     for ticker, pool in pools.items():
         if pool["pool_dollars"] < LIP_MIN_POOL:
             skipped["pool"] += 1
@@ -147,9 +148,12 @@ def select_lip_markets(kalshi_client, kalshi_data: tuple | None = None,
         if meta is None:
             skipped["unknown"] += 1
             continue
-        market, category = meta
+        market, category, event_ticker = meta
         if category.strip().lower() in excluded:
             skipped["category"] += 1
+            continue
+        if event_blocked({"category": category, "event_ticker": event_ticker or ticker}):
+            skipped["policy"] += 1
             continue
         prog_hours = _hours_from_now(pool["program_end"])
         close_hours = _hours_from_now(market.get("close_time"))

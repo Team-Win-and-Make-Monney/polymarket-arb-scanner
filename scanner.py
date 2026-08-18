@@ -16,7 +16,13 @@ compatibility.  Actual implementations live in:
 
 import argparse  # noqa: F401 — tests access scanner.argparse
 import logging
+import os
 import sys  # noqa: F401 — tests access scanner.sys.modules
+
+# CLI --dry-run must win over DRY_RUN=false in the environment before config
+# import (validate_config runs at import and requires a live envelope).
+if "--dry-run" in sys.argv:
+    os.environ["DRY_RUN"] = "true"
 
 # Re-export scan functions so existing imports (e.g. ``import scanner``) keep working.
 from scans.helpers import _extract_token_ids, _fetch_clob_for_market, _parallel_fetch_kalshi  # noqa: F401

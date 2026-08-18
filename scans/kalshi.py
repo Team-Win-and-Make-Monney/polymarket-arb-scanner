@@ -9,9 +9,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from kalshi_api import KalshiClient
 from config import KALSHI_MULTI_MIN_SUM as _KALSHI_MULTI_MIN_SUM
 from fees import net_profit_kalshi_binary, net_profit_kalshi_multi
+from kalshi_policy import event_blocked as _event_blocked
 from scans.helpers import _parallel_fetch_kalshi, _within_resolution_window, filter_dust, _days_to_resolution
 
 logger = logging.getLogger(__name__)
+
+
+def _blocked_event_tickers(events: list[dict]) -> set[str]:
+    return {e.get("event_ticker", "") for e in events if e.get("event_ticker") and _event_blocked(e)}
 
 
 # TTL cache for `_fetch_kalshi_data` — avoids re-pulling the full /events
@@ -116,9 +121,15 @@ def scan_kalshi_binary(
     if not markets_by_event:
         return opportunities
 
+    blocked = _blocked_event_tickers(events)
+    skipped_blocked = 0
+
     total_markets = 0
     filtered_resolution = 0
     for event_ticker, markets in markets_by_event.items():
+        if event_ticker in blocked:
+            skipped_blocked += 1
+            continue
         for km in markets:
             total_markets += 1
             if not _within_resolution_window(km, platform="kalshi"):
@@ -152,6 +163,8 @@ def scan_kalshi_binary(
 
     if filtered_resolution:
         logger.info("Filtered %d/%d Kalshi markets outside resolution window.", filtered_resolution, total_markets)
+    if skipped_blocked:
+        logger.info("Skipped %d Kalshi events blocked as sports/mentions.", skipped_blocked)
     logger.info("Scanned %d Kalshi markets across %d events.", total_markets - filtered_resolution, len(events))
 
     # Stage 2: Re-fetch order book depth for top candidates (parallel)
@@ -206,6 +219,8 @@ def scan_kalshi_multi(
     # months in production. Only events the API marks mutually_exclusive=True
     # qualify; missing/False is skipped.
     me_by_event = {e.get("event_ticker"): e.get("mutually_exclusive") for e in events}
+    blocked = _blocked_event_tickers(events)
+    skipped_blocked = 0
 
     def _is_exhaustive_strike_ladder(event_markets: list[dict]) -> bool | None:
         """Whether a scalar strike ladder covers the whole outcome space.
@@ -248,6 +263,9 @@ def scan_kalshi_multi(
     skipped_non_exclusive = 0
     skipped_non_exhaustive = 0
     for event_ticker, markets in markets_by_event.items():
+        if event_ticker in blocked:
+            skipped_blocked += 1
+            continue
         if len(markets) < 2:
             continue
         if me_by_event.get(event_ticker) is not True:
@@ -319,6 +337,8 @@ def scan_kalshi_multi(
         logger.info("Skipped %d non-mutually-exclusive Kalshi events (not complete sets).", skipped_non_exclusive)
     if skipped_non_exhaustive:
         logger.info("Skipped %d Kalshi strike-ladder events without open tail buckets (non-exhaustive sets).", skipped_non_exhaustive)
+    if skipped_blocked:
+        logger.info("Skipped %d Kalshi multi events blocked as sports/mentions.", skipped_blocked)
 
     # Stage 2: Re-fetch order book depth for candidates (parallel, min depth across all legs)
     if opportunities:

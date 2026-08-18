@@ -187,6 +187,10 @@ class PartialFillHedger:
             logger.info("Kalshi hedge: max_contracts=%s — nothing to reduce, "
                        "skipping %s %s on %s", max_contracts, action, side, ticker)
             return False
+        from kalshi_policy import live_kalshi_submit_allowed
+        if not live_kalshi_submit_allowed(ticker, reducing=True):
+            logger.warning("Kalshi hedge blocked by live policy: %s", ticker)
+            return False
         book = self.kalshi_client.fetch_order_book(ticker)
         if not book:
             return False

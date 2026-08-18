@@ -929,6 +929,11 @@ class KalshiMMPilot:
             and (signed > 0) != (net_ct > 0)
             and count <= abs(net_ct)
         )
+        from kalshi_policy import live_kalshi_submit_allowed
+        if not live_kalshi_submit_allowed(
+            ticker, reducing=reducing or derived_reducing
+        ):
+            return GateResult(False, "policy_blocked")
         if not config.DRY_RUN:
             envelope = getattr(config, "LIVE_ENVELOPE", None)
             if not envelope:

@@ -2142,6 +2142,17 @@ class TestMinOrderSize:
                     leg, 3.0, opp)
         assert success is True
 
+    def test_kalshi_sports_ticker_does_not_place(self, executor):
+        leg = {"platform": "kalshi", "side": "yes", "action": "buy",
+               "price": 0.50, "_ticker": "KXNFLGAME-26AUG18"}
+        opp = {"type": "KalshiBinary"}
+        with patch("executor.ENABLED_EXECUTION_PLATFORMS",
+                    frozenset(["polymarket", "kalshi"])):
+            success, order_id, fill_price = executor._execute_single_leg(
+                leg, 3.0, opp)
+        assert success is False
+        executor.kalshi_client.place_order.assert_not_called()
+
     def test_cross_all_rejects_when_per_leg_size_below_minimum(self, executor):
         """Cross-all with per-leg size below platform min returns empty."""
         opp = {

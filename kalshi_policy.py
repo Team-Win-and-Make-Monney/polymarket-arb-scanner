@@ -24,5 +24,20 @@ def event_blocked(event: dict) -> bool:
     category = (event.get("category") or "").strip()
     if category and any(category.lower() == excluded.lower() for excluded in EXCLUDED_CATEGORIES):
         return True
-    ticker = (event.get("event_ticker") or "").upper()
-    return any(token in ticker for token in BLOCKED_TICKER_TOKENS)
+    ticker = (event.get("event_ticker") or event.get("ticker") or "")
+    return ticker_blocked(ticker)
+
+
+def ticker_blocked(ticker: str) -> bool:
+    """True when a Kalshi ticker contains a forbidden sports/mention token."""
+    t = (ticker or "").upper()
+    if not t:
+        return False
+    return any(token in t for token in BLOCKED_TICKER_TOKENS)
+
+
+def live_kalshi_submit_allowed(ticker: str, *, reducing: bool = False) -> bool:
+    """Order-path guard. Flattening a blocked book is allowed; new size is not."""
+    if reducing:
+        return True
+    return not ticker_blocked(ticker)

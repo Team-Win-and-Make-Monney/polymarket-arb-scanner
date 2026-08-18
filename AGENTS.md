@@ -119,7 +119,7 @@ All scan modules follow: mid-price scan (fast) → CLOB refinement (`_refine_*_w
 `config.py` uses typed env helpers (`_env_float`, `_env_int`, `_env_bool`) that raise `ConfigError` on invalid input. Precedence: CLI args > env vars > defaults in `config.py`.
 
 ### Live Kalshi D0
-Operating target is live Kalshi D0 via `scripts/launch-kalshi-d0-live.sh`. `DRY_RUN=false` fail-closes unless `artifacts/live-envelope.json` contains venue, pair, max_notional_usd, max_daily_loss_usd, and kill_switch from one operator message. Agents do not invent those fields. International Polymarket, Hyperliquid execution, and Michigan sports remain forbidden. LLM agents do not pick quotes.
+Operating target is live Kalshi D0 via `scripts/launch-kalshi-d0-live.sh`. `DRY_RUN=false` fail-closes unless `artifacts/live-envelope.json` contains venue, pair, max_notional_usd, max_daily_loss_usd, and kill_switch from one operator message. Agents do not invent those fields. International Polymarket, Hyperliquid execution, and Michigan sports remain forbidden. `kalshi_policy.live_kalshi_submit_allowed` is the shared order-path guard (`mm_pilot`, `executor`, `hedger`). LLM agents do not pick quotes.
 
 ## Adding a New Opportunity Type
 1. Create the scan in `scans/<name>.py` following the two-stage pattern.

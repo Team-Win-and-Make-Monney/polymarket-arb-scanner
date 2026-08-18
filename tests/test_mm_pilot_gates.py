@@ -760,3 +760,18 @@ class TestLiveEnvelopeOrderGate:
         pilot = build_pilot(clock, client=FakeKalshiClient())
         result = pilot.authorize_order(TICKER, "yes", "buy", 10, 0.50)
         assert result.allowed is True
+
+    def test_live_sports_ticker_rejected(self, pilot_env, clock, monkeypatch):
+        monkeypatch.setattr(pilot_env, "DRY_RUN", False)
+        monkeypatch.setattr(pilot_env, "LIVE_ENVELOPE", {
+            "venue": "kalshi-d0",
+            "pair": "KXNFLGAME",
+            "max_notional_usd": 150,
+            "max_daily_loss_usd": 25,
+            "kill_switch": "quit",
+        })
+        monkeypatch.setattr(pilot_env, "MM_KALSHI_PILOT_ENABLED", True)
+        pilot = build_pilot(clock, client=FakeKalshiClient())
+        result = pilot.authorize_order("KXNFLGAME-26AUG18", "yes", "buy", 10, 0.50)
+        assert result.allowed is False
+        assert result.reason == "policy_blocked"

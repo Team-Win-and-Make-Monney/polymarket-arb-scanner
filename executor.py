@@ -3069,6 +3069,11 @@ class ArbitrageExecutor:
             else:
                 tif = "fill_or_kill"
 
+            from kalshi_policy import live_kalshi_submit_allowed
+            if not live_kalshi_submit_allowed(ticker):
+                logger.warning("Kalshi order blocked by live policy: %s", ticker)
+                return False, None, None
+
             resp = self.kalshi_client.place_order(
                 ticker=ticker,
                 side=side,

@@ -178,6 +178,18 @@ def polymarket_scan_enabled(mode: str) -> bool:
         return False
     return mode not in _POLYMARKET_SCAN_SKIP_MODES
 
+
+def polymarket_reward_fetch_enabled(mode: str) -> bool:
+    """Whether this run should hit the Polymarket rewards endpoint.
+
+    ``rewards`` is in the market-scan skip set (it does not fetch the CLOB
+    universe), but it still needs the dedicated reward feed unless the run is
+    pinned to Kalshi-only.
+    """
+    if _PAPER_SCAN_VENUES in {"kalshi", "kalshi-only"}:
+        return False
+    return mode in ("all", "rewards")
+
 # Platform minimum order sizes (USD). Orders below these are rejected
 # client-side to prevent API rejections and costly partial-fill hedging.
 PLATFORM_MIN_ORDER_SIZE: dict[str, float] = {

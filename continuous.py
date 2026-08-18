@@ -54,6 +54,7 @@ from config import (
     CORRELATED_ENABLED as CONFIG_CORRELATED_ENABLED,
     TIME_DECAY_ENABLED as CONFIG_TIME_DECAY_ENABLED,
     polymarket_scan_enabled,
+    polymarket_reward_fetch_enabled,
 )
 
 # Conditional metrics import — never breaks if metrics.py is missing
@@ -1794,11 +1795,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                             fetch_futures["poly_markets"] = pool.submit(fetch_all_markets)
                         if polymarket_scan_enabled(args.mode) and args.mode in ("all", "negrisk", "multi-cross"):
                             fetch_futures["poly_events"] = pool.submit(fetch_events)
-                        if (
-                            polymarket_scan_enabled(args.mode)
-                            and args.mode in ("all", "rewards")
-                            and CONFIG_REWARDS_ENABLED
-                        ):
+                        if polymarket_reward_fetch_enabled(args.mode) and CONFIG_REWARDS_ENABLED:
                             fetch_futures["poly_reward_markets"] = pool.submit(fetch_reward_markets)
                         if args.mode in ("all", "kalshi", "cross", "spread", "multi-cross", "rewards") and kalshi_client:
                             fetch_futures["kalshi_data"] = pool.submit(_fetch_kalshi_data, kalshi_client)

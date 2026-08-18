@@ -452,6 +452,19 @@ class TestPlatformWhitelistConfig:
             assert PLATFORM_MIN_ORDER_SIZE[plat] >= 0
 
 
+class TestPolymarketRewardFetch:
+    def test_rewards_mode_fetches_unless_kalshi_only(self):
+        from config import polymarket_reward_fetch_enabled, polymarket_scan_enabled
+        assert polymarket_reward_fetch_enabled("rewards") is True
+        assert polymarket_scan_enabled("rewards") is False
+
+    def test_kalshi_only_skips_polymarket_reward_fetch(self, monkeypatch):
+        monkeypatch.setenv("SCAN_VENUES", "kalshi")
+        cfg = _reload_config()
+        assert cfg.polymarket_reward_fetch_enabled("rewards") is False
+        assert cfg.polymarket_reward_fetch_enabled("all") is False
+
+
 # ---------------------------------------------------------------------------
 # validate_config — Phase 1 quick-win guards (PR #18)
 # ---------------------------------------------------------------------------

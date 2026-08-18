@@ -27,7 +27,9 @@ python scanner.py --mode cross-all
 
 # Execution controls
 python scanner.py --dry-run                         # detect only (default)
-python scanner.py --exec-mode full-auto --max-trade 10  # live trading
+# Live Kalshi D0: scripts/launch-kalshi-d0-live.sh
+# DRY_RUN=false requires artifacts/live-envelope.json (five operator fields).
+# Do not invent venue, pair, max_notional_usd, max_daily_loss_usd, or kill_switch.
 ```
 
 ## Testing
@@ -115,6 +117,9 @@ All scan modules follow: mid-price scan (fast) → CLOB refinement (`_refine_*_w
 
 ### Config
 `config.py` uses typed env helpers (`_env_float`, `_env_int`, `_env_bool`) that raise `ConfigError` on invalid input. Precedence: CLI args > env vars > defaults in `config.py`.
+
+### Live Kalshi D0
+Operating target is live Kalshi D0 via `scripts/launch-kalshi-d0-live.sh`. `DRY_RUN=false` fail-closes unless `artifacts/live-envelope.json` contains venue, pair, max_notional_usd, max_daily_loss_usd, and kill_switch from one operator message. Agents do not invent those fields. International Polymarket, Hyperliquid execution, and Michigan sports remain forbidden. LLM agents do not pick quotes.
 
 ## Adding a New Opportunity Type
 1. Create the scan in `scans/<name>.py` following the two-stage pattern.

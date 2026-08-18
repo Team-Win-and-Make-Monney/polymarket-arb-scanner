@@ -2,6 +2,8 @@
 
 **Authority:** live target, no live order. Envelope missing.
 
+Head: `feat/kalshi-factory-2026-08-17` @ `56c872c`. PR #131 Tests were green on the CI-fixture commit; review follow-ups pushed.
+
 ## Fail-closed checks (this session)
 
 | Check | Result |

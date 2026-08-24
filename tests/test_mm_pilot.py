@@ -1471,6 +1471,21 @@ class TestInventoryDerivedReduction:
         assert client.placed[-1]["count"] == 5
         assert pilot._orders[oid]["count"] == 5
 
+    def test_derived_reduction_reaches_client_policy_boundary(self, pilot_env,
+                                                               clock):
+        blocked_ticker = "KXNFLGAME-26AUG18"
+        client = FakeKalshiClient(books={blocked_ticker: make_book()})
+        pilot = build_pilot(clock, client=client)
+        pilot.inventory.apply_fill(blocked_ticker, "yes", "buy", 5, 0.49)
+
+        oid = pilot.place_pilot_order(
+            blocked_ticker, "yes", "sell", 5, 0.49,
+            purpose="hedge",
+        )
+
+        assert oid is not None
+        assert client.placed[-1]["reducing"] is True
+
 
 class TestIndeterminatePlacement:
     @pytest.mark.parametrize("response", [None, {}, {"order": {}}])

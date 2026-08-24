@@ -276,6 +276,22 @@ class TestLiveHoursToExpiry:
         assert len(refined) == 1
         assert refined[0]["_hours_to_expiry"] == pytest.approx(2.0)
 
+    @pytest.mark.parametrize("invalid_timestamp", [True, float("nan"), float("inf")])
+    def test_invalid_live_resolution_timestamp_fails_closed(
+            self, invalid_timestamp):
+        opp = _make_opp(hours=24.0)
+        markets = {"m1": _make_market("m1", resolution_ts=invalid_timestamp)}
+        clob = {"yes_ask": 0.92, "no_ask": 0.08,
+                "yes_ask_size": 50, "no_ask_size": 50}
+
+        with patch.object(td_mod, "_fetch_clob_for_market",
+                          return_value=(markets["m1"], clob)):
+            refined = _refine_time_decay_with_prices(
+                [opp], markets_by_key=markets, current_time=1_000_000.0,
+            )
+
+        assert refined == []
+
 
 # ---------------------------------------------------------------------------
 # TestBackwardCompat

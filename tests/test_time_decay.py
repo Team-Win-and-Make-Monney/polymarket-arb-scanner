@@ -145,6 +145,10 @@ class TestConsensusThreshold:
         result = _validate_consensus("0.95", min_threshold=0.90)
         assert result is False
 
+    def test_rejects_boolean_consensus(self):
+        """Booleans are not valid probabilities despite subclassing int."""
+        assert _validate_consensus(True, min_threshold=0.90) is False
+
     def test_accepts_very_high_consensus(self):
         """Consensus of 0.99 should easily pass threshold."""
         result = _validate_consensus(0.99, min_threshold=0.90)
@@ -606,6 +610,20 @@ class TestEdgeCases:
                 "question": "Test?",
                 "resolutionSource": {"timestamp": "unknown"},
                 "price": 0.90,
+            }
+        }
+        mock_aggregator = MagicMock()
+        mock_aggregator.get_consensus.return_value = 0.95
+
+        assert scan_time_decay(markets_by_key, mock_aggregator) == []
+
+    def test_market_boolean_price_is_skipped(self):
+        now = 1712282400
+        markets_by_key = {
+            "market_1": {
+                "question": "Test?",
+                "resolutionSource": {"timestamp": int(now + 24 * 3600)},
+                "price": False,
             }
         }
         mock_aggregator = MagicMock()

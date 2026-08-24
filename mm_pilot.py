@@ -1008,17 +1008,27 @@ class KalshiMMPilot:
         prevented, and would need its own de-duplication if introduced.
         """
         with self._lock:
+            net_ct = self.inventory.net_contracts(ticker)
             if reducing:
                 # Clamp at the held position before authorization and before
                 # the venue call. A caller cannot turn ``reducing=True`` into
                 # a position flip by asking to sell more than is held.
-                net_ct = self.inventory.net_contracts(ticker)
                 unit_delta = PilotInventory.signed_contracts(
                     side, action, 1)
                 if net_ct != 0 and (unit_delta > 0) != (net_ct > 0):
                     count = min(count, abs(net_ct))
+            signed = PilotInventory.signed_contracts(side, action, count)
+            derived_reducing = (
+                net_ct != 0
+                and (signed > 0) != (net_ct > 0)
+                and count <= abs(net_ct)
+            )
+            # Preserve one reduction decision across authorization and the
+            # client boundary. Otherwise an inventory-derived exit can pass
+            # policy here but be rejected when KalshiClient re-checks policy.
+            effective_reducing = reducing or derived_reducing
             verdict = self.authorize_order(ticker, side, action, count, price,
-                                           reducing=reducing)
+                                           reducing=effective_reducing)
             if not verdict.allowed:
                 return None
             if self.dry_run:
@@ -1067,7 +1077,7 @@ class KalshiMMPilot:
                 resp = self._client.place_order(
                     ticker=ticker, side=side, action=action, count=count,
                     price_dollars=price, time_in_force=tif,
-                    reducing=reducing,
+                    reducing=effective_reducing,
                 )
             except Exception:
                 logger.exception("MM pilot place_order outcome indeterminate "

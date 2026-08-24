@@ -119,8 +119,14 @@ class TreasuryManager:
                 error="idempotency key payload mismatch",
             )
         status = existing.get("status")
+        if status == "pending":
+            return TransferResult(
+                ok=False,
+                transfer_id=existing.get("id"),
+                error="transfer already in progress",
+            )
         return TransferResult(
-            ok=status in ("pending", "dry_run", "succeeded"),
+            ok=status in ("dry_run", "succeeded"),
             transfer_id=existing.get("id"),
             tx_hash=existing.get("tx_hash"),
             error=existing.get("error"),
@@ -176,26 +182,6 @@ class TreasuryManager:
         if self.kill_switch and callable(self.kill_switch) and self.kill_switch():
             return TransferResult(ok=False, error="kill switch engaged")
 
-        # Daily rolling limit — sum amounts of last-24h transfers
-        try:
-            recent = self.db.get_transfers_today() if self.db else []
-        except Exception as exc:
-            logger.exception("treasury: failed to read recent transfers: %s", exc)
-            recent = []
-        # "dry_run" counts toward the daily cap so DRY_RUN exercises the gate
-        # the same way live operation will.
-        used_today = sum(r.get("amount_usd", 0.0) for r in recent
-                         if r.get("status") in ("succeeded", "pending", "dry_run"))
-        if used_today + amount_usd > config.MAX_AUTO_TRANSFER_PER_DAY:
-            return TransferResult(
-                ok=False,
-                error=(
-                    f"Daily limit hit: ${used_today:.2f} used + ${amount_usd:.2f} "
-                    f"requested > MAX_AUTO_TRANSFER_PER_DAY "
-                    f"${config.MAX_AUTO_TRANSFER_PER_DAY:.2f}"
-                ),
-            )
-
         if self.gas_monitor is not None:
             try:
                 gas_ok = self.gas_monitor.should_execute({"net_profit": amount_usd})
@@ -206,12 +192,28 @@ class TreasuryManager:
 
         # Audit row first so we always know we tried
         if self.db:
-            transfer_id, created = self.db.claim_transfer(
-                from_platform=from_platform,
-                to_platform=to_platform,
-                amount_usd=amount_usd,
-                idempotency_key=idempotency_key,
-            )
+            try:
+                transfer_id, created, used_today = (
+                    self.db.claim_transfer_with_daily_limit(
+                        from_platform=from_platform,
+                        to_platform=to_platform,
+                        amount_usd=amount_usd,
+                        idempotency_key=idempotency_key,
+                        max_daily_usd=config.MAX_AUTO_TRANSFER_PER_DAY,
+                    )
+                )
+            except Exception as exc:
+                logger.exception("treasury: failed to claim transfer: %s", exc)
+                return TransferResult(ok=False, error="transfer audit unavailable")
+            if used_today is not None:
+                return TransferResult(
+                    ok=False,
+                    error=(
+                        f"Daily limit hit: ${used_today:.2f} used + ${amount_usd:.2f} "
+                        f"requested > MAX_AUTO_TRANSFER_PER_DAY "
+                        f"${config.MAX_AUTO_TRANSFER_PER_DAY:.2f}"
+                    ),
+                )
             if not created:
                 existing = self.db.get_transfer_by_idempotency_key(idempotency_key) or {}
                 return self._existing_transfer_result(
@@ -219,6 +221,15 @@ class TreasuryManager:
                 )
         else:
             transfer_id = None
+            if amount_usd > config.MAX_AUTO_TRANSFER_PER_DAY:
+                return TransferResult(
+                    ok=False,
+                    error=(
+                        f"Daily limit hit: $0.00 used + ${amount_usd:.2f} "
+                        f"requested > MAX_AUTO_TRANSFER_PER_DAY "
+                        f"${config.MAX_AUTO_TRANSFER_PER_DAY:.2f}"
+                    ),
+                )
 
         if self.dry_run:
             if transfer_id is not None and self.db:

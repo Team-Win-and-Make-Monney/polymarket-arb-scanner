@@ -13,6 +13,9 @@ Covers:
 
 import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 from unittest.mock import MagicMock
 
@@ -112,6 +115,41 @@ class TestRiskGates:
                                  idempotency_key="explicit_3")
         assert r3.ok is False
         assert "Daily limit" in (r3.error or "")
+
+    def test_concurrent_distinct_claims_cannot_exceed_daily_limit(
+            self, tmp_path, monkeypatch):
+        TreasuryManager, _, _ = _import_treasury()
+        import config
+        monkeypatch.setattr(config, "MAX_AUTO_TRANSFER_PER_DAY", 100.0)
+        db_path = str(tmp_path / "concurrent-transfers.db")
+        db_one = TradeDB(db_path)
+        db_two = TradeDB(db_path)
+        managers = (
+            TreasuryManager(db=db_one, dry_run=True),
+            TreasuryManager(db=db_two, dry_run=True),
+        )
+        start = threading.Barrier(2)
+
+        def attempt(item):
+            tm, key = item
+            start.wait(timeout=2)
+            return tm.execute_transfer(
+                "gemini", "polymarket", 60.0, idempotency_key=key,
+            )
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(
+                    attempt,
+                    zip(managers, ("concurrent_1", "concurrent_2")),
+                ))
+
+            assert sum(result.ok for result in results) == 1
+            assert sum(row["amount_usd"] for row in db_one.get_transfers_today()
+                       if row["status"] in ("succeeded", "pending", "dry_run")) <= 100.0
+        finally:
+            db_one.close()
+            db_two.close()
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +255,26 @@ class TestIdempotency:
         assert mismatch.ok is False
         assert mismatch.transfer_id == first.transfer_id
         assert "payload mismatch" in (mismatch.error or "")
+
+    def test_pending_replay_reports_in_progress_not_success(self, db):
+        TreasuryManager, _, _ = _import_treasury()
+        tm = TreasuryManager(db=db, dry_run=True)
+        transfer_id, created = db.claim_transfer(
+            from_platform="gemini",
+            to_platform="polymarket",
+            amount_usd=100.0,
+            idempotency_key="pending_key",
+        )
+        assert created is True
+
+        replay = tm.execute_transfer(
+            "gemini", "polymarket", 100.0,
+            idempotency_key="pending_key",
+        )
+
+        assert replay.ok is False
+        assert replay.transfer_id == transfer_id
+        assert "in progress" in (replay.error or "")
 
 
 # ---------------------------------------------------------------------------

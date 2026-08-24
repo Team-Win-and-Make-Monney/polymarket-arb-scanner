@@ -70,7 +70,7 @@ def scan_time_decay(
             continue
 
         consensus_prob = consensus_data.get("probability") if isinstance(consensus_data, dict) else consensus_data
-        if not isinstance(consensus_prob, (int, float)) or consensus_prob is None:
+        if isinstance(consensus_prob, bool) or not isinstance(consensus_prob, (int, float)):
             continue
 
         # Validate consensus meets threshold
@@ -84,7 +84,12 @@ def scan_time_decay(
         target_price = consensus_prob if consensus_side == "YES" else 1.0 - consensus_prob
 
         market_yes_price = market.get("price")
-        if not isinstance(market_yes_price, (int, float)) or not 0.0 <= market_yes_price <= 1.0:
+        if (
+            isinstance(market_yes_price, bool)
+            or not isinstance(market_yes_price, (int, float))
+            or not math.isfinite(market_yes_price)
+            or not 0.0 <= market_yes_price <= 1.0
+        ):
             continue
         current_price = market_yes_price if consensus_side == "YES" else 1.0 - market_yes_price
         if current_price >= buy_below_price or current_price >= target_price:
@@ -154,7 +159,7 @@ def _validate_consensus(consensus: float, min_threshold: float = 0.90) -> bool:
     Returns:
         True if consensus >= min_threshold, False otherwise.
     """
-    if not isinstance(consensus, (int, float)):
+    if isinstance(consensus, bool) or not isinstance(consensus, (int, float)):
         logger.warning("Invalid consensus type: %s", type(consensus))
         return False
 
@@ -253,7 +258,14 @@ def _refine_time_decay_with_prices(
         if market is not None:
             resolution_source = market.get("resolutionSource")
             resolution_ts = resolution_source.get("timestamp") if isinstance(resolution_source, dict) else None
-            if isinstance(resolution_ts, (int, float)):
+            if resolution_ts is not None:
+                if (
+                    isinstance(resolution_ts, bool)
+                    or not isinstance(resolution_ts, (int, float))
+                    or not math.isfinite(resolution_ts)
+                ):
+                    logger.debug("TimeDecay dropped: %s invalid live resolution timestamp", market_key)
+                    continue
                 live_hours_left = (resolution_ts - current_time) / 3600.0
                 opp["_hours_to_expiry"] = live_hours_left
 
@@ -275,7 +287,7 @@ def _refine_time_decay_with_prices(
                     if isinstance(consensus_data, dict)
                     else consensus_data
                 )
-                if isinstance(live_prob, (int, float)):
+                if not isinstance(live_prob, bool) and isinstance(live_prob, (int, float)):
                     if not _validate_consensus(live_prob, min_consensus):
                         logger.debug("TimeDecay dropped: %s consensus %.2f < %.2f",
                                     market_key, live_prob, min_consensus)

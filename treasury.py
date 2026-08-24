@@ -169,13 +169,25 @@ class TreasuryManager:
             from_platform, to_platform, amount_usd)
 
         # Audit row first so we always know we tried
-        transfer_id = self.db.log_transfer(
-            from_platform=from_platform,
-            to_platform=to_platform,
-            amount_usd=amount_usd,
-            idempotency_key=idempotency_key,
-            status="pending",
-        ) if self.db else None
+        if self.db:
+            transfer_id, created = self.db.claim_transfer(
+                from_platform=from_platform,
+                to_platform=to_platform,
+                amount_usd=amount_usd,
+                idempotency_key=idempotency_key,
+            )
+            if not created:
+                existing = self.db.get_transfer_by_idempotency_key(idempotency_key) or {}
+                status = existing.get("status")
+                return TransferResult(
+                    ok=status in ("pending", "dry_run", "succeeded"),
+                    transfer_id=transfer_id,
+                    tx_hash=existing.get("tx_hash"),
+                    error=existing.get("error"),
+                    dry_run=status == "dry_run",
+                )
+        else:
+            transfer_id = None
 
         if self.dry_run:
             if transfer_id is not None and self.db:

@@ -1030,6 +1030,45 @@ class TradeDB:
             )
             self.conn.commit()
 
+    def claim_transfer(
+        self,
+        from_platform: str,
+        to_platform: str,
+        amount_usd: float,
+        idempotency_key: str,
+    ) -> tuple[int | None, bool]:
+        """Atomically claim an idempotency key for a pending transfer."""
+        with self._lock:
+            cur = self.conn.execute(
+                """INSERT OR IGNORE INTO transfers
+                   (timestamp, from_platform, to_platform, amount_usd,
+                    status, idempotency_key)
+                   VALUES (?, ?, ?, ?, 'pending', ?)""",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    from_platform,
+                    to_platform,
+                    amount_usd,
+                    idempotency_key,
+                ),
+            )
+            created = cur.rowcount == 1
+            row = self.conn.execute(
+                "SELECT id FROM transfers WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            self.conn.commit()
+            return (row["id"] if row else None), created
+
+    def get_transfer_by_idempotency_key(self, idempotency_key: str) -> dict | None:
+        """Return the transfer already associated with an idempotency key."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM transfers WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def get_transfers_today(self) -> list[dict]:
         """Return transfers initiated in the last 24h. Used for daily limits."""
         cutoff = (datetime.now(timezone.utc).timestamp() - 86400)

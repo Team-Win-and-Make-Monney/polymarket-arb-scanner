@@ -12,6 +12,7 @@ import json
 import logging
 
 from config import POLYMARKET_DEFAULT_TAKER_RATE
+from fees import net_profit_logical_arb
 from scans.helpers import _extract_token_ids
 from polymarket_api import fetch_order_book
 
@@ -82,6 +83,10 @@ def scan_logical_arb(
         if then_price < if_price * (1 - price_threshold):
             # Extract token IDs for execution
             token_ids = _extract_token_ids(then_market)
+            if_token_ids = _extract_token_ids(if_market)
+            if len(token_ids) < 2 or len(if_token_ids) < 2:
+                logger.debug("Logical arb: missing executable token IDs for %s -> %s", if_market_id, then_market_id)
+                continue
 
             opportunity = {
                 "type": "LogicalArb",
@@ -91,6 +96,7 @@ def scan_logical_arb(
                 "_if_price": if_price,
                 "_then_price": then_price,
                 "_token_ids": token_ids,
+                "_if_token_ids": if_token_ids,
                 "_market_key": then_market_id,
                 "_layer": 4,
             }
@@ -131,30 +137,33 @@ def _refine_logical_arb_with_clob(opportunities: list[dict]) -> list[dict]:
     refined = []
     for opp in opportunities:
         token_ids = opp.get("_token_ids", [])
-        if not token_ids:
-            logger.debug("Dropping logical arb opportunity: no token IDs")
+        if_token_ids = opp.get("_if_token_ids", [])
+        if len(token_ids) < 2 or len(if_token_ids) < 2:
+            logger.debug("Dropping logical arb opportunity: incomplete token IDs")
             continue
 
         stage1_then_price = opp.get("_then_price", 0.0)
         max_ask_price = stage1_then_price * 1.30  # 30% tolerance
 
         try:
-            # Fetch live CLOB order book for the underpriced outcome (YES token)
+            # Buy the implied market YES and the implying market NO. This
+            # synthetic pair pays at least $1 in every logically valid state.
             then_yes_book = fetch_order_book(token_ids[0])
+            if_no_book = fetch_order_book(if_token_ids[1])
 
-            if not then_yes_book:
-                logger.debug("CLOB unavailable for logical arb refinement; keeping opportunity")
-                refined.append(opp)
+            if not then_yes_book or not if_no_book:
+                logger.debug("Dropping logical arb opportunity: CLOB unavailable")
                 continue
 
             # Get the best ask price from the CLOB
             asks = then_yes_book.get("asks", [])
-            if not asks:
-                logger.debug("No asks in CLOB for logical arb; keeping opportunity")
-                refined.append(opp)
+            if_no_asks = if_no_book.get("asks", [])
+            if not asks or not if_no_asks:
+                logger.debug("Dropping logical arb opportunity: executable asks unavailable")
                 continue
 
             clob_ask_price = float(asks[0].get("price", stage1_then_price))
+            if_no_ask_price = float(if_no_asks[0].get("price", 1.0 - opp.get("_if_price", 0.0)))
 
             # Check for spread widening: if ask price is >30% higher, drop it
             if clob_ask_price > max_ask_price:
@@ -165,15 +174,21 @@ def _refine_logical_arb_with_clob(opportunities: list[dict]) -> list[dict]:
                 )
                 continue
 
+            live_profit = net_profit_logical_arb(1.0 - if_no_ask_price, clob_ask_price)
+            if live_profit <= 0:
+                logger.debug("Logical arb no longer profitable at executable asks: %.4f", live_profit)
+                continue
+
             # Update opportunity with CLOB validated data
             opp["_clob_ask_price"] = clob_ask_price
+            opp["_if_no_price"] = if_no_ask_price
+            opp["_then_price"] = clob_ask_price
+            opp["net_profit"] = live_profit
             opp["_clob_validated"] = True
             refined.append(opp)
 
         except Exception as e:
             logger.debug("CLOB fetch failed for logical arb refinement: %s", e)
-            # Graceful degradation: keep opportunity if CLOB unavailable
-            refined.append(opp)
 
     dropped = len(opportunities) - len(refined)
     if dropped > 0:

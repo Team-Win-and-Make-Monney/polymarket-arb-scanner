@@ -110,18 +110,17 @@ class TestDuckDBAnalytics(unittest.TestCase):
         assert isinstance(result[0]["annual_sharpe"], (int, float))
         assert result[0]["annual_sharpe"] != "N/A"
 
-    def test_sharpe_calculation_uses_sqrt_252_annualization(self):
-        """Test 4: Sharpe = (std_dev * sqrt(252)) for annual volatility."""
+    def test_sharpe_calculation_uses_mean_over_volatility(self):
+        """Test 4: Sharpe = mean / standard deviation * sqrt(252)."""
         conn = sqlite3.connect(self.db_path)
         now = datetime.now(timezone.utc)
 
-        # Insert 20 identical trades: 0.02 profit each
-        # stddev_pop = 0 (all values the same)
+        profits = [0.01, 0.03] * 10
         for i in range(20):
             timestamp = (now - timedelta(hours=i)).isoformat()
             conn.execute(
                 "INSERT INTO opportunities (timestamp, type, market, prices, total_cost, net_profit, net_roi, depth, action) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (timestamp, "kalshi", f"Market {i}", None, 1.0, 0.02, 0.02, 1.0, "executed")
+                (timestamp, "kalshi", f"Market {i}", None, 1.0, profits[i], profits[i], 1.0, "executed")
             )
         conn.commit()
         conn.close()
@@ -129,8 +128,7 @@ class TestDuckDBAnalytics(unittest.TestCase):
         result = get_strategy_metrics(db_path=self.db_path, lookback_days=7)
 
         assert len(result) == 1
-        # stddev = 0, so sharpe = 0 * sqrt(252) = 0
-        assert result[0]["annual_sharpe"] == pytest.approx(0.0, abs=0.001)
+        assert result[0]["annual_sharpe"] == pytest.approx(2.0 * (252 ** 0.5), rel=0.001)
 
     def test_max_drawdown_calculation(self):
         """Test 5: Max drawdown = peak cumulative PnL - trough cumulative PnL."""
@@ -143,7 +141,7 @@ class TestDuckDBAnalytics(unittest.TestCase):
         # Trade 3: -0.08 -> cumsum = -0.07
         # Trade 4: +0.05 -> cumsum = -0.02
         # Trade 5 (most recent): +0.10 -> cumsum = 0.08
-        # Max drawdown = 0.08 - (-0.07) = 0.15
+        # Max drawdown is the largest peak-to-later-trough decline: 0.10.
 
         trades = [
             ((now - timedelta(hours=4)).isoformat(), 0.03),
@@ -164,7 +162,7 @@ class TestDuckDBAnalytics(unittest.TestCase):
         result = get_strategy_metrics(db_path=self.db_path, lookback_days=7)
 
         assert len(result) == 1
-        assert result[0]["max_drawdown"] == pytest.approx(0.15, abs=0.001)
+        assert result[0]["max_drawdown"] == pytest.approx(0.10, abs=0.001)
 
     def test_cutoff_timestamp_7_days_before_now(self):
         """Test 6: Cutoff is exactly 7 days before now; trades outside window excluded."""

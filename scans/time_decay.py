@@ -43,9 +43,13 @@ def scan_time_decay(
     now = time.time()
 
     for market_key, market in markets_by_key.items():
+        resolution_source = market.get("resolutionSource")
+        if not isinstance(resolution_source, dict):
+            logger.debug("TimeDecay skipped: %s has invalid resolutionSource", market_key)
+            continue
         # Check time to resolution — must be in sweet spot (1 < hours <= min_hours_to_expiry)
         hours_left = _check_time_to_expiry(
-            market.get("resolutionSource", {}).get("timestamp"),
+            resolution_source.get("timestamp"),
             min_hours=min_hours_to_expiry
         )
         if hours_left is None:
@@ -70,15 +74,14 @@ def scan_time_decay(
         # Target price is the consensus probability (or 1 - consensus if NO side)
         target_price = consensus_prob if consensus_side == "YES" else 1.0 - consensus_prob
 
-        # Skip if current price is already above buy threshold
-        current_price = market.get("price")
-        if current_price is None:
+        market_yes_price = market.get("price")
+        if not isinstance(market_yes_price, (int, float)) or not 0.0 <= market_yes_price <= 1.0:
             continue
-        if current_price >= buy_below_price:
+        current_price = market_yes_price if consensus_side == "YES" else 1.0 - market_yes_price
+        if current_price >= buy_below_price or current_price >= target_price:
             continue
 
-        # Calculate guaranteed gain: buy_below_price - target_price
-        guaranteed_gain = buy_below_price - target_price
+        guaranteed_gain = target_price - current_price
 
         opportunities.append({
             "type": "TimeDecay",
@@ -146,7 +149,11 @@ def _validate_consensus(consensus: float, min_threshold: float = 0.90) -> bool:
         logger.warning("Invalid consensus type: %s", type(consensus))
         return False
 
-    if consensus < min_threshold:
+    if not 0.0 <= consensus <= 1.0:
+        logger.warning("Consensus probability out of range: %s", consensus)
+        return False
+
+    if max(consensus, 1.0 - consensus) < min_threshold:
         logger.debug("Consensus %.1f%% below threshold %.1f%%", consensus * 100, min_threshold * 100)
         return False
 
@@ -235,7 +242,8 @@ def _refine_time_decay_with_prices(
         # Re-check hours-to-expiry from live resolution timestamp when available.
         live_hours_left = opp.get("_hours_to_expiry", 0.0)
         if market is not None:
-            resolution_ts = market.get("resolutionSource", {}).get("timestamp")
+            resolution_source = market.get("resolutionSource")
+            resolution_ts = resolution_source.get("timestamp") if isinstance(resolution_source, dict) else None
             if isinstance(resolution_ts, (int, float)):
                 live_hours_left = (resolution_ts - current_time) / 3600.0
                 opp["_hours_to_expiry"] = live_hours_left
@@ -250,7 +258,7 @@ def _refine_time_decay_with_prices(
                 consensus_data = signal_aggregator.get_consensus(market_key)
             except Exception as e:
                 logger.debug("TimeDecay consensus refresh failed for %s: %s", market_key, e)
-                consensus_data = None
+                continue
 
             if consensus_data is not None:
                 live_prob = (
@@ -259,7 +267,7 @@ def _refine_time_decay_with_prices(
                     else consensus_data
                 )
                 if isinstance(live_prob, (int, float)):
-                    if live_prob < min_consensus:
+                    if not _validate_consensus(live_prob, min_consensus):
                         logger.debug("TimeDecay dropped: %s consensus %.2f < %.2f",
                                     market_key, live_prob, min_consensus)
                         continue
@@ -269,10 +277,19 @@ def _refine_time_decay_with_prices(
                                     market_key, opp.get("_consensus_side"), live_side)
                         continue
                     opp["_consensus_prob"] = live_prob
+                else:
+                    logger.debug("TimeDecay dropped: %s invalid live consensus", market_key)
+                    continue
+            else:
+                logger.debug("TimeDecay dropped: %s live consensus unavailable", market_key)
+                continue
 
         # Live ask comparison from CLOB — falls back to current_prices/stored.
         live_ask = None
         clob = clob_results.get(market_key) if market_key else None
+        if market is not None and not clob:
+            logger.debug("TimeDecay dropped: %s executable CLOB unavailable", market_key)
+            continue
         if clob:
             consensus_side = opp.get("_consensus_side", "YES")
             live_ask = clob.get("yes_ask") if consensus_side == "YES" else clob.get("no_ask")

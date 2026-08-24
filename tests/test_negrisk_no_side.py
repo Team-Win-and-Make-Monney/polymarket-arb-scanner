@@ -93,6 +93,17 @@ class TestScanNegriskNoSide:
         opps = self._run(event, {"n1": 0.80, "n2": 0.80, "n3": 0.80})
         assert opps == []
 
+    @pytest.mark.parametrize("bad_ask", [-0.01, 0.0, 1.0, 1.01])
+    def test_invalid_executable_ask_fails_closed(self, bad_ask):
+        markets = [
+            _market(0.60, 0.40, "y1", "n1"),
+            _market(0.45, 0.55, "y2", "n2"),
+            _market(0.30, 0.70, "y3", "n3"),
+        ]
+        event = {"id": "evt-invalid", "title": "Invalid book", "markets": markets}
+
+        assert self._run(event, {"n1": bad_ask, "n2": 0.55, "n3": 0.70}) == []
+
 
 class TestBuildLegsNegriskNo:
     def test_build_legs_uses_no_tokens(self):

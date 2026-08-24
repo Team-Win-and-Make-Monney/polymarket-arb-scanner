@@ -406,13 +406,12 @@ def _refine_triangular_with_clob(opportunities: list[dict], min_profit: float) -
 
         token_ids = o.get("_token_ids", [])
         if not token_ids or len(token_ids) < 2:
-            refined.append(o)
+            logger.debug("Dropping triangular opportunity: Polymarket token IDs unavailable")
             continue
 
         clob = clob_cache.get(tuple(token_ids[:2]))
         if not clob or clob.get("yes_ask") is None or clob.get("no_ask") is None:
-            o["_clob_refined"] = False
-            refined.append(o)
+            logger.debug("Dropping triangular opportunity: executable Polymarket asks unavailable")
             continue
 
         # Determine which side Polymarket is on and use real ask price

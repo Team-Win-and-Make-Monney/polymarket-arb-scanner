@@ -1098,7 +1098,7 @@ class KalshiRewardTracker:
         avg_spread = sum(o["spread"] for o in orders) / len(orders) if orders else 0
 
         # Estimate: reward ∝ resting_time * (1 - spread_tightness)
-        estimated_daily = (total_resting / 86400) * (1 - avg_spread * 100) * 0.50
+        estimated_daily = (total_resting / 86400) * (1 - avg_spread) * 0.50
         return max(0.0, estimated_daily)
 
 

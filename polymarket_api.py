@@ -328,12 +328,26 @@ def get_best_bid_ask(order_book: dict) -> dict:
     asks = order_book.get("asks", [])
     if bids:
         best_bid = bids[0]  # Highest bid first
-        result["bid"] = float(best_bid.get("price", 0))
-        result["bid_size"] = float(best_bid.get("size", 0))
+        try:
+            price = float(best_bid.get("price"))
+            size = float(best_bid.get("size"))
+        except (TypeError, ValueError):
+            price = size = None
+        if price is not None and size is not None and math.isfinite(price) and math.isfinite(size):
+            if 0.0 < price < 1.0 and size > 0.0:
+                result["bid"] = price
+                result["bid_size"] = size
     if asks:
         best_ask = asks[0]  # Lowest ask first
-        result["ask"] = float(best_ask.get("price", 0))
-        result["ask_size"] = float(best_ask.get("size", 0))
+        try:
+            price = float(best_ask.get("price"))
+            size = float(best_ask.get("size"))
+        except (TypeError, ValueError):
+            price = size = None
+        if price is not None and size is not None and math.isfinite(price) and math.isfinite(size):
+            if 0.0 < price < 1.0 and size > 0.0:
+                result["ask"] = price
+                result["ask_size"] = size
     return result
 
 

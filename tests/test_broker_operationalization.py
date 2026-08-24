@@ -246,6 +246,13 @@ class TestCommandExecutors:
         with pytest.raises(RuntimeError, match="outside"):
             CommandIntentAdapter([str(repo_root / "scanner.py")], 5, repo_root)
 
+    @pytest.mark.parametrize("timeout", [float("nan"), float("inf"), "nan"])
+    def test_non_finite_timeout_is_rejected(self, tmp_path, timeout):
+        executable = self._script(tmp_path, "print('{}')")
+
+        with pytest.raises(RuntimeError, match="finite"):
+            CommandIntentAdapter([str(executable)], timeout, Path(__file__).parents[1])
+
     def test_loader_requires_all_three_adapters(self, tmp_path):
         config = tmp_path / "executors.json"
         config.write_text(json.dumps({}), encoding="utf-8")

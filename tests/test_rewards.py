@@ -213,14 +213,15 @@ class TestKalshiRewardTracker:
             order_id="order_4",
             market_key="QQQ_250101",
             size=15.0,
-            price=0.50,
+            price=0.485,
             mid_price=0.50,
             side="buy"
         )
 
         # Estimate should be positive (order resting)
-        estimate = krt.estimate_daily_reward("QQQ_250101")
-        assert estimate >= 0.0
+        with patch("market_maker.time.time", return_value=time.time() + 86400):
+            estimate = krt.estimate_daily_reward("QQQ_250101")
+        assert estimate == pytest.approx(0.485, rel=0.01)
 
         # No orders on different market
         estimate_none = krt.estimate_daily_reward("XYZ_250101")

@@ -80,6 +80,18 @@ def get_strategy_metrics(
                 WHERE timestamp >= ?
                   AND action IN ('executed', 'filled', 'dry_run')
             ),
+            strategy_curve AS (
+                SELECT
+                    *,
+                    GREATEST(
+                        0,
+                        MAX(cumulative_pnl) OVER (
+                            PARTITION BY type ORDER BY timestamp
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                        )
+                    ) as running_peak
+                FROM strategy_trades
+            ),
             strategy_metrics AS (
                 SELECT
                     type as strategy,
@@ -89,9 +101,8 @@ def get_strategy_metrics(
                     SUM(net_profit) as total_pnl,
                     AVG(net_profit) as avg_pnl,
                     STDDEV_POP(net_profit) as stddev,
-                    MIN(cumulative_pnl) as min_cumulative_pnl,
-                    MAX(cumulative_pnl) as max_cumulative_pnl
-                FROM strategy_trades
+                    MAX(running_peak - cumulative_pnl) as max_drawdown
+                FROM strategy_curve
                 GROUP BY type
             )
             SELECT
@@ -103,10 +114,10 @@ def get_strategy_metrics(
                 avg_pnl,
                 CASE
                     WHEN trade_count >= 20 AND stddev IS NOT NULL
-                    THEN stddev * SQRT(252)
+                    THEN avg_pnl / NULLIF(stddev, 0) * SQRT(252)
                     ELSE NULL
                 END as annual_sharpe,
-                CASE WHEN trade_count = 0 THEN 0 ELSE (max_cumulative_pnl - min_cumulative_pnl) END as max_drawdown
+                CASE WHEN trade_count = 0 THEN 0 ELSE max_drawdown END as max_drawdown
             FROM strategy_metrics
             ORDER BY total_pnl DESC
         """

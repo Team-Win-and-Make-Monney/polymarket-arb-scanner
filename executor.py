@@ -84,6 +84,7 @@ from fees import (
     net_profit_gemini_binary,
     net_profit_ibkr_binary,
     net_profit_multi_cross,
+    net_profit_logical_arb,
     find_lowest_fee_path,
 )
 
@@ -567,10 +568,8 @@ class ArbitrageExecutor:
         Returns True if the opportunity is still profitable (>= threshold of original).
         Returns False only when prices have genuinely degraded below threshold.
 
-        API/network failures are treated leniently: if the original ROI was >= 2%,
-        the opportunity is accepted despite the failed re-fetch (the CLOB prices
-        from scan time are still recent enough to act on). This prevents transient
-        API errors from causing 100% rejection rates.
+        API/network failures fail closed because an unverified price cannot
+        authorize a consequential order.
 
         Emits a structured REVAL| calibration log line for every decision (per D-01).
         """
@@ -743,7 +742,7 @@ class ArbitrageExecutor:
                     reason = "Market expired"
                 else:
                     consensus = opportunity.get("_consensus_prob", 0.0)
-                    if consensus < TIME_DECAY_MIN_CONSENSUS:
+                    if max(consensus, 1.0 - consensus) < TIME_DECAY_MIN_CONSENSUS:
                         logger.info("Time decay: consensus dropped below threshold: %.2f", consensus)
                         passed = False
                         reason = f"Consensus {consensus:.2f} dropped below {TIME_DECAY_MIN_CONSENSUS}"
@@ -760,24 +759,10 @@ class ArbitrageExecutor:
             # Unknown type — proceed cautiously (passed=True from init)
 
         except _RevalidationAPIError as e:
-            # API/network failure — not a price degradation.
-            # Accept if original ROI was strong enough (prices were CLOB-verified at scan).
-            if scan_roi >= 0.02:
-                logger.info(
-                    "Revalidation API error for %s (ROI=%.1f%%), proceeding with scan prices: %s",
-                    opp_type, scan_roi * 100, e,
-                )
-                passed = True
-                reval_profit = original_profit
-                reason = "api_error_accepted"
-            else:
-                logger.info(
-                    "Revalidation API error for %s (ROI=%.1f%% < 2%%), rejecting: %s",
-                    opp_type, scan_roi * 100, e,
-                )
-                passed = False
-                reval_profit = 0.0
-                reason = "api_error_rejected"
+            logger.info("Revalidation API error for %s; rejecting: %s", opp_type, e)
+            passed = False
+            reval_profit = 0.0
+            reason = "api_error_rejected"
         except Exception as e:
             logger.warning("Revalidation unexpected error: %s", e)
             passed = False
@@ -1348,24 +1333,25 @@ class ArbitrageExecutor:
             (passed, reval_profit, reason)
         """
         token_ids = opp.get("_token_ids", [])
-        if not token_ids or len(token_ids) < 1:
+        if_token_ids = opp.get("_if_token_ids", [])
+        if len(token_ids) < 2 or len(if_token_ids) < 2:
             raise _RevalidationAPIError("logical_arb missing token IDs")
 
         # Fetch live prices for the underpriced outcome (then_yes)
         try:
             then_yes_token = token_ids[0]
             then_yes_book = fetch_order_book(then_yes_token)
-            if not then_yes_book:
-                # API unavailable — proceed with scan prices (generous on Layer 4)
-                logger.debug("CLOB unavailable for logical_arb revalidation, proceeding with scan prices")
-                return True, original_profit, "clob_unavailable"
+            if_no_book = fetch_order_book(if_token_ids[1])
+            if not then_yes_book or not if_no_book:
+                raise _RevalidationAPIError("logical_arb CLOB unavailable")
 
             then_yes_asks = then_yes_book.get("asks", [])
-            if not then_yes_asks:
-                logger.debug("No asks in CLOB for logical_arb, proceeding")
-                return True, original_profit, "no_asks"
+            if_no_asks = if_no_book.get("asks", [])
+            if not then_yes_asks or not if_no_asks:
+                raise _RevalidationAPIError("logical_arb executable asks unavailable")
 
             fresh_then_price = float(then_yes_asks[0].get("price", opp.get("_then_price", 0)))
+            fresh_if_no_price = float(if_no_asks[0].get("price", opp.get("_if_no_price", 1)))
             original_then_price = opp.get("_then_price", fresh_then_price)
 
             # Check for >10% price movement (Layer 4 threshold)
@@ -1377,16 +1363,21 @@ class ArbitrageExecutor:
                 )
                 return False, 0.0, "price_moved_too_much"
 
-            # Update opportunity with fresh prices
+            reval_profit = net_profit_logical_arb(1.0 - fresh_if_no_price, fresh_then_price)
+            threshold = self._get_revalidation_threshold(original_profit, opp)
+            if reval_profit < threshold:
+                return False, reval_profit, "profit_below_floor"
+
             opp["_then_price"] = fresh_then_price
-            opp["net_profit"] = original_profit  # Profit calc doesn't change if just refetching
+            opp["_if_no_price"] = fresh_if_no_price
+            opp["net_profit"] = reval_profit
 
         except Exception as e:
-            logger.debug("Logical arb revalidation CLOB fetch failed: %s", e)
-            # Graceful degradation: accept if original ROI was good (handled by caller)
-            return True, original_profit, "clob_error_accepted"
+            if isinstance(e, _RevalidationAPIError):
+                raise
+            raise _RevalidationAPIError(f"logical_arb CLOB fetch failed: {e}") from e
 
-        return True, original_profit, "passed"
+        return True, reval_profit, "passed"
 
     def _revalidate_whale_copy(
         self, opp: dict, original_profit: float,
@@ -2173,28 +2164,24 @@ class ArbitrageExecutor:
             # Example: Bitcoin >$100k (if_yes) implies Bitcoin >$90k (then_yes).
             # If P(>$90k) < P(>$100k), buy >$90k and sell >$100k for arbitrage.
             token_ids = opportunity.get("_token_ids", [])
-            if not token_ids:
+            if_token_ids = opportunity.get("_if_token_ids", [])
+            if len(token_ids) < 2 or len(if_token_ids) < 2:
                 logger.warning("LogicalArb opp missing token IDs: %s", opportunity)
                 return []
 
-            # We need two token IDs: one for then_yes (underpriced), one for if_yes (hedge)
-            # token_ids[0] is typically the then_yes YES token
-            then_yes_token = token_ids[0] if len(token_ids) > 0 else ""
+            then_yes_token = token_ids[0]
+            if_no_token = if_token_ids[1]
 
-            # For the if_yes hedge, we need its token ID. In a two-outcome market,
-            # the NO token is the hedge. We may need to fetch if_market's token IDs separately.
-            # For now, we'll assume if_yes_token is provided or we have index [1]
-            if_yes_token = token_ids[1] if len(token_ids) > 1 else ""
-
-            if not then_yes_token or not if_yes_token:
+            if not then_yes_token or not if_no_token:
                 logger.warning("LogicalArb opp missing required token IDs for both outcomes")
                 return []
 
             legs = [
                 {"platform": "polymarket", "side": "BUY", "token": "yes",
                  "price": opportunity.get("_then_price", 0), "_token_id": then_yes_token},
-                {"platform": "polymarket", "side": "SELL", "token": "yes",
-                 "price": opportunity.get("_if_price", 0), "_token_id": if_yes_token},
+                {"platform": "polymarket", "side": "BUY", "token": "no",
+                 "price": opportunity.get("_if_no_price", 1.0 - opportunity.get("_if_price", 0)),
+                 "_token_id": if_no_token},
             ]
 
         elif opp_type == "WhaleCopy":
@@ -3068,6 +3055,11 @@ class ArbitrageExecutor:
                 tif = "gtc"
             else:
                 tif = "fill_or_kill"
+
+            from kalshi_policy import live_kalshi_submit_allowed
+            if not live_kalshi_submit_allowed(ticker):
+                logger.warning("Kalshi order blocked by live policy: %s", ticker)
+                return False, None, None
 
             resp = self.kalshi_client.place_order(
                 ticker=ticker,

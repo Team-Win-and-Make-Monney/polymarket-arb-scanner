@@ -1474,7 +1474,7 @@ class TestRevalidateTriangular:
             assert result is False
 
     def test_revalidate_triangular_missing_platforms_high_roi(self, executor):
-        """TriangularCross with missing platform info but high ROI: API error accepted."""
+        """TriangularCross with missing platform info fails closed at any ROI."""
         opp = {
             "type": "TriangularCross",
             "net_profit": 0.10,
@@ -1484,7 +1484,7 @@ class TestRevalidateTriangular:
             "_platform_b": "",
         }
         result = executor._revalidate(opp, None)
-        assert result is True  # ROI ~14% >= 2%, so API error is accepted
+        assert result is False
 
     def test_revalidate_triangular_missing_platforms_low_roi(self, executor):
         """TriangularCross with missing platform info and low ROI: rejected."""
@@ -1543,8 +1543,8 @@ class TestRevalidateNegRisk:
         result = executor._revalidate(opp, None)
         assert result is False
 
-    def test_api_error_accepted_when_high_roi(self, executor):
-        """NegRisk: API error accepted when ROI >= 2% (proceeds with scan prices)."""
+    def test_api_error_rejected_when_high_roi(self, executor):
+        """NegRisk: API errors fail closed even when scan ROI is high."""
         from unittest.mock import patch as mpatch
         opp = {
             "type": "NegRiskInternal",
@@ -1554,7 +1554,7 @@ class TestRevalidateNegRisk:
         }
         with mpatch("executor.fetch_order_book", return_value=None):
             result = executor._revalidate(opp, None)
-            assert result is True  # ROI ~11% >= 2%, API error accepted
+            assert result is False
 
     def test_api_error_rejected_when_low_roi(self, executor):
         """NegRisk: API error rejected when ROI < 2%."""
@@ -1624,8 +1624,8 @@ class TestRevalidateKalshiMulti:
         }
         mock_book = {
             "orderbook": {
-                "yes": [["45", "100"]],
-                "no": [],
+                "yes": [],
+                "no": [["55", "100"]],
             }
         }
         executor.kalshi_client.fetch_order_book.return_value = mock_book
@@ -1657,8 +1657,8 @@ class TestRevalidateKalshiMulti:
         result = ex._revalidate(opp, None)
         assert result is False
 
-    def test_api_error_accepted_when_high_roi(self, executor):
-        """KalshiMulti: API error accepted when ROI >= 2%."""
+    def test_api_error_rejected_when_high_roi(self, executor):
+        """KalshiMulti: API errors fail closed even when scan ROI is high."""
         opp = {
             "type": "KalshiMultiOutcome",
             "net_profit": 0.10,
@@ -1667,7 +1667,7 @@ class TestRevalidateKalshiMulti:
         }
         executor.kalshi_client.fetch_order_book.return_value = None
         result = executor._revalidate(opp, None)
-        assert result is True  # ROI 12.5% >= 2%, API error accepted
+        assert result is False
 
     def test_api_error_rejected_when_low_roi(self, executor):
         """KalshiMulti: API error rejected when ROI < 2%."""
@@ -2141,6 +2141,16 @@ class TestMinOrderSize:
                 success, order_id, fill_price = executor._execute_single_leg(
                     leg, 3.0, opp)
         assert success is True
+
+    def test_kalshi_sports_ticker_does_not_place(self, executor):
+        leg = {"platform": "kalshi", "side": "yes", "action": "buy",
+               "price": 0.50, "_ticker": "KXNFLGAME-26AUG18"}
+        opp = {"type": "KalshiBinary"}
+        with patch("executor.ENABLED_EXECUTION_PLATFORMS",
+                   frozenset(["polymarket", "kalshi"])):
+            success, _, _ = executor._execute_single_leg(leg, 3.0, opp)
+        assert success is False
+        executor.kalshi_client.place_order.assert_not_called()
 
     def test_cross_all_rejects_when_per_leg_size_below_minimum(self, executor):
         """Cross-all with per-leg size below platform min returns empty."""

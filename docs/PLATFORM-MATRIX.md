@@ -6,13 +6,15 @@
 
 ## Capability matrix
 
+"Built" below means code exists; it does not mean the venue is currently authorized or operationally ready for live capital. The only verified live target is Kalshi D0 through the gated launcher.
+
 | Platform | Role | Auth | Read | Buy | Sell | Streaming | Fee model | Feature flag | Status |
 |---|---|---|---|---|---|---|---|---|---|
-| Polymarket | Trade | Ethereum private key → CLOB (`py-clob-client`) | ✅ | ✅ | ✅ | ✅ WS | Gas (Polygon) + 0 trading fee on most markets | — (core) | BUILT |
-| Kalshi | Trade | RSA-PSS signed headers (key file or base64) | ✅ | ✅ | ✅ | ✅ WS | Built into pricing (~≤2% of max profit) | — (core) | BUILT |
+| Polymarket | Adapter / shadow | Ethereum private key → CLOB (`py-clob-client-v2`) | ✅ | ✅ | ✅ | ✅ WS | Category-dependent CLOB taker fees + Polygon gas | — (core) | BUILT CODE; NOT CURRENTLY VERIFIED LIVE |
+| Kalshi | Trade | RSA-PSS signed headers (key file or base64) | ✅ | ✅ | ✅ | ✅ WS | Contract fee formula in `fees.py` | — (core) | KALSHI D0 ONLY VERIFIED LIVE TARGET |
 | Betfair | Trade | SSO login + API key | ✅ | ✅ | ✅ | ❌ | Commission (`BETFAIR_COMMISSION_RATE`) | — | BUILT |
 | Smarkets | Trade | API key session | ✅ | ✅ | ✅ | ❌ | Commission (`SMARKETS_COMMISSION_RATE`) | — | BUILT |
-| SX Bet | Trade | API key session | ✅ | ⚠️ | ⚠️ | ❌ | Exchange fee | — | **PARTIAL — read-only**: `place_order()` sends unsigned JSON; EIP-712 signing not implemented. `validate_config()` errors at startup if `sxbet` ∈ `ENABLED_EXECUTION_PLATFORMS` while `DRY_RUN=false` |
+| SX Bet | Adapter | API key session | ✅ | ⚠️ | ⚠️ | ❌ | Exchange fee | — | **PARTIAL — read-only**: EIP-712 signing not implemented |
 | Matchbook | Trade | Username/password session | ✅ | ✅ | ✅ | ❌ | 0% commission on predictions | — | BUILT |
 | Gemini Predictions | Trade | HMAC-SHA384 (API key + secret) | ✅ | ✅ | ✅ | ❌ | **1.75% maker / 7% taker**, `roundup(rate×C×P×(1−P))` (CFTC 40.6 filing eff. 2026-03-09) | — | BUILT |
 | IBKR ForecastEx | Trade | TWS API via `ib_insync` (IB Gateway socket) | ✅ | ✅ | ❌ | ❌ | $0.00 commission | — | **BUILT — BUY-only, LMT-only**, 5s order rate limit |
@@ -33,7 +35,7 @@
 | IBKR | IB Gateway socket session (`IBKR_CLIENT_ID`) | Transfers off-API | Gateway-authenticated | Gateway re-auth | Requires reachable Gateway host | Permitted (TWS API) |
 | Metaculus / Manifold | Read-only; no trading scope | n/a | n/a | n/a | None material | Read permitted |
 
-**Custody note:** the only programmatic fund movement is the **Gemini ↔ Polymarket USDC-on-Polygon auto-rebalance corridor** (`AUTO_REBALANCE_ENABLED`, default off). The other six trading platforms expose **no** withdraw/transfer API and stay on the manual-rebalance path with weekly digests. Because Polymarket and Gemini keys are not trade/withdraw-separated, treat those two secrets as custody-grade (see `SECURITY.md`).
+**Custody note:** Gemini ↔ Polymarket transfer code exists but is not part of the current operating mission. `AUTO_REBALANCE_ENABLED` defaults off, duplicate keys are idempotent, and any activation still requires explicit action-time approval. Treat Polymarket and Gemini secrets as custody-grade (see `SECURITY.md`).
 
 ## Candidate platforms (not yet integrated)
 See `docs/audit/PLATFORM-RESEARCH-2026-05-31.md` for the ranked expansion memo (Tier 1: Sporttrade/Novig/ProphetX; Tier 2: Predict.fun/Myriad/Limitless; Tier 3: Drift, Crypto.com/OG). Each is gated on regulatory eligibility **and** operational-readiness before greenlight.

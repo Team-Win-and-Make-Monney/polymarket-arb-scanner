@@ -187,6 +187,9 @@ class TestIdempotency:
         # is called twice (the gate is the DB UNIQUE constraint), but the
         # audit table still has exactly one row.
         assert r1.transfer_id == r2.transfer_id
+        gemini.withdraw_usdc.assert_called_once_with(
+            address="0xPMproxy123", amount=100.0,
+        )
         rows = db.get_transfers_today()
         assert len(rows) == 1
 

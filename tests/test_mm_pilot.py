@@ -486,6 +486,14 @@ class TestKillSwitch:
 
         assert client._key == "service-role-test"
 
+    @pytest.mark.parametrize("url", ["http://example.supabase.co", "https://169.254.169.254"])
+    def test_rest_client_builder_rejects_unsafe_url(self, monkeypatch, url):
+        monkeypatch.setenv("SUPABASE_URL", url)
+        monkeypatch.setenv("SUPABASE_SERVICE_KEY", "service-role-test")
+
+        with pytest.raises(ValueError, match="SUPABASE_URL"):
+            build_controls_client_from_env()
+
     def test_controls_poller_accepts_read_only_rest_client(self, clock):
         client = MagicMock()
         client.fetch_control.return_value = True

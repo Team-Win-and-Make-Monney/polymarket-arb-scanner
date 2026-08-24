@@ -101,7 +101,7 @@ class TestScanStage1:
         assert len(opps) > 0
         assert opps[0]["type"] == "LogicalArb"
         assert opps[0]["_if_price"] == 0.50
-        assert opps[0]["_then_price"] == 0.40
+        assert opps[0]["_then_price"] == 0.41
 
     def test_respects_price_threshold(self):
         """Opportunities should only be created when discount exceeds threshold."""
@@ -171,10 +171,10 @@ class TestScanStage1:
         rules = [{"if_yes": "market-1", "then_yes": "market-2", "relationship": "implies"}]
 
         with patch("scans.logical_arb.fetch_order_book") as mock_fetch:
-            mock_fetch.return_value = {
-                "asks": [{"price": 0.51, "size": 100}],
-                "bids": [],
-            }
+            mock_fetch.side_effect = [
+                {"asks": [{"price": 0.51, "size": 100}], "bids": []},
+                {"asks": [{"price": 0.35, "size": 100}], "bids": []},
+            ]
             opps = scan_logical_arb(
                 markets_by_key=markets_by_key,
                 logical_arb_rules=rules,
@@ -193,6 +193,7 @@ class TestScanStage1:
             "_if_price",
             "_then_price",
             "_token_ids",
+            "_if_token_ids",
             "_market_key",
             "_layer",
         ]
@@ -289,7 +290,8 @@ class TestRefinementStage2:
             {
                 "type": "LogicalArb",
                 "_then_price": 0.40,
-                "_token_ids": ["token-yes"],
+                "_token_ids": ["token-yes", "token-no"],
+                "_if_token_ids": ["if-yes", "if-no"],
                 "_market_key": "market-1",
             }
         ]
@@ -315,7 +317,8 @@ class TestRefinementStage2:
             {
                 "type": "LogicalArb",
                 "_then_price": 0.40,
-                "_token_ids": ["token-yes"],
+                "_token_ids": ["token-yes", "token-no"],
+                "_if_token_ids": ["if-yes", "if-no"],
                 "_market_key": "market-1",
             }
         ]
@@ -332,15 +335,16 @@ class TestRefinementStage2:
         # Should drop the opportunity
         assert len(refined) == 0
 
-    def test_graceful_degradation_clob_unavailable(self):
-        """Should keep opportunity if CLOB fetch raises exception."""
+    def test_clob_exception_fails_closed(self):
+        """Should drop opportunity if CLOB fetch raises exception."""
         _, _refine_logical_arb_with_clob = _import_logical_arb()
 
         opportunities = [
             {
                 "type": "LogicalArb",
                 "_then_price": 0.40,
-                "_token_ids": ["token-yes"],
+                "_token_ids": ["token-yes", "token-no"],
+                "_if_token_ids": ["if-yes", "if-no"],
                 "_market_key": "market-1",
             }
         ]
@@ -351,18 +355,18 @@ class TestRefinementStage2:
 
             refined = _refine_logical_arb_with_clob(opportunities)
 
-        # Should gracefully degrade and keep the opportunity
-        assert len(refined) == 1
+        assert refined == []
 
-    def test_graceful_degradation_clob_returns_none(self):
-        """Should keep opportunity if CLOB returns None."""
+    def test_clob_none_fails_closed(self):
+        """Should drop opportunity if CLOB returns None."""
         _, _refine_logical_arb_with_clob = _import_logical_arb()
 
         opportunities = [
             {
                 "type": "LogicalArb",
                 "_then_price": 0.40,
-                "_token_ids": ["token-yes"],
+                "_token_ids": ["token-yes", "token-no"],
+                "_if_token_ids": ["if-yes", "if-no"],
                 "_market_key": "market-1",
             }
         ]
@@ -373,8 +377,7 @@ class TestRefinementStage2:
 
             refined = _refine_logical_arb_with_clob(opportunities)
 
-        # Should gracefully degrade and keep the opportunity
-        assert len(refined) == 1
+        assert refined == []
 
     def test_empty_opportunities_list(self):
         """Should return empty list when input is empty."""
@@ -504,6 +507,7 @@ class TestExecutorIntegration:
         # Opportunity structure should match what executor expects
         assert "type" in opp and opp["type"] == "LogicalArb"
         assert "_token_ids" in opp
+        assert "_if_token_ids" in opp
         assert "_if_price" in opp and "_then_price" in opp
         assert "_layer" in opp and opp["_layer"] == 4
 

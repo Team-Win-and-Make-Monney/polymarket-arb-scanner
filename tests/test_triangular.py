@@ -302,6 +302,7 @@ class TestScanTriangular:
 
     def _setup_three_platform_mocks(self, mod, pm_market, k_market, bf_market):
         """Return a match_side_effect function for 3 platforms."""
+        pm_market.setdefault("clobTokenIds", '["pm-yes", "pm-no"]')
         def match_side_effect(ma, mb, pa, pb, **kwargs):
             pairs = {
                 ("betfair", "kalshi"): (bf_market, k_market),
@@ -342,6 +343,8 @@ class TestScanTriangular:
         with patch.object(mod, "match_cross_platform", side_effect=self._setup_three_platform_mocks(mod, pm_market, k_market, bf_market)), \
              patch.object(mod, "filter_dust", side_effect=lambda x: x), \
              patch.object(mod, "net_profit_triangular", return_value=mock_fee_result), \
+             patch.object(mod, "get_clob_prices", return_value={"yes_ask": 0.30, "no_ask": 0.60,
+                                                                  "yes_ask_size": 100, "no_ask_size": 100}), \
              patch.object(mod, "parse_outcome_prices", return_value=[0.30, 0.60]):
 
             opps = mod.scan_triangular(
@@ -425,6 +428,8 @@ class TestScanTriangular:
         with patch.object(mod, "match_cross_platform", side_effect=self._setup_three_platform_mocks(mod, pm_market, k_market, bf_market)), \
              patch.object(mod, "filter_dust", side_effect=lambda x: x), \
              patch.object(mod, "net_profit_triangular", return_value=mock_fee_result), \
+             patch.object(mod, "get_clob_prices", return_value={"yes_ask": 0.25, "no_ask": 0.65,
+                                                                  "yes_ask_size": 100, "no_ask_size": 100}), \
              patch.object(mod, "parse_outcome_prices", return_value=[0.25, 0.65]):
 
             opps = mod.scan_triangular(
@@ -486,6 +491,8 @@ class TestScanTriangular:
         with patch.object(mod, "match_cross_platform", side_effect=self._setup_three_platform_mocks(mod, pm_market, k_market, bf_market)), \
              patch.object(mod, "filter_dust", side_effect=lambda x: x), \
              patch.object(mod, "net_profit_triangular", return_value=mock_fee_result) as mock_fee, \
+             patch.object(mod, "get_clob_prices", return_value={"yes_ask": 0.20, "no_ask": 0.80,
+                                                                  "yes_ask_size": 100, "no_ask_size": 100}), \
              patch.object(mod, "parse_outcome_prices", return_value=[0.20, 0.80]):
 
             opps = mod.scan_triangular(
@@ -570,6 +577,8 @@ class TestScanTriangular:
         with patch.object(mod, "match_cross_platform", side_effect=self._setup_three_platform_mocks(mod, pm_market, k_market, bf_market)), \
              patch.object(mod, "filter_dust", side_effect=lambda x: x), \
              patch.object(mod, "net_profit_triangular", return_value=mock_fee_result), \
+             patch.object(mod, "get_clob_prices", return_value={"yes_ask": 0.20, "no_ask": 0.80,
+                                                                  "yes_ask_size": 100, "no_ask_size": 100}), \
              patch.object(mod, "parse_outcome_prices", return_value=[0.20, 0.80]):
 
             opps = mod.scan_triangular(
@@ -750,3 +759,19 @@ class TestBothLegsPolymarketRefinement:
         assert opp["_price_b"] == pytest.approx(0.55)  # live NO ask, not 0.60
         assert opp["prices"] == "polymarket_Y=0.280 polymarket_N=0.550"
         assert opp["net_profit"] == pytest.approx(1.0 - 0.28 - 0.55)
+
+    def test_missing_token_ids_fail_closed(self):
+        mod = _import_triangular()
+        opp = {"_platform_a": "polymarket", "_platform_b": "kalshi", "_token_ids": []}
+
+        assert mod._refine_triangular_with_clob([opp], min_profit=0.001) == []
+
+    def test_missing_executable_asks_fail_closed(self):
+        mod = _import_triangular()
+        opp = {
+            "_platform_a": "polymarket",
+            "_platform_b": "kalshi",
+            "_token_ids": ["yes", "no"],
+        }
+        with patch.object(mod, "get_clob_prices", return_value=None):
+            assert mod._refine_triangular_with_clob([opp], min_profit=0.001) == []

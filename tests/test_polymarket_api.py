@@ -49,7 +49,7 @@ if not hasattr(_clob_types, "OrderType") or isinstance(getattr(_clob_types, "Ord
     _clob_types.BalanceAllowanceParams = MagicMock
 
 import polymarket_api
-from polymarket_api import _rate_limit, _rate_lock, PolymarketTrader
+from polymarket_api import _rate_limit, _rate_lock, get_best_bid_ask as _real_get_best_bid_ask, PolymarketTrader
 from config import PM_RATE_LIMIT as MIN_REQUEST_INTERVAL
 
 
@@ -558,3 +558,20 @@ class TestPolymarketTraderGetOrders:
         trader.client = MagicMock()
         trader.client.get_open_orders.side_effect = RuntimeError("boom")
         assert trader.get_orders() == []
+
+
+class TestBestBidAskValidation:
+    @pytest.mark.parametrize("bad_price", [-0.01, 0.0, 1.0, 1.01, float("nan"), float("inf")])
+    def test_invalid_top_level_is_not_executable(self, bad_price):
+        result = _real_get_best_bid_ask({
+            "bids": [{"price": bad_price, "size": 10}],
+            "asks": [{"price": bad_price, "size": 10}],
+        })
+        assert result == {"bid": None, "bid_size": None, "ask": None, "ask_size": None}
+
+    def test_valid_top_levels_are_preserved(self):
+        result = _real_get_best_bid_ask({
+            "bids": [{"price": "0.49", "size": "12"}],
+            "asks": [{"price": "0.51", "size": "8"}],
+        })
+        assert result == {"bid": 0.49, "bid_size": 12.0, "ask": 0.51, "ask_size": 8.0}

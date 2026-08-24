@@ -29,6 +29,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from url_guard import assert_public_url
+
 logger = logging.getLogger(__name__)
 
 PLATFORM = "kalshi"  # hardcoded venue — the pilot never routes anywhere else
@@ -268,6 +270,7 @@ def build_controls_client_from_env() -> SupabaseControlsClient:
         raise RuntimeError(
             "SUPABASE_URL and SUPABASE_SERVICE_KEY (or SUPABASE_KEY) must be set"
         )
+    url = assert_public_url(url, env_name="SUPABASE_URL", allow_http=False)
     return SupabaseControlsClient(url, key)
 
 class ControlsPoller:
@@ -929,6 +932,11 @@ class KalshiMMPilot:
             and (signed > 0) != (net_ct > 0)
             and count <= abs(net_ct)
         )
+        from kalshi_policy import live_kalshi_submit_allowed
+        if not live_kalshi_submit_allowed(
+            ticker, reducing=reducing or derived_reducing
+        ):
+            return GateResult(False, "policy_blocked")
         if not config.DRY_RUN:
             envelope = getattr(config, "LIVE_ENVELOPE", None)
             if not envelope:

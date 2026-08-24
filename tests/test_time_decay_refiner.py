@@ -127,9 +127,8 @@ class TestLiveCLOBRefetch:
         assert refined[0]["_current_price"] == pytest.approx(0.93)
         assert refined[0]["_partial_clob"] is True
 
-    def test_clob_fetch_failure_does_not_crash(self):
-        """If _fetch_clob_for_market raises, the opp is not dropped — it
-        falls back to the legacy stored-price gate."""
+    def test_clob_fetch_failure_fails_closed(self):
+        """If the executable book cannot be fetched, the opp is dropped."""
         opp = _make_opp(market_key="m1", target=0.95, current=0.90)
         markets = {"m1": _make_market("m1")}
 
@@ -139,8 +138,7 @@ class TestLiveCLOBRefetch:
                 [opp], markets_by_key=markets,
             )
 
-        # Stored _current_price (0.90) < target (0.95) so still passes.
-        assert len(refined) == 1
+        assert refined == []
 
 
 # ---------------------------------------------------------------------------
@@ -205,8 +203,8 @@ class TestLiveConsensusRefresh:
         assert len(refined) == 1
         assert refined[0]["_consensus_prob"] == 0.97
 
-    def test_aggregator_exception_is_swallowed(self):
-        """If aggregator raises, refiner falls through to other gates."""
+    def test_aggregator_exception_fails_closed(self):
+        """If the live consensus cannot be refreshed, the opp is dropped."""
         opp = _make_opp(market_key="m1")
         markets = {"m1": _make_market("m1")}
         clob = {"yes_ask": 0.92, "no_ask": 0.08, "yes_ask_size": 50, "no_ask_size": 50}
@@ -220,8 +218,7 @@ class TestLiveConsensusRefresh:
                 [opp], markets_by_key=markets, signal_aggregator=agg,
             )
 
-        # Live ask 0.92 < target 0.95 so opp survives.
-        assert len(refined) == 1
+        assert refined == []
 
 
 # ---------------------------------------------------------------------------

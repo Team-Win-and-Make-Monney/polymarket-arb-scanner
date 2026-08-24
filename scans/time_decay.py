@@ -1,6 +1,7 @@
 """Time decay convergence — buy near-certain outcomes approaching market expiry."""
 
 import logging
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -47,9 +48,17 @@ def scan_time_decay(
         if not isinstance(resolution_source, dict):
             logger.debug("TimeDecay skipped: %s has invalid resolutionSource", market_key)
             continue
+        resolution_timestamp = resolution_source.get("timestamp")
+        if (
+            isinstance(resolution_timestamp, bool)
+            or not isinstance(resolution_timestamp, (int, float))
+            or not math.isfinite(resolution_timestamp)
+        ):
+            logger.debug("TimeDecay skipped: %s has invalid resolution timestamp", market_key)
+            continue
         # Check time to resolution — must be in sweet spot (1 < hours <= min_hours_to_expiry)
         hours_left = _check_time_to_expiry(
-            resolution_source.get("timestamp"),
+            resolution_timestamp,
             min_hours=min_hours_to_expiry
         )
         if hours_left is None:
@@ -277,6 +286,7 @@ def _refine_time_decay_with_prices(
                                     market_key, opp.get("_consensus_side"), live_side)
                         continue
                     opp["_consensus_prob"] = live_prob
+                    opp["_target_price"] = live_prob if live_side == "YES" else 1.0 - live_prob
                 else:
                     logger.debug("TimeDecay dropped: %s invalid live consensus", market_key)
                     continue
@@ -284,7 +294,8 @@ def _refine_time_decay_with_prices(
                 logger.debug("TimeDecay dropped: %s live consensus unavailable", market_key)
                 continue
 
-        # Live ask comparison from CLOB — falls back to current_prices/stored.
+        # Live ask comparison from CLOB. A supplied market must have a real,
+        # executable selected-side ask; bids are never converted into asks.
         live_ask = None
         clob = clob_results.get(market_key) if market_key else None
         if market is not None and not clob:
@@ -293,27 +304,30 @@ def _refine_time_decay_with_prices(
         if clob:
             consensus_side = opp.get("_consensus_side", "YES")
             live_ask = clob.get("yes_ask") if consensus_side == "YES" else clob.get("no_ask")
-            if live_ask is None:
-                # Fall back to bid + 0.01 if ask is missing (matches cross.py)
-                bid_key = "yes_bid" if consensus_side == "YES" else "no_bid"
-                bid = clob.get(bid_key)
-                if bid is not None:
-                    live_ask = bid + 0.01
-                    opp["_partial_clob"] = True
-            if live_ask is not None:
-                opp["_current_price"] = live_ask
-                opp["_clob_depth"] = clob.get(
-                    "yes_ask_size" if consensus_side == "YES" else "no_ask_size", 0
-                ) or 0
-
-        if live_ask is None:
+        elif market is None:
             live_ask = current_prices.get(market_key, opp.get("_current_price"))
 
+        if (
+            isinstance(live_ask, bool)
+            or not isinstance(live_ask, (int, float))
+            or not math.isfinite(live_ask)
+            or not 0.0 < live_ask < 1.0
+        ):
+            logger.debug("TimeDecay dropped: %s invalid executable ask", market_key)
+            continue
+
+        opp["_current_price"] = live_ask
+        if clob:
+            opp["_clob_depth"] = clob.get(
+                "yes_ask_size" if opp.get("_consensus_side", "YES") == "YES" else "no_ask_size", 0
+            ) or 0
+
         target_price = opp.get("_target_price", 0.95)
-        if live_ask is not None and live_ask >= target_price:
+        if live_ask >= target_price:
             logger.debug("TimeDecay dropped: %s ask %.3f >= target %.3f",
                         market_key, live_ask, target_price)
             continue
+        opp["_guaranteed_gain"] = target_price - live_ask
 
         refined.append(opp)
 

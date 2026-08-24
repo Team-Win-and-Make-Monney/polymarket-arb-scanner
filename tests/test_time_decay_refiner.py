@@ -109,8 +109,8 @@ class TestLiveCLOBRefetch:
         assert refined[0]["_current_price"] == 0.93
         assert refined[0]["_clob_depth"] == 80
 
-    def test_falls_back_to_bid_plus_one_cent_when_ask_missing(self):
-        """When ask is None, refiner uses bid + 0.01 and flags _partial_clob."""
+    def test_missing_ask_fails_closed(self):
+        """A bid is not an executable ask, so a missing ask drops the candidate."""
         opp = _make_opp(market_key="m1", target=0.95)
         markets = {"m1": _make_market("m1")}
         clob = {"yes_ask": None, "no_ask": 0.04, "yes_bid": 0.92, "no_bid": 0.05,
@@ -123,9 +123,7 @@ class TestLiveCLOBRefetch:
                 [opp], markets_by_key=markets,
             )
 
-        assert len(refined) == 1
-        assert refined[0]["_current_price"] == pytest.approx(0.93)
-        assert refined[0]["_partial_clob"] is True
+        assert refined == []
 
     def test_clob_fetch_failure_fails_closed(self):
         """If the executable book cannot be fetched, the opp is dropped."""
@@ -202,6 +200,23 @@ class TestLiveConsensusRefresh:
 
         assert len(refined) == 1
         assert refined[0]["_consensus_prob"] == 0.97
+        assert refined[0]["_target_price"] == 0.97
+        assert refined[0]["_guaranteed_gain"] == pytest.approx(0.05)
+
+    def test_drops_when_refreshed_target_falls_below_live_ask(self):
+        opp = _make_opp(market_key="m1", prob=0.97, target=0.97)
+        markets = {"m1": _make_market("m1")}
+        clob = {"yes_ask": 0.94, "no_ask": 0.06, "yes_ask_size": 50, "no_ask_size": 50}
+        agg = MagicMock()
+        agg.get_consensus.return_value = {"probability": 0.93}
+
+        with patch.object(td_mod, "_fetch_clob_for_market",
+                          return_value=(markets["m1"], clob)):
+            refined = _refine_time_decay_with_prices(
+                [opp], markets_by_key=markets, signal_aggregator=agg,
+            )
+
+        assert refined == []
 
     def test_aggregator_exception_fails_closed(self):
         """If the live consensus cannot be refreshed, the opp is dropped."""

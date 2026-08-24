@@ -76,7 +76,7 @@ class FakeKalshiClient:
         return self.books.get(ticker)
 
     def place_order(self, ticker, side, action, count, price_dollars,
-                    time_in_force="fill_or_kill"):
+                    time_in_force="fill_or_kill", reducing=False):
         self.place_order_calls += 1
         if self.fail_place:
             return None
@@ -84,6 +84,7 @@ class FakeKalshiClient:
         self.placed.append({
             "order_id": oid, "ticker": ticker, "side": side, "action": action,
             "count": count, "price": price_dollars, "tif": time_in_force,
+            "reducing": reducing,
         })
         return {"order": {"order_id": oid}}
 

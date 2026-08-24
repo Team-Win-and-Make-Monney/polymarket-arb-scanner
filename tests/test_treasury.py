@@ -183,15 +183,40 @@ class TestIdempotency:
                                  idempotency_key=key)
         r2 = tm.execute_transfer("gemini", "polymarket", 100.0,
                                  idempotency_key=key)
-        # Both calls must surface the same transfer id; the live withdraw
-        # is called twice (the gate is the DB UNIQUE constraint), but the
-        # audit table still has exactly one row.
+        # Both calls surface the same transfer id and the venue is called once.
         assert r1.transfer_id == r2.transfer_id
         gemini.withdraw_usdc.assert_called_once_with(
             address="0xPMproxy123", amount=100.0,
         )
         rows = db.get_transfers_today()
         assert len(rows) == 1
+
+    def test_replay_returns_prior_result_before_daily_limit_gate(self, db, monkeypatch):
+        TreasuryManager, _, _ = _import_treasury()
+        tm = TreasuryManager(db=db, dry_run=True)
+        key = "replay_after_limit"
+        first = tm.execute_transfer("gemini", "polymarket", 100.0, idempotency_key=key)
+        import config
+        monkeypatch.setattr(config, "MAX_AUTO_TRANSFER_PER_DAY", 0.0)
+
+        replay = tm.execute_transfer("gemini", "polymarket", 100.0, idempotency_key=key)
+
+        assert replay.ok is True
+        assert replay.transfer_id == first.transfer_id
+        assert replay.dry_run is True
+
+    def test_reused_key_with_different_payload_is_rejected(self, db):
+        TreasuryManager, _, _ = _import_treasury()
+        tm = TreasuryManager(db=db, dry_run=True)
+        key = "payload_bound_key"
+        first = tm.execute_transfer("gemini", "polymarket", 100.0, idempotency_key=key)
+
+        mismatch = tm.execute_transfer("gemini", "polymarket", 125.0, idempotency_key=key)
+
+        assert first.ok is True
+        assert mismatch.ok is False
+        assert mismatch.transfer_id == first.transfer_id
+        assert "payload mismatch" in (mismatch.error or "")
 
 
 # ---------------------------------------------------------------------------

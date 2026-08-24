@@ -3,7 +3,7 @@
 Python CLI for detecting and paper-evaluating prediction-market arbitrage. The repository contains multiple venue adapters and execution code, but the project is currently paused for broad expansion and is dry-run by default.
 
 > **Current operating state (2026-08-24):** Railway is still running a dry-run worker. The only verified live operating target is a narrowly gated Kalshi D0 launcher. No generic multi-venue live command is authorized. See [`docs/STATE.md`](docs/STATE.md).
-
+>
 > Renamed from `polymarket-arb-scanner` on 2026-05-09. The new name reflects the actual scope — a grid of platforms × layers × strategies, not a Polymarket-only scanner. Local clones may keep the old directory name without any functional impact.
 
 ## What It Does

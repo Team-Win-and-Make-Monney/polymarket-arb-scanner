@@ -302,7 +302,7 @@ class TestScanTriangular:
 
     def _setup_three_platform_mocks(self, mod, pm_market, k_market, bf_market):
         """Return a match_side_effect function for 3 platforms."""
-        pm_market.setdefault("clobTokenIds", '["pm-yes", "pm-no"]')
+        pm_market.setdefault("clobTokenIds", "[\"pm-yes\", \"pm-no\"]")
         def match_side_effect(ma, mb, pa, pb, **kwargs):
             pairs = {
                 ("betfair", "kalshi"): (bf_market, k_market),

@@ -14,7 +14,7 @@ import logging
 from config import POLYMARKET_DEFAULT_TAKER_RATE
 from fees import net_profit_logical_arb
 from scans.helpers import _extract_token_ids
-from polymarket_api import fetch_order_book
+from polymarket_api import fetch_order_book, get_best_bid_ask
 
 logger = logging.getLogger(__name__)
 
@@ -155,15 +155,13 @@ def _refine_logical_arb_with_clob(opportunities: list[dict]) -> list[dict]:
                 logger.debug("Dropping logical arb opportunity: CLOB unavailable")
                 continue
 
-            # Get the best ask price from the CLOB
-            asks = then_yes_book.get("asks", [])
-            if_no_asks = if_no_book.get("asks", [])
-            if not asks or not if_no_asks:
+            then_yes_data = get_best_bid_ask(then_yes_book)
+            if_no_data = get_best_bid_ask(if_no_book)
+            clob_ask_price = then_yes_data.get("ask")
+            if_no_ask_price = if_no_data.get("ask")
+            if clob_ask_price is None or if_no_ask_price is None:
                 logger.debug("Dropping logical arb opportunity: executable asks unavailable")
                 continue
-
-            clob_ask_price = float(asks[0].get("price", stage1_then_price))
-            if_no_ask_price = float(if_no_asks[0].get("price", 1.0 - opp.get("_if_price", 0.0)))
 
             # Check for spread widening: if ask price is >30% higher, drop it
             if clob_ask_price > max_ask_price:

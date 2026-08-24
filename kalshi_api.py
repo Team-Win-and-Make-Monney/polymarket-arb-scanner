@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from config import KALSHI_RATE_LIMIT
+from kalshi_policy import live_kalshi_submit_allowed
 from rate_limiter import PlatformCircuitBreaker
 
 KALSHI_BASE_URL = "https://api.elections.kalshi.com"
@@ -625,6 +626,7 @@ class KalshiClient:
         count: int,
         price_dollars: float,
         time_in_force: str = "fill_or_kill",
+        reducing: bool = False,
     ) -> dict | None:
         """Place a limit order on Kalshi.
 
@@ -635,10 +637,15 @@ class KalshiClient:
             count: Number of contracts
             price_dollars: Price per contract in dollars (0.01-0.99)
             time_in_force: "fill_or_kill" (default for arb safety) or "gtc"
+            reducing: Whether the order strictly reduces an existing position.
 
         Returns:
             Order response dict or None on failure.
         """
+        if not live_kalshi_submit_allowed(ticker, reducing=reducing):
+            logger.warning("Kalshi place_order blocked by live policy: %s", ticker)
+            return None
+
         body = {
             "ticker": ticker,
             "side": side,

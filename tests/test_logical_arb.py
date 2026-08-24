@@ -2,6 +2,7 @@
 
 import sys
 import os
+import math
 import pytest
 import json
 from unittest.mock import patch, MagicMock
@@ -39,13 +40,39 @@ def mock_extract_token_ids(market: dict) -> list:
 helpers._extract_token_ids = mock_extract_token_ids
 
 
+def _validated_best_bid_ask(order_book: dict) -> dict:
+    """Test stub matching the production executable-ask contract."""
+    result = {"bid": None, "bid_size": None, "ask": None, "ask_size": None}
+    asks = order_book.get("asks", [])
+    if asks:
+        try:
+            price = float(asks[0].get("price"))
+            size = float(asks[0].get("size"))
+        except (TypeError, ValueError):
+            return result
+        if math.isfinite(price) and math.isfinite(size) and 0.0 < price < 1.0 and size > 0.0:
+            result["ask"] = price
+            result["ask_size"] = size
+    return result
+
+
 def _import_logical_arb():
     """Import or reimport the logical_arb module."""
     sys.modules.pop("scans.logical_arb", None)
-    from scans.logical_arb import (
-        scan_logical_arb,
-        _refine_logical_arb_with_clob,
-    )
+    saved_polymarket_api = sys.modules.get("polymarket_api")
+    polymarket_stub = MagicMock()
+    polymarket_stub.get_best_bid_ask.side_effect = _validated_best_bid_ask
+    sys.modules["polymarket_api"] = polymarket_stub
+    try:
+        from scans.logical_arb import (
+            scan_logical_arb,
+            _refine_logical_arb_with_clob,
+        )
+    finally:
+        if saved_polymarket_api is not None:
+            sys.modules["polymarket_api"] = saved_polymarket_api
+        else:
+            sys.modules.pop("polymarket_api", None)
     return scan_logical_arb, _refine_logical_arb_with_clob
 
 
@@ -375,6 +402,26 @@ class TestRefinementStage2:
         with patch("scans.logical_arb.fetch_order_book") as mock_fetch:
             mock_fetch.return_value = None
 
+            refined = _refine_logical_arb_with_clob(opportunities)
+
+        assert refined == []
+
+    def test_invalid_executable_ask_fails_closed(self):
+        """A non-finite ask must not fall back to the Stage 1 price."""
+        _, _refine_logical_arb_with_clob = _import_logical_arb()
+        opportunities = [{
+            "type": "LogicalArb",
+            "_then_price": 0.40,
+            "_token_ids": ["token-yes", "token-no"],
+            "_if_token_ids": ["if-yes", "if-no"],
+            "_market_key": "market-1",
+        }]
+
+        with patch("scans.logical_arb.fetch_order_book") as mock_fetch:
+            mock_fetch.side_effect = [
+                {"asks": [{"price": "nan", "size": 100}]},
+                {"asks": [{"price": 0.35, "size": 100}]},
+            ]
             refined = _refine_logical_arb_with_clob(opportunities)
 
         assert refined == []

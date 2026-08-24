@@ -297,6 +297,7 @@ class TestRestClientShim:
 
         monkeypatch.setenv("SUPABASE_URL", url)
         monkeypatch.setenv("SUPABASE_SERVICE_KEY", "svc-key")
+        monkeypatch.delenv("ALLOW_PRIVATE_INTERNAL_URLS", raising=False)
         with pytest.raises(ValueError, match="SUPABASE_URL"):
             supabase_sync.build_client_from_env()
 

@@ -600,6 +600,19 @@ class TestEdgeCases:
 
         assert len(opps) == 0
 
+    def test_market_nonnumeric_resolution_timestamp(self):
+        markets_by_key = {
+            "market_1": {
+                "question": "Test?",
+                "resolutionSource": {"timestamp": "unknown"},
+                "price": 0.90,
+            }
+        }
+        mock_aggregator = MagicMock()
+        mock_aggregator.get_consensus.return_value = 0.95
+
+        assert scan_time_decay(markets_by_key, mock_aggregator) == []
+
     def test_market_none_consensus(self):
         """Market with None consensus should be skipped."""
         now = 1712282400

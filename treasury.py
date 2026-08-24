@@ -97,6 +97,36 @@ class TreasuryManager:
     # Public API
     # -------------------------------------------------------------------
 
+    @staticmethod
+    def _existing_transfer_result(
+        existing: dict,
+        from_platform: str,
+        to_platform: str,
+        amount_usd: float,
+    ) -> TransferResult:
+        """Return a prior result only when its idempotency payload matches."""
+        existing_amount = existing.get("amount_usd")
+        payload_matches = (
+            existing.get("from_platform") == from_platform
+            and existing.get("to_platform") == to_platform
+            and isinstance(existing_amount, (int, float))
+            and abs(float(existing_amount) - float(amount_usd)) < 1e-9
+        )
+        if not payload_matches:
+            return TransferResult(
+                ok=False,
+                transfer_id=existing.get("id"),
+                error="idempotency key payload mismatch",
+            )
+        status = existing.get("status")
+        return TransferResult(
+            ok=status in ("pending", "dry_run", "succeeded"),
+            transfer_id=existing.get("id"),
+            tx_hash=existing.get("tx_hash"),
+            error=existing.get("error"),
+            dry_run=status == "dry_run",
+        )
+
     def execute_transfer(
         self,
         from_platform: str,
@@ -134,6 +164,15 @@ class TreasuryManager:
                       f"${config.MIN_TRANSFER_AMOUNT:.2f}",
             )
 
+        idempotency_key = idempotency_key or self._build_idempotency_key(
+            from_platform, to_platform, amount_usd)
+        if self.db:
+            existing = self.db.get_transfer_by_idempotency_key(idempotency_key)
+            if existing:
+                return self._existing_transfer_result(
+                    existing, from_platform, to_platform, amount_usd,
+                )
+
         if self.kill_switch and callable(self.kill_switch) and self.kill_switch():
             return TransferResult(ok=False, error="kill switch engaged")
 
@@ -165,9 +204,6 @@ class TreasuryManager:
             if not gas_ok:
                 return TransferResult(ok=False, error="gas above ceiling")
 
-        idempotency_key = idempotency_key or self._build_idempotency_key(
-            from_platform, to_platform, amount_usd)
-
         # Audit row first so we always know we tried
         if self.db:
             transfer_id, created = self.db.claim_transfer(
@@ -178,13 +214,8 @@ class TreasuryManager:
             )
             if not created:
                 existing = self.db.get_transfer_by_idempotency_key(idempotency_key) or {}
-                status = existing.get("status")
-                return TransferResult(
-                    ok=status in ("pending", "dry_run", "succeeded"),
-                    transfer_id=transfer_id,
-                    tx_hash=existing.get("tx_hash"),
-                    error=existing.get("error"),
-                    dry_run=status == "dry_run",
+                return self._existing_transfer_result(
+                    existing, from_platform, to_platform, amount_usd,
                 )
         else:
             transfer_id = None

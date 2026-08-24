@@ -71,11 +71,15 @@ def get_strategy_metrics(
         query = """
             WITH strategy_trades AS (
                 SELECT
+                    id,
                     type,
                     net_profit,
                     timestamp,
-                    ROW_NUMBER() OVER (PARTITION BY type ORDER BY timestamp) as rn,
-                    SUM(net_profit) OVER (PARTITION BY type ORDER BY timestamp) as cumulative_pnl
+                    ROW_NUMBER() OVER (PARTITION BY type ORDER BY timestamp, id) as rn,
+                    SUM(net_profit) OVER (
+                        PARTITION BY type ORDER BY timestamp, id
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) as cumulative_pnl
                 FROM opportunities
                 WHERE timestamp >= ?
                   AND action IN ('executed', 'filled', 'dry_run')
@@ -86,7 +90,7 @@ def get_strategy_metrics(
                     GREATEST(
                         0,
                         MAX(cumulative_pnl) OVER (
-                            PARTITION BY type ORDER BY timestamp
+                            PARTITION BY type ORDER BY timestamp, id
                             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
                         )
                     ) as running_peak

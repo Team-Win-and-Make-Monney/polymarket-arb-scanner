@@ -1067,6 +1067,7 @@ class KalshiMMPilot:
                 resp = self._client.place_order(
                     ticker=ticker, side=side, action=action, count=count,
                     price_dollars=price, time_in_force=tif,
+                    reducing=reducing,
                 )
             except Exception:
                 logger.exception("MM pilot place_order outcome indeterminate "

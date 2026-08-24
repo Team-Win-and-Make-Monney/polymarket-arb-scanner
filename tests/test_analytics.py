@@ -164,6 +164,25 @@ class TestDuckDBAnalytics(unittest.TestCase):
         assert len(result) == 1
         assert result[0]["max_drawdown"] == pytest.approx(0.10, abs=0.001)
 
+    def test_max_drawdown_includes_same_timestamp_loss(self):
+        """Stable id ordering must expose losses among timestamp peers."""
+        conn = sqlite3.connect(self.db_path)
+        timestamp = datetime.now(timezone.utc).isoformat()
+        trades = [(0.10, "first"), (-0.08, "second"), (0.02, "third")]
+        for profit, market in trades:
+            conn.execute(
+                "INSERT INTO opportunities (timestamp, type, market, prices, total_cost, net_profit, "
+                "net_roi, depth, action) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (timestamp, "same-ts", market, None, 1.0, profit, profit, 1.0, "executed"),
+            )
+        conn.commit()
+        conn.close()
+
+        result = get_strategy_metrics(db_path=self.db_path, lookback_days=7)
+
+        assert len(result) == 1
+        assert result[0]["max_drawdown"] == pytest.approx(0.08, abs=0.001)
+
     def test_cutoff_timestamp_7_days_before_now(self):
         """Test 6: Cutoff is exactly 7 days before now; trades outside window excluded."""
         conn = sqlite3.connect(self.db_path)

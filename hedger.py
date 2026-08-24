@@ -223,7 +223,8 @@ class PartialFillHedger:
                        max_contracts, ticker)
             count = max_contracts
         resp = self.kalshi_client.place_order(ticker=ticker, side=side, action=action,
-                                               count=count, price_dollars=touch)
+                                               count=count, price_dollars=touch,
+                                               reducing=True)
         return resp is not None
 
     def _hedge_betfair(self, pf: dict, fill_price: float, size: float, max_loss: float) -> bool:

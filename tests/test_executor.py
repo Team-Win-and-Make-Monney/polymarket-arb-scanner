@@ -1509,6 +1509,25 @@ class TestRevalidateTriangular:
         assert result is True
 
 
+class TestRevalidateLogicalArb:
+    def test_invalid_executable_ask_fails_closed(self, executor):
+        opp = {
+            "type": "LogicalArb",
+            "net_profit": 0.10,
+            "total_cost": "$0.7000",
+            "_then_price": 0.40,
+            "_token_ids": ["then-yes", "then-no"],
+            "_if_token_ids": ["if-yes", "if-no"],
+        }
+        books = [
+            {"asks": [{"price": "nan", "size": "100"}]},
+            {"asks": [{"price": "0.35", "size": "100"}]},
+        ]
+
+        with patch("executor.fetch_order_book", side_effect=books):
+            assert executor._revalidate(opp, None) is False
+
+
 # ---------------------------------------------------------------------------
 # _revalidate_negrisk
 # ---------------------------------------------------------------------------

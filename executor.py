@@ -1345,13 +1345,12 @@ class ArbitrageExecutor:
             if not then_yes_book or not if_no_book:
                 raise _RevalidationAPIError("logical_arb CLOB unavailable")
 
-            then_yes_asks = then_yes_book.get("asks", [])
-            if_no_asks = if_no_book.get("asks", [])
-            if not then_yes_asks or not if_no_asks:
+            then_yes_data = get_best_bid_ask(then_yes_book)
+            if_no_data = get_best_bid_ask(if_no_book)
+            fresh_then_price = then_yes_data.get("ask")
+            fresh_if_no_price = if_no_data.get("ask")
+            if fresh_then_price is None or fresh_if_no_price is None:
                 raise _RevalidationAPIError("logical_arb executable asks unavailable")
-
-            fresh_then_price = float(then_yes_asks[0].get("price", opp.get("_then_price", 0)))
-            fresh_if_no_price = float(if_no_asks[0].get("price", opp.get("_if_no_price", 1)))
             original_then_price = opp.get("_then_price", fresh_then_price)
 
             # Check for >10% price movement (Layer 4 threshold)

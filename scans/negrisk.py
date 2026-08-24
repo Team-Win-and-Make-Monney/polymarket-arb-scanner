@@ -44,7 +44,7 @@ def _refine_negrisk_with_clob(opportunities: list[dict], events_by_title: dict, 
         event_key = opp.get("_event_key")
         event = events_by_title.get(event_key) if event_key else None
         if not event:
-            refined.append(opp)
+            logger.debug("Dropping NegRisk opportunity: event unavailable during refinement")
             continue
 
         markets = event.get("markets", [])
@@ -55,31 +55,23 @@ def _refine_negrisk_with_clob(opportunities: list[dict], events_by_title: dict, 
 
         for m in markets:
             clob = clob_cache.get(id(m))
-            if clob and clob["yes_ask"] is not None:
-                yes_asks.append(clob["yes_ask"])
+            ask = clob.get("yes_ask") if clob else None
+            if isinstance(ask, (int, float)) and 0.0 < ask < 1.0:
+                yes_asks.append(ask)
                 clob_count += 1
                 depth = clob["yes_ask_size"] or 0
                 min_depth = min(min_depth, depth)
             else:
-                # Fall back to mid-price + $0.01 buffer
-                prices = parse_outcome_prices(m)
-                if prices:
-                    mid_price = prices[0]
-                    yes_asks.append(mid_price + 0.01)
-                else:
-                    yes_asks.append(None)
+                yes_asks.append(None)
 
         # Remove entries where we couldn't get any price
         if None in yes_asks:
-            opp["_clob_refined"] = False
-            refined.append(opp)
+            logger.debug("Dropping NegRisk opportunity: executable YES ask unavailable or invalid")
             continue
 
-        # Require at least 50% of outcomes to have real CLOB data
+        # Every outcome is a required leg; partial coverage is not an arb.
         clob_coverage = clob_count / total_outcomes if total_outcomes > 0 else 0
-        if clob_coverage < 0.5:
-            opp["_clob_refined"] = False
-            refined.append(opp)
+        if clob_coverage < 1.0:
             continue
 
         category = event.get("category") or (markets[0].get("category") if markets else None)
@@ -145,7 +137,7 @@ def scan_negrisk_internal(events: list[dict], min_profit: float,
                 break
             # For negRisk markets, first price is the YES price for that outcome
             yes_price = prices[0]
-            if yes_price <= 0:
+            if not isinstance(yes_price, (int, float)) or not 0.0 < yes_price < 1.0:
                 valid = False
                 break
             yes_prices.append(yes_price)
@@ -324,7 +316,7 @@ def _refine_negrisk_no_side_with_clob(opportunities: list[dict], events_by_title
     for opp in opportunities:
         event = events_by_title.get(opp.get("_event_key"))
         if not event:
-            refined.append(opp)
+            logger.debug("Dropping NegRiskNO opportunity: event unavailable during refinement")
             continue
 
         markets = event.get("markets", [])
@@ -335,27 +327,21 @@ def _refine_negrisk_no_side_with_clob(opportunities: list[dict], events_by_title
 
         for m in markets:
             clob = clob_cache.get(id(m))
-            if clob and clob.get("no_ask") is not None:
-                no_asks.append(clob["no_ask"])
+            ask = clob.get("no_ask") if clob else None
+            if isinstance(ask, (int, float)) and 0.0 < ask < 1.0:
+                no_asks.append(ask)
                 clob_count += 1
                 depth = clob.get("no_ask_size") or 0
                 min_depth = min(min_depth, depth)
             else:
-                prices = parse_outcome_prices(m)
-                if prices and len(prices) > 1:
-                    no_asks.append(prices[1] + 0.01)
-                else:
-                    no_asks.append(None)
+                no_asks.append(None)
 
         if None in no_asks:
-            opp["_clob_refined"] = False
-            refined.append(opp)
+            logger.debug("Dropping NegRiskNO opportunity: executable NO ask unavailable or invalid")
             continue
 
         clob_coverage = clob_count / total_outcomes if total_outcomes > 0 else 0
-        if clob_coverage < 0.5:
-            opp["_clob_refined"] = False
-            refined.append(opp)
+        if clob_coverage < 1.0:
             continue
 
         result = net_profit_negrisk_no_side(no_asks)

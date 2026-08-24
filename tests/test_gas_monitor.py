@@ -303,6 +303,8 @@ class TestShouldExecute:
         """Create a monitor with fixed gas cost."""
         monitor = GasMonitor(enabled=True, safety_margin=1.2)
         monitor.get_polygon_gas_cost = MagicMock(return_value=gas_cost)
+        monitor._gas_source_valid = True
+        monitor._matic_source_valid = True
         return monitor
 
     def test_returns_true_for_profitable_opp(self):
@@ -526,6 +528,25 @@ class TestGracefulFallback:
         # (uses default MATIC price $0.50)
         expected_cost = 30.0 * 21000 * 0.50 / 1e9
         assert gas_cost == pytest.approx(expected_cost)
+
+    def test_fallback_inputs_never_authorize_polymarket_execution(self):
+        monitor = GasMonitor(polygon_rpc_url="http://fake-rpc", enabled=True)
+
+        with patch("gas_monitor.requests.post", side_effect=Exception("rpc down")), \
+             patch("gas_monitor.requests.get", side_effect=Exception("price down")):
+            allowed = monitor.should_execute({
+                "type": "CrossPlatform",
+                "_platform_a": "polymarket",
+                "_platform_b": "kalshi",
+                "net_profit": 100.0,
+            })
+
+        assert allowed is False
+
+    @pytest.mark.parametrize("net_profit", [float("nan"), float("inf"), "bad"])
+    def test_invalid_profit_never_authorizes_execution(self, net_profit):
+        monitor = GasMonitor(enabled=True)
+        assert monitor.should_execute({"type": "KalshiBinary", "net_profit": net_profit}) is False
 
     def test_disabled_monitor_does_not_call_apis(self):
         """When disabled, no HTTP calls should be made."""

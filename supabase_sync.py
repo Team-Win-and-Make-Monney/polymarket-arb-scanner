@@ -16,6 +16,8 @@ import datetime
 import logging
 import os
 
+from url_guard import assert_public_url
+
 logger = logging.getLogger(__name__)
 
 REWARDS_TABLE = 'rewards_events'
@@ -47,7 +49,7 @@ def reward_metric_to_event(row: dict) -> dict:
     Returns:
         A rewards_events record dict.
     """
-    ts = int(row.get('timestamp', 0))
+    ts = int(row.get('timestamp') or 0)
     event_date = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).date().isoformat()
     return {
         'engine': _engine_for(row.get('platform', 'unknown')),
@@ -81,6 +83,7 @@ def build_client_from_env():
         raise RuntimeError(
             'SUPABASE_URL and SUPABASE_SERVICE_KEY (or SUPABASE_KEY) must be set'
         )
+    url = assert_public_url(url, env_name='SUPABASE_URL', allow_http=False)
     try:
         from supabase import create_client
     except ImportError:

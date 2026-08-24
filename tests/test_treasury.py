@@ -13,6 +13,9 @@ Covers:
 
 import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 from unittest.mock import MagicMock
 
@@ -99,6 +102,52 @@ class TestRiskGates:
         assert result.ok is False
         assert "kill switch" in (result.error or "")
 
+    def test_missing_audit_database_fails_closed(self):
+        TreasuryManager, _, _ = _import_treasury()
+        gemini = MagicMock()
+        tm = TreasuryManager(db=None, gemini_client=gemini, dry_run=False)
+
+        result = tm.execute_transfer("gemini", "polymarket", 100.0)
+
+        assert result.ok is False
+        assert result.error == "transfer audit unavailable"
+        gemini.withdraw_usdc.assert_not_called()
+
+    def test_initial_audit_lookup_failure_fails_closed(self):
+        TreasuryManager, _, _ = _import_treasury()
+        audit_db = MagicMock()
+        audit_db.get_transfer_by_idempotency_key.side_effect = RuntimeError(
+            "database unavailable"
+        )
+        tm = TreasuryManager(db=audit_db, dry_run=True)
+
+        result = tm.execute_transfer(
+            "gemini", "polymarket", 100.0, idempotency_key="lookup_failure",
+        )
+
+        assert result.ok is False
+        assert result.error == "transfer audit unavailable"
+        audit_db.claim_transfer_with_daily_limit.assert_not_called()
+
+    def test_post_claim_audit_lookup_failure_fails_closed(self):
+        TreasuryManager, _, _ = _import_treasury()
+        audit_db = MagicMock()
+        audit_db.get_transfer_by_idempotency_key.side_effect = [
+            None,
+            RuntimeError("database unavailable"),
+        ]
+        audit_db.claim_transfer_with_daily_limit.return_value = (1, False, None)
+        tm = TreasuryManager(db=audit_db, dry_run=True)
+
+        result = tm.execute_transfer(
+            "gemini", "polymarket", 100.0,
+            idempotency_key="post_claim_lookup_failure",
+        )
+
+        assert result.ok is False
+        assert result.error == "transfer audit unavailable"
+        assert audit_db.get_transfer_by_idempotency_key.call_count == 2
+
     def test_daily_limit_blocks_overflow(self, db):
         TreasuryManager, _, _ = _import_treasury()
         tm = TreasuryManager(db=db, dry_run=True)
@@ -112,6 +161,41 @@ class TestRiskGates:
                                  idempotency_key="explicit_3")
         assert r3.ok is False
         assert "Daily limit" in (r3.error or "")
+
+    def test_concurrent_distinct_claims_cannot_exceed_daily_limit(
+            self, tmp_path, monkeypatch):
+        TreasuryManager, _, _ = _import_treasury()
+        import config
+        monkeypatch.setattr(config, "MAX_AUTO_TRANSFER_PER_DAY", 100.0)
+        db_path = str(tmp_path / "concurrent-transfers.db")
+        db_one = TradeDB(db_path)
+        db_two = TradeDB(db_path)
+        managers = (
+            TreasuryManager(db=db_one, dry_run=True),
+            TreasuryManager(db=db_two, dry_run=True),
+        )
+        start = threading.Barrier(2)
+
+        def attempt(item):
+            tm, key = item
+            start.wait(timeout=2)
+            return tm.execute_transfer(
+                "gemini", "polymarket", 60.0, idempotency_key=key,
+            )
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(
+                    attempt,
+                    zip(managers, ("concurrent_1", "concurrent_2")),
+                ))
+
+            assert sum(result.ok for result in results) == 1
+            assert sum(row["amount_usd"] for row in db_one.get_transfers_today()
+                       if row["status"] in ("succeeded", "pending", "dry_run")) <= 100.0
+        finally:
+            db_one.close()
+            db_two.close()
 
 
 # ---------------------------------------------------------------------------
@@ -183,12 +267,60 @@ class TestIdempotency:
                                  idempotency_key=key)
         r2 = tm.execute_transfer("gemini", "polymarket", 100.0,
                                  idempotency_key=key)
-        # Both calls must surface the same transfer id; the live withdraw
-        # is called twice (the gate is the DB UNIQUE constraint), but the
-        # audit table still has exactly one row.
+        # Both calls surface the same transfer id and the venue is called once.
         assert r1.transfer_id == r2.transfer_id
+        gemini.withdraw_usdc.assert_called_once_with(
+            address="0xPMproxy123", amount=100.0,
+        )
         rows = db.get_transfers_today()
         assert len(rows) == 1
+
+    def test_replay_returns_prior_result_before_daily_limit_gate(self, db, monkeypatch):
+        TreasuryManager, _, _ = _import_treasury()
+        tm = TreasuryManager(db=db, dry_run=True)
+        key = "replay_after_limit"
+        first = tm.execute_transfer("gemini", "polymarket", 100.0, idempotency_key=key)
+        import config
+        monkeypatch.setattr(config, "MAX_AUTO_TRANSFER_PER_DAY", 0.0)
+
+        replay = tm.execute_transfer("gemini", "polymarket", 100.0, idempotency_key=key)
+
+        assert replay.ok is True
+        assert replay.transfer_id == first.transfer_id
+        assert replay.dry_run is True
+
+    def test_reused_key_with_different_payload_is_rejected(self, db):
+        TreasuryManager, _, _ = _import_treasury()
+        tm = TreasuryManager(db=db, dry_run=True)
+        key = "payload_bound_key"
+        first = tm.execute_transfer("gemini", "polymarket", 100.0, idempotency_key=key)
+
+        mismatch = tm.execute_transfer("gemini", "polymarket", 125.0, idempotency_key=key)
+
+        assert first.ok is True
+        assert mismatch.ok is False
+        assert mismatch.transfer_id == first.transfer_id
+        assert "payload mismatch" in (mismatch.error or "")
+
+    def test_pending_replay_reports_in_progress_not_success(self, db):
+        TreasuryManager, _, _ = _import_treasury()
+        tm = TreasuryManager(db=db, dry_run=True)
+        transfer_id, created = db.claim_transfer(
+            from_platform="gemini",
+            to_platform="polymarket",
+            amount_usd=100.0,
+            idempotency_key="pending_key",
+        )
+        assert created is True
+
+        replay = tm.execute_transfer(
+            "gemini", "polymarket", 100.0,
+            idempotency_key="pending_key",
+        )
+
+        assert replay.ok is False
+        assert replay.transfer_id == transfer_id
+        assert "in progress" in (replay.error or "")
 
 
 # ---------------------------------------------------------------------------

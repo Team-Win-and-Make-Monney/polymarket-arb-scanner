@@ -277,6 +277,24 @@ class TestKalshiOrders:
         assert result is None
 
     @patch("kalshi_api._rate_limit")
+    def test_place_order_blocks_disallowed_ticker_at_client_boundary(self, mock_rl, client):
+        result = client.place_order("KXNFLGAME-26AUG18", "yes", "buy", 1, 0.50)
+
+        assert result is None
+        client.session.request.assert_not_called()
+
+    @patch("kalshi_api._rate_limit")
+    def test_place_order_allows_reducing_disallowed_ticker(self, mock_rl, client):
+        client.session.request.return_value = _mock_response(201, {"order": {"id": "flatten"}})
+
+        result = client.place_order(
+            "KXNFLGAME-26AUG18", "yes", "sell", 1, 0.50, reducing=True,
+        )
+
+        assert result == {"order": {"id": "flatten"}}
+        client.session.request.assert_called_once()
+
+    @patch("kalshi_api._rate_limit")
     def test_get_order_status_success(self, mock_rl, client):
         """get_order_status returns order dict."""
         client.session.request.return_value = _mock_response(

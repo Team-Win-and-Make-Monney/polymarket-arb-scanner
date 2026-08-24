@@ -1030,6 +1030,103 @@ class TradeDB:
             )
             self.conn.commit()
 
+    def claim_transfer(
+        self,
+        from_platform: str,
+        to_platform: str,
+        amount_usd: float,
+        idempotency_key: str,
+    ) -> tuple[int | None, bool]:
+        """Atomically claim an idempotency key for a pending transfer."""
+        with self._lock:
+            cur = self.conn.execute(
+                """INSERT OR IGNORE INTO transfers
+                   (timestamp, from_platform, to_platform, amount_usd,
+                    status, idempotency_key)
+                   VALUES (?, ?, ?, ?, 'pending', ?)""",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    from_platform,
+                    to_platform,
+                    amount_usd,
+                    idempotency_key,
+                ),
+            )
+            created = cur.rowcount == 1
+            row = self.conn.execute(
+                "SELECT id FROM transfers WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            self.conn.commit()
+            return (row["id"] if row else None), created
+
+    def claim_transfer_with_daily_limit(
+        self,
+        from_platform: str,
+        to_platform: str,
+        amount_usd: float,
+        idempotency_key: str,
+        max_daily_usd: float,
+    ) -> tuple[int | None, bool, float | None]:
+        """Atomically enforce the rolling daily cap and claim a transfer.
+
+        Returns the transfer id and whether this call created it. The third
+        value is the amount already used when the daily cap rejects the claim,
+        otherwise ``None``. ``BEGIN IMMEDIATE`` serializes the read-and-insert
+        across separate SQLite connections as well as this instance's lock.
+        """
+        cutoff = datetime.now(timezone.utc).timestamp() - 86400
+        with self._lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self.conn.execute(
+                    "SELECT id FROM transfers WHERE idempotency_key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if existing:
+                    self.conn.commit()
+                    return existing["id"], False, None
+
+                row = self.conn.execute(
+                    """SELECT COALESCE(SUM(amount_usd), 0.0) AS used_usd
+                       FROM transfers
+                       WHERE strftime('%s', timestamp) >= ?
+                         AND status IN ('succeeded', 'pending', 'dry_run')""",
+                    (str(int(cutoff)),),
+                ).fetchone()
+                used_today = float(row["used_usd"] if row else 0.0)
+                if used_today + amount_usd > max_daily_usd:
+                    self.conn.commit()
+                    return None, False, used_today
+
+                cur = self.conn.execute(
+                    """INSERT INTO transfers
+                       (timestamp, from_platform, to_platform, amount_usd,
+                        status, idempotency_key)
+                       VALUES (?, ?, ?, ?, 'pending', ?)""",
+                    (
+                        datetime.now(timezone.utc).isoformat(),
+                        from_platform,
+                        to_platform,
+                        amount_usd,
+                        idempotency_key,
+                    ),
+                )
+                self.conn.commit()
+                return cur.lastrowid, True, None
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def get_transfer_by_idempotency_key(self, idempotency_key: str) -> dict | None:
+        """Return the transfer already associated with an idempotency key."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM transfers WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def get_transfers_today(self) -> list[dict]:
         """Return transfers initiated in the last 24h. Used for daily limits."""
         cutoff = (datetime.now(timezone.utc).timestamp() - 86400)

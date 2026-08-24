@@ -8,6 +8,7 @@ the authority snapshot, or the command that performs a consequential action.
 from __future__ import annotations
 
 import json
+import math
 import os
 import stat
 import subprocess
@@ -127,10 +128,14 @@ class CommandIntentAdapter:
         mode = executable.stat().st_mode
         if not stat.S_ISREG(mode) or not os.access(executable, os.X_OK):
             raise RuntimeError(f"executor is not an executable regular file: {executable}")
-        if isinstance(timeout_seconds, bool) or float(timeout_seconds) <= 0:
-            raise RuntimeError("executor timeout_seconds must be > 0")
+        try:
+            timeout = float(timeout_seconds)
+        except (TypeError, ValueError):
+            raise RuntimeError("executor timeout_seconds must be finite and > 0") from None
+        if isinstance(timeout_seconds, bool) or not math.isfinite(timeout) or timeout <= 0:
+            raise RuntimeError("executor timeout_seconds must be finite and > 0")
         self.argv = [str(executable), *argv[1:]]
-        self.timeout_seconds = float(timeout_seconds)
+        self.timeout_seconds = timeout
 
     def __call__(self, intent: Intent) -> ExecutionResult:
         try:

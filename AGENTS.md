@@ -27,7 +27,9 @@ python scanner.py --mode cross-all
 
 # Execution controls
 python scanner.py --dry-run                         # detect only (default)
-python scanner.py --exec-mode full-auto --max-trade 10  # live trading
+# Live Kalshi D0: scripts/launch-kalshi-d0-live.sh
+# DRY_RUN=false requires artifacts/live-envelope.json (five operator fields).
+# Do not invent venue, pair, max_notional_usd, max_daily_loss_usd, or kill_switch.
 ```
 
 ## Testing
@@ -116,6 +118,9 @@ All scan modules follow: mid-price scan (fast) → CLOB refinement (`_refine_*_w
 ### Config
 `config.py` uses typed env helpers (`_env_float`, `_env_int`, `_env_bool`) that raise `ConfigError` on invalid input. Precedence: CLI args > env vars > defaults in `config.py`.
 
+### Live Kalshi D0
+The currently verified operating target is live Kalshi D0 via `scripts/launch-kalshi-d0-live.sh`. `DRY_RUN=false` fail-closes unless `artifacts/live-envelope.json` contains venue, pair, max_notional_usd, max_daily_loss_usd, and kill_switch from one operator message. Agents do not invent those fields. Other adapter-backed venues need their own validated authority, account, eligibility, limit, emergency-stop, and action-time approval gates. User-reported access is not independent eligibility verification. `kalshi_policy.live_kalshi_submit_allowed` guards every Kalshi submit path. LLM agents do not pick quotes.
+
 ## Adding a New Opportunity Type
 1. Create the scan in `scans/<name>.py` following the two-stage pattern.
 2. Add the fee function in `fees.py`.
@@ -130,5 +135,5 @@ Add entries to `_CROSS_FEE_FUNCS` in `scans/cross.py` using `functools.partial(n
 `.env`, `.env.*`, `*.pem`, `*.key`, `*credential*`, `secrets/*`
 
 ## CI / CD & Deployment
-- `.github/workflows/test.yml` — pytest on PRs to `master` (Python 3.12). A baseline of up to 315 non-passing tests is tolerated.
+- `.github/workflows/test.yml` — correctness lint plus pytest on PRs to `master` (Python 3.12); any failure or collection crash fails CI.
 - Railway auto-deploys on push to `master` via GitHub integration. Dockerfile-based build (`python:3.12-slim`).

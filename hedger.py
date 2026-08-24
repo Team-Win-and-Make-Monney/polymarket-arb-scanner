@@ -187,6 +187,10 @@ class PartialFillHedger:
             logger.info("Kalshi hedge: max_contracts=%s — nothing to reduce, "
                        "skipping %s %s on %s", max_contracts, action, side, ticker)
             return False
+        from kalshi_policy import live_kalshi_submit_allowed
+        if not live_kalshi_submit_allowed(ticker, reducing=True):
+            logger.warning("Kalshi hedge blocked by live policy: %s", ticker)
+            return False
         book = self.kalshi_client.fetch_order_book(ticker)
         if not book:
             return False
@@ -219,7 +223,8 @@ class PartialFillHedger:
                        max_contracts, ticker)
             count = max_contracts
         resp = self.kalshi_client.place_order(ticker=ticker, side=side, action=action,
-                                               count=count, price_dollars=touch)
+                                               count=count, price_dollars=touch,
+                                               reducing=True)
         return resp is not None
 
     def _hedge_betfair(self, pf: dict, fill_price: float, size: float, max_loss: float) -> bool:

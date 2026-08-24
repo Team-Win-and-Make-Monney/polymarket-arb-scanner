@@ -48,6 +48,10 @@ class TestMapping:
         assert 'cancelled' in event['notes']
         assert 'resting_s=42' in event['notes']
 
+    def test_none_timestamp_uses_epoch(self):
+        event = reward_metric_to_event(_metric(timestamp=None))
+        assert event['event_date'] == '1970-01-01'
+
 
 class _FakeUpsertChain:
     def __init__(self, recorder):
@@ -286,6 +290,16 @@ class TestRestClientShim:
         monkeypatch.setattr(builtins, "__import__", _no_sdk)
         client = supabase_sync.build_client_from_env()
         assert isinstance(client, supabase_sync.PostgrestClient)
+
+    @pytest.mark.parametrize("url", ["http://proj.supabase.co", "https://127.0.0.1"])
+    def test_build_client_rejects_unsafe_url(self, monkeypatch, url):
+        import supabase_sync
+
+        monkeypatch.setenv("SUPABASE_URL", url)
+        monkeypatch.setenv("SUPABASE_SERVICE_KEY", "svc-key")
+        monkeypatch.delenv("ALLOW_PRIVATE_INTERNAL_URLS", raising=False)
+        with pytest.raises(ValueError, match="SUPABASE_URL"):
+            supabase_sync.build_client_from_env()
 
 
 class TestWindowSeededHighWaterMark:

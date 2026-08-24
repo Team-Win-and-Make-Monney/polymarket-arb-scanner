@@ -1,6 +1,7 @@
 """Real-time gas price monitor for dynamic fee-aware arbitrage thresholds."""
 
 import logging
+import math
 import threading
 import time
 
@@ -83,6 +84,8 @@ class GasMonitor:
         # Default fallbacks
         self._default_gas_gwei = 30.0
         self._default_matic_price = 0.50
+        self._gas_source_valid = False
+        self._matic_source_valid = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -180,9 +183,21 @@ class GasMonitor:
         if not self.enabled:
             return True
 
-        net_profit = opp.get("net_profit", 0)
+        try:
+            net_profit = float(opp.get("net_profit", 0))
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(net_profit):
+            return False
         platform_a, platform_b = self._infer_platforms(opp)
+        gas_txns = self.PLATFORM_GAS_TXNS.get(platform_a, 0) + self.PLATFORM_GAS_TXNS.get(platform_b, 0)
+        if gas_txns == 0:
+            return True
         threshold = self.get_effective_threshold(platform_a, platform_b)
+
+        if not self._gas_source_valid or not self._matic_source_valid:
+            logger.warning("Gas-aware execution blocked: live gas or token-price input unavailable")
+            return False
 
         if net_profit < threshold:
             logger.debug(
@@ -226,9 +241,13 @@ class GasMonitor:
             # Result is hex string in Wei
             gas_wei = int(data["result"], 16)
             gas_gwei = gas_wei / 1e9
+            if not math.isfinite(gas_gwei) or gas_gwei <= 0:
+                raise ValueError("non-positive or non-finite gas price")
+            self._gas_source_valid = True
             logger.debug("Polygon gas price: %.2f Gwei", gas_gwei)
             return gas_gwei
         except Exception as exc:
+            self._gas_source_valid = False
             logger.warning(
                 "Failed to fetch Polygon gas price: %s. Using default %.1f Gwei",
                 exc,
@@ -254,10 +273,12 @@ class GasMonitor:
 
         with self._matic_lock:
             if price is not None:
+                self._matic_source_valid = True
                 self._matic_price = price
                 self._matic_price_ts = time.time()
                 return price
             if self._matic_price is not None:
+                self._matic_source_valid = False
                 # Fetch failed: keep the last-good price rather than
                 # poisoning the cache with the default; bump ts so a flaky
                 # CoinGecko is not hammered every call.
@@ -271,6 +292,7 @@ class GasMonitor:
                 self._default_matic_price)
             self._matic_price = self._default_matic_price
             self._matic_price_ts = time.time()
+            self._matic_source_valid = False
             return self._default_matic_price
 
     def _do_fetch_matic_price(self) -> float | None:
@@ -299,6 +321,8 @@ class GasMonitor:
                 usd = (data.get(coin_id) or {}).get("usd")
                 if usd is not None:
                     price = float(usd)
+                    if not math.isfinite(price) or price <= 0:
+                        raise ValueError("non-positive or non-finite Polygon token price")
                     logger.debug("Polygon gas-token price: $%.4f (%s)", price, coin_id)
                     return price
             logger.warning("CoinGecko returned no usd price for POL/MATIC: %s", data)

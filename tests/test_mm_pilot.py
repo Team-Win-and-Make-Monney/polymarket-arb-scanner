@@ -76,7 +76,7 @@ class FakeKalshiClient:
         return self.books.get(ticker)
 
     def place_order(self, ticker, side, action, count, price_dollars,
-                    time_in_force="fill_or_kill"):
+                    time_in_force="fill_or_kill", reducing=False):
         self.place_order_calls += 1
         if self.fail_place:
             return None
@@ -84,6 +84,7 @@ class FakeKalshiClient:
         self.placed.append({
             "order_id": oid, "ticker": ticker, "side": side, "action": action,
             "count": count, "price": price_dollars, "tif": time_in_force,
+            "reducing": reducing,
         })
         return {"order": {"order_id": oid}}
 
@@ -485,6 +486,14 @@ class TestKillSwitch:
         client = build_controls_client_from_env()
 
         assert client._key == "service-role-test"
+
+    @pytest.mark.parametrize("url", ["http://example.supabase.co", "https://169.254.169.254"])
+    def test_rest_client_builder_rejects_unsafe_url(self, monkeypatch, url):
+        monkeypatch.setenv("SUPABASE_URL", url)
+        monkeypatch.setenv("SUPABASE_SERVICE_KEY", "service-role-test")
+
+        with pytest.raises(ValueError, match="SUPABASE_URL"):
+            build_controls_client_from_env()
 
     def test_controls_poller_accepts_read_only_rest_client(self, clock):
         client = MagicMock()
@@ -1461,6 +1470,21 @@ class TestInventoryDerivedReduction:
         assert oid is not None
         assert client.placed[-1]["count"] == 5
         assert pilot._orders[oid]["count"] == 5
+
+    def test_derived_reduction_reaches_client_policy_boundary(self, pilot_env,
+                                                               clock):
+        blocked_ticker = "KXNFLGAME-26AUG18"
+        client = FakeKalshiClient(books={blocked_ticker: make_book()})
+        pilot = build_pilot(clock, client=client)
+        pilot.inventory.apply_fill(blocked_ticker, "yes", "buy", 5, 0.49)
+
+        oid = pilot.place_pilot_order(
+            blocked_ticker, "yes", "sell", 5, 0.49,
+            purpose="hedge",
+        )
+
+        assert oid is not None
+        assert client.placed[-1]["reducing"] is True
 
 
 class TestIndeterminatePlacement:

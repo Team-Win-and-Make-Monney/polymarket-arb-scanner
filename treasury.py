@@ -97,6 +97,42 @@ class TreasuryManager:
     # Public API
     # -------------------------------------------------------------------
 
+    @staticmethod
+    def _existing_transfer_result(
+        existing: dict,
+        from_platform: str,
+        to_platform: str,
+        amount_usd: float,
+    ) -> TransferResult:
+        """Return a prior result only when its idempotency payload matches."""
+        existing_amount = existing.get("amount_usd")
+        payload_matches = (
+            existing.get("from_platform") == from_platform
+            and existing.get("to_platform") == to_platform
+            and isinstance(existing_amount, (int, float))
+            and abs(float(existing_amount) - float(amount_usd)) < 1e-9
+        )
+        if not payload_matches:
+            return TransferResult(
+                ok=False,
+                transfer_id=existing.get("id"),
+                error="idempotency key payload mismatch",
+            )
+        status = existing.get("status")
+        if status == "pending":
+            return TransferResult(
+                ok=False,
+                transfer_id=existing.get("id"),
+                error="transfer already in progress",
+            )
+        return TransferResult(
+            ok=status in ("dry_run", "succeeded"),
+            transfer_id=existing.get("id"),
+            tx_hash=existing.get("tx_hash"),
+            error=existing.get("error"),
+            dry_run=status == "dry_run",
+        )
+
     def execute_transfer(
         self,
         from_platform: str,
@@ -134,28 +170,23 @@ class TreasuryManager:
                       f"${config.MIN_TRANSFER_AMOUNT:.2f}",
             )
 
+        if self.db is None:
+            return TransferResult(ok=False, error="transfer audit unavailable")
+
+        idempotency_key = idempotency_key or self._build_idempotency_key(
+            from_platform, to_platform, amount_usd)
+        try:
+            existing = self.db.get_transfer_by_idempotency_key(idempotency_key)
+        except Exception as exc:
+            logger.exception("treasury: failed to read transfer audit: %s", exc)
+            return TransferResult(ok=False, error="transfer audit unavailable")
+        if existing:
+            return self._existing_transfer_result(
+                existing, from_platform, to_platform, amount_usd,
+            )
+
         if self.kill_switch and callable(self.kill_switch) and self.kill_switch():
             return TransferResult(ok=False, error="kill switch engaged")
-
-        # Daily rolling limit — sum amounts of last-24h transfers
-        try:
-            recent = self.db.get_transfers_today() if self.db else []
-        except Exception as exc:
-            logger.exception("treasury: failed to read recent transfers: %s", exc)
-            recent = []
-        # "dry_run" counts toward the daily cap so DRY_RUN exercises the gate
-        # the same way live operation will.
-        used_today = sum(r.get("amount_usd", 0.0) for r in recent
-                         if r.get("status") in ("succeeded", "pending", "dry_run"))
-        if used_today + amount_usd > config.MAX_AUTO_TRANSFER_PER_DAY:
-            return TransferResult(
-                ok=False,
-                error=(
-                    f"Daily limit hit: ${used_today:.2f} used + ${amount_usd:.2f} "
-                    f"requested > MAX_AUTO_TRANSFER_PER_DAY "
-                    f"${config.MAX_AUTO_TRANSFER_PER_DAY:.2f}"
-                ),
-            )
 
         if self.gas_monitor is not None:
             try:
@@ -165,20 +196,43 @@ class TreasuryManager:
             if not gas_ok:
                 return TransferResult(ok=False, error="gas above ceiling")
 
-        idempotency_key = idempotency_key or self._build_idempotency_key(
-            from_platform, to_platform, amount_usd)
-
         # Audit row first so we always know we tried
-        transfer_id = self.db.log_transfer(
-            from_platform=from_platform,
-            to_platform=to_platform,
-            amount_usd=amount_usd,
-            idempotency_key=idempotency_key,
-            status="pending",
-        ) if self.db else None
+        try:
+            transfer_id, created, used_today = (
+                self.db.claim_transfer_with_daily_limit(
+                    from_platform=from_platform,
+                    to_platform=to_platform,
+                    amount_usd=amount_usd,
+                    idempotency_key=idempotency_key,
+                    max_daily_usd=config.MAX_AUTO_TRANSFER_PER_DAY,
+                )
+            )
+        except Exception as exc:
+            logger.exception("treasury: failed to claim transfer: %s", exc)
+            return TransferResult(ok=False, error="transfer audit unavailable")
+        if used_today is not None:
+            return TransferResult(
+                ok=False,
+                error=(
+                    f"Daily limit hit: ${used_today:.2f} used + ${amount_usd:.2f} "
+                    f"requested > MAX_AUTO_TRANSFER_PER_DAY "
+                    f"${config.MAX_AUTO_TRANSFER_PER_DAY:.2f}"
+                ),
+            )
+        if not created:
+            try:
+                existing = (
+                    self.db.get_transfer_by_idempotency_key(idempotency_key) or {}
+                )
+            except Exception as exc:
+                logger.exception("treasury: failed to read claimed transfer: %s", exc)
+                return TransferResult(ok=False, error="transfer audit unavailable")
+            return self._existing_transfer_result(
+                existing, from_platform, to_platform, amount_usd,
+            )
 
         if self.dry_run:
-            if transfer_id is not None and self.db:
+            if transfer_id is not None:
                 self.db.update_transfer(transfer_id, status="dry_run")
             return TransferResult(ok=True, transfer_id=transfer_id, dry_run=True)
 
@@ -192,13 +246,13 @@ class TreasuryManager:
                 raise ValueError("unreachable")
         except Exception as exc:
             logger.exception("treasury: transfer failed: %s", exc)
-            if transfer_id is not None and self.db:
+            if transfer_id is not None:
                 self.db.update_transfer(transfer_id, status="failed",
                                         error=str(exc))
             return TransferResult(ok=False, transfer_id=transfer_id,
                                   error=str(exc))
 
-        if transfer_id is not None and self.db:
+        if transfer_id is not None:
             self.db.update_transfer(transfer_id, status="succeeded",
                                     tx_hash=tx_hash)
         return TransferResult(ok=True, transfer_id=transfer_id, tx_hash=tx_hash)

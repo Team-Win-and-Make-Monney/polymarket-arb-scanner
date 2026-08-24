@@ -175,7 +175,11 @@ class TreasuryManager:
 
         idempotency_key = idempotency_key or self._build_idempotency_key(
             from_platform, to_platform, amount_usd)
-        existing = self.db.get_transfer_by_idempotency_key(idempotency_key)
+        try:
+            existing = self.db.get_transfer_by_idempotency_key(idempotency_key)
+        except Exception as exc:
+            logger.exception("treasury: failed to read transfer audit: %s", exc)
+            return TransferResult(ok=False, error="transfer audit unavailable")
         if existing:
             return self._existing_transfer_result(
                 existing, from_platform, to_platform, amount_usd,
@@ -216,7 +220,13 @@ class TreasuryManager:
                 ),
             )
         if not created:
-            existing = self.db.get_transfer_by_idempotency_key(idempotency_key) or {}
+            try:
+                existing = (
+                    self.db.get_transfer_by_idempotency_key(idempotency_key) or {}
+                )
+            except Exception as exc:
+                logger.exception("treasury: failed to read claimed transfer: %s", exc)
+                return TransferResult(ok=False, error="transfer audit unavailable")
             return self._existing_transfer_result(
                 existing, from_platform, to_platform, amount_usd,
             )

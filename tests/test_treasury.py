@@ -113,6 +113,41 @@ class TestRiskGates:
         assert result.error == "transfer audit unavailable"
         gemini.withdraw_usdc.assert_not_called()
 
+    def test_initial_audit_lookup_failure_fails_closed(self):
+        TreasuryManager, _, _ = _import_treasury()
+        audit_db = MagicMock()
+        audit_db.get_transfer_by_idempotency_key.side_effect = RuntimeError(
+            "database unavailable"
+        )
+        tm = TreasuryManager(db=audit_db, dry_run=True)
+
+        result = tm.execute_transfer(
+            "gemini", "polymarket", 100.0, idempotency_key="lookup_failure",
+        )
+
+        assert result.ok is False
+        assert result.error == "transfer audit unavailable"
+        audit_db.claim_transfer_with_daily_limit.assert_not_called()
+
+    def test_post_claim_audit_lookup_failure_fails_closed(self):
+        TreasuryManager, _, _ = _import_treasury()
+        audit_db = MagicMock()
+        audit_db.get_transfer_by_idempotency_key.side_effect = [
+            None,
+            RuntimeError("database unavailable"),
+        ]
+        audit_db.claim_transfer_with_daily_limit.return_value = (1, False, None)
+        tm = TreasuryManager(db=audit_db, dry_run=True)
+
+        result = tm.execute_transfer(
+            "gemini", "polymarket", 100.0,
+            idempotency_key="post_claim_lookup_failure",
+        )
+
+        assert result.ok is False
+        assert result.error == "transfer audit unavailable"
+        assert audit_db.get_transfer_by_idempotency_key.call_count == 2
+
     def test_daily_limit_blocks_overflow(self, db):
         TreasuryManager, _, _ = _import_treasury()
         tm = TreasuryManager(db=db, dry_run=True)

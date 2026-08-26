@@ -280,7 +280,11 @@ class TwitterClient:
         if not keywords:
             return None
 
-        query = " OR ".join(keywords[:5])
+        # Quote extracted terms so market text cannot inject Twitter operators.
+        query = " OR ".join(
+            f'"{keyword.replace(chr(92), "").replace(chr(34), "")}"'
+            for keyword in keywords[:5]
+        )
         start_time = datetime.utcnow() - timedelta(hours=lookback_hours)
 
         tweets = self.search_tweets(

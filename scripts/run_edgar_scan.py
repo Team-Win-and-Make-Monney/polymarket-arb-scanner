@@ -30,6 +30,7 @@ import os
 import re
 import sys
 import time
+from urllib.parse import urlparse
 from pathlib import Path
 
 import defusedxml.ElementTree as ET
@@ -206,6 +207,10 @@ def save_seen(path: Path | None, seen: set[str]) -> None:
 
 def _get(session: requests.Session, url: str, ua: str, timeout: int = 20) -> str | None:
     """GET text from SEC, returning None on any error (never raises)."""
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname != "www.sec.gov":
+        logger.warning("Rejected non-SEC EDGAR URL: %s", url)
+        return None
     try:
         resp = session.get(url, headers={"User-Agent": ua}, timeout=timeout)
         resp.raise_for_status()

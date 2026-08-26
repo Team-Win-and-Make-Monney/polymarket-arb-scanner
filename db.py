@@ -173,6 +173,13 @@ class TradeDB:
                 self.conn.commit()
             except sqlite3.OperationalError:
                 logger.debug("Migration: %s column already exists on partial_fills", col)
+        try:
+            self.conn.execute("ALTER TABLE partial_fills ADD COLUMN _max_contracts INTEGER")
+            self.conn.commit()
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
+            logger.debug("Migration: _max_contracts column already exists on partial_fills")
 
     def log_opportunity(
         self,
@@ -473,6 +480,7 @@ class TradeDB:
         runner_id: str | None = None,
         outcome_id: str | None = None,
         symbol: str | None = None,
+        max_contracts: int | None = None,
     ) -> int | None:
         """Log a partial fill for hedging. Returns partial_fill ID.
 
@@ -484,11 +492,13 @@ class TradeDB:
             cur = self.conn.execute(
                 """INSERT INTO partial_fills
                    (trade_id, opportunity_id, platform, token_id, side, fill_price, size, created_at,
-                    _market_id, _selection_id, _contract_id, _market_hash, _runner_id, _outcome_id, _symbol)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    _market_id, _selection_id, _contract_id, _market_hash, _runner_id, _outcome_id, _symbol,
+                    _max_contracts)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (trade_id, opportunity_id, platform, token_id, side, fill_price, size,
                  datetime.now(timezone.utc).isoformat(),
-                 market_id, selection_id, contract_id, market_hash, runner_id, outcome_id, symbol),
+                 market_id, selection_id, contract_id, market_hash, runner_id, outcome_id, symbol,
+                 max_contracts),
             )
             self.conn.commit()
             return cur.lastrowid

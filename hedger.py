@@ -51,6 +51,7 @@ class PartialFillHedger:
         runner_id: str | None = None,
         outcome_id: str | None = None,
         symbol: str | None = None,
+        max_contracts: int | None = None,
     ):
         """Record a partial fill for hedging.
 
@@ -73,6 +74,7 @@ class PartialFillHedger:
                 runner_id=runner_id,
                 outcome_id=outcome_id,
                 symbol=symbol,
+                max_contracts=max_contracts,
             )
             logger.info("Queued hedge for trade #%d on %s (fill=$%.3f)", trade_id, platform, fill_price)
 
@@ -117,6 +119,9 @@ class PartialFillHedger:
             if platform == "polymarket":
                 return self._hedge_polymarket(token_id, fill_price, size, max_loss)
             elif platform == "kalshi":
+                if pf.get("_max_contracts") is None:
+                    logger.warning("Kalshi hedge blocked: authoritative contract ceiling is missing for %s", token_id)
+                    return False
                 return self._hedge_kalshi(token_id, fill_price, size, max_loss,
                                           pf.get("side", "yes"),
                                           action=pf.get("_reduce_action", "sell"),

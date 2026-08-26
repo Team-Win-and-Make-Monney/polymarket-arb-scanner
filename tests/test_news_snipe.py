@@ -136,7 +136,7 @@ class TestSentimentScoring:
     def test_yes_keywords_detected(self):
         """Sentiment scorer detects YES keywords."""
         for keyword in YES_KEYWORDS:
-            text = f"The event has {keyword}d successfully."
+            text = f"The event result is {keyword}."
             result = _score_sentiment(text)
             assert result["sentiment"] == "YES"
             assert result["confidence"] == 0.8

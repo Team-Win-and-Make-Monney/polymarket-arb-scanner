@@ -69,7 +69,7 @@ def _read_cached_price(cache: dict, key: tuple[str, str], max_age: float) -> dic
     if not entry:
         return None
     ts = entry.get("_ts", 0)
-    if ts and time.time() - ts > max_age:
+    if not ts or time.time() - ts > max_age:
         return None
     return entry
 
@@ -261,13 +261,15 @@ class CrossPairIndex:
         k_entry = _read_cached_price(price_cache, ("kalshi", pair.kalshi_ticker), cache_max_age)
         if not k_entry:
             return None
-        k_yes = _kalshi_price(k_entry, "yes")
-        k_no = _kalshi_price(k_entry, "no")
-        if k_yes is None or k_no is None:
+        original_k_yes = _kalshi_price(k_entry, "yes")
+        original_k_no = _kalshi_price(k_entry, "no")
+        if original_k_yes is None or original_k_no is None:
             return None
 
         # Try both directions: PM_YES + K_NO vs PM_NO + K_YES. If the
         # pair was detected as inverted, swap K's sides accordingly.
+        k_yes = original_k_yes
+        k_no = original_k_no
         if pair.inverted:
             k_yes, k_no = k_no, k_yes
 
@@ -279,12 +281,26 @@ class CrossPairIndex:
 
         if best is result1:
             total_cost = pm_yes + k_no
-            prices_str = f"PM_Y={pm_yes:.3f} K_N={k_no:.3f}"
-            opp_type = "Cross(PM_YES + K_NO)"
+            kalshi_side = "yes" if pair.inverted else "no"
+            prices_str = f"PM_Y={pm_yes:.3f} K_{kalshi_side[0].upper()}={k_no:.3f}"
+            opp_type = f"Cross(PM_YES + K_{kalshi_side.upper()})"
+            cross_legs = [
+                {"platform": "polymarket", "side": "BUY", "token": "yes",
+                 "price": pm_yes, "_token_id": pair.poly_token_yes},
+                {"platform": "kalshi", "side": kalshi_side, "action": "buy",
+                 "price": k_no, "_ticker": pair.kalshi_ticker},
+            ]
         else:
             total_cost = pm_no + k_yes
-            prices_str = f"PM_N={pm_no:.3f} K_Y={k_yes:.3f}"
-            opp_type = "Cross(PM_NO + K_YES)"
+            kalshi_side = "no" if pair.inverted else "yes"
+            prices_str = f"PM_N={pm_no:.3f} K_{kalshi_side[0].upper()}={k_yes:.3f}"
+            opp_type = f"Cross(PM_NO + K_{kalshi_side.upper()})"
+            cross_legs = [
+                {"platform": "polymarket", "side": "BUY", "token": "no",
+                 "price": pm_no, "_token_id": pair.poly_token_no},
+                {"platform": "kalshi", "side": kalshi_side, "action": "buy",
+                 "price": k_yes, "_ticker": pair.kalshi_ticker},
+            ]
 
         return {
             "type": opp_type,
@@ -299,8 +315,9 @@ class CrossPairIndex:
             "net_roi": f"{best['net_profit'] / total_cost * 100:.2f}%" if total_cost > 0 else "0%",
             "_token_ids": [pair.poly_token_yes, pair.poly_token_no],
             "_kalshi_ticker": pair.kalshi_ticker,
-            "_kalshi_yes": k_yes,
-            "_kalshi_no": k_no,
+            "_kalshi_yes": original_k_yes,
+            "_kalshi_no": original_k_no,
+            "_cross_legs": cross_legs,
             "_market_key": f"polymarket-{pair.poly_condition_id}" if pair.poly_condition_id else "",
             "_days_to_resolution": pair.days_to_resolution,
         }

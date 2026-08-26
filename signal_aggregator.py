@@ -101,6 +101,11 @@ class SignalAggregator:
         with self._lock:
             signals = self._get_fresh_signals(market_key)
 
+        return self._consensus_from_signals(signals)
+
+    def _consensus_from_signals(self, signals: dict[str, dict]) -> dict | None:
+        """Calculate a consensus from one immutable signal snapshot."""
+
         if not signals:
             return None
 
@@ -147,12 +152,12 @@ class SignalAggregator:
             List of dicts with ``source``, ``probability``,
             ``consensus``, ``divergence``.
         """
-        consensus = self.get_consensus(market_key)
-        if consensus is None:
-            return []
-
         with self._lock:
             signals = self._get_fresh_signals(market_key)
+
+        consensus = self._consensus_from_signals(signals)
+        if consensus is None:
+            return []
 
         divergences = []
         for source, data in signals.items():

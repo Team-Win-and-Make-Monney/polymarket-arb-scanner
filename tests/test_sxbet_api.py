@@ -45,7 +45,8 @@ class TestSXBetLogin:
         c.session.get.return_value = resp
         assert c.login("my_key") is True
         assert c.authenticated is True
-        assert c.wallet_address == "my_key"
+        assert c.api_key == "my_key"
+        assert c.wallet_address is None
 
     def test_login_env_var_fallback(self):
         c = SXBetClient()
@@ -53,7 +54,16 @@ class TestSXBetLogin:
         c.session.get.return_value = MagicMock(status_code=200)
         with patch.dict(os.environ, {"SXBET_API_KEY": "env_key"}):
             assert c.login() is True
-        assert c.wallet_address == "env_key"
+        assert c.api_key == "env_key"
+
+    def test_login_keeps_wallet_identifier_separate(self):
+        c = SXBetClient()
+        c.session = MagicMock()
+        c.session.get.return_value = MagicMock(status_code=200)
+        with patch.dict(os.environ, {"SXBET_WALLET_ADDRESS": "0xwallet"}):
+            assert c.login("api-key") is True
+        assert c.api_key == "api-key"
+        assert c.wallet_address == "0xwallet"
 
     def test_login_fails_missing_key(self):
         c = SXBetClient()
@@ -145,17 +155,10 @@ class TestSXBetMarketPrice:
 class TestSXBetOrders:
     """place_order, get_order_status, cancel_order, get_balance."""
 
-    def test_place_order_success(self, client):
-        resp = MagicMock(status_code=200)
-        resp.json.return_value = {"orderId": "ord1"}
-        client.session.post.return_value = resp
+    def test_place_order_fails_closed_without_eip712_signing(self, client):
         result = client.place_order("0xhash", "out1", "buy", 0.55, 10.0)
-        assert result["orderId"] == "ord1"
-        # Verify price/size sent as strings
-        call_kwargs = client.session.post.call_args
-        body = call_kwargs[1]["json"] if "json" in call_kwargs[1] else call_kwargs.kwargs["json"]
-        assert body["price"] == "0.55"
-        assert body["size"] == "10.0"
+        assert result is None
+        client.session.post.assert_not_called()
 
     def test_place_order_failure(self, client):
         resp = MagicMock(status_code=400, text="bad request")
@@ -178,15 +181,33 @@ class TestSXBetOrders:
 
     def test_get_balance_uses_balance_key(self, client):
         resp = MagicMock(status_code=200)
-        resp.json.return_value = {"balance": "42.5"}
+        resp.json.return_value = {
+            "data": {"balances": [{"availableAmount": "42500000"}]},
+        }
         client.session.get.return_value = resp
         assert client.get_balance() == 42.5
+        client.session.get.assert_called_once_with(
+            f"{SXBET_API_URL}/user/balance-v3",
+            headers={"x-sx-api-key": "test_key"},
+            timeout=15,
+        )
 
-    def test_get_balance_falls_back_to_available(self, client):
+    def test_get_balance_sums_available_token_rows(self, client):
         resp = MagicMock(status_code=200)
-        resp.json.return_value = {"availableBalance": "99.0"}
+        resp.json.return_value = {
+            "data": {"balances": [
+                {"availableAmount": "99000000"},
+                {"availableAmount": "1000000"},
+            ]},
+        }
         client.session.get.return_value = resp
-        assert client.get_balance() == 99.0
+        assert client.get_balance() == 100.0
+
+    def test_get_balance_fails_closed_on_malformed_schema(self, client):
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"data": {"balances": [{}]}}
+        client.session.get.return_value = resp
+        assert client.get_balance() is None
 
 
 # ---------------------------------------------------------------------------

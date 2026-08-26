@@ -19,6 +19,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from config import KALSHI_RATE_LIMIT
 from kalshi_policy import live_kalshi_submit_allowed
 from rate_limiter import PlatformCircuitBreaker
+from url_guard import assert_public_url
 
 KALSHI_BASE_URL = "https://api.elections.kalshi.com"
 KALSHI_API_PATH = "/trade-api/v2"
@@ -48,9 +49,6 @@ def _load_private_key(file_path: str):
             f.read(),
             password=None,
             backend=default_backend(),
-            # Kalshi-generated keys may have non-standard CRT parameters
-            # that fail strict validation in newer cryptography versions.
-            unsafe_skip_rsa_key_validation=True,
         )
 
 
@@ -61,7 +59,6 @@ def _load_private_key_from_base64(b64_string: str):
         pem_bytes,
         password=None,
         backend=default_backend(),
-        unsafe_skip_rsa_key_validation=True,
     )
 
 
@@ -103,6 +100,7 @@ class KalshiClient:
         # Proxy support
         proxy_url = os.getenv("KALSHI_PROXY_URL")
         if proxy_url:
+            proxy_url = assert_public_url(proxy_url, env_name="KALSHI_PROXY_URL")
             self.session.proxies = {"http": proxy_url, "https": proxy_url}
         self.session.mount("https://", HTTPAdapter(pool_connections=1, pool_maxsize=10))
         self.api_key_id = None
@@ -175,8 +173,12 @@ class KalshiClient:
                 timeout=30,
             )
             if resp.status_code == 429:
+                _circuit.record_failure()
                 raise _RateLimitError(f"Rate limited: {method} {path}")
-            _circuit.record_success()
+            if 200 <= resp.status_code < 300:
+                _circuit.record_success()
+            else:
+                _circuit.record_failure()
             return resp
         except (requests.ConnectionError, requests.Timeout) as e:
             logger.warning("Kalshi request failed (%s %s): %s", method, path, e)

@@ -164,8 +164,8 @@ class TestArgumentParsing:
         args = parser.parse_args(["--log-level", "DEBUG"])
         assert args.log_level == "DEBUG"
 
-    def test_all_14_modes_accepted(self):
-        """All 14 scan modes should be valid choices."""
+    def test_all_15_modes_accepted(self):
+        """All 15 scan modes should be valid choices."""
         modes = [
             "all", "binary", "negrisk", "cross", "kalshi", "cross-all",
             "spread", "betfair", "smarkets", "sxbet", "matchbook",
@@ -274,7 +274,7 @@ class TestRunOneshotModeRouting:
     @patch.object(_cli_mod, "scan_kalshi_binary", return_value=[])
     @patch.object(_cli_mod, "scan_kalshi_multi", return_value=[])
     @patch.object(_cli_mod, "_fetch_kalshi_data", return_value=([{"event_ticker": "E1"}], []))
-    def test_kalshi_mode_calls_both_kalshi_scans(self, mock_fetch, mock_binary, mock_multi, mock_dash, mock_display):
+    def test_kalshi_mode_calls_both_kalshi_scans(self, mock_fetch, mock_multi, mock_binary, mock_dash, mock_display):
         args = _make_args(mode="kalshi")
         kalshi_client = MagicMock()
         _cli_mod._run_oneshot(args, 0.01, kalshi_client, _make_executor(), _make_db())

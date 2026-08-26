@@ -231,6 +231,8 @@ class ArbitrageExecutor:
         self._balance_cache: dict = {}
         self._balance_cache_ts: float = 0.0
         self._balance_cache_type: str = ""
+        self._balance_cache_generation = 0
+        self._balance_cache_lock = threading.Lock()
         # Failed-trade cooldown: ticker/market -> earliest retry time.
         # Prevents catastrophic loops when the same bogus opportunity keeps
         # failing (e.g. insufficient liquidity) and is re-presented.
@@ -258,22 +260,28 @@ class ArbitrageExecutor:
             Dict of {platform: balance} or None if no balances available.
         """
         now = time.time()
-        if (now - self._balance_cache_ts < BALANCE_CACHE_TTL
-                and self._balance_cache_type == opp_type
-                and self._balance_cache):
-            return self._balance_cache
+        with self._balance_cache_lock:
+            if (now - self._balance_cache_ts < BALANCE_CACHE_TTL
+                    and self._balance_cache_type == opp_type
+                    and self._balance_cache):
+                return dict(self._balance_cache)
+            generation = self._balance_cache_generation
         balances = self._fetch_balances(opp_type)
         if balances:
-            self._balance_cache = balances
-            self._balance_cache_ts = now
-            self._balance_cache_type = opp_type
+            with self._balance_cache_lock:
+                if generation == self._balance_cache_generation:
+                    self._balance_cache = dict(balances)
+                    self._balance_cache_ts = now
+                    self._balance_cache_type = opp_type
         return balances
 
     def invalidate_balance_cache(self):
         """Clear the balance cache after a trade fills or position changes."""
-        self._balance_cache = {}
-        self._balance_cache_ts = 0.0
-        self._balance_cache_type = ""
+        with self._balance_cache_lock:
+            self._balance_cache_generation += 1
+            self._balance_cache = {}
+            self._balance_cache_ts = 0.0
+            self._balance_cache_type = ""
 
     def execute(self, opportunity: dict, market_data: dict | None = None) -> bool:
         """Execute an arbitrage opportunity through the full pipeline.
@@ -2019,6 +2027,10 @@ class ArbitrageExecutor:
             )
             legs = []
         elif opp_type.startswith("Cross"):
+            explicit_cross_legs = opportunity.get("_cross_legs")
+            if isinstance(explicit_cross_legs, list) and explicit_cross_legs:
+                return [dict(leg) for leg in explicit_cross_legs]
+
             # Re-validate fee path if scan provided a hint (per user decision: confirm or override)
             fee_path = opportunity.get("_fee_path")
             if fee_path:
@@ -2782,6 +2794,7 @@ class ArbitrageExecutor:
                             runner_id=leg.get("_runner_id"),
                             outcome_id=leg.get("_outcome_id"),
                             symbol=leg.get("symbol"),
+                            max_contracts=leg.get("_max_contracts"),
                         )
                         # Attempt immediate hedge
                         hedger.process_pending_hedges()
@@ -2811,7 +2824,10 @@ class ArbitrageExecutor:
         so any opportunity involving IBKR must fall back to sequential mode.
         """
         for leg in legs:
-            if leg.get("platform", "") in self._NO_CANCEL_PLATFORMS:
+            platform = leg.get("platform")
+            if not isinstance(platform, str) or not platform:
+                return False
+            if platform in self._NO_CANCEL_PLATFORMS:
                 return False
         return len(legs) >= 2
 
@@ -2932,6 +2948,7 @@ class ArbitrageExecutor:
                             runner_id=leg.get("_runner_id"),
                             outcome_id=leg.get("_outcome_id"),
                             symbol=leg.get("symbol"),
+                            max_contracts=leg.get("_max_contracts"),
                         )
                 hedger.process_pending_hedges()
             self._notify_trade(opportunity, legs, size, success=False)
@@ -3045,6 +3062,7 @@ class ArbitrageExecutor:
             action = leg.get("action", "buy")
             # Convert dollar size to contracts (1 contract = $1 payout)
             count = max(1, int(size / price)) if price > 0 else 1
+            leg["_max_contracts"] = count
 
             # Determine time-in-force based on config and leg position
             leg_index = leg.get("_leg_index", 0)

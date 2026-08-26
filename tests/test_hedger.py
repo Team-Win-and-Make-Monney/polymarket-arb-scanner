@@ -273,7 +273,7 @@ class TestHedgerPartialFills:
                 assert call_args[1]["side"] == "SELL"
                 assert call_args[1]["size"] == 2.5
 
-    def test_kalshi_partial_fill_hedge(self, PartialFillHedger, db):
+    def test_kalshi_partial_fill_hedge(self, PartialFillHedger, db, real_kalshi_api):
         """Kalshi: 50% fill on YES, 100% on NO → hedge sells YES."""
         mock_kalshi = MagicMock()
         mock_kalshi.fetch_order_book.return_value = {
@@ -286,6 +286,7 @@ class TestHedgerPartialFills:
             "id": 2, "platform": "kalshi",
             "token_id": "TICKER-ABC", "fill_price": 0.40,
             "size": 2.5, "side": "yes", "hedge_attempts": 0,
+            "_max_contracts": 6,
         }
         result = hedger._attempt_hedge(pf)
         assert result is True
@@ -521,7 +522,7 @@ class TestHedgerErrorHandling:
                 # No hedges processed
                 mock_pm.place_order.assert_not_called()
 
-    def test_hedger_logs_all_hedges_multiple_platforms(self, PartialFillHedger, db):
+    def test_hedger_logs_all_hedges_multiple_platforms(self, PartialFillHedger, db, real_kalshi_api):
         """Execute hedges on 2 platforms, verify log contains hedge details."""
         mock_pm = MagicMock()
         mock_pm.place_order.return_value = {"success": True}
@@ -552,6 +553,7 @@ class TestHedgerErrorHandling:
                     "id": 302, "platform": "kalshi",
                     "token_id": "TICKER-XYZ", "fill_price": 0.40,
                     "size": 2.5, "side": "yes", "hedge_attempts": 0,
+                    "_max_contracts": 6,
                 }
                 result_kalshi = hedger._attempt_hedge(pf_kalshi)
                 assert result_kalshi is True
@@ -748,7 +750,7 @@ class TestKalshiBuyToReduce:
         result = hedger.hedge_inventory(
             market_key="TICK", platform="kalshi", side="yes",
             fill_price=0.55, size=5.6, token_id="TICK",
-            reduce_action="buy",
+            reduce_action="buy", max_contracts=10,
         )
         assert result is True
         assert mock_kalshi.place_order.call_args[1]["action"] == "buy"

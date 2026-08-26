@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import shlex
 import stat
 import subprocess
 from datetime import datetime, timezone
@@ -37,6 +38,10 @@ def _outside_repo(path: str | Path, repo_root: Path, what: str) -> Path:
             raise RuntimeError(f"{what} must be a regular file: {resolved}")
         if resolved.stat().st_mode & (stat.S_IWGRP | stat.S_IWOTH):
             raise RuntimeError(f"{what} must not be group/world writable: {resolved}")
+        if resolved.parent.stat().st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise RuntimeError(
+                f"{what} parent directory must not be group/world writable: {resolved.parent}"
+            )
         return resolved
     raise RuntimeError(f"{what} must live outside this repository: {resolved}")
 
@@ -125,6 +130,28 @@ class CommandIntentAdapter:
         if executable.name.lower() in _SHELL_NAMES:
             raise RuntimeError("shell executables are not permitted as broker adapters")
         executable = _outside_repo(executable, repo_root, "executor")
+        try:
+            first_line = executable.open("rb").readline(256).decode("utf-8", "ignore").strip()
+        except OSError as exc:
+            raise RuntimeError(f"executor cannot be inspected: {exc}") from exc
+        if first_line.startswith("#!"):
+            try:
+                shebang_parts = shlex.split(first_line[2:])
+            except ValueError as exc:
+                raise RuntimeError(f"executor has an invalid shebang: {exc}") from exc
+            interpreter = Path(shebang_parts[0]).name.lower() if shebang_parts else ""
+            if interpreter in _SHELL_NAMES:
+                raise RuntimeError("shell-script executors are not permitted as broker adapters")
+            if interpreter == "env":
+                possible_commands = {
+                    Path(part).name.lower()
+                    for part in shebang_parts[1:]
+                    if not part.startswith("-") and "=" not in part
+                }
+                if possible_commands & _SHELL_NAMES:
+                    raise RuntimeError("shell-script executors are not permitted as broker adapters")
+        if any(arg in ("-c", "--command") for arg in argv[1:]):
+            raise RuntimeError("command-string execution flags are not permitted")
         mode = executable.stat().st_mode
         if not stat.S_ISREG(mode) or not os.access(executable, os.X_OK):
             raise RuntimeError(f"executor is not an executable regular file: {executable}")

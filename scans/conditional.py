@@ -159,6 +159,9 @@ def scan_conditional_arb(
         if not unconditional_market:
             continue
 
+        if condition_market is unconditional_market:
+            continue
+
         if condition_market == cond_market or unconditional_market == cond_market:
             continue
 

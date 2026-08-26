@@ -51,8 +51,12 @@ def scan_fee_promo(
         # Re-evaluate using the current fee globals.
         platform_a = entry.get("_platform_a") or entry.get("_platform_yes")
         platform_b = entry.get("_platform_b") or entry.get("_platform_no")
-        price_a = entry.get("_price_a") or entry.get("_yes_price")
-        price_b = entry.get("_price_b") or entry.get("_no_price")
+        price_a = entry.get("_price_a")
+        price_b = entry.get("_price_b")
+        if price_a is None:
+            price_a = entry.get("_yes_price")
+        if price_b is None:
+            price_b = entry.get("_no_price")
         side_a = entry.get("_side_a", "yes")
         side_b = entry.get("_side_b", "no")
         if not platform_a or not platform_b or price_a is None or price_b is None:

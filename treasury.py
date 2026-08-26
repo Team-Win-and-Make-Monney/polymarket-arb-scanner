@@ -17,6 +17,7 @@ Risk gates layered around every transfer:
 
 import hashlib
 import logging
+import math
 import time
 
 import config
@@ -190,10 +191,13 @@ class TreasuryManager:
 
         if self.gas_monitor is not None:
             try:
-                gas_ok = self.gas_monitor.should_execute({"net_profit": amount_usd})
-            except Exception:
-                gas_ok = True  # Gas monitor optional — don't block on errors
-            if not gas_ok:
+                gas_cost = float(self.gas_monitor.get_current_gas_cost())
+            except Exception as exc:
+                logger.warning("treasury: gas cost unavailable: %s", exc)
+                return TransferResult(ok=False, error="gas cost unavailable")
+            if not math.isfinite(gas_cost) or gas_cost < 0:
+                return TransferResult(ok=False, error="invalid gas cost")
+            if gas_cost > config.TREASURY_MAX_GAS_COST_USD:
                 return TransferResult(ok=False, error="gas above ceiling")
 
         # Audit row first so we always know we tried

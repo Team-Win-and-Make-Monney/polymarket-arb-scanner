@@ -311,6 +311,7 @@ MM_HEDGE_THRESHOLD = _env_float("MM_HEDGE_THRESHOLD", "0.8")
 AUTO_REBALANCE_ENABLED = _env_bool("AUTO_REBALANCE_ENABLED", "false")
 MAX_AUTO_TRANSFER_PER_DAY = _env_float("MAX_AUTO_TRANSFER_PER_DAY", "500.0")
 MIN_TRANSFER_AMOUNT = _env_float("MIN_TRANSFER_AMOUNT", "50.0")
+TREASURY_MAX_GAS_COST_USD = _env_float("TREASURY_MAX_GAS_COST_USD", "1.0")
 POLYMARKET_DEPOSIT_ADDRESS = os.getenv("POLYMARKET_DEPOSIT_ADDRESS", "")
 
 # Cross-platform market making (Strategy #11).
@@ -1302,12 +1303,15 @@ def validate_config() -> list[str]:
         "KALSHI_RATE_LIMIT": KALSHI_RATE_LIMIT,
         "KALSHI_AUTH_BOOT_RETRY_WAIT": KALSHI_AUTH_BOOT_RETRY_WAIT,
         "POLYGON_GAS_ESTIMATE": POLYGON_GAS_ESTIMATE,
+        "TREASURY_MAX_GAS_COST_USD": TREASURY_MAX_GAS_COST_USD,
         "WEBHOOK_MIN_PROFIT": WEBHOOK_MIN_PROFIT,
         "ALERT_BALANCE_LOW_THRESHOLD": ALERT_BALANCE_LOW_THRESHOLD,
         "LIP_MIN_POOL": LIP_MIN_POOL,
         "LIP_MIN_HOURS_REMAINING": LIP_MIN_HOURS_REMAINING,
     }
     for name, val in _non_negative.items():
+        if not math.isfinite(val):
+            raise ConfigError(f"{name}={val} must be finite")
         if val < 0:
             raise ConfigError(f"{name}={val} must be >= 0")
 

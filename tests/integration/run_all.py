@@ -37,6 +37,8 @@ if PROJECT_ROOT not in sys.path:
 import importlib.util as _ilu
 
 _spec = _ilu.spec_from_file_location("test_strategies", os.path.join(_HERE, "test_strategies.py"))
+if _spec is None or _spec.loader is None:
+    raise RuntimeError("Unable to load integration test_strategies.py")
 _mod = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
@@ -245,17 +247,20 @@ def main() -> int:
 
     # Summary
     strategy_results = [r for r in results if r["mode"] != "fee-verification"]
-    failed = [r for r in results if r["status"] == "FAIL"]
+    failed = [r for r in strategy_results if r["status"] == "FAIL"]
+    fee_failed = fee_result["status"] == "FAIL"
     passed = sum(1 for r in strategy_results if r["status"] == "PASS")
     skipped = sum(1 for r in strategy_results if r["status"] == "SKIP")
 
     print()
     print(f"Summary: {passed} passed, {len(failed)} failed, {skipped} skipped")
 
-    if failed:
+    if failed or fee_failed:
         print("FAILED tests:")
         for r in failed:
             print(f"  - {r['strategy']} ({r['mode']})")
+        if fee_failed:
+            print(f"  - {fee_result['strategy']} (fee-verification)")
         return 1
     return 0
 

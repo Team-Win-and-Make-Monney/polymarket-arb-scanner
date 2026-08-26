@@ -10,6 +10,7 @@ This is a READ-ONLY client -- no trading, no order placement.
 
 import logging
 import os
+import re
 import threading
 import time
 
@@ -155,6 +156,9 @@ class ManifoldClient:
         Returns:
             Market dict or None if not found.
         """
+        if not isinstance(market_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", market_id):
+            logger.warning("Rejected invalid Manifold market ID")
+            return None
         data = self._get(f"/market/{market_id}")
         if not data or not isinstance(data, dict):
             return None
@@ -210,6 +214,9 @@ class ManifoldClient:
         Returns:
             Market dict or None if not found.
         """
+        if not isinstance(slug, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", slug):
+            logger.warning("Rejected invalid Manifold market slug")
+            return None
         data = self._get(f"/slug/{slug}")
         if not data or not isinstance(data, dict):
             return None

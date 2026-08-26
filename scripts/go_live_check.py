@@ -6,10 +6,34 @@ and exposing expected endpoints (healthz, status, metrics).
 
 import argparse
 import base64
+import ipaddress
+import os
 import json
+import socket
 import sys
 import urllib.error
 import urllib.request
+from urllib.parse import urlparse
+
+
+def _validate_base_url(value: str) -> str:
+    """Validate a dashboard URL and reject internal-network SSRF targets."""
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("must be an http(s) URL with a hostname")
+    hostname = parsed.hostname
+    if hostname == "localhost":
+        return value
+    try:
+        default_port = 443 if parsed.scheme == "https" else 80
+        addresses = {item[4][0] for item in socket.getaddrinfo(hostname, parsed.port or default_port)}
+    except socket.gaierror as exc:
+        raise ValueError(f"hostname does not resolve: {exc}") from exc
+    for address in addresses:
+        ip = ipaddress.ip_address(address)
+        if not ip.is_global:
+            raise ValueError("must not resolve to a private, loopback, or link-local address")
+    return value
 
 
 def _make_auth_header(user: str | None, password: str | None) -> dict:
@@ -85,11 +109,13 @@ def main():
     parser.add_argument("--url", default="http://localhost:8080",
                         help="Base URL of the deployed scanner (default: http://localhost:8080)")
     parser.add_argument("--user", default=None, help="HTTP Basic Auth username")
-    parser.add_argument("--password", default=None, help="HTTP Basic Auth password")
     args = parser.parse_args()
 
-    base_url = args.url
-    auth = _make_auth_header(args.user, args.password)
+    try:
+        base_url = _validate_base_url(args.url)
+    except ValueError as exc:
+        parser.error(f"--url {exc}")
+    auth = _make_auth_header(args.user, os.getenv("DASHBOARD_PASS"))
     print(_bold(f"\nPre-flight check: {base_url}\n"))
 
     checks = [

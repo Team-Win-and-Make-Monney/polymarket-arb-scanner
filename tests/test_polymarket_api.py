@@ -474,7 +474,7 @@ class TestClobProxyInjection:
             if had_attr:
                 delattr(helpers_mod, "_http_client")
             with pytest.raises(RuntimeError):
-                polymarket_api._install_clob_proxy("http://proxy.local:8080")
+                polymarket_api._install_clob_proxy("http://proxy.example.com:8080")
         finally:
             if had_attr:
                 helpers_mod._http_client = saved
@@ -486,9 +486,9 @@ class TestClobProxyInjection:
         helpers_mod._http_client = object()
         try:
             with patch.object(polymarket_api.httpx, "Client") as mock_client_cls:
-                polymarket_api._install_clob_proxy("http://proxy.local:8080")
+                polymarket_api._install_clob_proxy("http://proxy.example.com:8080")
                 mock_client_cls.assert_called_once_with(
-                    http2=True, proxy="http://proxy.local:8080")
+                    http2=True, proxy="http://proxy.example.com:8080")
                 assert helpers_mod._http_client is mock_client_cls.return_value
         finally:
             if had_attr:
@@ -499,13 +499,13 @@ class TestClobProxyInjection:
     def test_trader_init_installs_proxy_before_client_when_env_set(self):
         """The write path must be proxied before the CLOB client exists."""
         calls = []
-        with patch.dict(os.environ, {"POLYMARKET_PROXY_URL": "http://proxy.local:8080"}), \
+        with patch.dict(os.environ, {"POLYMARKET_PROXY_URL": "http://proxy.example.com:8080"}), \
              patch.object(polymarket_api, "_install_clob_proxy",
                           side_effect=lambda url: calls.append(("proxy", url))), \
              patch.object(polymarket_api, "ClobClient",
                           side_effect=lambda **kw: calls.append(("client",)) or MagicMock()):
             PolymarketTrader(private_key="0xkey", execution_enabled=True)
-        assert calls[0] == ("proxy", "http://proxy.local:8080")
+        assert calls[0] == ("proxy", "http://proxy.example.com:8080")
         assert ("client",) in calls
 
     def test_trader_init_fails_closed_when_sdk_internal_missing(self):
@@ -516,7 +516,7 @@ class TestClobProxyInjection:
         try:
             if had_attr:
                 delattr(helpers_mod, "_http_client")
-            with patch.dict(os.environ, {"POLYMARKET_PROXY_URL": "http://proxy.local:8080"}), \
+            with patch.dict(os.environ, {"POLYMARKET_PROXY_URL": "http://proxy.example.com:8080"}), \
                  patch.object(polymarket_api, "ClobClient") as mock_cls:
                 with pytest.raises(RuntimeError):
                     PolymarketTrader(private_key="0xkey", execution_enabled=True)

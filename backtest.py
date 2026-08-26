@@ -386,6 +386,8 @@ def _suggest_min_roi(result: BacktestResult) -> float:
     import config as _config
     current = _config.MIN_NET_ROI
     if result.win_rate > 0.7:
+        if current <= 0:
+            return current
         suggested = current * 0.90
         clamped = max(0.001, min(0.05, suggested))
         return min(clamped, current)

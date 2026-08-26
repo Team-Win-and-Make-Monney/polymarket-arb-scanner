@@ -174,13 +174,13 @@ class TestSupportsConcurrent:
             assert executor_concurrent._supports_concurrent(legs) is True, \
                 f"{plat} should support concurrent execution"
 
-    def test_missing_platform_key_treated_as_supported(self, executor_concurrent):
-        """Legs without a platform key default to empty string, which is not in _NO_CANCEL_PLATFORMS."""
+    def test_missing_platform_key_fails_closed(self, executor_concurrent):
+        """Legs without a platform cannot prove cancellation support."""
         legs = [
             {"price": 0.4},
             {"price": 0.5},
         ]
-        assert executor_concurrent._supports_concurrent(legs) is True
+        assert executor_concurrent._supports_concurrent(legs) is False
 
 
 # ---------------------------------------------------------------------------

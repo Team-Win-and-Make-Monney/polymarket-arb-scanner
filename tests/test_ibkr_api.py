@@ -45,24 +45,18 @@ class TestIBKRConnection:
 
         with patch.dict(sys.modules, {"ib_insync": MagicMock(IB=mock_ib_class, LimitOrder=MagicMock)}):
             c = IBKRClient()
-            # Need to reimport after patching
-            import importlib
-            import ibkr_api
-            importlib.reload(ibkr_api)
-            c = ibkr_api.IBKRClient()
-            c.ib = mock_ib
-            c.authenticated = True
-            assert c.authenticated is True
+            assert c.login(host="127.0.0.1", port=4001, client_id=7) is True
+        mock_ib.connect.assert_called_once_with("127.0.0.1", 4001, clientId=7, readonly=False, timeout=10)
 
     def test_login_fails_when_not_connected(self):
         mock_ib = MagicMock()
         mock_ib.isConnected.return_value = False
 
-        c = IBKRClient()
-        c.ib = mock_ib
-        # Simulate failed connection
-        c.authenticated = False
-        assert c.authenticated is False
+        mock_ib_class = MagicMock(return_value=mock_ib)
+        with patch.dict(sys.modules, {"ib_insync": MagicMock(IB=mock_ib_class, LimitOrder=MagicMock)}):
+            c = IBKRClient()
+            assert c.login() is False
+        mock_ib.connect.assert_called_once()
 
     def test_disconnect(self, client):
         client.disconnect()
@@ -180,6 +174,7 @@ class TestPlaceOrder:
         assert result is not None
         assert result["orderId"] == "42"
         assert result["status"] == "Submitted"
+        mock_ib_insync.LimitOrder.assert_called_once_with("BUY", 5, 0.65)
 
     def test_fails_when_not_authenticated(self):
         c = IBKRClient()

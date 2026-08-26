@@ -15,6 +15,7 @@ Pure + deterministic.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import Enum
 
@@ -55,6 +56,12 @@ def decide_paper_trade(signal: WeatherSignal, min_edge: float = 0.03) -> PaperDe
     p = signal.model_prob
     m = signal.market_yes_prob
     fee = signal.fee_per_contract
+    if not all(math.isfinite(value) for value in (p, m, fee, min_edge)):
+        raise ValueError("weather paper inputs must be finite")
+    if not 0 <= p <= 1 or not 0 <= m <= 1:
+        raise ValueError("weather probabilities must be in [0, 1]")
+    if fee < 0 or min_edge < 0:
+        raise ValueError("fee_per_contract and min_edge must be non-negative")
     yes_edge = p - m - fee
     no_edge = m - p - fee
 

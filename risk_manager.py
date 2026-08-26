@@ -91,7 +91,6 @@ class RiskManager:
                     return False, f"Insufficient IBKR balance (${i_balance:.2f})"
             elif "Cross" in opp_type:
                 # Cross-platform: check both participating platforms
-                half_cost = trade_cost / 2
                 platform_a = opportunity.get("_platform_a", "")
                 platform_b = opportunity.get("_platform_b", "")
                 platforms_involved = {platform_a, platform_b} if platform_a else {"polymarket", "kalshi"}
@@ -99,7 +98,10 @@ class RiskManager:
                     if not plat:
                         continue
                     bal = balances.get(plat, 0)
-                    if bal is not None and bal < half_cost:
+                    # A missing per-leg notional must not be guessed as 50/50.
+                    # Requiring each venue to cover the full bounded size is
+                    # conservative and cannot authorize an underfunded leg.
+                    if bal is not None and bal < trade_cost:
                         return False, f"Insufficient {plat.capitalize()} balance (${bal:.2f})"
             else:
                 pm_balance = balances.get("polymarket", 0)
@@ -133,7 +135,12 @@ class RiskManager:
         if opp_type not in self._SKIP_DEDUP_TYPES and db.is_market_active(market):
             if self.allow_better_reentry:
                 existing_pnl = db.get_active_market_expected_pnl(market)
-                if existing_pnl is not None and net_profit > existing_pnl * (1 + self.reentry_improvement_threshold):
+                improvement_floor = (
+                    existing_pnl + abs(existing_pnl) * self.reentry_improvement_threshold
+                    if existing_pnl is not None
+                    else None
+                )
+                if improvement_floor is not None and net_profit > improvement_floor:
                     pass  # Allow re-entry — new opportunity is significantly better
                 else:
                     return False, "Already trading this market"

@@ -77,13 +77,15 @@ def scan_smarkets_backall(smarkets_client: SmarketsClient, min_profit: float) ->
                 price_summary += f"... ({n} runners)"
 
             # Min depth from available quantities
-            min_depth = 0
+            min_depth = float("inf")
             for runner in runners:
                 quotes = runner.get("quotes", {})
                 best_back = quotes.get("best_available_to_back", {})
                 if best_back:
                     size = float(best_back.get("quantity", 0))
-                    min_depth = min(min_depth, size) if min_depth > 0 else size
+                    min_depth = min(min_depth, size)
+            if min_depth == float("inf"):
+                min_depth = 0
 
             opportunities.append({
                 "type": "SmarketsBackAll",

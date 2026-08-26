@@ -188,7 +188,7 @@ class TestKalshiRewardTracker:
             side="buy"
         )
 
-        time.sleep(0.2)
+        time.sleep(1.1)
         cancelled_time = time.time()
 
         krt.log_order_cancelled("order_3")
@@ -198,8 +198,8 @@ class TestKalshiRewardTracker:
         cursor.execute("SELECT resting_seconds FROM reward_metrics WHERE event='cancelled'")
         resting = cursor.fetchone()[0]
 
-        expected_resting = int(cancelled_time - placed_time)
-        assert resting >= expected_resting - 1  # Within 1 second margin
+        expected_resting = cancelled_time - placed_time
+        assert abs(resting - expected_resting) <= 0.25
 
         db.close()
 

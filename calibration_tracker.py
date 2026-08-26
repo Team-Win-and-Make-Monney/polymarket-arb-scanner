@@ -48,6 +48,7 @@ class CalibrationTracker:
         self._init_db()
 
         self._in_memory_cache: dict[str, dict] = {}
+        self._cache_generation = 0
 
     def _init_db(self) -> None:
         """Initialize the SQLite database."""
@@ -100,10 +101,12 @@ class CalibrationTracker:
             """, (platform, category, market_key, prediction, outcome, time.time()))
             conn.commit()
             conn.close()
-
-        keys_to_delete = [k for k in self._in_memory_cache if k.startswith(f"{platform}:")]
-        for k in keys_to_delete:
-            del self._in_memory_cache[k]
+            keys_to_delete = [
+                k for k in self._in_memory_cache if k.startswith(f"{platform}:")
+            ]
+            for key in keys_to_delete:
+                del self._in_memory_cache[key]
+            self._cache_generation += 1
 
     def get_platform_brier_score(
         self,
@@ -224,10 +227,12 @@ class CalibrationTracker:
             return base_weight
 
         cache_key = f"{platform}:{category or 'all'}"
-        if cache_key in self._in_memory_cache:
-            cached = self._in_memory_cache[cache_key]
-            if time.time() < cached.get("expires", 0):
-                return cached.get("weight", base_weight)
+        with self._lock:
+            cached = self._in_memory_cache.get(cache_key)
+            generation = self._cache_generation
+        if cached is not None:
+            if time.time() < cached.get("_expires", 0):
+                return cached.get("_weight", base_weight)
 
         brier = self.get_platform_brier_score(platform, category)
         if brier is None:
@@ -248,11 +253,13 @@ class CalibrationTracker:
 
         weight = base_weight * multiplier
 
-        self._in_memory_cache[cache_key] = {
-            "weight": weight,
-            "brier": brier,
-            "expires": time.time() + 3600,
-        }
+        with self._lock:
+            if generation == self._cache_generation:
+                self._in_memory_cache[cache_key] = {
+                    "_weight": weight,
+                    "_brier": brier,
+                    "_expires": time.time() + 3600,
+                }
 
         return weight
 

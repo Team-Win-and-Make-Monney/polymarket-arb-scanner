@@ -170,8 +170,15 @@ def _extract_outcome_prices(market: dict, platform: str) -> dict[str, float]:
                 prices[outcome] = float(price)
         # Alternative format
         if not prices:
-            yes_price = market.get("yes_price") or market.get("outcomePrices", [None, None])[0]
-            no_price = market.get("no_price") or market.get("outcomePrices", [None, None])[1]
+            outcome_prices = market.get("outcomePrices") or []
+            if not isinstance(outcome_prices, (list, tuple)):
+                outcome_prices = []
+            yes_price = market.get("yes_price")
+            no_price = market.get("no_price")
+            if yes_price is None and len(outcome_prices) > 0:
+                yes_price = outcome_prices[0]
+            if no_price is None and len(outcome_prices) > 1:
+                no_price = outcome_prices[1]
             if yes_price is not None:
                 prices["yes"] = float(yes_price)
             if no_price is not None:

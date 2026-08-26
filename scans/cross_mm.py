@@ -88,7 +88,7 @@ def scan_cross_mm(
         for buy_plat, sell_plat, buy_price, sell_price, side_a, side_b in candidates:
             try:
                 fee_result = net_profit_cross_generic(
-                    buy_price, 1 - sell_price, side_a, side_b,
+                    buy_price, sell_price, side_a, side_b,
                     platform_a=buy_plat, platform_b=sell_plat,
                 )
             except Exception:

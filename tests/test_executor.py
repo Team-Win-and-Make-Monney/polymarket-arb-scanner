@@ -83,7 +83,7 @@ def risk_manager():
 def executor(ArbitrageExecutor, db, risk_manager):
     pm_trader = MagicMock()
     kalshi_client = MagicMock()
-    return ArbitrageExecutor(
+    instance = ArbitrageExecutor(
         pm_trader=pm_trader,
         kalshi_client=kalshi_client,
         db=db,
@@ -91,6 +91,8 @@ def executor(ArbitrageExecutor, db, risk_manager):
         dry_run=True,
         max_trade_size=5.0,
     )
+    yield instance
+    instance.close()
 
 
 # ---------------------------------------------------------------------------
@@ -428,12 +430,13 @@ class TestOrphanedTrades:
         # Mock cancel to fail so it gets marked orphaned
         executor._cancel_leg = lambda leg: False
 
-        result = executor._execute_legs(opp, legs, 5.0)
+        with patch("executor.HEDGE_ENABLED", False):
+            result = executor._execute_legs(opp, legs, 5.0)
         assert result is False
 
         trades = db.get_trades_for_opportunity(1)
         statuses = [t["status"] for t in trades]
-        assert "orphaned" in statuses or "filled" in statuses
+        assert "orphaned" in statuses
 
 
 # ---------------------------------------------------------------------------

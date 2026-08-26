@@ -28,6 +28,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 
 from url_guard import assert_public_url
 
@@ -35,8 +36,24 @@ logger = logging.getLogger(__name__)
 
 PLATFORM = "kalshi"  # hardcoded venue — the pilot never routes anywhere else
 KALSHI_TICK = 0.01
-DECISIONS_LOG_PATH = os.getenv("MM_DECISIONS_LOG_PATH") or "decisions.jsonl"
-STATE_PATH = os.getenv("MM_STATE_PATH") or "mm_pilot_state.json"
+
+
+def _data_path(env_name: str, default_name: str) -> str:
+    """Resolve an operator-configured pilot file inside ``DATA_DIR``."""
+    data_dir = Path(os.getenv("DATA_DIR", ".")).expanduser().resolve()
+    raw = os.getenv(env_name)
+    candidate = (
+        Path(raw).expanduser() if raw else data_dir / default_name
+    ).resolve()
+    try:
+        candidate.relative_to(data_dir)
+    except ValueError as exc:
+        raise ValueError(f"{env_name} must resolve inside DATA_DIR") from exc
+    return str(candidate)
+
+
+DECISIONS_LOG_PATH = _data_path("MM_DECISIONS_LOG_PATH", "decisions.jsonl")
+STATE_PATH = _data_path("MM_STATE_PATH", "mm_pilot_state.json")
 
 # Startup reconciliation (finding #4): when there is no persisted checkpoint
 # to anchor the fill lookback, use a wide fixed window rather than "now" —

@@ -9,6 +9,7 @@ This is a READ-ONLY client — no posting, no voting.
 
 import logging
 import os
+import re
 import threading
 import time
 from datetime import datetime, timedelta
@@ -21,6 +22,10 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+
+_VALID_SUBREDDIT = re.compile(r"[A-Za-z0-9_-]{1,50}\Z")
+_VALID_SEARCH_SORTS = frozenset({"relevance", "hot", "top", "new", "comments"})
+_VALID_LIST_SORTS = frozenset({"hot", "new", "top", "rising"})
 
 REDDIT_API_URL = "https://oauth.reddit.com"
 REDDIT_AUTH_URL = "https://www.reddit.com/api/v1/access_token"
@@ -109,6 +114,11 @@ class RedditClient:
 
             data = resp.json()
             self._access_token = data.get("access_token")
+            if not isinstance(self._access_token, str) or not self._access_token.strip():
+                self._access_token = None
+                self.authenticated = False
+                logger.warning("Reddit auth response did not include an access token")
+                return False
             expires_in = data.get("expires_in", 3600)
             self._token_expires = time.time() + expires_in - 60
 
@@ -148,6 +158,13 @@ class RedditClient:
             created_utc, subreddit.
         """
         if not self._authenticate():
+            return []
+
+        if subreddit is not None and not _VALID_SUBREDDIT.fullmatch(subreddit):
+            logger.warning("Invalid subreddit name rejected")
+            return []
+        if sort not in _VALID_SEARCH_SORTS:
+            logger.warning("Invalid Reddit search sort rejected: %s", sort)
             return []
 
         _rate_limit()
@@ -217,6 +234,13 @@ class RedditClient:
             List of post dicts.
         """
         if not self._authenticate():
+            return []
+
+        if not _VALID_SUBREDDIT.fullmatch(subreddit):
+            logger.warning("Invalid subreddit name rejected")
+            return []
+        if sort not in _VALID_LIST_SORTS:
+            logger.warning("Invalid Reddit listing sort rejected: %s", sort)
             return []
 
         _rate_limit()

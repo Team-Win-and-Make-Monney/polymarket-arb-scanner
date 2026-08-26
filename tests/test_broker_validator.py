@@ -62,13 +62,12 @@ class TestCaps:
             assert not result.ok, variant
             assert "operator-gated" in result.reason
 
-    def test_fail_post_action_over_ceiling(self):
-        # ceiling 8200; portfolio 8100 (under) but 8100 + 200 = 8300 over the
-        # working ceiling — must fail on POST-ACTION exposure (Codex R2 #2).
+    def test_move_does_not_double_count_portfolio_value(self):
+        # Moving existing capital between venues does not add to total portfolio
+        # value; adding amount_usd again would double-count the transfer.
         v = make_validator(sources=healthy_sources(portfolio_value_usd=lambda: 8100.0))
         result = v._check_caps(move(200.0))
-        assert not result.ok
-        assert "post-action" in result.reason
+        assert result.ok
 
     def test_fail_portfolio_over_ceiling(self):
         # ceiling = 8000 + 200 realized; portfolio 9000 breaches it
@@ -78,9 +77,9 @@ class TestCaps:
         assert "ceiling" in result.reason
 
     def test_negative_pnl_shrinks_ceiling(self):
-        # ceiling = 8000 - 7950 = 50; portfolio 40 is fine but amount 100 is not
+        # ceiling = 8000 - 7950 = 50; an existing portfolio above 50 fails.
         v = make_validator(sources=healthy_sources(
-            realized_pnl_usd=lambda: -7950.0, portfolio_value_usd=lambda: 40.0))
+            realized_pnl_usd=lambda: -7950.0, portfolio_value_usd=lambda: 60.0))
         assert not v._check_caps(move(100.0)).ok
 
     def test_pass_market_scoped_within_cap_and_depth(self):

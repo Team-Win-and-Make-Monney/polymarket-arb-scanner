@@ -10,6 +10,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 from config import BETFAIR_RATE_LIMIT
 from rate_limiter import PlatformCircuitBreaker
+from url_guard import assert_public_url
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ class BetfairClient:
         self.session = requests.Session()
         proxy_url = os.getenv("BETFAIR_PROXY_URL")
         if proxy_url:
+            proxy_url = assert_public_url(proxy_url, env_name="BETFAIR_PROXY_URL")
             self.session.proxies = {"http": proxy_url, "https": proxy_url}
         self.api_key = None
         self.ssoid = None

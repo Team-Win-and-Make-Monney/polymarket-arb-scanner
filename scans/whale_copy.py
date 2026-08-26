@@ -59,12 +59,19 @@ def _parse_clob_transaction(tx: dict, whale_address: str) -> dict | None:
         return None
 
     tx_hash = tx.get("hash")
+    try:
+        whale_timestamp = int(tx.get("timeStamp", 0))
+        whale_block = int(tx.get("blockNumber", 0))
+    except (TypeError, ValueError):
+        logger.debug("WhaleCopy: invalid timestamp/block for tx %s", tx_hash)
+        return None
+
     base_opp: dict = {
         "type": "WhaleCopy",
         "_whale_address": whale_address,
         "_whale_tx_hash": tx_hash,
-        "_whale_timestamp": int(tx.get("timeStamp", 0)),
-        "_whale_block": int(tx.get("blockNumber", 0)),
+        "_whale_timestamp": whale_timestamp,
+        "_whale_block": whale_block,
         "_market_key": tx_hash,  # tx hash is unique per CTF call
         "_layer": 4,
     }
@@ -183,11 +190,15 @@ def scan_whale_copy(
 
             # Update last seen block for this wallet (for next scan cycle)
             if txs:
-                highest_block = int(txs[0].get("blockNumber", 0))
-                last_block_cache[wallet] = highest_block
-                logger.debug(
-                    "Updated block cache for %s: %d", wallet, highest_block
-                )
+                try:
+                    highest_block = int(txs[0].get("blockNumber", 0))
+                except (TypeError, ValueError):
+                    logger.warning("Invalid block number returned for whale wallet %s", wallet)
+                else:
+                    last_block_cache[wallet] = highest_block
+                    logger.debug(
+                        "Updated block cache for %s: %d", wallet, highest_block
+                    )
 
         except Exception as e:
             logger.warning("Failed to fetch whale wallet %s: %s", wallet, str(e))

@@ -360,7 +360,12 @@ def scan_kalshi_multi(
         with ThreadPoolExecutor(max_workers=8) as pool:
             futures = {pool.submit(_fetch_multi_depth, opp): opp for opp in opportunities}
             for future in as_completed(futures):
-                opp, d = future.result()
+                try:
+                    opp, d = future.result()
+                except Exception as exc:
+                    opp = futures[future]
+                    d = 0
+                    logger.warning("Kalshi multi depth fetch failed closed: %s", exc)
                 opp["_clob_depth"] = d
 
     opportunities = filter_dust(opportunities)

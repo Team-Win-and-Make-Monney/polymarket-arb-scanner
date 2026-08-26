@@ -283,9 +283,8 @@ class MetricsCollector:
             else:
                 for labels_tuple, entry in data.items():
                     label_str = _labels_to_prom(labels_tuple)
-                    cumulative = 0
                     for bucket_bound in sorted(entry["buckets"].keys()):
-                        cumulative += entry["buckets"][bucket_bound]
+                        cumulative = entry["buckets"][bucket_bound]
                         if bucket_bound == float("inf"):
                             le_str = "+Inf"
                         else:

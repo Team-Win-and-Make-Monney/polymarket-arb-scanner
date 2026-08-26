@@ -8,6 +8,10 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 logger = logging.getLogger(__name__)
 
 
+class _RateLimitError(requests.RequestException):
+    """Raised for Polygonscan HTTP 429 responses."""
+
+
 class PolygonscanClient:
     """Polygonscan REST API client for wallet transaction monitoring.
 
@@ -36,7 +40,12 @@ class PolygonscanClient:
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type((requests.ConnectionError, requests.Timeout)),
+        retry=retry_if_exception_type((
+            requests.ConnectionError,
+            requests.Timeout,
+            requests.HTTPError,
+            _RateLimitError,
+        )),
         reraise=True,
     )
     def get_latest_transactions(
@@ -95,7 +104,7 @@ class PolygonscanClient:
 
             if resp.status_code == 429:
                 logger.warning("Polygonscan rate limited (429), will retry")
-                raise requests.Timeout("Rate limit exceeded")
+                raise _RateLimitError("Rate limit exceeded")
 
             resp.raise_for_status()
 
@@ -112,8 +121,8 @@ class PolygonscanClient:
 
             return transactions
 
-        except requests.Timeout:
-            logger.warning("Polygonscan timeout for %s, will retry", address)
+        except (requests.Timeout, requests.HTTPError, _RateLimitError):
+            logger.warning("Polygonscan request failed for %s, will retry", address)
             raise
 
         except Exception as e:

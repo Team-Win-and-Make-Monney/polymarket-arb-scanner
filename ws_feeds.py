@@ -27,6 +27,7 @@ except Exception:
 import websockets
 
 from kalshi_api import _sign_pss, _load_private_key, _load_private_key_from_base64
+from url_guard import assert_public_url
 
 # Proxy support for WebSocket connections
 try:
@@ -92,6 +93,14 @@ class FeedManager:
         self._running = False
         self._pm_proxy = os.getenv("POLYMARKET_PROXY_URL")
         self._kalshi_proxy = os.getenv("KALSHI_PROXY_URL")
+        if self._pm_proxy:
+            self._pm_proxy = assert_public_url(
+                self._pm_proxy, env_name="POLYMARKET_PROXY_URL"
+            )
+        if self._kalshi_proxy:
+            self._kalshi_proxy = assert_public_url(
+                self._kalshi_proxy, env_name="KALSHI_PROXY_URL"
+            )
         self._pending_poly_subs: list[str] = []
         self._pending_kalshi_subs: list[str] = []
         self._pending_betfair_subs: list[str] = []
@@ -833,14 +842,8 @@ class BetfairMarketCache:
             {selection_id: price_dict} for each runner in the market.
         """
         with self._lock:
-            runners = self._markets.get(market_id, {})
-            result = {}
-            for sel_id in runners:
-                # Release lock briefly per runner via get_best_prices (re-acquires)
-                pass
-        # Call outside lock to avoid deadlock
-        with self._lock:
             sel_ids = list(self._markets.get(market_id, {}).keys())
+        result = {}
         for sel_id in sel_ids:
             prices = self.get_best_prices(market_id, sel_id)
             if prices:
@@ -969,7 +972,6 @@ class BetfairFeed:
             while self._running:
                 # Send any pending subscription updates
                 if self._pending_market_ids:
-                    pending = list(self._pending_market_ids)
                     self._pending_market_ids.clear()
                     await self._subscribe(self._market_ids)  # Re-subscribe with full list
                     logger.info("Betfair stream: updated subscription (%d markets total)",

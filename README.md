@@ -2,7 +2,7 @@
 
 Python CLI for detecting and paper-evaluating prediction-market arbitrage. The repository contains multiple venue adapters and execution code, but the project is currently paused for broad expansion and is dry-run by default.
 
-> **Current operating state (2026-08-24):** Railway is still running a dry-run worker. The only verified live operating target is a narrowly gated Kalshi D0 launcher. No generic multi-venue live command is authorized. See [`docs/STATE.md`](docs/STATE.md).
+> **Current operating state (2026-08-26):** PR #134 is merged and Railway is running that exact commit as a healthy Kalshi-only dry-run worker. The only verified live operating target remains the separately gated Kalshi D0 launcher. No generic multi-venue live command is authorized. See [`docs/STATE.md`](docs/STATE.md).
 >
 > Renamed from `polymarket-arb-scanner` on 2026-05-09. The new name reflects the actual scope — a grid of platforms × layers × strategies, not a Polymarket-only scanner. Local clones may keep the old directory name without any functional impact.
 
@@ -123,8 +123,9 @@ IBKR connectivity requires a reachable IB Gateway socket — not viable from Rai
 ## Project Status
 
 - Broad multi-venue expansion is parked while safety and reproducibility work is consolidated.
-- Recovery work is being prepared on `codex/project-recovery-20260824`; it is not merged or deployed yet.
-- Railway remains active in dry-run mode, so the project is paused but not resource-free.
+- PR #134 is merged on `master`; its Railway deployment is healthy, Kalshi-only, and dry-run.
+- The remaining audit reconciliation is prepared on `codex/project-completion-20260825`; it is not merged or deployed.
+- Railway still runs both `arb-scanner` and the legacy `polymarket-egress-proxy`, so the parked project is not resource-free.
 - Verified live readiness: Kalshi D0 only, subject to all operator gates and separate action-time approval.
 - This is a personal trading tool. **Out of scope:** public-facing product, SaaS, user accounts, selling access.
 
@@ -144,6 +145,7 @@ IBKR connectivity requires a reachable IB Gateway socket — not viable from Rai
 | [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Deploy, post-deploy checklist, observability contract, rollback. |
 | [`docs/BACKTESTING.md`](docs/BACKTESTING.md) | Snapshot → replay → tuning (#20) methodology. |
 | [`docs/SECURITY.md`](docs/SECURITY.md) | Secrets, custody-grade keys, dashboard exposure (ENFORCED vs TODO). |
+| [`docs/AUDIT-RECONCILIATION-2026-08-26.md`](docs/AUDIT-RECONCILIATION-2026-08-26.md) | Disposition of PR #130's 125 findings and the completion review. |
 | [`TASK_CONTRACT.md`](TASK_CONTRACT.md) | Definition of done, opportunity-dict schema, execution legs, exceptions. |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Branching, style, testing, how to add a strategy. |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release history (Keep a Changelog). |

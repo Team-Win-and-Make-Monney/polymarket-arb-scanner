@@ -15,6 +15,7 @@ Layer 5: Capital Optimization — reduce execution latency.
 """
 
 import logging
+import math
 import os
 import socket
 import threading
@@ -70,8 +71,8 @@ class LatencyTracker:
             if len(self._samples) < 5:
                 return 0.0
             sorted_samples = sorted(self._samples)
-            idx = int(len(sorted_samples) * 0.95)
-            return sorted_samples[min(idx, len(sorted_samples) - 1)]
+            idx = max(0, math.ceil(len(sorted_samples) * 0.95) - 1)
+            return sorted_samples[idx]
 
     def get_min(self) -> float:
         """Get minimum latency in ms."""
@@ -285,13 +286,16 @@ class LatencyMonitor:
 
 
 _monitor: LatencyMonitor | None = None
+_monitor_lock = threading.Lock()
 
 
 def get_latency_monitor() -> LatencyMonitor:
     """Get or create the module-level LatencyMonitor instance."""
     global _monitor
     if _monitor is None:
-        _monitor = LatencyMonitor()
+        with _monitor_lock:
+            if _monitor is None:
+                _monitor = LatencyMonitor()
     return _monitor
 
 
@@ -377,11 +381,14 @@ class RegionRouter:
 
 
 _router: RegionRouter | None = None
+_router_lock = threading.Lock()
 
 
 def get_region_router() -> RegionRouter:
     """Get or create the module-level RegionRouter instance."""
     global _router
     if _router is None:
-        _router = RegionRouter()
+        with _router_lock:
+            if _router is None:
+                _router = RegionRouter()
     return _router

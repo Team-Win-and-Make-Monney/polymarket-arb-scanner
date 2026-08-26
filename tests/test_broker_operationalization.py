@@ -246,6 +246,14 @@ class TestCommandExecutors:
         with pytest.raises(RuntimeError, match="outside"):
             CommandIntentAdapter([str(repo_root / "scanner.py")], 5, repo_root)
 
+    @pytest.mark.parametrize("shebang", ["#!/usr/bin/env bash", "#!/usr/bin/env -S bash -eu"])
+    def test_env_wrapped_shell_shebang_is_rejected(self, tmp_path, shebang):
+        executable = tmp_path / "shell-adapter"
+        executable.write_text(f"{shebang}\nexit 0\n", encoding="utf-8")
+        executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+        with pytest.raises(RuntimeError, match="shell-script"):
+            CommandIntentAdapter([str(executable)], 5, Path(__file__).parents[1])
+
     @pytest.mark.parametrize("timeout", [float("nan"), float("inf"), "nan"])
     def test_non_finite_timeout_is_rejected(self, tmp_path, timeout):
         executable = self._script(tmp_path, "print('{}')")

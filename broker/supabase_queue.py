@@ -19,6 +19,8 @@ import json
 import logging
 import os
 
+from url_guard import assert_public_url
+
 try:
     import requests
 except ImportError:  # SQLite-only install — this backend refuses to construct
@@ -26,7 +28,6 @@ except ImportError:  # SQLite-only install — this backend refuses to construct
 
 from .queue import (
     STATUS_PENDING,
-    TERMINAL_STATUSES,
     VALID_STATUSES,
     Intent,
     IntentError,
@@ -54,7 +55,8 @@ def _require_env(url: str | None, key: str | None) -> tuple[str, str]:
             "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set for the "
             "Supabase broker backend"
         )
-    return url.rstrip("/"), key
+    validated_url = assert_public_url(url, env_name="SUPABASE_URL", allow_http=False)
+    return validated_url.rstrip("/"), key
 
 
 class SupabaseIntentQueue:
@@ -141,7 +143,10 @@ class SupabaseIntentQueue:
             raise IntentError(f"{op}: append-only violation ({resp.status_code})")
         if "reused for a different intent" in body:
             raise IntentError(f"{op}: idempotency_key reused for a different intent")
-        raise RuntimeError(f"Supabase {op} failed ({resp.status_code}): {body}")
+        if "already terminal" in body:
+            raise IntentError(f"{op}: outcome is write-once because the intent is already terminal")
+        safe_body = "".join(char if 32 <= ord(char) <= 126 else "?" for char in body)[:200]
+        raise RuntimeError(f"Supabase {op} failed ({resp.status_code}): {safe_body}")
 
     # -- intents ------------------------------------------------------------
 
@@ -197,15 +202,10 @@ class SupabaseIntentQueue:
     def append_event(self, intent_id: int, status: str, reason: str = "") -> None:
         if status not in VALID_STATUSES:
             raise IntentError(f"invalid status {status!r}")
-        # Terminal outcomes are write-once (parity with the SQLite backend); the
-        # DB migration enforces this server-side too, this is the client guard.
-        if self.current_status(intent_id) in TERMINAL_STATUSES:
-            raise IntentError(
-                f"intent {intent_id} is already in a terminal status — "
-                "outcomes are write-once"
-            )
-        self._insert("broker_intent_events", {
-            "intent_id": intent_id, "status": status, "reason": reason,
+        # The RPC takes an advisory transaction lock and performs the terminal
+        # check plus insert atomically. A client-side GET+POST guard races.
+        self._post_rpc("broker_append_intent_event", {
+            "p_intent_id": intent_id, "p_status": status, "p_reason": reason,
         })
 
     def current_status(self, intent_id: int) -> str:

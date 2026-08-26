@@ -25,6 +25,9 @@ else:
     sys.modules.pop("polymarket_api", None)
 
 # Patch _extract_token_ids in helpers
+_original_extract_token_ids = helpers._extract_token_ids
+
+
 def mock_extract_token_ids(market: dict) -> list:
     """Mock implementation of _extract_token_ids."""
     token_ids_raw = market.get("clobTokenIds")
@@ -37,7 +40,12 @@ def mock_extract_token_ids(market: dict) -> list:
     except (json.JSONDecodeError, ValueError, TypeError):
         return []
 
-helpers._extract_token_ids = mock_extract_token_ids
+@pytest.fixture(autouse=True)
+def patch_extract_token_ids():
+    """Scope the helper replacement to each test and restore it afterward."""
+    helpers._extract_token_ids = mock_extract_token_ids
+    yield
+    helpers._extract_token_ids = _original_extract_token_ids
 
 
 def _validated_best_bid_ask(order_book: dict) -> dict:

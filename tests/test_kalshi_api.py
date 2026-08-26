@@ -955,7 +955,8 @@ class TestParseOrderbook:
         from pathlib import Path
         import json
         from kalshi_api import parse_orderbook, best_yes_bid, best_no_bid, best_yes_ask, best_no_ask
-        sample = json.loads(Path("tests/fixtures/kalshi_orderbook_two_sided.json").read_text())
+        fixture_path = Path(__file__).resolve().parent / "fixtures" / "kalshi_orderbook_two_sided.json"
+        sample = json.loads(fixture_path.read_text())
         parsed = parse_orderbook(sample["response"])
         # Real data: 1 YES bid at $0.01, 26 NO bids ascending from $0.01 to $0.96
         assert len(parsed["yes_bids"]) == 1

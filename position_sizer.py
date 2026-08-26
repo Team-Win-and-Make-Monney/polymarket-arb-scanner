@@ -348,13 +348,11 @@ class PositionSizer:
         """
         raw = opportunity.get("net_roi", 0)
         if isinstance(raw, str):
+            is_percent = raw.strip().endswith("%")
             raw = raw.rstrip("%").strip()
             try:
                 val = float(raw)
-                # If the string was "5.23%" it means 5.23%, convert to 0.0523
-                if abs(val) > 1:
-                    return val / 100.0
-                return val
+                return val / 100.0 if is_percent else val
             except (ValueError, TypeError):
                 return 0.0
         try:

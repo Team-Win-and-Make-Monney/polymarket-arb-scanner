@@ -144,11 +144,12 @@ def polymarket_fee(buy_price: float, sell_price: float = 1.0) -> float:
 
 
 # Kalshi series with non-standard fees, verified against the official
-# schedule (kalshi.com/fee-schedule, effective Feb 5, 2026) on 2026-06-10:
+# schedule (kalshi.com/fee-schedule, effective July 7, 2026) on 2026-08-26:
 # - Most markets: taker fee only (0.07 coefficient); makers pay $0.
-# - ~93 flagged series additionally charge makers the 0.0175 coefficient.
-# - S&P 500 (INX*) and Nasdaq-100 (NASDAQ100*) series use a HALVED taker
-#   coefficient (0.035).
+# - Flagged series additionally charge makers the 0.0175 coefficient.
+# - The current schedule has no half-taker default.  The env override remains
+#   available so a future published non-standard multiplier can fail closed
+#   into an explicit operator configuration instead of a code hotfix.
 # Both lists are env-overridable; the maker list ships with the known
 # flagged examples and should be refreshed from the fee-schedule page.
 KALSHI_MAKER_FEE_SERIES = tuple(
@@ -161,7 +162,7 @@ KALSHI_MAKER_FEE_SERIES = tuple(
 )
 KALSHI_HALF_TAKER_SERIES = tuple(
     p.strip().upper()
-    for p in os.getenv("KALSHI_HALF_TAKER_SERIES", "INX,NASDAQ100").split(",")
+    for p in os.getenv("KALSHI_HALF_TAKER_SERIES", "").split(",")
     if p.strip()
 )
 
@@ -177,15 +178,16 @@ def kalshi_taker_fee(price: float, contracts: int = 1,
                      ticker: str | None = None) -> float:
     """Calculate Kalshi taker fee.
 
-    Verified 2026-06-10 against the official schedule (effective Feb 5,
+    Verified 2026-08-26 against the official schedule (effective July 7,
     2026): fees = roundup(0.07 * C * P * (1 - P)), rounded up to the next
     cent ONCE PER ORDER — not per contract. The previous per-contract
     ceil + 2-cent floor overstated the real fee by up to 6x at price
     extremes (e.g. P=0.05, C=100: real $0.33 vs charged $2.00),
     suppressing legitimate long-tail detections.
 
-    S&P 500 / Nasdaq-100 series (KALSHI_HALF_TAKER_SERIES) use a halved
-    coefficient (0.035). Capped at KALSHI_FEE_CAP_CENTS per contract.
+    Series explicitly configured in KALSHI_HALF_TAKER_SERIES use a halved
+    coefficient (0.035). The current schedule does not configure any by
+    default. Capped at KALSHI_FEE_CAP_CENTS per contract.
 
     Returns total fee in dollars.
     """

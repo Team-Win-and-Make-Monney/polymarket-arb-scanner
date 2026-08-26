@@ -823,23 +823,28 @@ class TestKalshiMakerFee:
         assert kalshi_maker_fee(0.50, 1, ticker=self.FLAGGED) == pytest.approx(fee_cents / 100.0)
 
 
-class TestKalshiIndexTakerFee:
-    """S&P 500 / Nasdaq-100 series use a halved taker coefficient (0.035)."""
+class TestKalshiNonStandardTakerFee:
+    """Non-standard taker multipliers require explicit configuration."""
 
-    def test_index_series_halved(self):
+    def test_current_index_series_use_standard_rate(self):
         from fees import kalshi_taker_fee
-        # Standard at 0.50 x100: ceil(0.07*100*0.25*100) = 175 cents = $1.75
-        # Index at 0.50 x100:    ceil(0.035*100*0.25*100) = 88 cents = $0.88
+        # The July 7, 2026 schedule lists the current index series at the
+        # standard taker multiplier. Legacy prefixes must not undercharge.
         assert kalshi_taker_fee(0.50, 100) == pytest.approx(1.75)
-        assert kalshi_taker_fee(0.50, 100, ticker="INX-26JUN10") == pytest.approx(0.88)
+        assert kalshi_taker_fee(0.50, 100, ticker="INX-26JUN10") == pytest.approx(1.75)
+        assert kalshi_taker_fee(0.50, 100, ticker="NASDAQ100-26JUN") == pytest.approx(1.75)
 
-    def test_nasdaq_prefix_matches(self):
+    def test_explicit_override_applies(self, monkeypatch):
+        monkeypatch.setattr("fees.KALSHI_HALF_TAKER_SERIES", ("SPECIAL",))
         from fees import kalshi_taker_fee
-        assert kalshi_taker_fee(0.50, 100, ticker="NASDAQ100-26JUN") < kalshi_taker_fee(0.50, 100)
+        assert kalshi_taker_fee(0.50, 100, ticker="SPECIAL-26AUG") == pytest.approx(0.88)
 
-    def test_non_index_unchanged(self):
+    def test_published_one_contract_extremes(self):
         from fees import kalshi_taker_fee
-        assert kalshi_taker_fee(0.50, 100, ticker="KXCPI-26JUN") == kalshi_taker_fee(0.50, 100)
+        # The current official table lists both 10-cent and 85-cent contracts
+        # at a one-cent fee for one contract.
+        assert kalshi_taker_fee(0.10) == pytest.approx(0.01)
+        assert kalshi_taker_fee(0.85) == pytest.approx(0.01)
 
 
 class TestPolymarketCategoryRates:

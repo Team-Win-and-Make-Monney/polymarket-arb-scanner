@@ -83,7 +83,7 @@ def _aggregate_sentiment(
 
     weighted_score = sum(s * w for s, w in zip(scores, weights)) / sum(weights)
 
-    implied_prob = (weighted_score + 1) / 2
+    implied_prob = max(0.0, min(1.0, (weighted_score + 1) / 2))
 
     return {
         "score": weighted_score,

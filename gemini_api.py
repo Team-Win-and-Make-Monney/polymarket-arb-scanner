@@ -79,6 +79,7 @@ class GeminiClient:
         self.session = requests.Session()
         proxy_url = os.getenv("GEMINI_PROXY_URL")
         if proxy_url:
+            proxy_url = assert_public_url(proxy_url, env_name="GEMINI_PROXY_URL")
             self.session.proxies = {"http": proxy_url, "https": proxy_url}
         self.api_key = None
         self.api_secret = None
@@ -329,7 +330,9 @@ class GeminiClient:
                 except (ValueError, TypeError):
                     return None
 
-            yes_price = _to_float(buy.get("yes")) or _to_float(prices_obj.get("bestAsk"))
+            yes_price = _to_float(buy.get("yes"))
+            if yes_price is None:
+                yes_price = _to_float(prices_obj.get("bestAsk"))
             no_price = _to_float(buy.get("no"))
             if yes_price is not None and no_price is None:
                 no_price = round(1.0 - yes_price, 6)

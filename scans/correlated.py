@@ -458,7 +458,7 @@ def _refine_correlated_with_depth(
             # This is a sterner version of the same gate above; keep both
             # since callers may relax max_spread_collapse but want the
             # layer floor enforced.
-            pass  # already handled by spread_collapse gate
+            continue
 
         opp.update({
             "_long_ask": long_ask,

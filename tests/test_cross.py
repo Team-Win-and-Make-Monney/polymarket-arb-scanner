@@ -241,7 +241,7 @@ class TestRefineCrossWithClob:
         assert len(result) == 0
 
     @patch("scans.cross._fetch_clob_for_market")
-    def test_missing_ask_uses_bid_fallback(self, mock_clob):
+    def test_missing_ask_fails_closed(self, mock_clob):
         mock_clob.return_value = (
             {"conditionId": "mk1"},
             {
@@ -262,8 +262,7 @@ class TestRefineCrossWithClob:
         with patch("scans.cross.net_profit_cross_platform") as mock_fee:
             mock_fee.return_value = {"net_profit": 0.08, "fees": 0.01, "gross_spread": 0.09}
             result = _refine_cross_with_clob([opp], markets_by_key, 0.005)
-            if result:
-                assert result[0].get("_partial_clob") is True
+            assert result == []
 
     def test_no_market_key_drops_fail_closed(self):
         """Audit #77 round 2: no market to verify against -> drop, not

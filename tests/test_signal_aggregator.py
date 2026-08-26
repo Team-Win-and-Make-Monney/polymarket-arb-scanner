@@ -127,11 +127,12 @@ class TestGetDivergences:
         agg = SignalAggregator()
         agg.add_signal("m", "a", 0.50)
         agg.add_signal("m", "b", 0.52)  # only 2c off
-        agg.add_signal("m", "c", 0.80)  # diverges
+        agg.add_signal("m", "c", 0.75)  # diverges while a/b stay below 10c
         # Default threshold is 0.10; only c should appear.
         divs = agg.get_divergences("m")
         sources = {d["source"] for d in divs}
         assert "c" in sources
+        assert "a" not in sources
         assert "b" not in sources
 
     def test_sorted_by_absolute_divergence(self):

@@ -150,11 +150,15 @@ class OrderFlowTracker:
         avg_hourly = total_volume / time_span_hours
 
         hourly_imbalances = []
-        now = time.time()
+        ref_time = max(timestamps)
         for hour_offset in range(int(time_span_hours)):
-            start = now - ((hour_offset + 1) * 3600)
-            end = now - (hour_offset * 3600)
-            hour_trades = [t for t in all_trades if start <= t["timestamp"] < end]
+            start = ref_time - ((hour_offset + 1) * 3600)
+            end = ref_time - (hour_offset * 3600)
+            hour_trades = [
+                t for t in all_trades
+                if start <= t["timestamp"] <= end
+                if hour_offset == 0 or t["timestamp"] < end
+            ]
             if len(hour_trades) >= 3:
                 buy = sum(t["size"] for t in hour_trades if t["side"] == "buy")
                 sell = sum(t["size"] for t in hour_trades if t["side"] == "sell")
@@ -188,8 +192,10 @@ class OrderFlowTracker:
         Returns:
             Anomaly dict with direction, confidence, or None.
         """
-        volume_threshold = volume_threshold or INSIDER_PATTERN_VOLUME_THRESHOLD
-        imbalance_threshold = imbalance_threshold or INSIDER_PATTERN_IMBALANCE_THRESHOLD
+        if volume_threshold is None:
+            volume_threshold = INSIDER_PATTERN_VOLUME_THRESHOLD
+        if imbalance_threshold is None:
+            imbalance_threshold = INSIDER_PATTERN_IMBALANCE_THRESHOLD
 
         recent = self.get_recent_flow(market_key)
         baseline = self.get_baseline_flow(market_key)

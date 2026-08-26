@@ -1560,6 +1560,7 @@ def main():
 
     if dashboard_server:
         dashboard_server.shutdown()
+    executor.close()
     db.close()
 
 

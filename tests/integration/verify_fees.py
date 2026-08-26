@@ -11,7 +11,7 @@ Exit codes:
 
 Fee references:
   Polymarket: 2% taker fee on net winnings -- docs.polymarket.com
-  Kalshi: 7% of C * P * (1-P) per contract, capped at $1.75 -- kalshi.com/docs/fees
+  Kalshi: round up 7% of C * P * (1-P) per order -- kalshi.com/docs/kalshi-fee-schedule.pdf
   Betfair: 2-5% commission on net winnings -- BETFAIR_COMMISSION_RATE in config.py (default 3%)
   Smarkets: 2% fixed commission -- SMARKETS_COMMISSION_RATE in config.py
   Gemini: 1% maker / 5% taker -- GEMINI_FEE_RATE in config.py (default 5% taker)
@@ -114,10 +114,10 @@ def verify_polymarket() -> list[dict]:
 
 
 def verify_kalshi() -> list[dict]:
-    """Kalshi: 7% of C * P * (1-P) per contract, capped at $1.75.
+    """Kalshi: round up 7% of C * P * (1-P) once per order.
 
-    Reference: kalshi.com/docs/fees
-    Minimum: $0.02 per contract.
+    Reference: official schedule effective July 7, 2026.
+    Whole-contract, whole-cent orders round the order total up to a cent.
     """
     cases = [
         # (yes_price, no_price, description)
@@ -130,12 +130,12 @@ def verify_kalshi() -> list[dict]:
         result = net_profit_kalshi_binary(yes_p, no_p)
         calculated_total_fee = result["fees"]
 
-        # Documented formula: kalshi_taker_fee(p) for each leg
-        # fee_cents = max(2, ceil(7 * P * (1-P))), capped at KALSHI_FEE_CAP_CENTS
+        # Documented formula: kalshi_taker_fee(p) for each one-contract leg.
+        # fee_cents = ceil(7 * P * (1-P)), capped at KALSHI_FEE_CAP_CENTS.
         def expected_kalshi_fee(price: float) -> float:
             if price <= 0 or price >= 1:
                 return 0.0
-            fee_cents = max(2, math.ceil(7 * price * (1.0 - price)))
+            fee_cents = math.ceil(7 * price * (1.0 - price) - 1e-9)
             fee_cents = min(fee_cents, KALSHI_FEE_CAP_CENTS)
             return fee_cents / 100.0
 
@@ -150,7 +150,7 @@ def verify_kalshi() -> list[dict]:
             "sell_price": no_p,
             "calculated_fee": round(calculated_fee_sum, 6),
             "documented_fee": round(expected_fee, 6),
-            "documented_formula": "7% of P*(1-P) per contract, min $0.02, cap $1.75",
+            "documented_formula": "round up 7% of C*P*(1-P) once per order",
             "match": match,
         })
     return results
@@ -226,7 +226,7 @@ def verify_smarkets() -> list[dict]:
 
 
 def verify_gemini() -> list[dict]:
-    """Gemini Predictions: min(P, 1-P) * fee_rate per contract.
+    """Gemini Predictions: fee_rate * P * (1-P), rounded up per leg.
 
     Reference: GEMINI_FEE_RATE in config.py (default 0.05 = 5% taker).
     Maker rate is 1%, taker rate is 5%.
@@ -241,10 +241,9 @@ def verify_gemini() -> list[dict]:
         result = net_profit_gemini_binary(yes_p, no_p, fee_rate=GEMINI_FEE_RATE)
         calculated_fee = result["fees"]
 
-        # Documented formula: min(P, 1-P) * fee_rate for each leg
         expected_fee = (
-            min(yes_p, 1.0 - yes_p) * GEMINI_FEE_RATE
-            + min(no_p, 1.0 - no_p) * GEMINI_FEE_RATE
+            math.ceil(GEMINI_FEE_RATE * yes_p * (1.0 - yes_p) * 100) / 100
+            + math.ceil(GEMINI_FEE_RATE * no_p * (1.0 - no_p) * 100) / 100
         )
 
         match = _within_tolerance(calculated_fee, expected_fee)
@@ -255,7 +254,7 @@ def verify_gemini() -> list[dict]:
             "sell_price": no_p,
             "calculated_fee": round(calculated_fee, 6),
             "documented_fee": round(expected_fee, 6),
-            "documented_formula": f"min(P,1-P) * {GEMINI_FEE_RATE*100:.0f}% per leg (taker)",
+            "documented_formula": f"ceil({GEMINI_FEE_RATE*100:.0f}% * P * (1-P)) per leg",
             "match": match,
         })
     return results

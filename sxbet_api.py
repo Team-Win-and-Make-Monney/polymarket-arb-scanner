@@ -1,5 +1,6 @@
 """SX Bet Exchange API client for market data and trading."""
 
+from collections.abc import Mapping
 import logging
 import os
 import threading
@@ -108,7 +109,7 @@ class SXBetClient:
         self.wallet_address: str | None = None
         self.authenticated = False
 
-    def login(self, api_key: str = None, private_key: str = None) -> bool:
+    def login(self, api_key: str | None = None, private_key: str | None = None) -> bool:
         """Connect to SX Bet and verify API reachability.
 
         Public SX Bet market-data endpoints require no authentication. The
@@ -129,10 +130,6 @@ class SXBetClient:
             logger.warning(
                 "SXBET_PRIVATE_KEY is ignored while trading remains read-only"
             )
-
-        if not self.api_key:
-            logger.error("SX Bet API key not provided")
-            return False
 
         # Verify by fetching sports list (no auth header needed)
         _rate_limit()
@@ -164,10 +161,6 @@ class SXBetClient:
         Returns:
             Response JSON or None on failure.
         """
-        if not self.authenticated:
-            logger.error("SX Bet: must login before making API calls")
-            return None
-
         if _circuit.is_open():
             raise _RateLimitError("Circuit open -- sxbet in backoff")
         _rate_limit()
@@ -382,9 +375,16 @@ class SXBetClient:
                 timeout=15,
             )
             if resp.status_code == 200:
-                data = resp.json()
-                balances = data.get("data", {}).get("balances", [])
-                if not balances:
+                payload = resp.json()
+                if not isinstance(payload, Mapping):
+                    logger.debug("SX Bet balance response root was not an object")
+                    return None
+                data = payload.get("data")
+                if not isinstance(data, Mapping):
+                    logger.debug("SX Bet balance response data was not an object")
+                    return None
+                balances = data.get("balances")
+                if not isinstance(balances, list) or not balances:
                     logger.debug("SX Bet balance response contained no balances")
                     return None
                 available = sum(float(row["availableAmount"]) for row in balances)
@@ -428,7 +428,7 @@ class SXBetClient:
         Returns:
             True if cancellation succeeded.
         """
-        if not self.authenticated:
+        if not self.authenticated or not self.api_key:
             return False
         _rate_limit()
         try:

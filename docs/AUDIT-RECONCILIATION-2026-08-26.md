@@ -29,13 +29,13 @@ Total: 125/125 findings have a current disposition; none remain silently unclass
 
 ## Independent review
 
-CodeRabbit CLI 0.7.5 reviewed the full uncommitted completion diff in three completed passes and raised 20 issues total: 15 in the initial pass, 3 in the first post-fix pass, and 2 in the second post-fix pass. Each was verified against current code and all valid issues were corrected. A fourth zero-issue confirmation attempt was blocked by CodeRabbit's free OSS rate limit, which reported a 22-minute reset window; that blocked attempt is not represented as a green review.
+CodeRabbit CLI reviewed the full uncommitted completion diff in three completed passes and raised 20 issues total: 15 in the initial pass, 3 in the first post-fix pass, and 2 in the second post-fix pass. Each was verified against current code and all valid issues were corrected. An authenticated follow-up review on 2026-08-27 completed across the six changed source/test files with zero findings.
 
-Codex Security Deep Scan retains scan ID `487c03f8-f9cc-481d-ae82-cc0f102dffc9`. Its discovery worker could not be started on the current host because the host did not provide the required managed filesystem permission profile. This is an infrastructure verification gap, not a zero-finding security result; the scan must be resumed under a compatible profile without creating a duplicate scan.
+The legacy Codex Security Deep Scan retains scan ID `487c03f8-f9cc-481d-ae82-cc0f102dffc9` and remains blocked at its original host preflight. A fresh exact-range Codex Security diff scan, `dff40a30-2741-4409-b269-94733848489c`, completed against PR #135 head `811e79a1`. It reviewed all 65 executable files in scope and reported one low-severity execution-plan finding: inverted one-shot cross matches did not preserve the physical Kalshi-side mapping. The current diff persists `_pair_inverted`, always replaces action-time `_cross_legs`, and adds deterministic regression coverage. The finding is not represented as closed until the remediation is published and verified at the new PR head.
 
 ## Local verification
 
-- `python -m pytest tests -q --tb=short`: 3,643 passed, 39 skipped.
+- `python -m pytest tests -q --tb=short`: 3,646 passed, 39 skipped.
 - `python tests/integration/verify_fees.py`: all 24 cases across eight platforms passed.
 - `python -m compileall -q .`: passed.
 - `ruff check --select E9,F63,F7,F82 .`: passed.
@@ -49,7 +49,7 @@ Codex Security Deep Scan retains scan ID `487c03f8-f9cc-481d-ae82-cc0f102dffc9`.
 
 ## Remaining gates
 
-- Completion-branch CI must be green on the published commit. CodeRabbit's zero-issue confirmation remains pending its external rate-limit reset; the three completed passes and local gates above are green after all reported issues were fixed.
-- PRs #130 and #132 should be closed as superseded only after the completion PR is published and verified.
+- The Codex Security remediation must be published and completion-branch CI must be green at the resulting exact PR head.
+- PRs #130 and #132 are closed as superseded; PR #135 remains draft and unmerged.
 - Merging to `master` triggers Railway deployment and therefore requires separate action-time approval.
 - Live Kalshi D0 still requires one operator message containing all five envelope fields plus credential, eligibility, limit, emergency-stop, and per-action approval checks.

@@ -559,8 +559,15 @@ class TestCrossRevalidationStrategy:
             "type": "Cross",
             "net_profit": 0.10,
             "prices": "PM_Y=0.300 K_N=0.350",
+            "total_cost": "$0.6500",
             "_token_ids": ["tok_yes", "tok_no"],
             "_kalshi_ticker": "TICKER-XYZ",
+            "_cross_legs": [
+                {"platform": "polymarket", "side": "BUY", "token": "yes",
+                 "price": 0.30, "_token_id": "tok_yes"},
+                {"platform": "kalshi", "side": "no", "action": "buy",
+                 "price": 0.35, "_ticker": "TICKER-XYZ"},
+            ],
         }
 
         mock_book = {"asks": [{"price": "0.30", "size": "100"}]}
@@ -586,6 +593,65 @@ class TestCrossRevalidationStrategy:
         assert "PM_N=" in opp["prices"]
         assert "K_Y=" in opp["prices"]
         assert opp["net_profit"] == pytest.approx(0.14)
+        assert opp["total_cost"] == "$0.9000"
+        assert opp["net_roi"] == "15.56%"
+        assert opp["_cross_legs"] == [
+            {"platform": "polymarket", "side": "BUY", "token": "no",
+             "price": 0.30, "_token_id": "tok_no"},
+            {"platform": "kalshi", "side": "yes", "action": "buy",
+             "price": 0.60, "_ticker": "TICKER-XYZ"},
+        ]
+
+    def test_inverted_pair_revalidates_physical_sides_and_refreshes_legs(self, executor):
+        """An inverted match must score and submit the same physical contracts."""
+        from unittest.mock import call, patch as mpatch
+
+        opp = {
+            "type": "Cross(PM_YES + K_YES)",
+            "net_profit": 0.10,
+            "prices": "PM_Y=0.300 K_Y=0.350",
+            "total_cost": "$0.6500",
+            "_token_ids": ["tok_yes", "tok_no"],
+            "_kalshi_ticker": "TICKER-XYZ",
+            "_pair_inverted": True,
+            "_cross_legs": [
+                {"platform": "polymarket", "side": "BUY", "token": "yes",
+                 "price": 0.30, "_token_id": "tok_yes"},
+                {"platform": "kalshi", "side": "yes", "action": "buy",
+                 "price": 0.35, "_ticker": "TICKER-XYZ"},
+            ],
+        }
+        now = time.time()
+        price_cache = {
+            ("polymarket", "tok_yes"): {"best_ask": 0.31, "_ts": now},
+            ("polymarket", "tok_no"): {"best_ask": 0.69, "_ts": now},
+            ("kalshi", "TICKER-XYZ"): {
+                "yes_ask": 0.36,
+                "no_ask": 0.41,
+                "_ts": now,
+            },
+        }
+
+        with mpatch(
+            "executor.net_profit_cross_platform",
+            side_effect=[{"net_profit": 0.12}, {"net_profit": 0.04}],
+        ) as profit:
+            passed, reval_profit, reason = executor._revalidate_cross(
+                opp, 0.10, price_cache,
+            )
+
+        assert (passed, reval_profit, reason) == (True, pytest.approx(0.12), "passed")
+        assert profit.call_args_list == [
+            call(0.31, 0.36, "yes", "no"),
+            call(0.69, 0.41, "no", "yes"),
+        ]
+        assert opp["total_cost"] == "$0.6700"
+        assert opp["_cross_legs"] == [
+            {"platform": "polymarket", "side": "BUY", "token": "yes",
+             "price": 0.31, "_token_id": "tok_yes"},
+            {"platform": "kalshi", "side": "yes", "action": "buy",
+             "price": 0.36, "_ticker": "TICKER-XYZ"},
+        ]
 
     def test_net_profit_updated_to_winning_strategy(self, executor):
         """Verify net_profit is set to the winning strategy's value, not left at original."""

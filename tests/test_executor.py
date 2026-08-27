@@ -550,6 +550,12 @@ class TestCrossRevalidationStrategy:
         assert "PM_Y=" in opp["prices"]
         assert "K_N=" in opp["prices"]
         assert opp["net_profit"] == pytest.approx(0.12)
+        assert opp["_cross_legs"] == [
+            {"platform": "polymarket", "side": "BUY", "token": "yes",
+             "price": 0.30, "_token_id": "tok_yes"},
+            {"platform": "kalshi", "side": "no", "action": "buy",
+             "price": 0.60, "_ticker": "TICKER-XYZ"},
+        ]
 
     def test_strategy2_becomes_best(self, executor):
         """When strategy 2 (PM_NO + K_YES) becomes best, prices should flip to PM_N= and K_Y=."""

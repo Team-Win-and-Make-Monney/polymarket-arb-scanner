@@ -2,7 +2,7 @@
 
 Python CLI for detecting and paper-evaluating prediction-market arbitrage. The repository contains multiple venue adapters and execution code, but the project is currently paused for broad expansion and is dry-run by default.
 
-> **Current operating state (2026-08-26):** PR #134 is merged and Railway is running that exact commit as a healthy Kalshi-only dry-run worker. The only verified live operating target remains the separately gated Kalshi D0 launcher. No generic multi-venue live command is authorized. See [`docs/STATE.md`](docs/STATE.md).
+> **Current operating state (2026-08-27):** PR #134 is merged and Railway is running that exact commit as a healthy Kalshi-only dry-run worker. Draft PR #135 contains the remaining audit reconciliation and is not merged or deployed. The only verified live operating target remains the separately gated Kalshi D0 launcher. No generic multi-venue live command is authorized. See [`docs/STATE.md`](docs/STATE.md).
 >
 > Renamed from `polymarket-arb-scanner` on 2026-05-09. The new name reflects the actual scope — a grid of platforms × layers × strategies, not a Polymarket-only scanner. Local clones may keep the old directory name without any functional impact.
 
@@ -124,7 +124,7 @@ IBKR connectivity requires a reachable IB Gateway socket — not viable from Rai
 
 - Broad multi-venue expansion is parked while safety and reproducibility work is consolidated.
 - PR #134 is merged on `master`; its Railway deployment is healthy, Kalshi-only, and dry-run.
-- The remaining audit reconciliation is prepared on `codex/project-completion-20260825`; it is not merged or deployed.
+- The remaining audit reconciliation is published as draft PR #135; it is not merged or deployed.
 - Railway still runs both `arb-scanner` and the legacy `polymarket-egress-proxy`, so the parked project is not resource-free.
 - Verified live readiness: Kalshi D0 only, subject to all operator gates and separate action-time approval.
 - This is a personal trading tool. **Out of scope:** public-facing product, SaaS, user accounts, selling access.

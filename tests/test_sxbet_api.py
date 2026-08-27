@@ -65,11 +65,14 @@ class TestSXBetLogin:
         assert c.api_key == "api-key"
         assert c.wallet_address == "0xwallet"
 
-    def test_login_fails_missing_key(self):
+    def test_login_allows_public_mode_without_key(self):
         c = SXBetClient()
+        c.session = MagicMock()
+        c.session.get.return_value = MagicMock(status_code=200)
         with patch.dict(os.environ, {}, clear=True):
-            assert c.login() is False
-        assert c.authenticated is False
+            assert c.login() is True
+        assert c.authenticated is True
+        assert c.api_key is None
 
     def test_login_fails_bad_status(self):
         c = SXBetClient()
@@ -209,6 +212,12 @@ class TestSXBetOrders:
         client.session.get.return_value = resp
         assert client.get_balance() is None
 
+    def test_get_balance_fails_closed_when_data_is_list(self, client):
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"data": []}
+        client.session.get.return_value = resp
+        assert client.get_balance() is None
+
 
 # ---------------------------------------------------------------------------
 # TestSXBetFetchData
@@ -339,13 +348,17 @@ class TestSXBetFetchData:
 # ---------------------------------------------------------------------------
 
 class TestSXBetAuthGuard:
-    """Methods return empty/None when client is not authenticated."""
+    """Public reads work without credentials; account methods fail closed."""
 
     def setup_method(self):
         self.client = SXBetClient()  # authenticated = False
 
-    def test_request_returns_none(self):
-        assert self.client._request("GET", "/anything") is None
+    def test_public_request_works_without_login(self):
+        self.client.session = MagicMock()
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"data": []}
+        self.client.session.request.return_value = response
+        assert self.client._request("GET", "/sports") == {"data": []}
 
     def test_place_order_returns_none(self):
         assert self.client.place_order("h", "o", "buy", 0.5, 1) is None

@@ -304,6 +304,7 @@ class TestEvaluate:
         assert opp["net_profit"] > 0
         assert opp["_kalshi_yes"] == 0.30
         assert opp["_kalshi_no"] == 0.20
+        assert opp["_pair_inverted"] is True
         assert opp["_cross_legs"][1]["platform"] == "kalshi"
         assert opp["_cross_legs"][1]["side"] == "no"
         assert opp["_cross_legs"][1]["price"] == 0.20

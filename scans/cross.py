@@ -320,6 +320,7 @@ def scan_cross_platform(
                         "_market_key": market_key,
                         "_kalshi_yes": best_k_yes,
                         "_kalshi_no": best_k_no,
+                        "_pair_inverted": inverted,
                         "_kalshi_ticker": km.get("ticker", ""),
                         "_token_ids": pm_token_ids,
                         "confidence": match.get("confidence", "LOW"),

@@ -40,20 +40,20 @@ The strategy taxonomy is an implementation inventory, not a live-readiness claim
 ## Quick Start
 
 ```bash
-# Install
-pip install -r requirements.txt
-pip install -r requirements-dev.txt   # pytest, dev tools
+# Create the same Python line used by CI, then install all dependencies.
+python3.12 -m venv .venv
+.venv/bin/pip install -r requirements.txt -r requirements-dev.txt
 
 # One-shot scan (all strategies, dry-run)
-python scanner.py
+.venv/bin/python scanner.py
 
 # Continuous mode
-python scanner.py --continuous --interval 60
+.venv/bin/python scanner.py --continuous --interval 60
 
 # Single strategy
-python scanner.py --mode kalshi
-python scanner.py --mode cross-all
-python scanner.py --mode mm
+.venv/bin/python scanner.py --mode kalshi
+.venv/bin/python scanner.py --mode cross-all
+.venv/bin/python scanner.py --mode mm
 
 # Live Kalshi D0 only; do not run until the five-field operator envelope,
 # account/credential/jurisdiction checks, physical kill switch, and
@@ -102,9 +102,9 @@ Production deploys should set the feature flags explicitly. Full env-var referen
 ## Testing
 
 ```bash
-pytest tests/ -v                                        # full suite
-pytest tests/test_fees.py -v                            # one file
-pytest tests/test_executor.py::TestExecutor -v          # one class
+.venv/bin/python -m pytest tests/ -v                    # full suite
+.venv/bin/python -m pytest tests/test_fees.py -v        # one file
+.venv/bin/python -m pytest tests/test_executor.py::TestExecutor -v
 ```
 
 Tests use `pytest` + `unittest.mock`. External SDKs are mocked via `sys.modules` stubs. No `conftest.py` — per-file `autouse` fixtures provide shared setup.

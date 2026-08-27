@@ -31,7 +31,7 @@ Total: 125/125 findings have a current disposition; none remain silently unclass
 
 CodeRabbit CLI reviewed the full uncommitted completion diff in three completed passes and raised 20 issues total: 15 in the initial pass, 3 in the first post-fix pass, and 2 in the second post-fix pass. Each was verified against current code and all valid issues were corrected. An authenticated follow-up review on 2026-08-27 completed across the six changed source/test files with zero findings.
 
-The legacy Codex Security Deep Scan retains scan ID `487c03f8-f9cc-481d-ae82-cc0f102dffc9` and remains blocked at its original host preflight. A fresh exact-range Codex Security diff scan, `dff40a30-2741-4409-b269-94733848489c`, completed against PR #135 head `811e79a1`. It reviewed all 65 executable files in scope and reported one low-severity execution-plan finding: inverted one-shot cross matches did not preserve the physical Kalshi-side mapping. The current diff persists `_pair_inverted`, always replaces action-time `_cross_legs`, and adds deterministic regression coverage. The finding is not represented as closed until the remediation is published and verified at the new PR head.
+The legacy Codex Security Deep Scan retains scan ID `487c03f8-f9cc-481d-ae82-cc0f102dffc9` and remains blocked at its original host preflight. Historically, exact-range scan `dff40a30-2741-4409-b269-94733848489c` completed against PR #135 head `811e79a1` and reported one low-severity execution-plan finding: inverted one-shot cross matches did not preserve the physical Kalshi-side mapping. That finding was remediated and published at head `1e4cc6a8`; follow-up scan `4068112a-cdf5-42ec-a71f-2c92e30f8b6d` completed with zero reportable findings. Maintenance head `5183c0c7` then passed exact-head CI with 3,646 tests and 39 skips, and exact-range scan `52bea6b9-1925-40af-b6db-1e5522c12478` reviewed its six security surfaces with zero reportable findings.
 
 ## Local verification
 
@@ -50,7 +50,7 @@ The legacy Codex Security Deep Scan retains scan ID `487c03f8-f9cc-481d-ae82-cc0
 
 ## Remaining gates
 
-- The Codex Security remediation must be published and completion-branch CI must be green at the resulting exact PR head.
+- The Codex Security remediation is published and completion-branch CI is green; these are branch checks, not merge or deployment authority.
 - PRs #130 and #132 are closed as superseded; PR #135 remains draft and unmerged.
 - Merging to `master` triggers Railway deployment and therefore requires separate action-time approval.
 - Live Kalshi D0 still requires one operator message containing all five envelope fields plus credential, eligibility, limit, emergency-stop, and per-action approval checks.

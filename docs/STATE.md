@@ -11,7 +11,7 @@ Broad multi-venue expansion is parked. The retained mission is a narrow, observa
 - Remote default branch inspected: `origin/master` at `13072f2885bbd4351907b6dbe1d037bf0665c57a` (merged PR #134).
 - Completion branch and draft PR: `codex/project-completion-20260825` / PR #135.
 - Completion worktree: `/Users/jonathontamm/Dev/pm-arb-completion-20260825`.
-- Original dirty checkouts and worktrees are preserved. None have been reset, pruned, or deleted.
+- All dirty and active checkouts are preserved. Two clean obsolete worktrees were removed without force on 2026-08-27 after full-status checks: `pm-arb-recovery-20260824` and `.worktrees/joh-251-origin-master-clean`. The recovery commit remains reconstructible from local branch `codex/scanner-recovery-hardening-20260824`; the detached JOH-251 checkout pointed to an ancestor of `master`.
 - The uncommitted multi-venue controller work in `/Users/jonathontamm/Dev/polymarket-arb-scanner` is deliberately parked and excluded from this recovery branch. Its tracked and untracked files remain intact for a future, separately scoped review.
 - Configured remote is the verified organization repository `https://github.com/Team-Win-and-Make-Monney/polymarket-arb-scanner.git`.
 

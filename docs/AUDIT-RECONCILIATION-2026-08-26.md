@@ -36,6 +36,7 @@ The legacy Codex Security Deep Scan retains scan ID `487c03f8-f9cc-481d-ae82-cc0
 ## Local verification
 
 - `python -m pytest tests -q --tb=short`: 3,646 passed, 39 skipped.
+- A clean local Python 3.12 `.venv` installed from both requirement files reproduces the same 3,646-pass result without collection errors.
 - `python tests/integration/verify_fees.py`: all 24 cases across eight platforms passed.
 - `python -m compileall -q .`: passed.
 - `ruff check --select E9,F63,F7,F82 .`: passed.

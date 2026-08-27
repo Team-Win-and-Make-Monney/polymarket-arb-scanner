@@ -1141,8 +1141,12 @@ class ArbitrageExecutor:
         opp["net_profit"] = best
         opp["total_cost"] = f"${total_cost:.4f}"
         opp["net_roi"] = f"{best / total_cost * 100:.2f}%" if total_cost > 0 else "0%"
-        if "_cross_legs" in opp:
-            opp["_cross_legs"] = fresh_legs
+        # Every Polymarket/Kalshi cross that passes action-time revalidation
+        # must execute the exact plan that was just scored.  Legacy one-shot
+        # opportunities do not arrive with ``_cross_legs`` pre-populated, so
+        # making this conditional would discard the fresh strategy and fall
+        # back to stale scan-time routing in ``_build_legs``.
+        opp["_cross_legs"] = fresh_legs
         opp["_kalshi_yes"] = k_yes
         opp["_kalshi_no"] = k_no
         return True, best, "passed"

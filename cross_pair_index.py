@@ -317,6 +317,7 @@ class CrossPairIndex:
             "_kalshi_ticker": pair.kalshi_ticker,
             "_kalshi_yes": original_k_yes,
             "_kalshi_no": original_k_no,
+            "_pair_inverted": pair.inverted,
             "_cross_legs": cross_legs,
             "_market_key": f"polymarket-{pair.poly_condition_id}" if pair.poly_condition_id else "",
             "_days_to_resolution": pair.days_to_resolution,

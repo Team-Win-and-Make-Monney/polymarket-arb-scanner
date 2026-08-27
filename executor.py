@@ -1076,15 +1076,60 @@ class ArbitrageExecutor:
         if pm_yes is None or pm_no is None or k_yes is None or k_no is None:
             raise _RevalidationAPIError("incomplete prices after re-fetch for cross")
 
-        result1 = net_profit_cross_platform(pm_yes, k_no, "yes", "no")
-        result2 = net_profit_cross_platform(pm_no, k_yes, "no", "yes")
+        # An inverted matched pair maps logical Kalshi YES/NO to the opposite
+        # physical contract. Preserve that mapping through live revalidation;
+        # otherwise the revalidator scores one pair of contracts while the
+        # executor submits another.
+        pair_inverted = bool(opp.get("_pair_inverted", False))
+        logical_k_yes, logical_k_no = (
+            (k_no, k_yes) if pair_inverted else (k_yes, k_no)
+        )
+
+        result1 = net_profit_cross_platform(pm_yes, logical_k_no, "yes", "no")
+        result2 = net_profit_cross_platform(pm_no, logical_k_yes, "no", "yes")
 
         if result1["net_profit"] >= result2["net_profit"]:
             best = result1["net_profit"]
-            opp["prices"] = f"PM_Y={pm_yes:.3f} K_N={k_no:.3f}"
+            total_cost = pm_yes + logical_k_no
+            kalshi_side = "yes" if pair_inverted else "no"
+            fresh_legs = [
+                {
+                    "platform": "polymarket",
+                    "side": "BUY",
+                    "token": "yes",
+                    "price": pm_yes,
+                    "_token_id": token_ids[0],
+                },
+                {
+                    "platform": "kalshi",
+                    "side": kalshi_side,
+                    "action": "buy",
+                    "price": logical_k_no,
+                    "_ticker": kalshi_ticker,
+                },
+            ]
+            opp["prices"] = f"PM_Y={pm_yes:.3f} K_{kalshi_side[0].upper()}={logical_k_no:.3f}"
         else:
             best = result2["net_profit"]
-            opp["prices"] = f"PM_N={pm_no:.3f} K_Y={k_yes:.3f}"
+            total_cost = pm_no + logical_k_yes
+            kalshi_side = "no" if pair_inverted else "yes"
+            fresh_legs = [
+                {
+                    "platform": "polymarket",
+                    "side": "BUY",
+                    "token": "no",
+                    "price": pm_no,
+                    "_token_id": token_ids[1],
+                },
+                {
+                    "platform": "kalshi",
+                    "side": kalshi_side,
+                    "action": "buy",
+                    "price": logical_k_yes,
+                    "_ticker": kalshi_ticker,
+                },
+            ]
+            opp["prices"] = f"PM_N={pm_no:.3f} K_{kalshi_side[0].upper()}={logical_k_yes:.3f}"
 
         threshold = self._get_revalidation_threshold(original_profit, opp)
         if best < threshold:
@@ -1094,6 +1139,12 @@ class ArbitrageExecutor:
             )
             return False, best, "profit_below_floor"
         opp["net_profit"] = best
+        opp["total_cost"] = f"${total_cost:.4f}"
+        opp["net_roi"] = f"{best / total_cost * 100:.2f}%" if total_cost > 0 else "0%"
+        if "_cross_legs" in opp:
+            opp["_cross_legs"] = fresh_legs
+        opp["_kalshi_yes"] = k_yes
+        opp["_kalshi_no"] = k_no
         return True, best, "passed"
 
     def _revalidate_kalshi_binary(

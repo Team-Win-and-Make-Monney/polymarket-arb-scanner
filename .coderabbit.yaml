@@ -6,7 +6,8 @@ inheritance: true
 # request_changes_workflow makes CodeRabbit submit formal GitHub reviews:
 # "Request changes" while findings are open, "Approve" once all comments are
 # resolved. This satisfies the required-review gate; the repository's Railway
-# deployment stop still requires explicit approval before merge.
+# restart gate still requires the documented low-risk allowlist and verified
+# quiescent operating state before auto-merge.
 reviews:
   request_changes_workflow: true
   enable_prompt_for_ai_agents: true

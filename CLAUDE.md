@@ -274,6 +274,27 @@ External SDKs are mocked via `sys.modules` stubs before importing the module und
 
 Run a specific test: `pytest tests/test_fees.py::TestPolymarketFee::test_zero_when_sell_equals_buy -v`
 
+## Agent Delivery Workflow
+
+### Isolate and scope the work
+- Refresh `origin/master`, then inspect `git status`, `git worktree list`, and open PRs before editing. Work from a dedicated task branch and isolated worktree based on the current `origin/master`; never edit, clean, stash, or reset the dirty canonical checkout.
+- Use one branch per objective. If another branch, worktree, or PR overlaps the same files or subsystem, coordinate or serialize the work instead of racing it.
+- Keep one PR to one purpose. Before commit and again before the PR, inspect `git status`, `git diff --stat`, and the complete diff. Exclude unrelated code, formatting, generated artifacts, dependencies, and secrets.
+
+### Verify, review, and hand off
+- For every change, run `git diff --check`. For `.coderabbit.yaml`, also run `ruby -e 'require "yaml"; YAML.parse_file(".coderabbit.yaml")'`.
+- For Python or CI behavior changes, use Python 3.12 and run the same correctness gates as `.github/workflows/test.yml`: `ruff check . --select E9,F63,F7,F82` and `pytest tests/ -v --tb=short`. Add the narrowest relevant regression test first when practical; do not weaken, skip, or relabel checks to obtain green status.
+- Write an imperative, outcome-specific PR title. The PR body must explain why, what changed, exact verification and results, deployment or trading risk, and deferred work. State every unrun check.
+- CodeRabbit reviews every non-draft PR incrementally. Address actionable findings with narrow fixes, push, and wait for CodeRabbit and `test` again. Do not resolve a thread without fixing it or recording why it is non-actionable.
+- Before handoff, fetch `origin/master`, confirm the branch is current, inspect the final diff, and rerun affected verification after any branch update or conflict resolution. Required `test` and `CodeRabbit` checks, conversation resolution, and a mergeable state are mandatory; never bypass protection or force-push.
+
+### Depot, merge, and production boundaries
+- Depot supplies the managed runner only for `.github/workflows/test.yml`. Keep scheduled monitoring, market scans, digests, communications, and any deployment workflow off Depot unless a separate, explicit infrastructure task authorizes the change. Depot account settings, runner groups, cache or network policy, and usage caps are external account changes, not part of repository implementation.
+- Never exercise a write-capable trading path during validation. Do not run with `DRY_RUN=false`, `--exec-mode full-auto`, a live launcher, order submission, fund movement, or production credentials. Tests must use mocks or read-only/dry-run paths.
+- Stop at a review-ready PR for changes involving live order placement, risk or loss limits, funds, credentials or secrets, permissions, account configuration, migrations, production configuration, scheduled external communications, or other hard-to-reverse effects. Obtain explicit action-time confirmation for the exact effect.
+- Every merge to `master` can trigger Railway production deployment. Therefore do not enable auto-merge or merge—even when the PR is otherwise green—until the user explicitly confirms that deployment for that PR. This repository-specific deployment stop overrides the global autonomous merge lane.
+- After an explicitly authorized merge, verify the remote result with `gh pr view <PR> --json state,mergedAt,mergeCommit,statusCheckRollup`, fetch `origin/master`, confirm the merge commit is an ancestor, inspect the latest `Tests` run on `master`, and read back `https://arb-scanner-production.up.railway.app/healthz`. A merged commit or green PR checks alone do not prove a healthy deployment.
+
 ## CI / CD
 
 - `.github/workflows/test.yml` runs `pytest` on every PR to `master` (Python 3.12, installs both `requirements.txt` and `requirements-dev.txt`).

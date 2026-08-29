@@ -42,12 +42,12 @@ reviews:
         triggers, least-privilege permissions, pinned or trusted actions, secret
         boundaries, and direct pytest/ruff exit-code gating. Flag changes that move
         scheduled scans, digests, communications, trading, or deployment onto Depot.
-    - path: "**/Dockerfile"
+    - path: "**/Dockerfile*"
       instructions: |
         Treat container changes as deployment-sensitive. Check least privilege,
         deterministic dependencies, secret exclusion, health-check compatibility,
         and whether merging can change Railway production behavior.
-    - path: "**/railway.toml"
+    - path: "**/railway*.toml"
       instructions: |
         Treat Railway configuration as production-sensitive. Flag weakened health
         checks, unsafe commands, secret exposure, or any deployment behavior lacking

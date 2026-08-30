@@ -8,10 +8,16 @@ This project defines its Railway infrastructure in code.
 
 Use this file to describe the Railway project you want: services, databases, buckets, custom domains, replicas, groups, and environment variables.
 
-The TypeScript file imports `railway/iac`. Install the SDK from the repository root:
+The TypeScript file imports `railway/iac`. Install the pinned SDK into the isolated `.railway` package (Node.js 22 or newer):
 
 ```bash
-npm install railway
+npm ci --prefix .railway
+```
+
+Install Railway CLI 5.45.7 or newer separately from Railway's official distribution, then verify it before planning:
+
+```bash
+railway --version
 ```
 
 ## Common commands
@@ -51,7 +57,7 @@ Merging this file does not apply Railway changes. Do not run `railway config mig
 - `railway config plan` is safe and does not change Railway.
 - `railway config apply` previews changes and asks before applying unless you pass `--yes`.
 - Destructive changes in non-interactive or agent sessions require `railway config apply --confirm-destructive` after reviewing the plan.
-- CI should pin a plan (`railway config plan --out railway-plan.json`) and apply that file on merge (`railway config apply --plan railway-plan.json --yes --confirm-destructive`) so the reviewed change set is what lands. On GitHub Actions, use https://github.com/railwayapp/config.
+- A future protected deployment workflow may pin a plan (`railway config plan --out railway-plan.json`) and apply only that reviewed plan after an explicit environment approval. Do not auto-apply on merge. On GitHub Actions, use https://github.com/railwayapp/config.
 - Services already managed by `railway.json` must be migrated before `.railway/railway.ts` can manage them.
 - Keep one `.railway` file for the whole project. A named `export const partial` (or `PARTIAL` / `const Partial`) is a last resort for separate repos that cannot share that file. Do not add it unless omit=delete across repos is a blocker.
 - Use `replicas` for scaling; advanced placement can still specify region names.

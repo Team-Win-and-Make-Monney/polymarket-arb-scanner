@@ -1,10 +1,55 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# Inherit the organization controls, then add repository-specific review focus.
+inheritance: true
+
 # CodeRabbit configuration
 # request_changes_workflow makes CodeRabbit submit formal GitHub reviews:
 # "Request changes" while findings are open, "Approve" once all comments are
-# resolved — which is what satisfies the required-review gate and lets
-# GitHub native auto-merge fire.
+# resolved. This satisfies the required-review gate; the repository's Railway
+# restart gate still requires the documented low-risk allowlist and verified
+# quiescent operating state before auto-merge.
 reviews:
   request_changes_workflow: true
+  enable_prompt_for_ai_agents: true
   auto_review:
     enabled: true
+    auto_incremental_review: true
     drafts: false
+  path_instructions:
+    - path: "*.py"
+      instructions: |
+        Treat root Python execution and orchestration changes as financially sensitive.
+        Verify that dry-run remains the default, write-capable venue actions retain
+        explicit authorization and risk gates, and failure paths fail closed. Require
+        focused regression coverage for changed behavior.
+    - path: "broker/**"
+      instructions: |
+        Review every broker change for a single guarded write path, idempotency,
+        current action-time authorization, bounded notional and loss limits, and a
+        tested kill switch. Flag any path that can bypass those controls.
+    - path: "scripts/launch-*-live.sh"
+      instructions: |
+        Treat live launchers as production trading controls. Require an explicit
+        venue envelope, dry-run-safe defaults, bounded loss/notional, and an operable
+        emergency stop. Flag implicit activation or invented operator values.
+    - path: "tests/**"
+      instructions: |
+        Require deterministic tests that mock external venues and cover success,
+        rejection, stale authorization, partial failure, and fail-closed behavior
+        where relevant. Tests must never place orders, move funds, or require secrets.
+    - path: ".github/workflows/**"
+      instructions: |
+        Depot managed runners are authorized only for test.yml. Preserve existing
+        triggers, least-privilege permissions, pinned or trusted actions, secret
+        boundaries, and direct pytest/ruff exit-code gating. Flag changes that move
+        scheduled scans, digests, communications, trading, or deployment onto Depot.
+    - path: "**/Dockerfile*"
+      instructions: |
+        Treat container changes as deployment-sensitive. Check least privilege,
+        deterministic dependencies, secret exclusion, health-check compatibility,
+        and whether merging can change Railway production behavior.
+    - path: "**/railway*.toml"
+      instructions: |
+        Treat Railway configuration as production-sensitive. Flag weakened health
+        checks, unsafe commands, secret exposure, or any deployment behavior lacking
+        explicit rollout and rollback evidence.

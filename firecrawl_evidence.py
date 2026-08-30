@@ -41,6 +41,8 @@ EVIDENCE_SCHEMA: dict[str, Any] = {
 }
 
 
+# ---------------------------------------------------------------------------
+
 class FirecrawlEvidenceClient:
     """Synchronous, credit-capped Firecrawl Agent client for evidence only."""
 
@@ -144,6 +146,8 @@ class FirecrawlEvidenceClient:
                     )
                     cancel_response.raise_for_status()
 
+
+# ---------------------------------------------------------------------------
 
 def normalize_evidence(
     question: str,

@@ -67,6 +67,40 @@ class TestReconcilePendingTrades:
             _reconcile_pending_trades(db, trades)
         db.update_trade_status.assert_not_called()
 
+    def test_kalshi_client_order_reference_resolves_before_status_check(self):
+        db = MagicMock()
+        trades = [{
+            "id": 1,
+            "platform": "kalshi",
+            "order_id": "client:durable-id",
+        }]
+        kalshi = MagicMock()
+        kalshi.find_order_by_client_order_id.return_value = {
+            "order_id": "venue-order-1",
+            "status": "executed",
+        }
+        kalshi.get_order_status.return_value = {"status": "executed"}
+
+        _reconcile_pending_trades(db, trades, kalshi_client=kalshi)
+
+        db.set_trade_order_id.assert_called_once_with(1, "venue-order-1")
+        db.update_trade_status.assert_called_once_with(1, "filled")
+
+    def test_unresolved_kalshi_client_order_reference_blocks_retry(self):
+        db = MagicMock()
+        trades = [{
+            "id": 1,
+            "platform": "kalshi",
+            "order_id": "client:durable-id",
+        }]
+        kalshi = MagicMock()
+        kalshi.find_order_by_client_order_id.return_value = None
+
+        _reconcile_pending_trades(db, trades, kalshi_client=kalshi)
+
+        db.update_trade_status.assert_called_once_with(1, "orphaned")
+        kalshi.get_order_status.assert_not_called()
+
 
 class TestCheckOrderStatus:
     def test_polymarket_matched(self):

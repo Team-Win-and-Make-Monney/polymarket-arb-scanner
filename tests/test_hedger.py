@@ -294,6 +294,44 @@ class TestHedgerPartialFills:
         call_args = mock_kalshi.place_order.call_args
         assert call_args[1]["side"] == "yes"
 
+    def test_indeterminate_kalshi_hedge_is_not_retried(
+            self, PartialFillHedger, db, real_kalshi_api):
+        class KalshiOrderIndeterminate(RuntimeError):
+            def __init__(self, message, client_order_id=None):
+                super().__init__(message)
+                self.client_order_id = client_order_id
+
+        mock_kalshi = MagicMock()
+        mock_kalshi.fetch_order_book.return_value = {
+            "orderbook": {"yes": [[35, 10]], "no": [[60, 10]]},
+        }
+        mock_kalshi.place_order.side_effect = KalshiOrderIndeterminate(
+            "response lost", "durable-client-id")
+        mock_kalshi.find_order_by_client_order_id.return_value = None
+        hedger = PartialFillHedger(kalshi_client=mock_kalshi, db=db)
+        opp_id = db.log_opportunity(
+            "Binary", "TICKER-ABC", "", 0.0, 0.0, 0.0, 0.0, "traded")
+        trade_id = db.log_trade(
+            opp_id, "kalshi", "yes", 0.40, 2.5, "filled")
+        hedger.queue_hedge(
+            trade_id=trade_id,
+            opportunity_id=opp_id,
+            platform="kalshi",
+            token_id="TICKER-ABC",
+            side="yes",
+            fill_price=0.40,
+            size=2.5,
+            max_contracts=6,
+        )
+
+        hedger.process_pending_hedges()
+        row = db.get_indeterminate_partial_fills()[0]
+        assert row["hedge_order_id"] == "client:durable-client-id"
+        assert row["hedge_attempts"] == 0
+
+        hedger.process_pending_hedges()
+        assert mock_kalshi.place_order.call_count == 1
+
     def test_betfair_partial_fill_hedge(self, PartialFillHedger, db):
         """Betfair: 50% BACK filled, 100% LAY → hedge LAYs the position."""
         mock_betfair = MagicMock()

@@ -7,6 +7,7 @@ import math
 import os
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config import (
@@ -3177,6 +3178,12 @@ class ArbitrageExecutor:
                 logger.warning("Kalshi order blocked by live policy: %s", ticker)
                 return False, None, None
 
+            client_order_id = str(uuid.uuid4())
+            client_order_ref = f"client:{client_order_id}"
+            leg["_order_id"] = client_order_ref
+            trade_id = leg.get("_trade_id")
+            if trade_id:
+                self.db.set_trade_order_id(trade_id, client_order_ref)
             resp = self.kalshi_client.place_order(
                 ticker=ticker,
                 side=side,
@@ -3184,11 +3191,20 @@ class ArbitrageExecutor:
                 count=count,
                 price_dollars=price,
                 time_in_force=tif,
+                client_order_id=client_order_id,
             )
             if resp:
                 order = resp.get("order", resp)
-                order_id = order.get("order_id", "")
+                order_id = order.get("order_id") or order.get("id") or ""
+                if not order_id:
+                    from kalshi_api import KalshiOrderIndeterminate
+                    raise KalshiOrderIndeterminate(
+                        f"Kalshi accepted {ticker} but returned no order identity",
+                        client_order_id=client_order_id,
+                    )
                 leg["_order_id"] = order_id
+                if trade_id:
+                    self.db.set_trade_order_id(trade_id, order_id)
                 status = order.get("status", "")
                 if status == "executed":
                     # FOK filled instantly — extract avg_price directly
@@ -3219,6 +3235,9 @@ class ArbitrageExecutor:
                 logger.warning("Kalshi order not filled: status=%s ticker=%s resp=%s",
                                status, ticker, str(resp)[:300])
             else:
+                leg.pop("_order_id", None)
+                if trade_id:
+                    self.db.set_trade_order_id(trade_id, None)
                 logger.warning("Kalshi place_order returned None for %s %s @ $%.3f (count=%d)",
                                side, ticker, price, count)
             return False, None, None

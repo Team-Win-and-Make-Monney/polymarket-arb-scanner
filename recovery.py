@@ -73,6 +73,33 @@ def _reconcile_pending_trades(
             resolved += 1
             continue
 
+        if platform == "kalshi" and str(order_id).startswith("client:"):
+            client_order_id = str(order_id).split(":", 1)[1]
+            try:
+                order = kalshi_client.find_order_by_client_order_id(
+                    client_order_id) if kalshi_client else None
+            except Exception as e:
+                logger.warning(
+                    "Trade #%d: Kalshi client-order reconciliation failed: %s",
+                    trade_id, e,
+                )
+                order = None
+            venue_order_id = (
+                order.get("order_id") or order.get("id")
+                if isinstance(order, dict) else None
+            )
+            if not venue_order_id:
+                db.update_trade_status(trade_id, "orphaned")
+                logger.warning(
+                    "Trade #%d: Kalshi submission %s remains indeterminate; "
+                    "retry blocked and manual reconciliation required.",
+                    trade_id, client_order_id,
+                )
+                resolved += 1
+                continue
+            order_id = str(venue_order_id)
+            db.set_trade_order_id(trade_id, order_id)
+
         # HARDEN-05: Skip trades that have already been reconciled or re-placed.
         # If a sibling trade for the same opportunity is already filled/confirmed,
         # this trade is a duplicate — mark as dedup_skipped and do not re-submit.

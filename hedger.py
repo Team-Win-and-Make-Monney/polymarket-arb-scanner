@@ -2,11 +2,17 @@
 
 import logging
 import time
+import uuid
 
 from config import HEDGE_MAX_ATTEMPTS, HEDGE_MAX_SPREAD_LOSS_PCT
 from db import TradeDB
 
 logger = logging.getLogger(__name__)
+
+
+def _is_kalshi_order_indeterminate(exc: Exception) -> bool:
+    """Recognize the client exception without importing mocked SDK modules."""
+    return exc.__class__.__name__ == "KalshiOrderIndeterminate"
 
 
 class PartialFillHedger:
@@ -82,6 +88,7 @@ class PartialFillHedger:
         """Process all pending partial fills — attempt to sell each."""
         if not self.db:
             return
+        self._reconcile_indeterminate_kalshi_hedges()
         pending = self.db.get_pending_partial_fills()
         if not pending:
             return
@@ -95,13 +102,67 @@ class PartialFillHedger:
                 logger.warning("Hedge #%d exceeded max attempts (%d). Marking failed.", pf_id, HEDGE_MAX_ATTEMPTS)
                 continue
 
-            success = self._attempt_hedge(pf)
+            try:
+                success = self._attempt_hedge(pf)
+            except Exception as exc:
+                if not _is_kalshi_order_indeterminate(exc):
+                    raise
+                client_order_id = exc.client_order_id
+                order_ref = (
+                    f"client:{client_order_id}" if client_order_id else None
+                )
+                self.db.set_partial_fill_hedge_order(
+                    pf_id, order_ref, "indeterminate")
+                logger.error(
+                    "Hedge #%d submission is indeterminate; retries blocked "
+                    "until Kalshi reconciliation completes.", pf_id,
+                )
+                continue
             if success:
                 self.db.update_partial_fill(pf_id, "hedged", attempts + 1)
                 logger.info("Hedge #%d successful.", pf_id)
             else:
                 self.db.update_partial_fill(pf_id, "pending", attempts + 1)
                 logger.info("Hedge #%d attempt %d failed. Will retry.", pf_id, attempts + 1)
+
+    def _reconcile_indeterminate_kalshi_hedges(self) -> None:
+        """Resolve persisted Kalshi submissions before permitting a retry."""
+        if not self.db or not self.kalshi_client:
+            return
+        for pf in self.db.get_indeterminate_partial_fills():
+            pf_id = pf["id"]
+            order_ref = str(pf.get("hedge_order_id") or "")
+            if not order_ref.startswith("client:"):
+                logger.error(
+                    "Hedge #%d lacks a Kalshi client-order reference; "
+                    "manual reconciliation required.", pf_id,
+                )
+                continue
+            client_order_id = order_ref.split(":", 1)[1]
+            try:
+                order = self.kalshi_client.find_order_by_client_order_id(
+                    client_order_id, ticker=pf.get("token_id") or None)
+            except Exception as exc:
+                logger.warning(
+                    "Hedge #%d reconciliation query failed: %s", pf_id, exc,
+                )
+                continue
+            if not isinstance(order, dict):
+                logger.warning(
+                    "Hedge #%d remains indeterminate; Kalshi exposed no "
+                    "matching recent order.", pf_id,
+                )
+                continue
+            venue_order_id = order.get("order_id") or order.get("id")
+            status = str(order.get("status") or "").lower()
+            if status in ("executed", "filled"):
+                self.db.set_partial_fill_hedge_order(
+                    pf_id, venue_order_id, "hedged")
+            elif status in ("canceled", "cancelled", "expired", "rejected"):
+                self.db.set_partial_fill_hedge_order(pf_id, None, "pending")
+            else:
+                self.db.set_partial_fill_hedge_order(
+                    pf_id, order_ref, "indeterminate")
 
     def _attempt_hedge(self, pf: dict) -> bool:
         """Attempt to sell a partial fill position.
@@ -122,10 +183,13 @@ class PartialFillHedger:
                 if pf.get("_max_contracts") is None:
                     logger.warning("Kalshi hedge blocked: authoritative contract ceiling is missing for %s", token_id)
                     return False
-                return self._hedge_kalshi(token_id, fill_price, size, max_loss,
-                                          pf.get("side", "yes"),
-                                          action=pf.get("_reduce_action", "sell"),
-                                          max_contracts=pf.get("_max_contracts"))
+                return self._hedge_kalshi(
+                    token_id, fill_price, size, max_loss,
+                    pf.get("side", "yes"),
+                    action=pf.get("_reduce_action", "sell"),
+                    max_contracts=pf.get("_max_contracts"),
+                    partial_fill_id=pf.get("id"),
+                )
             elif platform == "betfair":
                 return self._hedge_betfair(pf, fill_price, size, max_loss)
             elif platform == "smarkets":
@@ -138,6 +202,8 @@ class PartialFillHedger:
                 return self._hedge_gemini(pf, fill_price, size, max_loss)
             # IBKR: cannot hedge — BUY-only platform, no sell capability
         except Exception as e:
+            if _is_kalshi_order_indeterminate(e):
+                raise
             logger.warning("Hedge attempt failed for %s on %s: %s", token_id, platform, e)
 
         return False
@@ -164,7 +230,8 @@ class PartialFillHedger:
 
     def _hedge_kalshi(self, ticker: str, fill_price: float, size: float, max_loss: float,
                       side: str, action: str = "sell",
-                      max_contracts: int | None = None) -> bool:
+                      max_contracts: int | None = None,
+                      partial_fill_id: int | None = None) -> bool:
         """Reduce a Kalshi position at the current touch.
 
         ``action="sell"`` (default, original behavior) sells an over-long
@@ -227,10 +294,43 @@ class PartialFillHedger:
                        "entry, dollars/touch sizing overshot", count,
                        max_contracts, ticker)
             count = max_contracts
-        resp = self.kalshi_client.place_order(ticker=ticker, side=side, action=action,
-                                               count=count, price_dollars=touch,
-                                               reducing=True)
-        return resp is not None
+        client_order_id = str(uuid.uuid4())
+        if self.db and partial_fill_id is not None:
+            self.db.set_partial_fill_hedge_order(
+                partial_fill_id, f"client:{client_order_id}", "indeterminate")
+        try:
+            resp = self.kalshi_client.place_order(
+                ticker=ticker,
+                side=side,
+                action=action,
+                count=count,
+                price_dollars=touch,
+                reducing=True,
+                client_order_id=client_order_id,
+            )
+        except Exception as exc:
+            if not _is_kalshi_order_indeterminate(exc):
+                raise
+            if exc.client_order_id is None:
+                exc.client_order_id = client_order_id
+            if self.db and partial_fill_id is not None:
+                self.db.set_partial_fill_hedge_order(
+                    partial_fill_id,
+                    f"client:{exc.client_order_id}",
+                    "indeterminate",
+                )
+            raise
+        if resp is None:
+            if self.db and partial_fill_id is not None:
+                self.db.set_partial_fill_hedge_order(
+                    partial_fill_id, None, "pending")
+            return False
+        order = resp.get("order", resp) if isinstance(resp, dict) else {}
+        venue_order_id = order.get("order_id") or order.get("id")
+        if self.db and partial_fill_id is not None:
+            self.db.set_partial_fill_hedge_order(
+                partial_fill_id, venue_order_id, "pending")
+        return bool(venue_order_id)
 
     def _hedge_betfair(self, pf: dict, fill_price: float, size: float, max_loss: float) -> bool:
         """Hedge a Betfair position with an opposing bet."""

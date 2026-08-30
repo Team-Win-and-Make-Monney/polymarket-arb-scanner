@@ -2733,6 +2733,36 @@ class TestRecordFailedLeg:
             "SELECT status FROM trades WHERE id = ?", (trade_id,)).fetchall()
         assert rows[0][0] == "failed"
 
+    def test_kalshi_indeterminate_submission_persists_client_reference(
+            self, executor, db):
+        from kalshi_api import KalshiOrderIndeterminate
+
+        trade_id = self._make_trade(db)
+        leg = {
+            "platform": "kalshi",
+            "side": "yes",
+            "action": "buy",
+            "price": 0.50,
+            "_ticker": "KXTEST-1",
+            "_trade_id": trade_id,
+        }
+
+        def raise_indeterminate(**kwargs):
+            raise KalshiOrderIndeterminate(
+                "response lost", kwargs["client_order_id"])
+
+        executor.kalshi_client.place_order.side_effect = raise_indeterminate
+        with patch("executor.ENABLED_EXECUTION_PLATFORMS", frozenset({"kalshi"})), \
+             patch("kalshi_policy.live_kalshi_submit_allowed", return_value=True):
+            with pytest.raises(KalshiOrderIndeterminate):
+                executor._execute_single_leg(
+                    leg, 3.0, {"type": "KalshiBinary"})
+
+        assert leg["_order_id"].startswith("client:")
+        executor._record_failed_leg(trade_id, leg, unknown_state=True)
+        row = [t for t in db.get_pending_trades() if t["id"] == trade_id][0]
+        assert row["order_id"] == leg["_order_id"]
+
 
 # ---------------------------------------------------------------------------
 # _derive_position_platform: position.platform must reflect the legs' actual

@@ -259,6 +259,7 @@ class TestKalshiOrders:
         assert result == {"order": {"id": "o1", "status": "resting"}}
         body = client.session.request.call_args[1]["json"]
         assert body["yes_price"] == 60
+        assert body["client_order_id"]
         assert "no_price" not in body
 
     @patch("kalshi_api._rate_limit")
@@ -284,6 +285,66 @@ class TestKalshiOrders:
         client.session.request.side_effect = _req.ConnectionError("down")
         with pytest.raises(KalshiOrderIndeterminate):
             client.place_order("TICK", "yes", "buy", 1, 0.50)
+
+    @patch("kalshi_api._rate_limit")
+    def test_place_order_timeout_is_not_retried(self, mock_rl, client):
+        """A lost POST response must never cause a duplicate submission."""
+        import requests as _req
+        client.session.request.side_effect = _req.Timeout("response lost")
+
+        with pytest.raises(KalshiOrderIndeterminate) as exc_info:
+            client.place_order(
+                "TICK", "yes", "buy", 1, 0.50,
+                client_order_id="4c355b9e-08d8-4ff5-b8ef-59a12b0e4561",
+            )
+
+        assert client.session.request.call_count == 1
+        assert exc_info.value.client_order_id == "4c355b9e-08d8-4ff5-b8ef-59a12b0e4561"
+
+    @patch("kalshi_api._rate_limit")
+    def test_place_order_malformed_success_is_indeterminate(self, mock_rl, client):
+        response = _mock_response(201, {"order": {"order_id": "o1"}})
+        response.json.side_effect = ValueError("malformed JSON")
+        client.session.request.return_value = response
+
+        with pytest.raises(KalshiOrderIndeterminate) as exc_info:
+            client.place_order(
+                "TICK", "yes", "buy", 1, 0.50,
+                client_order_id="762d66e1-ce80-4914-a58e-39b8f1189f41",
+            )
+
+        assert exc_info.value.client_order_id == "762d66e1-ce80-4914-a58e-39b8f1189f41"
+
+    @patch("kalshi_api._rate_limit")
+    def test_place_order_success_without_order_id_is_indeterminate(
+            self, mock_rl, client):
+        client.session.request.return_value = _mock_response(
+            201, {"order": {"status": "resting"}})
+
+        with pytest.raises(KalshiOrderIndeterminate):
+            client.place_order("TICK", "yes", "buy", 1, 0.50)
+
+    @patch("kalshi_api._rate_limit")
+    def test_place_order_server_error_is_indeterminate(self, mock_rl, client):
+        client.session.request.return_value = _mock_response(500, text="server error")
+
+        with pytest.raises(KalshiOrderIndeterminate):
+            client.place_order("TICK", "yes", "buy", 1, 0.50)
+
+    @patch("kalshi_api._rate_limit")
+    def test_find_order_by_client_order_id(self, mock_rl, client):
+        client.session.request.return_value = _mock_response(200, {
+            "orders": [
+                {"order_id": "o1", "client_order_id": "other"},
+                {"order_id": "o2", "client_order_id": "target"},
+            ],
+            "cursor": "",
+        })
+
+        result = client.find_order_by_client_order_id("target", ticker="TICK")
+
+        assert result["order_id"] == "o2"
+        assert client.session.request.call_args[1]["params"]["ticker"] == "TICK"
 
     @patch("kalshi_api._rate_limit")
     def test_place_order_blocks_disallowed_ticker_at_client_boundary(self, mock_rl, client):

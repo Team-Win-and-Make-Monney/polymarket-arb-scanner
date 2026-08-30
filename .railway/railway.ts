@@ -1,4 +1,18 @@
+import { existsSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { defineRailway, github, preserve, project, service, volume } from "railway/iac";
+
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const legacyManifests = ["railway.json", "railway.toml"].filter((name) => existsSync(resolve(repoRoot, name)));
+
+if (legacyManifests.length > 0) {
+  throw new Error(
+    `Refusing Railway IaC planning/apply while legacy manifest(s) remain: ${legacyManifests.join(", ")}. ` +
+      "Migrate them in a separately reviewed change before using .railway/railway.ts.",
+  );
+}
 
 // The egress proxy remains intentionally outside this partial until its source,
 // ownership, and continued need are proven. The current importer cannot round-

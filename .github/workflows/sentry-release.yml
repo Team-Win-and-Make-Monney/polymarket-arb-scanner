@@ -37,7 +37,6 @@ jobs:
 
       - name: Associate commits
         if: env.HAS_SENTRY_AUTH_TOKEN == 'true'
-        continue-on-error: true
         env:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
         run: npx --yes @sentry/cli@2.58.6 releases set-commits "$GITHUB_SHA" --auto --ignore-missing

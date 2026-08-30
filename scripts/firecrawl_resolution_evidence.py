@@ -40,7 +40,7 @@ def main(
     try:
         client = client_factory(os.getenv("FIRECRAWL_API_KEY", ""), max_credits=args.max_credits)
         artifact = client.discover(args.question, max_age_hours=args.max_age_hours)
-    except (ValueError, RuntimeError, TimeoutError, httpx.HTTPError):
+    except (TypeError, ValueError, RuntimeError, TimeoutError, httpx.HTTPError):
         print("Evidence discovery failed; no artifact emitted.", file=sys.stderr)
         return 1
     print(json.dumps(artifact, indent=2, sort_keys=True))

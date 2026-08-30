@@ -41,6 +41,17 @@ EVIDENCE_SCHEMA: dict[str, Any] = {
 }
 
 
+def _response_object(response: httpx.Response, context: str) -> dict[str, Any]:
+    """Decode one provider response and reject malformed or non-object JSON."""
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"Firecrawl returned invalid JSON for {context}.") from exc
+    if not isinstance(payload, dict):
+        raise TypeError(f"Firecrawl returned non-object JSON for {context}.")
+    return payload
+
+
 # ---------------------------------------------------------------------------
 
 class FirecrawlEvidenceClient:
@@ -98,7 +109,7 @@ class FirecrawlEvidenceClient:
                     timeout=_remaining_seconds(deadline),
                 )
                 response.raise_for_status()
-                job_id_value = response.json().get("id")
+                job_id_value = _response_object(response, "agent creation").get("id")
                 if not isinstance(job_id_value, str) or not job_id_value:
                     raise RuntimeError("Firecrawl did not return an agent job id.")
                 job_id = job_id_value
@@ -110,7 +121,7 @@ class FirecrawlEvidenceClient:
                         timeout=_remaining_seconds(deadline),
                     )
                     status_response.raise_for_status()
-                    payload = status_response.json()
+                    payload = _response_object(status_response, "agent status")
                     status = payload.get("status")
                     if status == "completed":
                         terminal = True

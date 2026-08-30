@@ -141,6 +141,44 @@ class TestFirecrawlEvidence:
             ("DELETE", "/v2/agent/job-timeout"),
         ]
 
+    def test_invalid_agent_creation_json_fails_closed(self):
+        client = FirecrawlEvidenceClient(
+            "fixture-key",
+            poll_interval_seconds=0,
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, text="{not-json", request=request)
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="invalid JSON for agent creation"):
+            client.discover("Did the official result publish?")
+
+    def test_non_object_status_json_fails_closed_and_cancels(self):
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.method == "POST":
+                return httpx.Response(200, json={"success": True, "id": "job-invalid"})
+            if request.method == "DELETE":
+                return httpx.Response(200, json={"success": True})
+            return httpx.Response(200, json=[])
+
+        client = FirecrawlEvidenceClient(
+            "fixture-key",
+            poll_interval_seconds=0,
+            transport=httpx.MockTransport(handler),
+        )
+
+        with pytest.raises(TypeError, match="non-object JSON for agent status"):
+            client.discover("Did the official result publish?")
+
+        assert [(request.method, request.url.path) for request in requests] == [
+            ("POST", "/v2/agent"),
+            ("GET", "/v2/agent/job-invalid"),
+            ("DELETE", "/v2/agent/job-invalid"),
+        ]
+
     def test_cli_accepts_only_exact_gate_and_emits_complete_artifact(self, monkeypatch, capsys):
         client = Mock()
         client.discover.return_value = {"evidence": [], "authorizes_trading": False}

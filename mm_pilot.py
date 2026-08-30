@@ -1752,6 +1752,11 @@ class KalshiMMPilot:
         purpose = order_info.get("purpose", "")
         is_hedge = purpose == "hedge"
 
+        # Establish a new UTC day's opening total before this fill can mutate
+        # realized P&L. Otherwise the first realized fill after midnight would
+        # become the new baseline and be omitted from the daily-loss ceiling.
+        self._daily_realized_pnl()
+
         # Fill accounting (registry, inventory, log) runs UNCONDITIONALLY,
         # before ANY halt decision below — including the taker-fill
         # deviation check that immediately follows. Codex round-3: this

@@ -18,6 +18,7 @@ class TestContainerHardening:
         assert "SXBET_PROXY_TOKEN" in dockerfile
         assert "$http_x_proxy_token" in dockerfile
         assert 'proxy_set_header Authorization ""' in dockerfile
+        assert 'proxy_set_header X-Proxy-Token ""' in dockerfile
 
 
 class TestWorkflowHardening:

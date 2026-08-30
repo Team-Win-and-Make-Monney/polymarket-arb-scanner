@@ -19,7 +19,7 @@ import pytest
 import config
 import market_maker
 from market_maker import ToxicFlowDetector, VolatilityTracker
-from mm_pilot import KalshiMMPilot
+from mm_pilot import FillEvent, KalshiMMPilot
 
 from test_mm_pilot import (TICKER, FakeKalshiClient, RecordingHedger,
                            build_pilot, live_config, make_book)
@@ -776,6 +776,36 @@ class TestLiveEnvelopeOrderGate:
 
         assert result.allowed is False
         assert result.reason == "daily_loss_limit"
+
+    def test_first_realized_fill_after_utc_rollover_counts_toward_limit(
+            self, pilot_env, clock, monkeypatch):
+        monkeypatch.setattr(pilot_env, "MM_MAX_DAILY_LOSS_USD", 10.0)
+        pilot = build_pilot(clock, client=FakeKalshiClient())
+        pilot.canary_graduated = True
+        pilot.inventory.apply_fill(TICKER, "yes", "buy", 20, 0.60)
+        prior_day = pilot._daily_pnl_date
+        clock[0] += 86_400
+
+        pilot._process_fill(
+            FillEvent(
+                fill_id="fill-after-midnight",
+                order_id="hedge-after-midnight",
+                ticker=TICKER,
+                side="yes",
+                action="sell",
+                count=20,
+                price=0.05,
+                is_taker=False,
+                created_ts=clock[0],
+                mid_at_detect=0.50,
+            ),
+            {"purpose": "hedge"},
+        )
+
+        assert pilot._daily_pnl_date != prior_day
+        assert pilot._daily_realized_pnl() == pytest.approx(-11.0)
+        assert pilot.halted is True
+        assert "daily realized P&L" in pilot.halt_reason
 
     def test_aggregate_resting_notional_is_capped(self, pilot_env, clock,
                                                    monkeypatch):

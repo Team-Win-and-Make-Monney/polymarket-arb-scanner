@@ -37,6 +37,7 @@ server {
         proxy_set_header Accept $http_accept;
         proxy_set_header Content-Type $http_content_type;
         proxy_set_header Authorization "";
+        proxy_set_header X-Proxy-Token "";
         proxy_connect_timeout 15s;
         proxy_read_timeout 30s;
     }

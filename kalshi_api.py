@@ -654,7 +654,11 @@ class KalshiClient:
             reducing: Whether the order strictly reduces an existing position.
 
         Returns:
-            Order response dict or None on failure.
+            Order response dict on acceptance, or None after a confirmed rejection.
+
+        Raises:
+            KalshiOrderIndeterminate: If the submission outcome cannot be confirmed.
+                Callers must reconcile the order before retrying.
         """
         if not live_kalshi_submit_allowed(ticker, reducing=reducing):
             logger.warning("Kalshi place_order blocked by live policy: %s", ticker)

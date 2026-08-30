@@ -191,7 +191,10 @@ class TreasuryManager:
 
         if self.gas_monitor is not None:
             try:
-                gas_cost = float(self.gas_monitor.get_current_gas_cost())
+                raw_gas_cost = self.gas_monitor.get_current_gas_cost()
+                if isinstance(raw_gas_cost, bool):
+                    raise ValueError("boolean gas cost")
+                gas_cost = float(raw_gas_cost)
             except Exception as exc:
                 logger.warning("treasury: gas cost unavailable: %s", exc)
                 return TransferResult(ok=False, error="gas cost unavailable")

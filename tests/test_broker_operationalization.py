@@ -254,6 +254,10 @@ class TestCommandExecutors:
         with pytest.raises(RuntimeError, match="shell-script"):
             CommandIntentAdapter([str(executable)], 5, Path(__file__).parents[1])
 
+    def test_env_executable_dispatch_is_rejected(self):
+        with pytest.raises(RuntimeError, match="env dispatch"):
+            CommandIntentAdapter(["/usr/bin/env", "python3", "/tmp/adapter"], 5, Path(__file__).parents[1])
+
     @pytest.mark.parametrize("timeout", [float("nan"), float("inf"), "nan"])
     def test_non_finite_timeout_is_rejected(self, tmp_path, timeout):
         executable = self._script(tmp_path, "print('{}')")

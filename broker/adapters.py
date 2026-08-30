@@ -127,8 +127,11 @@ class CommandIntentAdapter:
         executable = Path(argv[0]).expanduser()
         if not executable.is_absolute():
             raise RuntimeError("executor path must be absolute")
-        if executable.name.lower() in _SHELL_NAMES:
+        executable_name = executable.name.lower()
+        if executable_name in _SHELL_NAMES:
             raise RuntimeError("shell executables are not permitted as broker adapters")
+        if executable_name == "env":
+            raise RuntimeError("env dispatch is not permitted for broker adapters")
         executable = _outside_repo(executable, repo_root, "executor")
         try:
             first_line = executable.open("rb").readline(256).decode("utf-8", "ignore").strip()

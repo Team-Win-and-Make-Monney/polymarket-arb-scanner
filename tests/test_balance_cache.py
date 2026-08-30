@@ -309,7 +309,10 @@ class TestBalanceCache:
             return {"polymarket": 100.0}
 
         executor._fetch_balances = delayed_fetch
-        thread = threading.Thread(target=executor._get_cached_balances, args=("Binary",))
+        result = []
+        thread = threading.Thread(
+            target=lambda: result.append(executor._get_cached_balances("Binary")),
+        )
         thread.start()
         assert fetch_started.wait(timeout=1)
         executor.invalidate_balance_cache()
@@ -317,6 +320,7 @@ class TestBalanceCache:
         thread.join(timeout=2)
 
         assert not thread.is_alive()
+        assert result == [None]
         assert executor._balance_cache == {}
         assert executor._balance_cache_ts == 0.0
 

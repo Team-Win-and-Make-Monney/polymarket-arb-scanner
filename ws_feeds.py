@@ -95,11 +95,15 @@ class FeedManager:
         self._kalshi_proxy = os.getenv("KALSHI_PROXY_URL")
         if self._pm_proxy:
             self._pm_proxy = assert_public_url(
-                self._pm_proxy, env_name="POLYMARKET_PROXY_URL"
+                self._pm_proxy,
+                env_name="POLYMARKET_PROXY_URL",
+                allow_socks=True,
             )
         if self._kalshi_proxy:
             self._kalshi_proxy = assert_public_url(
-                self._kalshi_proxy, env_name="KALSHI_PROXY_URL"
+                self._kalshi_proxy,
+                env_name="KALSHI_PROXY_URL",
+                allow_socks=True,
             )
         self._pending_poly_subs: list[str] = []
         self._pending_kalshi_subs: list[str] = []

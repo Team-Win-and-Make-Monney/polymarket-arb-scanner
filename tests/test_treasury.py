@@ -102,6 +102,17 @@ class TestRiskGates:
         assert result.ok is False
         assert "kill switch" in (result.error or "")
 
+    def test_boolean_gas_cost_is_rejected(self, db):
+        TreasuryManager, _, _ = _import_treasury()
+        gas_monitor = MagicMock()
+        gas_monitor.get_current_gas_cost.return_value = True
+        tm = TreasuryManager(db=db, dry_run=True, gas_monitor=gas_monitor)
+
+        result = tm.execute_transfer("gemini", "polymarket", 100.0)
+
+        assert result.ok is False
+        assert result.error == "gas cost unavailable"
+
     def test_missing_audit_database_fails_closed(self):
         TreasuryManager, _, _ = _import_treasury()
         gemini = MagicMock()

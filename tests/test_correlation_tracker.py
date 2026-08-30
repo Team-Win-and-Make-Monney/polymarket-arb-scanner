@@ -113,6 +113,16 @@ class TestBucketing:
         series = ct.build_bucketed_series(snapshots, bucket_seconds=3600)
         assert "A" not in series
 
+    def test_drops_non_finite_prices(self):
+        base = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        snapshots = [
+            _row("A", base, float("nan")),
+            _row("A", base + timedelta(hours=1), float("inf")),
+            _row("A", base + timedelta(hours=2), float("-inf")),
+        ]
+        series = ct.build_bucketed_series(snapshots, bucket_seconds=3600)
+        assert "A" not in series
+
     def test_aligned_series_takes_overlap(self):
         a = {1: 0.1, 2: 0.2, 3: 0.3}
         b = {2: 0.5, 3: 0.6, 4: 0.7}

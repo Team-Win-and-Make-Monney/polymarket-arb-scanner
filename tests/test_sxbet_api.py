@@ -90,6 +90,18 @@ class TestSXBetLogin:
         c.session.get.side_effect = req.RequestException("timeout")
         assert c.login("key") is False
 
+    def test_reverse_proxy_receives_proxy_token(self):
+        with patch.object(sxbet_api, "SXBET_API_URL", "https://proxy.example.com"), \
+                patch.dict(os.environ, {"SXBET_PROXY_TOKEN": "test-proxy-token"}):
+            c = SXBetClient()
+        assert c.session.headers["X-Proxy-Token"] == "test-proxy-token"
+
+    def test_official_api_never_receives_proxy_token(self):
+        with patch.object(sxbet_api, "SXBET_API_URL", "https://api.sx.bet"), \
+                patch.dict(os.environ, {"SXBET_PROXY_TOKEN": "test-proxy-token"}):
+            c = SXBetClient()
+        assert "X-Proxy-Token" not in c.session.headers
+
 
 # ---------------------------------------------------------------------------
 # TestSXBetMarketPrice

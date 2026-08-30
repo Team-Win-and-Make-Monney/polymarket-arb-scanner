@@ -270,12 +270,13 @@ class ArbitrageExecutor:
                 return dict(self._balance_cache)
             generation = self._balance_cache_generation
         balances = self._fetch_balances(opp_type)
-        if balances:
-            with self._balance_cache_lock:
-                if generation == self._balance_cache_generation:
-                    self._balance_cache = dict(balances)
-                    self._balance_cache_ts = now
-                    self._balance_cache_type = opp_type
+        with self._balance_cache_lock:
+            if generation != self._balance_cache_generation:
+                return None
+            if balances:
+                self._balance_cache = dict(balances)
+                self._balance_cache_ts = now
+                self._balance_cache_type = opp_type
         return balances
 
     def invalidate_balance_cache(self):

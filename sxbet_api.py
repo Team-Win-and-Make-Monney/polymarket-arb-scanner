@@ -105,6 +105,9 @@ class SXBetClient:
             "Accept": "application/json",
             "Content-Type": "application/json",
         })
+        proxy_token = os.getenv("SXBET_PROXY_TOKEN", "").strip()
+        if SXBET_API_URL.rstrip("/") != "https://api.sx.bet" and proxy_token:
+            self.session.headers["X-Proxy-Token"] = proxy_token
         self.api_key: str | None = None
         self.wallet_address: str | None = None
         self.authenticated = False

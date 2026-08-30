@@ -33,3 +33,7 @@ class TestWorkflowHardening:
         workflow = (ROOT / ".github" / "workflows" / "kalshi-lip-scan.yml").read_text(encoding="utf-8")
         assert "permissions: {}" in workflow
         assert "persist-credentials: false" in workflow
+
+    def test_primary_test_checkout_does_not_persist_credentials(self):
+        workflow = (ROOT / ".github" / "workflows" / "test.yml").read_text(encoding="utf-8")
+        assert "persist-credentials: false" in workflow

@@ -156,6 +156,11 @@ class TestSentimentScoring:
         assert result["sentiment"] is None
         assert result["confidence"] == 0.0
 
+    def test_keyword_substrings_do_not_match(self):
+        result = _score_sentiment("The request was unapproved.")
+        assert result["sentiment"] is None
+        assert result["confidence"] == 0.0
+
     def test_confidence_level_yes(self):
         """YES keyword match returns 0.8 confidence."""
         text = "The proposal was approved by the committee."

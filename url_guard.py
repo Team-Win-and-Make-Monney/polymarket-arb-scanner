@@ -37,6 +37,7 @@ from urllib.parse import urlparse
 logger = logging.getLogger(__name__)
 
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
+_SOCKS_SCHEMES = frozenset({"socks5", "socks5h"})
 
 # Hostname suffixes/names that are never public.
 _INTERNAL_HOST_SUFFIXES = (".internal", ".local", ".lan", ".localdomain", ".localhost")
@@ -83,7 +84,13 @@ def _as_ip(host: str):
         return None
 
 
-def assert_public_url(url: str, *, env_name: str = "", allow_http: bool = True) -> str:
+def assert_public_url(
+    url: str,
+    *,
+    env_name: str = "",
+    allow_http: bool = True,
+    allow_socks: bool = False,
+) -> str:
     """Return ``url`` unchanged if it is SSRF-safe, else raise ``ValueError``.
 
     Args:
@@ -91,6 +98,8 @@ def assert_public_url(url: str, *, env_name: str = "", allow_http: bool = True) 
         env_name: The env-var name, used only to make error messages actionable.
         allow_http: When False, only ``https`` is accepted (use for endpoints
             that are always TLS, e.g. exchange APIs).
+        allow_socks: Also accept ``socks5`` and ``socks5h`` for callers that
+            pass the URL to a SOCKS-capable proxy library.
 
     Returns:
         The same ``url`` string, so call sites can assign the validated value.
@@ -105,6 +114,8 @@ def assert_public_url(url: str, *, env_name: str = "", allow_http: bool = True) 
 
     parsed = urlparse(url)
     allowed = _ALLOWED_SCHEMES if allow_http else frozenset({"https"})
+    if allow_socks:
+        allowed = allowed | _SOCKS_SCHEMES
     if parsed.scheme not in allowed:
         raise ValueError(f"{label} scheme {parsed.scheme!r} not allowed (need one of {sorted(allowed)})")
     if parsed.username or parsed.password:

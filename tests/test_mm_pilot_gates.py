@@ -19,7 +19,7 @@ import pytest
 import config
 import market_maker
 from market_maker import ToxicFlowDetector, VolatilityTracker
-from mm_pilot import FillEvent, KalshiMMPilot
+from mm_pilot import FillEvent
 
 from test_mm_pilot import (TICKER, FakeKalshiClient, RecordingHedger,
                            build_pilot, live_config, make_book)

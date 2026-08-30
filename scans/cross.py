@@ -146,11 +146,8 @@ def _refine_cross_with_clob(opportunities: list[dict], markets_by_key: dict, min
             opp["fees"] = f"${best['fees']:.4f}"
             opp["net_profit"] = best["net_profit"]
             opp["net_roi"] = f"{best['net_profit'] / total_cost * 100:.2f}%"
-            opp["_clob_depth"] = (
-                pm_yes_depth or 0
-                if best == result1
-                else pm_no_depth or 0
-            )
+            selected_pm_depth = pm_yes_depth if best == result1 else pm_no_depth
+            opp["_clob_depth"] = selected_pm_depth or 0
             if partial:
                 opp["_partial_clob"] = True
             refined.append(opp)

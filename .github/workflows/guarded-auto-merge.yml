@@ -2,28 +2,48 @@ name: Enable guarded auto-merge
 
 on:
   pull_request_target:
-    types: [labeled, reopened, ready_for_review, synchronize]
+    types: [labeled, unlabeled, reopened, ready_for_review]
+
+concurrency:
+  group: guarded-auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 permissions:
   contents: write
   pull-requests: write
 
 jobs:
-  enable-auto-merge:
-    if: >-
-      github.event.pull_request.draft == false &&
-      contains(github.event.pull_request.labels.*.name, 'automerge')
+  manage-auto-merge:
     runs-on: ubuntu-latest
     steps:
+      - name: Disable native auto-merge on opt-out
+        if: >-
+          github.event.action == 'unlabeled' &&
+          github.event.label.name == 'automerge'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [[ "$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.auto_merge != null')" == "true" ]]; then
+            gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --disable-auto
+          fi
+
       - name: Enable native auto-merge at the current head
+        if: >-
+          github.event.action != 'unlabeled' &&
+          github.event.pull_request.draft == false
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: >-
-          gh pr merge "$PR_NUMBER"
-          --repo "$GITHUB_REPOSITORY"
-          --match-head-commit "$PR_HEAD_SHA"
-          --auto
-          --squash
-          --delete-branch
+        run: |
+          if [[ "$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER" --jq 'any(.labels[]; .name == "automerge")')" != "true" ]]; then
+            exit 0
+          fi
+
+          gh pr merge "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --match-head-commit "$PR_HEAD_SHA" \
+            --auto \
+            --squash \
+            --delete-branch

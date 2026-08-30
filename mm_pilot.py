@@ -1299,9 +1299,11 @@ class KalshiMMPilot:
                     f"indeterminate order placement on {ticker}")
                 return None
 
+        pending_info = None
         with self._lock:
             if not self.dry_run:
-                self._pending_submissions.pop(client_order_id, None)
+                pending_info = self._pending_submissions.pop(
+                    client_order_id, None)
             self._orders[order_id] = {
                 "ticker": ticker,
                 "side": side,
@@ -1318,6 +1320,9 @@ class KalshiMMPilot:
                 "placed_mono": self._mono_fn(),
             }
         if not self._persist_state():
+            if not self.dry_run and pending_info is not None:
+                with self._lock:
+                    self._pending_submissions[client_order_id] = pending_info
             self._require_reconciliation(
                 f"could not persist accepted order {order_id} on {ticker}")
             return None

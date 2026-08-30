@@ -784,6 +784,36 @@ class TestPlaceOrderCounter:
         assert client.place_order_calls == 0
         assert "never-submitted" not in pilot._pending_submissions
 
+    def test_hedger_proxy_preserves_identity_when_accept_persist_fails(
+            self, pilot_env, clock):
+        from kalshi_api import KalshiOrderIndeterminate
+        from mm_pilot import _PilotKalshiProxy
+
+        class FailSecondSave:
+            def __init__(self):
+                self.calls = 0
+
+            def save(self, state):
+                self.calls += 1
+                return self.calls == 1
+
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client)
+        pilot._state_store = FailSecondSave()
+        pilot.inventory.apply_fill(TICKER, "yes", "buy", 5, 0.49)
+        proxy = _PilotKalshiProxy(pilot)
+
+        with pytest.raises(KalshiOrderIndeterminate) as exc_info:
+            proxy.place_order(
+                TICKER, "yes", "sell", 5, 0.48,
+                reducing=True, client_order_id="accepted-not-persisted",
+            )
+
+        assert exc_info.value.client_order_id == "accepted-not-persisted"
+        assert client.place_order_calls == 1
+        assert "accepted-not-persisted" in pilot._pending_submissions
+        assert pilot._reconciled is False
+
 
 # ---------------------------------------------------------------------------
 # Finding #2: cancel confirms on the exchange before the registry pop;

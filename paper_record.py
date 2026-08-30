@@ -106,7 +106,9 @@ class PaperRecordTracker:
 
     def _send(self, message: str) -> bool:
         if not self.notifier:
-            return False
+            # Notifications are optional. Treat the no-notifier configuration as
+            # successfully handled so completion checks are not repeated forever.
+            return True
         try:
             return bool(self.notifier.notify_text(message))
         except Exception as exc:

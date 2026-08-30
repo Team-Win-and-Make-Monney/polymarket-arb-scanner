@@ -12,6 +12,7 @@ from typing import Callable
 
 from .policy import PolicyConfig
 from .queue import (
+    HALT_SCOPE_ALL,
     HALT_SCOPE_CAPITAL,
     STATUS_EXECUTED,
     STATUS_HARD_STOP,
@@ -83,6 +84,7 @@ class PolicyBroker:
         # halt could not be persisted. The normal (successful) halt path leaves
         # this False and relies on the DB halt (which an operator clears).
         self._capital_frozen = False
+        self._processing_frozen = False
 
     # ------------------------------------------------------------------
 
@@ -127,6 +129,11 @@ class PolicyBroker:
         return result
 
     def _process_created(self, intent_id: int, intent: Intent) -> BrokerDecision:
+        if self._processing_frozen or self.queue.halt_active(HALT_SCOPE_ALL):
+            return self._finish(
+                intent_id, intent, STATUS_HARD_STOP,
+                "automatic broker processing is frozen pending operator reconciliation",
+            )
         malformed = self._malformed_reason(intent)
         if malformed:
             return self._finish(intent_id, intent, STATUS_REJECTED, malformed)
@@ -172,6 +179,17 @@ class PolicyBroker:
                 f"[broker] CRITICAL: could not durably record the capital halt "
                 f"({reason}): {exc} — in-process guard is now blocking all capital "
                 "moves; operator must reconcile and restart"
+            )
+
+    def _freeze_processing(self, reason: str) -> None:
+        """Durably halt all automatic processing, with an in-process fallback."""
+        self._processing_frozen = True
+        try:
+            self.queue.record_halt(HALT_SCOPE_ALL, reason)
+        except Exception as exc:
+            self.escalate(
+                f"[broker] CRITICAL: could not durably halt all processing "
+                f"({reason}): {exc}; in-process guard is active"
             )
 
     # ------------------------------------------------------------------
@@ -253,6 +271,9 @@ class PolicyBroker:
                 f"but status persistence failed: {exc} — ledger still shows PENDING, "
                 "operator must reconcile"
             )
+            self._freeze_processing(
+                f"post-execute status persistence failed for intent {intent_id}"
+            )
             # A capital move whose EXECUTED status could not be persisted leaves
             # the ledger incomplete — freeze capital so a later move cannot
             # proceed against it until the operator reconciles.
@@ -283,7 +304,17 @@ class PolicyBroker:
 
     def _finish(self, intent_id: int, intent: Intent, status: str,
                 reason: str) -> BrokerDecision:
-        self.queue.append_event(intent_id, status, reason)
+        try:
+            self.queue.append_event(intent_id, status, reason)
+        except Exception as exc:
+            persistence_reason = (
+                f"status persistence failed for intent {intent_id} ({status}): {exc}"
+            )
+            logger.critical("%s", persistence_reason)
+            self.escalate(f"[broker] CRITICAL: {persistence_reason}")
+            self._freeze_processing(persistence_reason)
+            if intent.intent_type == "move_capital":
+                self._freeze_capital(persistence_reason)
         if status != STATUS_PENDING:
             self.escalate(
                 f"[broker] intent {intent_id} ({intent.intent_type}) {status}: {reason}"

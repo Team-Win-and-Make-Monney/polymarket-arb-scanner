@@ -462,7 +462,10 @@ def _refine_multi_cross_with_clob(
         clob_ok = True
 
         for leg in legs:
-            if leg["platform"] == "polymarket" and leg.get("_token_id"):
+            if leg["platform"] == "polymarket":
+                if not leg.get("_token_id"):
+                    clob_ok = False
+                    break
                 # Multi-cross legs have a single YES token per outcome.
                 # Check WS price cache directly (not _fetch_clob_for_market
                 # which expects a full market dict with YES+NO token pair).
@@ -473,14 +476,20 @@ def _refine_multi_cross_with_clob(
                     new_platforms.append("polymarket")
                     leg["price"] = cached["best_ask"]
                 else:
-                    # Fallback to mid-price
-                    new_prices.append(leg["price"])
-                    new_platforms.append(leg["platform"])
+                    logger.debug(
+                        "MultiCross dropped (fail-closed): no executable Polymarket ask for %s",
+                        token_id,
+                    )
+                    clob_ok = False
+                    break
             else:
                 new_prices.append(leg["price"])
                 new_platforms.append(leg["platform"])
 
         if not clob_ok:
+            continue
+
+        if len(new_prices) != len(legs) or not new_prices:
             continue
 
         total_cost = sum(new_prices)

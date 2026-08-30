@@ -295,6 +295,35 @@ class TestBalanceCache:
         assert executor._balance_cache_ts == 0.0
         assert executor._balance_cache_type == ""
 
+    def test_inflight_fetch_cannot_restore_invalidated_cache(self, ArbitrageExecutor, db, risk_manager):
+        executor = ArbitrageExecutor(
+            pm_trader=None, kalshi_client=None,
+            db=db, risk_manager=risk_manager, dry_run=True,
+        )
+        fetch_started = threading.Event()
+        release_fetch = threading.Event()
+
+        def delayed_fetch(_opp_type):
+            fetch_started.set()
+            release_fetch.wait(timeout=2)
+            return {"polymarket": 100.0}
+
+        executor._fetch_balances = delayed_fetch
+        result = []
+        thread = threading.Thread(
+            target=lambda: result.append(executor._get_cached_balances("Binary")),
+        )
+        thread.start()
+        assert fetch_started.wait(timeout=1)
+        executor.invalidate_balance_cache()
+        release_fetch.set()
+        thread.join(timeout=2)
+
+        assert not thread.is_alive()
+        assert result == [None]
+        assert executor._balance_cache == {}
+        assert executor._balance_cache_ts == 0.0
+
     def test_cache_returns_none_when_fetch_returns_none(self, ArbitrageExecutor, db, risk_manager):
         """If _fetch_balances returns None, cache should not store it."""
         executor = ArbitrageExecutor(

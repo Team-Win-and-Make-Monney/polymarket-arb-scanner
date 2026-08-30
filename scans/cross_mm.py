@@ -17,7 +17,7 @@ Inventory tracking is handled by ``CrossPlatformMaker`` in
 
 import logging
 
-from fees import net_profit_cross_generic
+from fees import estimate_total_fee
 from .helpers import capital_efficiency_score
 
 logger = logging.getLogger(__name__)
@@ -80,20 +80,19 @@ def scan_cross_mm(
         # Two candidate orientations: buy on A and sell on B, or vice versa.
         # Pick whichever produces the larger net spread after fees.
         candidates = (
-            (platform_a, platform_b, a_bid, b_ask, "yes", "no"),
-            (platform_b, platform_a, b_bid, a_ask, "yes", "no"),
+            (platform_a, platform_b, a_bid, b_ask),
+            (platform_b, platform_a, b_bid, a_ask),
         )
 
         best = None
-        for buy_plat, sell_plat, buy_price, sell_price, side_a, side_b in candidates:
+        for buy_plat, sell_plat, buy_price, sell_price in candidates:
             try:
-                fee_result = net_profit_cross_generic(
-                    buy_price, 1 - sell_price, side_a, side_b,
-                    platform_a=buy_plat, platform_b=sell_plat,
-                )
+                buy_fee = estimate_total_fee(buy_plat, buy_price, order_type="maker")
+                sell_fee = estimate_total_fee(sell_plat, sell_price, order_type="maker")
             except Exception:
                 continue
-            net_spread = sell_price - buy_price - fee_result.get("fees", 0.0)
+            fees = buy_fee + sell_fee
+            net_spread = sell_price - buy_price - fees
             if net_spread < min_spread:
                 continue
             if best is None or net_spread > best["spread"]:
@@ -103,7 +102,7 @@ def scan_cross_mm(
                     "buy_price": buy_price,
                     "sell_price": sell_price,
                     "spread": net_spread,
-                    "fees": fee_result.get("fees", 0.0),
+                    "fees": fees,
                 }
         if best is None:
             continue

@@ -39,8 +39,8 @@ class TestScanCrossMM:
     def test_emits_opp_when_spread_above_threshold(self, monkeypatch):
         import fees as fees_mod
         monkeypatch.setattr(
-            fees_mod, "net_profit_cross_generic",
-            lambda *a, **kw: {"net_profit": 0.01, "fees": 0.005, "gross_spread": 0.05},
+            fees_mod, "estimate_total_fee",
+            lambda *a, **kw: 0.0025,
         )
         scan_cross_mm = self._import()
         pairs = [{
@@ -78,8 +78,8 @@ class TestScanCrossMM:
     def test_filters_low_spread(self, monkeypatch):
         import fees as fees_mod
         monkeypatch.setattr(
-            fees_mod, "net_profit_cross_generic",
-            lambda *a, **kw: {"net_profit": 0.001, "fees": 0.005, "gross_spread": 0.005},
+            fees_mod, "estimate_total_fee",
+            lambda *a, **kw: 0.0025,
         )
         scan_cross_mm = self._import()
         pairs = [{
@@ -91,6 +91,34 @@ class TestScanCrossMM:
         opps = scan_cross_mm(pairs, min_spread=0.04,
                              platforms_whitelist=("polymarket", "kalshi"))
         assert opps == []
+
+    def test_charges_both_maker_legs_when_bid_plus_ask_is_one(self, monkeypatch):
+        calls = []
+
+        def fake_fee(platform, price, order_type="taker"):
+            calls.append((platform, price, order_type))
+            return 0.01
+
+        import fees as fees_mod
+        monkeypatch.setattr(fees_mod, "estimate_total_fee", fake_fee)
+        scan_cross_mm = self._import()
+        pairs = [{
+            "platform_a": "polymarket",
+            "platform_b": "kalshi",
+            "market_key": "x",
+            "market_a": {"yes_bid": 0.45, "yes_ask": 0.49},
+            "market_b": {"yes_bid": 0.40, "yes_ask": 0.55},
+        }]
+
+        opps = scan_cross_mm(
+            pairs,
+            min_spread=0.09,
+            platforms_whitelist=("polymarket", "kalshi"),
+        )
+
+        assert opps == []
+        assert ("polymarket", 0.45, "maker") in calls
+        assert ("kalshi", 0.55, "maker") in calls
 
     def test_skips_pairs_missing_prices(self):
         scan_cross_mm = self._import()

@@ -76,7 +76,8 @@ class FakeKalshiClient:
         return self.books.get(ticker)
 
     def place_order(self, ticker, side, action, count, price_dollars,
-                    time_in_force="fill_or_kill", reducing=False):
+                    time_in_force="fill_or_kill", reducing=False,
+                    client_order_id=None):
         self.place_order_calls += 1
         if self.fail_place:
             return None
@@ -84,9 +85,9 @@ class FakeKalshiClient:
         self.placed.append({
             "order_id": oid, "ticker": ticker, "side": side, "action": action,
             "count": count, "price": price_dollars, "tif": time_in_force,
-            "reducing": reducing,
+            "reducing": reducing, "client_order_id": client_order_id,
         })
-        return {"order": {"order_id": oid}}
+        return {"order": {"order_id": oid, "client_order_id": client_order_id}}
 
     def cancel_order(self, order_id):
         self.cancel_order_calls += 1
@@ -118,6 +119,13 @@ class FakeKalshiClient:
         if self.fail_get_open_orders:
             raise RuntimeError("fake get_open_orders failure")
         return list(self.open_orders_script)
+
+    def find_order_by_client_order_id(self, client_order_id, ticker=None,
+                                      **kwargs):
+        for order in self.open_orders_script:
+            if order.get("client_order_id") == client_order_id:
+                return order
+        return None
 
 
 class RecordingHedger:
@@ -734,6 +742,78 @@ class TestPlaceOrderCounter:
         assert client.place_order_calls == pilot.place_order_calls
         assert client.place_order_calls > 0
 
+    def test_hedger_proxy_preserves_client_order_identity(self, pilot_env,
+                                                           clock):
+        from mm_pilot import _PilotKalshiProxy
+
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client)
+        pilot.inventory.apply_fill(TICKER, "yes", "buy", 5, 0.49)
+        proxy = _PilotKalshiProxy(pilot)
+
+        response = proxy.place_order(
+            TICKER, "yes", "sell", 5, 0.48,
+            reducing=True, client_order_id="hedge-client-1",
+        )
+
+        assert response == {"order": {"order_id": "k_1"}}
+        assert client.placed[-1]["client_order_id"] == "hedge-client-1"
+        client.open_orders_script = [{
+            "order_id": "k_1",
+            "client_order_id": "hedge-client-1",
+            "ticker": TICKER,
+        }]
+        assert proxy.find_order_by_client_order_id(
+            "hedge-client-1", ticker=TICKER,
+        )["order_id"] == "k_1"
+
+    def test_hedger_proxy_does_not_invent_submission_after_gate_rejection(
+            self, pilot_env, clock):
+        from mm_pilot import _PilotKalshiProxy
+
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client, reconciled=False)
+        proxy = _PilotKalshiProxy(pilot)
+
+        response = proxy.place_order(
+            TICKER, "yes", "sell", 5, 0.48,
+            reducing=True, client_order_id="never-submitted",
+        )
+
+        assert response is None
+        assert client.place_order_calls == 0
+        assert "never-submitted" not in pilot._pending_submissions
+
+    def test_hedger_proxy_preserves_identity_when_accept_persist_fails(
+            self, pilot_env, clock):
+        from kalshi_api import KalshiOrderIndeterminate
+        from mm_pilot import _PilotKalshiProxy
+
+        class FailSecondSave:
+            def __init__(self):
+                self.calls = 0
+
+            def save(self, state):
+                self.calls += 1
+                return self.calls == 1
+
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client)
+        pilot._state_store = FailSecondSave()
+        pilot.inventory.apply_fill(TICKER, "yes", "buy", 5, 0.49)
+        proxy = _PilotKalshiProxy(pilot)
+
+        with pytest.raises(KalshiOrderIndeterminate) as exc_info:
+            proxy.place_order(
+                TICKER, "yes", "sell", 5, 0.48,
+                reducing=True, client_order_id="accepted-not-persisted",
+            )
+
+        assert exc_info.value.client_order_id == "accepted-not-persisted"
+        assert client.place_order_calls == 1
+        assert "accepted-not-persisted" in pilot._pending_submissions
+        assert pilot._reconciled is False
+
 
 # ---------------------------------------------------------------------------
 # Finding #2: cancel confirms on the exchange before the registry pop;
@@ -959,6 +1039,23 @@ class TestReconciliation:
         pilot = self._direct_pilot(clock, client)
         assert pilot.reconcile() is False
         assert pilot._reconciled is False
+
+    def test_indeterminate_lookup_failure_keeps_pilot_unreconciled(
+            self, pilot_env, clock, monkeypatch):
+        client = FakeKalshiClient()
+        pilot = self._direct_pilot(clock, client)
+        pilot._pending_submissions["durable-client-id"] = {
+            "ticker": TICKER,
+        }
+
+        def fail_lookup(*args, **kwargs):
+            raise RuntimeError("order history unavailable")
+
+        monkeypatch.setattr(client, "find_order_by_client_order_id", fail_lookup)
+
+        assert pilot.reconcile() is False
+        assert pilot._reconciled is False
+        assert "durable-client-id" in pilot._pending_submissions
 
     def test_success_seeds_inventory_and_cancels_stale_orders(self, pilot_env,
                                                                clock):
@@ -1488,7 +1585,7 @@ class TestInventoryDerivedReduction:
 
 
 class TestIndeterminatePlacement:
-    @pytest.mark.parametrize("response", [None, {}, {"order": {}}])
+    @pytest.mark.parametrize("response", [{}, {"order": {}}])
     def test_missing_order_identity_halts_and_requires_reconciliation(
             self, pilot_env, clock, response, monkeypatch):
         client = FakeKalshiClient()
@@ -1502,6 +1599,20 @@ class TestIndeterminatePlacement:
         assert pilot.halted is True
         assert pilot._reconciled is False
         assert "indeterminate order placement" in pilot.halt_reason
+
+    def test_confirmed_rejection_does_not_require_reconciliation(
+            self, pilot_env, clock, monkeypatch):
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client)
+        monkeypatch.setattr(client, "place_order", lambda **kwargs: None)
+
+        oid = pilot.place_pilot_order(
+            TICKER, "yes", "buy", 4, 0.49, purpose="quote_bid")
+
+        assert oid is None
+        assert pilot.halted is False
+        assert pilot._reconciled is True
+        assert pilot._pending_submissions == {}
 
     def test_placement_exception_takes_same_fail_closed_path(
             self, pilot_env, clock, monkeypatch):
@@ -1517,6 +1628,34 @@ class TestIndeterminatePlacement:
             TICKER, "yes", "buy", 4, 0.49,
             purpose="quote_bid") is None
         assert pilot.halted is True
+        assert pilot._reconciled is False
+
+    def test_pending_client_id_is_durable_before_live_post(
+            self, pilot_env, clock, tmp_path, monkeypatch):
+        from mm_pilot import PilotStateStore
+
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client)
+        state_path = tmp_path / "pilot-state.json"
+        pilot._state_store = PilotStateStore(str(state_path))
+        captured: dict = {}
+
+        def raise_timeout(**kwargs):
+            captured.update(kwargs)
+            persisted = PilotStateStore(str(state_path)).load()
+            assert kwargs["client_order_id"] in persisted["pending_submissions"]
+            raise TimeoutError("venue response lost")
+
+        monkeypatch.setattr(client, "place_order", raise_timeout)
+
+        assert pilot.place_pilot_order(
+            TICKER, "yes", "buy", 4, 0.49,
+            purpose="quote_bid") is None
+
+        client_order_id = captured["client_order_id"]
+        persisted = PilotStateStore(str(state_path)).load()
+        assert client_order_id in persisted["pending_submissions"]
+        assert pilot._pending_submissions[client_order_id]["ticker"] == TICKER
         assert pilot._reconciled is False
 
 

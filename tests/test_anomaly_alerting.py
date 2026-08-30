@@ -147,9 +147,8 @@ class TestZeroOppPeriod:
     def test_does_not_fire_below_5_consecutive_empty(self):
         """4 consecutive zero-opp scans should not fire."""
         am = self._make_am()
-        for _ in range(4):
-            result = am.check_zero_opp_period(0)
-        assert result is False
+        results = [am.check_zero_opp_period(0) for _ in range(4)]
+        assert all(result is False for result in results)
 
     def test_fires_warning_at_5_consecutive_empty(self):
         """5 consecutive zero-opp scans should fire WARNING."""

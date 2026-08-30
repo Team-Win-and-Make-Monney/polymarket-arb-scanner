@@ -163,8 +163,9 @@ class TestTransactionParsing:
         opp = _parse_clob_transaction(tx, "0xaddr")
         assert opp is None
 
-    def test_returns_none_for_reverted(self):
-        tx = _make_tx(is_error="1")
+    def test_returns_none_for_invalid_block_metadata(self):
+        tx = _make_tx()
+        tx["blockNumber"] = "not-a-block"
         result = _parse_clob_transaction(tx, "0xaddr")
         assert result is None
 

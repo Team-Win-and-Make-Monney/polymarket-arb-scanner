@@ -24,14 +24,19 @@ class ConfigError(ValueError):
 
 
 def _env_float(name: str, default: str) -> float:
-    """Read an env var as float, raising ConfigError on bad values."""
+    """Read a finite env var as float, raising ConfigError on bad values."""
     raw = os.getenv(name, default)
     try:
-        return float(raw)
+        value = float(raw)
     except (ValueError, TypeError):
         raise ConfigError(
             f"Environment variable {name}={raw!r} is not a valid float"
         )
+    if not math.isfinite(value):
+        raise ConfigError(
+            f"Environment variable {name}={raw!r} must be finite"
+        )
+    return value
 
 
 def _env_non_negative_float(name: str, default: str) -> float:
@@ -311,6 +316,7 @@ MM_HEDGE_THRESHOLD = _env_float("MM_HEDGE_THRESHOLD", "0.8")
 AUTO_REBALANCE_ENABLED = _env_bool("AUTO_REBALANCE_ENABLED", "false")
 MAX_AUTO_TRANSFER_PER_DAY = _env_float("MAX_AUTO_TRANSFER_PER_DAY", "500.0")
 MIN_TRANSFER_AMOUNT = _env_float("MIN_TRANSFER_AMOUNT", "50.0")
+TREASURY_MAX_GAS_COST_USD = _env_float("TREASURY_MAX_GAS_COST_USD", "1.0")
 POLYMARKET_DEPOSIT_ADDRESS = os.getenv("POLYMARKET_DEPOSIT_ADDRESS", "")
 
 # Cross-platform market making (Strategy #11).
@@ -705,6 +711,7 @@ MM_MAX_INVENTORY_USD = _env_float("MM_MAX_INVENTORY_USD", "100.0")
 MM_MAX_INVENTORY_CONTRACTS = _env_int("MM_MAX_INVENTORY_CONTRACTS", "250")
 MM_MAX_TOTAL_INVENTORY_USD = _env_float("MM_MAX_TOTAL_INVENTORY_USD", "250.0")
 MM_MAX_GROSS_PER_MARKET_USD = _env_float("MM_MAX_GROSS_PER_MARKET_USD", "300.0")
+MM_MAX_DAILY_LOSS_USD = _env_float("MM_MAX_DAILY_LOSS_USD", "10.0")
 MM_QUOTE_SIZE_USD = _env_float("MM_QUOTE_SIZE_USD", "10.0")
 MM_PILOT_BANKROLL_USD = _env_float("MM_PILOT_BANKROLL_USD", "2000.0")
 
@@ -1199,7 +1206,8 @@ def validate_config() -> list[str]:
     Returns:
         List of non-fatal warning messages (logged but not raised).
     """
-    global LIVE_ENVELOPE, MM_MAX_GROSS_PER_MARKET_USD, MM_MAX_INVENTORY_USD, MM_CANARY_MAX_LOSS_USD
+    global LIVE_ENVELOPE, MM_MAX_GROSS_PER_MARKET_USD, MM_MAX_INVENTORY_USD
+    global MM_MAX_TOTAL_INVENTORY_USD, MM_MAX_DAILY_LOSS_USD, MM_CANARY_MAX_LOSS_USD
     warnings: list[str] = []
 
     # --- Enum checks ---
@@ -1260,6 +1268,7 @@ def validate_config() -> list[str]:
         "MM_MAX_INVENTORY_CONTRACTS": MM_MAX_INVENTORY_CONTRACTS,
         "MM_MAX_TOTAL_INVENTORY_USD": MM_MAX_TOTAL_INVENTORY_USD,
         "MM_MAX_GROSS_PER_MARKET_USD": MM_MAX_GROSS_PER_MARKET_USD,
+        "MM_MAX_DAILY_LOSS_USD": MM_MAX_DAILY_LOSS_USD,
         "MM_QUOTE_SIZE_USD": MM_QUOTE_SIZE_USD,
         "MM_PILOT_BANKROLL_USD": MM_PILOT_BANKROLL_USD,
         "MM_BOOK_MAX_STALE_SECONDS": MM_BOOK_MAX_STALE_SECONDS,
@@ -1302,12 +1311,15 @@ def validate_config() -> list[str]:
         "KALSHI_RATE_LIMIT": KALSHI_RATE_LIMIT,
         "KALSHI_AUTH_BOOT_RETRY_WAIT": KALSHI_AUTH_BOOT_RETRY_WAIT,
         "POLYGON_GAS_ESTIMATE": POLYGON_GAS_ESTIMATE,
+        "TREASURY_MAX_GAS_COST_USD": TREASURY_MAX_GAS_COST_USD,
         "WEBHOOK_MIN_PROFIT": WEBHOOK_MIN_PROFIT,
         "ALERT_BALANCE_LOW_THRESHOLD": ALERT_BALANCE_LOW_THRESHOLD,
         "LIP_MIN_POOL": LIP_MIN_POOL,
         "LIP_MIN_HOURS_REMAINING": LIP_MIN_HOURS_REMAINING,
     }
     for name, val in _non_negative.items():
+        if not math.isfinite(val):
+            raise ConfigError(f"{name}={val} must be finite")
         if val < 0:
             raise ConfigError(f"{name}={val} must be >= 0")
 
@@ -1509,9 +1521,25 @@ def validate_config() -> list[str]:
             MM_MAX_GROSS_PER_MARKET_USD, envelope["max_notional_usd"]
         )
         MM_MAX_INVENTORY_USD = min(MM_MAX_INVENTORY_USD, envelope["max_notional_usd"])
+        MM_MAX_TOTAL_INVENTORY_USD = min(
+            MM_MAX_TOTAL_INVENTORY_USD, envelope["max_notional_usd"]
+        )
+        MM_MAX_DAILY_LOSS_USD = min(
+            MM_MAX_DAILY_LOSS_USD, envelope["max_daily_loss_usd"]
+        )
         MM_CANARY_MAX_LOSS_USD = min(
             MM_CANARY_MAX_LOSS_USD, envelope["max_daily_loss_usd"]
         )
+        if ENABLED_EXECUTION_PLATFORMS != frozenset({"kalshi"}):
+            raise ConfigError(
+                "DRY_RUN=false is Kalshi D0 only and requires "
+                "ENABLED_EXECUTION_PLATFORMS=kalshi"
+            )
+        if not MM_KALSHI_PILOT_ENABLED:
+            raise ConfigError(
+                "DRY_RUN=false requires MM_KALSHI_PILOT_ENABLED=true; "
+                "generic live execution is disabled"
+            )
 
     # --- Kalshi MM pilot invariants (plan 10, spec sections 4-6) ---
     if MM_KALSHI_PILOT_ENABLED:

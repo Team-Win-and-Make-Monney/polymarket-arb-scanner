@@ -485,6 +485,14 @@ class TestSettlementChecks:
         positions = db.get_open_positions()
         return db, positions[0]
 
+    def test_fixture_creates_open_position(self):
+        db, position = self._make_db_with_position("polymarket")
+        try:
+            assert position["status"] == "open"
+            assert position["platform"] == "polymarket"
+        finally:
+            db.close()
+
 
 
 # ============================================================

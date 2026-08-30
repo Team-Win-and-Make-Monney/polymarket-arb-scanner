@@ -380,7 +380,7 @@ class TestShouldExecute:
         assert monitor.should_execute(opp) is True
 
     def test_exact_threshold_boundary(self):
-        """Profit exactly at threshold should fail (must exceed, not equal)."""
+        """Profit exactly at threshold is accepted by the inclusive boundary."""
         monitor = self._make_monitor(gas_cost=0.001)
         # PM vs PM threshold: 2 * 0.001 * 1.2 = 0.0024
         threshold = monitor.get_effective_threshold("polymarket", "polymarket")

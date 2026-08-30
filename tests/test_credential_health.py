@@ -175,12 +175,10 @@ class TestCredentialHealthChecker(unittest.TestCase):
             finally:
                 loop.close()
 
-            # Check that alert was fired with INFO severity
-            if self.mock_alert_manager.alert.called:
-                # At least one INFO alert should have been fired for timeout
-                calls = self.mock_alert_manager.alert.call_args_list
-                found_info = any("INFO" in str(call) for call in calls)
-                self.assertTrue(found_info, "Should have fired INFO severity alert for timeout")
+            self.mock_alert_manager.alert.assert_called()
+            calls = self.mock_alert_manager.alert.call_args_list
+            found_info = any("INFO" in str(call) for call in calls)
+            self.assertTrue(found_info, "Should have fired INFO severity alert for timeout")
 
     def test_auth_failure_is_warning_severity(self):
         """Test that auth failures fire WARNING severity alerts."""
@@ -203,11 +201,26 @@ class TestCredentialHealthChecker(unittest.TestCase):
         finally:
             loop.close()
 
-        # Check that alert was fired with WARNING severity
-        if self.mock_alert_manager.alert.called:
-            calls = self.mock_alert_manager.alert.call_args_list
-            found_warning = any("WARNING" in str(call) for call in calls)
-            self.assertTrue(found_warning, "Should have fired WARNING severity alert for auth failure")
+        self.mock_alert_manager.alert.assert_called()
+        calls = self.mock_alert_manager.alert.call_args_list
+        found_warning = any("WARNING" in str(call) for call in calls)
+        self.assertTrue(found_warning, "Should have fired WARNING severity alert for auth failure")
+
+    def test_outer_exception_path_alerts_after_three_failures(self):
+        with mock.patch.object(
+            self.health_checker,
+            "_check_platform_health",
+            side_effect=RuntimeError("probe crashed"),
+        ):
+            loop = asyncio.new_event_loop()
+            try:
+                for _ in range(3):
+                    loop.run_until_complete(self.health_checker.check_all_platforms())
+            finally:
+                loop.close()
+
+        calls = self.mock_alert_manager.alert.call_args_list
+        self.assertTrue(any("CRITICAL" in str(call) for call in calls))
 
     def test_alert_rate_limiting(self):
         """Test that alerts are rate-limited to 1 per 5-minute window per platform."""

@@ -124,6 +124,8 @@ class ExternalSignalFetcher:
             )
             resp.raise_for_status()
             price = resp.json()["bitcoin"]["usd"]
+            if not isinstance(price, (int, float)) or isinstance(price, bool) or not 0 < price <= 1e9:
+                raise ValueError("CoinGecko returned an invalid BTC price")
             self._set_cached("btc_price", price)
             return price
         except Exception as e:
@@ -145,6 +147,8 @@ class ExternalSignalFetcher:
             )
             resp.raise_for_status()
             price = resp.json()["ethereum"]["usd"]
+            if not isinstance(price, (int, float)) or isinstance(price, bool) or not 0 < price <= 1e9:
+                raise ValueError("CoinGecko returned an invalid ETH price")
             self._set_cached("eth_price", price)
             return price
         except Exception as e:
@@ -277,7 +281,8 @@ def scan_cross_category(
         return []
 
     fetcher = signal_fetcher or get_signal_fetcher()
-    min_divergence = min_divergence or CROSS_CATEGORY_MIN_DIVERGENCE
+    if min_divergence is None:
+        min_divergence = CROSS_CATEGORY_MIN_DIVERGENCE
     opportunities = []
 
     for market in markets:

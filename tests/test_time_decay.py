@@ -177,7 +177,7 @@ class TestScanStage1:
         }
 
         mock_aggregator = MagicMock()
-        mock_aggregator.get_consensus.return_value = 0.95
+        mock_aggregator.get_consensus.return_value = {"probability": 0.95, "sources": ["test"]}
 
         opps = scan_time_decay(
             markets_by_key,
@@ -207,7 +207,7 @@ class TestScanStage1:
         }
 
         mock_aggregator = MagicMock()
-        mock_aggregator.get_consensus.return_value = 0.85
+        mock_aggregator.get_consensus.return_value = {"probability": 0.85, "sources": ["test"]}
 
         opps = scan_time_decay(
             markets_by_key,
@@ -233,7 +233,7 @@ class TestScanStage1:
         }
 
         mock_aggregator = MagicMock()
-        mock_aggregator.get_consensus.return_value = 0.95
+        mock_aggregator.get_consensus.return_value = {"probability": 0.95, "sources": ["test"]}
 
         opps = scan_time_decay(
             markets_by_key,
@@ -259,7 +259,7 @@ class TestScanStage1:
         }
 
         mock_aggregator = MagicMock()
-        mock_aggregator.get_consensus.return_value = 0.95
+        mock_aggregator.get_consensus.return_value = {"probability": 0.95, "sources": ["test"]}
 
         opps = scan_time_decay(
             markets_by_key,
@@ -286,7 +286,7 @@ class TestScanStage1:
         }
 
         mock_aggregator = MagicMock()
-        mock_aggregator.get_consensus.return_value = 0.95
+        mock_aggregator.get_consensus.return_value = {"probability": 0.95, "sources": ["test"]}
 
         opps = scan_time_decay(
             markets_by_key,
@@ -315,7 +315,7 @@ class TestScanStage1:
         }
 
         mock_aggregator = MagicMock()
-        mock_aggregator.get_consensus.return_value = 0.92
+        mock_aggregator.get_consensus.return_value = {"probability": 0.92, "sources": ["test"]}
 
         opps = scan_time_decay(
             markets_by_key,
@@ -342,7 +342,7 @@ class TestScanStage1:
         }
 
         mock_aggregator = MagicMock()
-        mock_aggregator.get_consensus.return_value = 0.08  # 92% consensus on NO
+        mock_aggregator.get_consensus.return_value = {"probability": 0.08, "sources": ["test"]}  # 92% consensus on NO
 
         opps = scan_time_decay(
             markets_by_key,
@@ -500,7 +500,7 @@ class TestOpportunitiesSerialization:
         }
 
         mock_aggregator = MagicMock()
-        mock_aggregator.get_consensus.return_value = 0.95
+        mock_aggregator.get_consensus.return_value = {"probability": 0.95, "sources": ["test"]}
 
         opps = scan_time_decay(
             markets_by_key,
@@ -542,7 +542,7 @@ class TestOpportunitiesSerialization:
         }
 
         mock_aggregator = MagicMock()
-        mock_aggregator.get_consensus.return_value = 0.92
+        mock_aggregator.get_consensus.return_value = {"probability": 0.92, "sources": ["test"]}
 
         opps = scan_time_decay(markets_by_key, mock_aggregator)
         assert len(opps) == 1
@@ -558,7 +558,7 @@ class TestOpportunitiesSerialization:
             }
         }
 
-        mock_aggregator.get_consensus.return_value = 0.08
+        mock_aggregator.get_consensus.return_value = {"probability": 0.08, "sources": ["test"]}
 
         opps_no = scan_time_decay(
             markets_by_key_no,
@@ -598,7 +598,7 @@ class TestEdgeCases:
         }
 
         mock_aggregator = MagicMock()
-        mock_aggregator.get_consensus.return_value = 0.95
+        mock_aggregator.get_consensus.return_value = {"probability": 0.95, "sources": ["test"]}
 
         opps = scan_time_decay(markets_by_key, mock_aggregator)
 
@@ -613,7 +613,7 @@ class TestEdgeCases:
             }
         }
         mock_aggregator = MagicMock()
-        mock_aggregator.get_consensus.return_value = 0.95
+        mock_aggregator.get_consensus.return_value = {"probability": 0.95, "sources": ["test"]}
 
         assert scan_time_decay(markets_by_key, mock_aggregator) == []
 
@@ -627,7 +627,7 @@ class TestEdgeCases:
             }
         }
         mock_aggregator = MagicMock()
-        mock_aggregator.get_consensus.return_value = 0.95
+        mock_aggregator.get_consensus.return_value = {"probability": 0.95, "sources": ["test"]}
 
         assert scan_time_decay(markets_by_key, mock_aggregator) == []
 
@@ -665,7 +665,7 @@ class TestEdgeCases:
         }
 
         mock_aggregator = MagicMock()
-        mock_aggregator.get_consensus.return_value = 0.95
+        mock_aggregator.get_consensus.return_value = {"probability": 0.95, "sources": ["test"]}
 
         opps = scan_time_decay(markets_by_key, mock_aggregator)
 

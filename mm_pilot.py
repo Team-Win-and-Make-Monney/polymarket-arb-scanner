@@ -23,11 +23,14 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 
 from url_guard import assert_public_url
 
@@ -35,8 +38,24 @@ logger = logging.getLogger(__name__)
 
 PLATFORM = "kalshi"  # hardcoded venue — the pilot never routes anywhere else
 KALSHI_TICK = 0.01
-DECISIONS_LOG_PATH = os.getenv("MM_DECISIONS_LOG_PATH") or "decisions.jsonl"
-STATE_PATH = os.getenv("MM_STATE_PATH") or "mm_pilot_state.json"
+
+
+def _data_path(env_name: str, default_name: str) -> str:
+    """Resolve an operator-configured pilot file inside ``DATA_DIR``."""
+    data_dir = Path(os.getenv("DATA_DIR", ".")).expanduser().resolve()
+    raw = os.getenv(env_name)
+    candidate = (
+        Path(raw).expanduser() if raw else data_dir / default_name
+    ).resolve()
+    try:
+        candidate.relative_to(data_dir)
+    except ValueError as exc:
+        raise ValueError(f"{env_name} must resolve inside DATA_DIR") from exc
+    return str(candidate)
+
+
+DECISIONS_LOG_PATH = _data_path("MM_DECISIONS_LOG_PATH", "decisions.jsonl")
+STATE_PATH = _data_path("MM_STATE_PATH", "mm_pilot_state.json")
 
 # Startup reconciliation (finding #4): when there is no persisted checkpoint
 # to anchor the fill lookback, use a wide fixed window rather than "now" —
@@ -201,15 +220,17 @@ class PilotStateStore:
         self.path = path
         self._lock = threading.Lock()
 
-    def save(self, state: dict) -> None:
+    def save(self, state: dict) -> bool:
         tmp = f"{self.path}.tmp"
         with self._lock:
             try:
                 with open(tmp, "w", encoding="utf-8") as fh:
                     json.dump(state, fh)
                 os.replace(tmp, self.path)
+                return True
             except Exception:
                 logger.exception("MM pilot state persist failed (%s)", self.path)
+                return False
 
     def load(self) -> dict | None:
         with self._lock:
@@ -358,13 +379,47 @@ class _PilotKalshiProxy:
     def fetch_order_book(self, ticker: str) -> dict | None:
         return self._pilot.get_raw_book(ticker)
 
-    def place_order(self, ticker: str, side: str, action: str, count: int,
-                    price_dollars: float, time_in_force: str = "ioc") -> dict | None:
+    def find_order_by_client_order_id(
+        self, client_order_id: str, ticker: str | None = None,
+    ) -> dict | None:
+        if self._pilot._client is None:
+            return None
+        return self._pilot._client.find_order_by_client_order_id(
+            client_order_id, ticker=ticker)
+
+    def place_order(
+        self,
+        ticker: str,
+        side: str,
+        action: str,
+        count: int,
+        price_dollars: float,
+        time_in_force: str = "ioc",
+        reducing: bool = True,
+        client_order_id: str | None = None,
+    ) -> dict | None:
         order_id = self._pilot.place_pilot_order(
-            ticker=ticker, side=side, action=action, count=count,
-            price=price_dollars, purpose="hedge", reducing=True,
+            ticker=ticker,
+            side=side,
+            action=action,
+            count=count,
+            price=price_dollars,
+            purpose="hedge",
+            reducing=reducing,
+            client_order_id=client_order_id,
         )
         if order_id is None:
+            with self._pilot._lock:
+                submission_pending = (
+                    client_order_id in self._pilot._pending_submissions
+                    if client_order_id else False
+                )
+            if submission_pending:
+                from kalshi_api import KalshiOrderIndeterminate
+                raise KalshiOrderIndeterminate(
+                    f"MM pilot hedge outcome is indeterminate for {ticker}",
+                    client_order_id=client_order_id,
+                )
             return None
         return {"order": {"order_id": order_id}}
 
@@ -429,6 +484,9 @@ class KalshiMMPilot:
         # Resting-order registry: order_id -> order info. The ONLY source of
         # truth for what the pilot has on the book.
         self._orders: dict[str, dict] = {}
+        # Client ids are persisted before a live POST and removed only after
+        # its venue order id is known or a rejection is confirmed.
+        self._pending_submissions: dict[str, dict] = {}
         self._order_seq = 0
         self.place_order_calls = 0  # test/runtime assertion counter
 
@@ -463,6 +521,8 @@ class KalshiMMPilot:
         self.canary_graduated = False
         self.canary_clean_fills = 0
         self._live_started_ts = self._time_fn()
+        self._daily_pnl_date = self._utc_date()
+        self._daily_pnl_opening_total = self.inventory.realized_pnl_total()
 
         self._decision_writer = decision_writer
         self._decision_fh = None
@@ -523,6 +583,9 @@ class KalshiMMPilot:
         with self._lock:
             tickers = set(self._selected or ())
             tickers.update(info["ticker"] for info in self._orders.values())
+            tickers.update(
+                info["ticker"] for info in self._pending_submissions.values()
+            )
         tickers.update(self.inventory.tickers_with_inventory())
         return sorted(tickers)
 
@@ -640,13 +703,50 @@ class KalshiMMPilot:
 
     def _resting_notional(self, ticker: str) -> float:
         with self._lock:
-            return sum(info["count"] * info["price"]
+            live = sum(info["count"] * info["price"]
                        for info in self._orders.values()
                        if info["ticker"] == ticker)
+            pending = sum(info["count"] * info["price"]
+                          for info in self._pending_submissions.values()
+                          if info["ticker"] == ticker)
+            return live + pending
+
+    def _total_resting_notional(self) -> float:
+        """Return aggregate notional reserved by every resting pilot order."""
+        with self._lock:
+            return sum(
+                info["count"] * info["price"] for info in self._orders.values()
+            ) + sum(
+                info["count"] * info["price"]
+                for info in self._pending_submissions.values()
+            )
+
+    def _utc_date(self) -> str:
+        """Return the current UTC date using the injectable wall clock."""
+        return datetime.fromtimestamp(self._time_fn(), tz=timezone.utc).date().isoformat()
+
+    def _daily_realized_pnl(self) -> float:
+        """Return realized P&L since the persisted opening total for this UTC day."""
+        day = self._utc_date()
+        total = self.inventory.realized_pnl_total()
+        with self._lock:
+            if self._daily_pnl_date != day:
+                self._daily_pnl_date = day
+                self._daily_pnl_opening_total = total
+            return total - self._daily_pnl_opening_total
+
+    @staticmethod
+    def _dashboard_paused() -> bool:
+        """Fail closed when the dashboard's operator pause is engaged."""
+        try:
+            from dashboard import is_paused
+        except ImportError:
+            return False
+        return bool(is_paused())
 
     # -- restart persistence / startup reconciliation (finding #4) -----------
 
-    def _persist_state(self) -> None:
+    def _persist_state(self) -> bool:
         """Best-effort snapshot of restart-recovery state.
 
         Non-blocking on failure: a write failure here must never interrupt
@@ -658,18 +758,25 @@ class KalshiMMPilot:
         position-query endpoint is ever unavailable.
         """
         if self._state_store is None:
-            return
+            return True
         with self._lock:
             orders_snapshot = {oid: dict(info)
                               for oid, info in self._orders.items()}
+            pending_snapshot = {
+                client_id: dict(info)
+                for client_id, info in self._pending_submissions.items()
+            }
         state = {
             "last_fill_ts": self._last_fill_ts,
             "orders": orders_snapshot,
+            "pending_submissions": pending_snapshot,
             "inventory": self.inventory.snapshot(),
             "seen_fill_ids": list(self._seen_fill_ids.keys())[-200:],
+            "daily_pnl_date": self._daily_pnl_date,
+            "daily_pnl_opening_total": self._daily_pnl_opening_total,
             "saved_at": self._time_fn(),
         }
-        self._state_store.save(state)
+        return self._state_store.save(state)
 
     def reconcile(self) -> bool:
         """Startup reconciliation against LIVE venue state (finding #4).
@@ -715,6 +822,43 @@ class KalshiMMPilot:
                                  "unreadable — continuing with venue-only "
                                  "reconciliation (not fatal by itself)")
                 persisted = None
+
+        persisted_pending = (persisted or {}).get("pending_submissions") or {}
+        if isinstance(persisted_pending, dict):
+            with self._lock:
+                self._pending_submissions.update(
+                    {
+                        str(client_id): dict(info)
+                        for client_id, info in persisted_pending.items()
+                        if client_id and isinstance(info, dict)
+                    }
+                )
+
+        with self._lock:
+            pending_submissions = {
+                client_id: dict(info)
+                for client_id, info in self._pending_submissions.items()
+            }
+        for client_id, info in pending_submissions.items():
+            try:
+                order = self._client.find_order_by_client_order_id(
+                    client_id, ticker=info.get("ticker") or None)
+            except Exception:
+                logger.exception(
+                    "MM pilot reconcile: client-order lookup failed for %s "
+                    "-- fail closed", client_id,
+                )
+                self._reconciled = False
+                return False
+            if order is not None and not (
+                    isinstance(order, dict)
+                    and (order.get("order_id") or order.get("id"))):
+                logger.error(
+                    "MM pilot reconcile: client-order lookup for %s returned "
+                    "no venue identity -- fail closed", client_id,
+                )
+                self._reconciled = False
+                return False
 
         since_ts = int((persisted or {}).get(
             "last_fill_ts", self._time_fn() - RECONCILE_FALLBACK_LOOKBACK_SECONDS))
@@ -847,7 +991,26 @@ class KalshiMMPilot:
         self.inventory.restore({"net": net_map, "avg": avg_map,
                                "realized": realized_map})
 
+        current_total = self.inventory.realized_pnl_total()
+        current_day = self._utc_date()
+        persisted_day = (persisted or {}).get("daily_pnl_date")
+        persisted_opening = (persisted or {}).get("daily_pnl_opening_total")
+        if persisted_day == current_day:
+            try:
+                opening_total = float(persisted_opening)
+            except (TypeError, ValueError):
+                opening_total = current_total
+            if not math.isfinite(opening_total):
+                opening_total = current_total
+        else:
+            opening_total = current_total
         with self._lock:
+            self._daily_pnl_date = current_day
+            self._daily_pnl_opening_total = opening_total
+
+        with self._lock:
+            reconciled_submission_count = len(self._pending_submissions)
+            self._pending_submissions = {}
             self._orders = {}
             for fill in fills or []:
                 fid = self._fill_id(fill)
@@ -863,8 +1026,10 @@ class KalshiMMPilot:
         self._reconciled = True
         logger.info("MM pilot reconciled at startup: %d ticker(s) with "
                     "inventory, %d prior resting order(s) cancelled, fills "
-                    "checked since %s", len(self.inventory.tickers_with_inventory()),
-                    len(open_orders or []), since_ts)
+                    "checked since %s, %d indeterminate submission(s) "
+                    "resolved", len(self.inventory.tickers_with_inventory()),
+                    len(open_orders or []), since_ts,
+                    reconciled_submission_count)
         self._persist_state()
         return True
 
@@ -912,6 +1077,8 @@ class KalshiMMPilot:
             return GateResult(False, "kill_switch_env")
         if not self._controls.is_enabled():
             return GateResult(False, "kill_switch")
+        if self._dashboard_paused():
+            return GateResult(False, "dashboard_paused")
         # 2. Platform allowlist + hardcoded venue
         if PLATFORM not in config.ENABLED_EXECUTION_PLATFORMS:
             return GateResult(False, "platform_not_allowlisted")
@@ -932,6 +1099,9 @@ class KalshiMMPilot:
             and (signed > 0) != (net_ct > 0)
             and count <= abs(net_ct)
         )
+        if (not derived_reducing
+                and self._daily_realized_pnl() <= -config.MM_MAX_DAILY_LOSS_USD):
+            return GateResult(False, "daily_loss_limit")
         from kalshi_policy import live_kalshi_submit_allowed
         if not live_kalshi_submit_allowed(
             ticker, reducing=reducing or derived_reducing
@@ -979,6 +1149,13 @@ class KalshiMMPilot:
             if (self.inventory.total_net_usd() + notional
                     > config.MM_MAX_TOTAL_INVENTORY_USD):
                 return GateResult(False, "total_inventory_cap")
+            aggregate = (
+                self.inventory.total_net_usd()
+                + self._total_resting_notional()
+                + notional
+            )
+            if aggregate > config.MM_MAX_TOTAL_INVENTORY_USD:
+                return GateResult(False, "aggregate_notional_cap")
         # 7. Gross cap: inventory at cost + resting quote notional + this order
         gross = net_usd + self._resting_notional(ticker) + notional
         if gross > config.MM_MAX_GROSS_PER_MARKET_USD:
@@ -987,7 +1164,8 @@ class KalshiMMPilot:
 
     def place_pilot_order(self, ticker: str, side: str, action: str,
                           count: int, price: float, purpose: str,
-                          reducing: bool = False) -> str | None:
+                          reducing: bool = False,
+                          client_order_id: str | None = None) -> str | None:
         """Place one pilot order through the choke point.
 
         Returns the order id (synthetic in dry-run), or None on rejection or
@@ -1073,11 +1251,31 @@ class KalshiMMPilot:
             # Quotes rest GTC; hedges are IOC-style fill_or_kill at touch
             # (unfilled hedges are caught by _check_pending_hedges).
             tif = "fill_or_kill" if purpose == "hedge" else "gtc"
+            client_order_id = client_order_id or str(uuid.uuid4())
+            pending_info = {
+                "ticker": ticker,
+                "side": side,
+                "action": action,
+                "count": count,
+                "price": price,
+                "purpose": purpose,
+                "reducing": effective_reducing,
+                "submitted_at": self._time_fn(),
+            }
+            with self._lock:
+                self._pending_submissions[client_order_id] = pending_info
+            if not self._persist_state():
+                with self._lock:
+                    self._pending_submissions.pop(client_order_id, None)
+                self._require_reconciliation(
+                    f"could not persist pending order submission on {ticker}")
+                return None
             try:
                 resp = self._client.place_order(
                     ticker=ticker, side=side, action=action, count=count,
                     price_dollars=price, time_in_force=tif,
                     reducing=effective_reducing,
+                    client_order_id=client_order_id,
                 )
             except Exception:
                 logger.exception("MM pilot place_order outcome indeterminate "
@@ -1086,10 +1284,11 @@ class KalshiMMPilot:
                     f"indeterminate order placement on {ticker}")
                 return None
             if resp is None:
-                logger.error("MM pilot place_order returned no response on %s "
-                             "— acceptance is indeterminate", ticker)
-                self._require_reconciliation(
-                    f"indeterminate order placement on {ticker}")
+                with self._lock:
+                    self._pending_submissions.pop(client_order_id, None)
+                self._persist_state()
+                logger.warning("MM pilot place_order was confirmed rejected "
+                               "on %s", ticker)
                 return None
             order = resp.get("order", resp) if isinstance(resp, dict) else {}
             order_id = order.get("order_id") or order.get("id")
@@ -1100,7 +1299,11 @@ class KalshiMMPilot:
                     f"indeterminate order placement on {ticker}")
                 return None
 
+        pending_info = None
         with self._lock:
+            if not self.dry_run:
+                pending_info = self._pending_submissions.pop(
+                    client_order_id, None)
             self._orders[order_id] = {
                 "ticker": ticker,
                 "side": side,
@@ -1108,6 +1311,7 @@ class KalshiMMPilot:
                 "count": count,
                 "price": price,
                 "purpose": purpose,
+                "client_order_id": (client_order_id if not self.dry_run else None),
                 "placed_at": self._time_fn(),
                 # Monotonic placement time — _check_pending_hedges ages
                 # hedge orders off this, not wall-clock `placed_at`, so NTP
@@ -1115,7 +1319,13 @@ class KalshiMMPilot:
                 # the latency ceiling.
                 "placed_mono": self._mono_fn(),
             }
-        self._persist_state()
+        if not self._persist_state():
+            if not self.dry_run and pending_info is not None:
+                with self._lock:
+                    self._pending_submissions[client_order_id] = pending_info
+            self._require_reconciliation(
+                f"could not persist accepted order {order_id} on {ticker}")
+            return None
         return order_id
 
     MAX_CANCEL_ATTEMPTS = 3
@@ -1273,7 +1483,11 @@ class KalshiMMPilot:
             gate("G0b_fill_sight", False, "fills_blind")
             return {"action": "pull", "reason": "fills_blind"}
         # G1 kill switch
-        g1 = config.MM_KALSHI_PILOT_ENABLED and self._controls.is_enabled()
+        g1 = (
+            config.MM_KALSHI_PILOT_ENABLED
+            and self._controls.is_enabled()
+            and not self._dashboard_paused()
+        )
         if not gate("G1_kill_switch", g1, "ok" if g1 else "kill_switch"):
             self.halt_all("kill switch off or control plane stale")
             return {"action": "halted", "reason": "kill_switch"}
@@ -1667,6 +1881,11 @@ class KalshiMMPilot:
         purpose = order_info.get("purpose", "")
         is_hedge = purpose == "hedge"
 
+        # Establish a new UTC day's opening total before this fill can mutate
+        # realized P&L. Otherwise the first realized fill after midnight would
+        # become the new baseline and be omitted from the daily-loss ceiling.
+        self._daily_realized_pnl()
+
         # Fill accounting (registry, inventory, log) runs UNCONDITIONALLY,
         # before ANY halt decision below — including the taker-fill
         # deviation check that immediately follows. Codex round-3: this
@@ -1736,9 +1955,19 @@ class KalshiMMPilot:
                 if self.halted:
                     return
 
-        # 3. Canary accounting (deviation checks halt the whole pilot).
-        # Realized-loss ceiling considers ALL fills — hedge exits are where
-        # canary losses actually crystallize.
+        # 3. Always-on UTC-day loss accounting. The operator envelope is a
+        # permanent ceiling, not a canary-only rollout threshold.
+        daily_realized = self._daily_realized_pnl()
+        if daily_realized <= -config.MM_MAX_DAILY_LOSS_USD:
+            label = "canary realized P&L" if not self.canary_graduated else "daily realized P&L"
+            self.halt_all(
+                f"{label} ${daily_realized:.2f} at or below daily ceiling "
+                f"-${config.MM_MAX_DAILY_LOSS_USD:.2f}"
+            )
+            return
+
+        # Canary accounting (deviation checks halt the whole pilot).
+        # The canary keeps its own tighter lifetime ceiling until graduation.
         if not self.canary_graduated:
             realized = self.inventory.realized_pnl_total()
             if realized < -config.MM_CANARY_MAX_LOSS_USD:
@@ -1905,6 +2134,11 @@ class KalshiMMPilot:
                 logger.exception("MM pilot hedge attempt %d raised on %s",
                                  attempt, event.ticker)
             if success:
+                break
+            if not self._reconciled:
+                logger.error(
+                    "MM pilot hedge retry blocked on %s until venue "
+                    "reconciliation completes", event.ticker)
                 break
 
         # Latency = (wall-clock staleness of the fill AT THE MOMENT we
@@ -2121,6 +2355,7 @@ class KalshiMMPilot:
             "canary_graduated": self.canary_graduated,
             "canary_clean_fills": self.canary_clean_fills,
             "resting_orders": len(self._orders),
+            "pending_submissions": len(self._pending_submissions),
             "total_inventory_usd": self.inventory.total_net_usd(),
             "realized_pnl": self.inventory.realized_pnl_total(),
             "dry_run": self.dry_run,

@@ -12,13 +12,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 
 import importlib
+from unittest.mock import patch
 
 import pytest
 
 import config
 import market_maker
 from market_maker import ToxicFlowDetector, VolatilityTracker
-from mm_pilot import KalshiMMPilot
+from mm_pilot import FillEvent
 
 from test_mm_pilot import (TICKER, FakeKalshiClient, RecordingHedger,
                            build_pilot, live_config, make_book)
@@ -130,7 +131,8 @@ class TestTotalCap:
 # ---------------------------------------------------------------------------
 
 class TestGrossCap:
-    def test_gross_over_300_rejected(self, pilot_env, clock):
+    def test_gross_over_300_rejected(self, pilot_env, clock, monkeypatch):
+        monkeypatch.setattr(live_config(), "MM_MAX_TOTAL_INVENTORY_USD", 1_000.0)
         pilot = build_pilot(clock, client=FakeKalshiClient())
         # $60 net inventory + $230 resting notional
         pilot.inventory.apply_fill(TICKER, "yes", "buy", 120, 0.50)
@@ -144,7 +146,8 @@ class TestGrossCap:
         assert result.allowed is False
         assert result.reason == "gross_cap"
 
-    def test_gross_under_ceiling_allowed(self, pilot_env, clock):
+    def test_gross_under_ceiling_allowed(self, pilot_env, clock, monkeypatch):
+        monkeypatch.setattr(live_config(), "MM_MAX_TOTAL_INVENTORY_USD", 1_000.0)
         pilot = build_pilot(clock, client=FakeKalshiClient())
         pilot.inventory.apply_fill(TICKER, "yes", "buy", 120, 0.50)
         pilot._orders["resting_1"] = {
@@ -760,6 +763,72 @@ class TestLiveEnvelopeOrderGate:
         pilot = build_pilot(clock, client=FakeKalshiClient())
         result = pilot.authorize_order(TICKER, "yes", "buy", 10, 0.50)
         assert result.allowed is True
+
+    def test_daily_loss_still_blocks_after_canary_graduation(self, pilot_env,
+                                                              clock, monkeypatch):
+        monkeypatch.setattr(pilot_env, "MM_MAX_DAILY_LOSS_USD", 10.0)
+        pilot = build_pilot(clock, client=FakeKalshiClient())
+        pilot.canary_graduated = True
+        pilot.inventory.apply_fill(TICKER, "yes", "buy", 20, 0.60)
+        pilot.inventory.apply_fill(TICKER, "yes", "sell", 20, 0.05)
+
+        result = pilot.authorize_order(TICKER, "yes", "buy", 2, 0.50)
+
+        assert result.allowed is False
+        assert result.reason == "daily_loss_limit"
+
+    def test_first_realized_fill_after_utc_rollover_counts_toward_limit(
+            self, pilot_env, clock, monkeypatch):
+        monkeypatch.setattr(pilot_env, "MM_MAX_DAILY_LOSS_USD", 10.0)
+        pilot = build_pilot(clock, client=FakeKalshiClient())
+        pilot.canary_graduated = True
+        pilot.inventory.apply_fill(TICKER, "yes", "buy", 20, 0.60)
+        prior_day = pilot._daily_pnl_date
+        clock[0] += 86_400
+
+        pilot._process_fill(
+            FillEvent(
+                fill_id="fill-after-midnight",
+                order_id="hedge-after-midnight",
+                ticker=TICKER,
+                side="yes",
+                action="sell",
+                count=20,
+                price=0.05,
+                is_taker=False,
+                created_ts=clock[0],
+                mid_at_detect=0.50,
+            ),
+            {"purpose": "hedge"},
+        )
+
+        assert pilot._daily_pnl_date != prior_day
+        assert pilot._daily_realized_pnl() == pytest.approx(-11.0)
+        assert pilot.halted is True
+        assert "daily realized P&L" in pilot.halt_reason
+
+    def test_aggregate_resting_notional_is_capped(self, pilot_env, clock,
+                                                   monkeypatch):
+        monkeypatch.setattr(pilot_env, "MM_MAX_TOTAL_INVENTORY_USD", 100.0)
+        pilot = build_pilot(clock, client=FakeKalshiClient())
+        pilot.inventory.apply_fill("KXTEST-A", "yes", "buy", 80, 0.50)
+        pilot._orders["resting-b"] = {
+            "ticker": "KXTEST-B", "side": "yes", "action": "buy",
+            "count": 80, "price": 0.50, "purpose": "quote_bid",
+            "placed_at": clock[0],
+        }
+
+        result = pilot.authorize_order("KXTEST-C", "yes", "buy", 50, 0.50)
+
+        assert result.allowed is False
+        assert result.reason == "aggregate_notional_cap"
+
+    def test_dashboard_pause_blocks_mm_authorization(self, pilot_env, clock):
+        pilot = build_pilot(clock, client=FakeKalshiClient())
+        with patch("dashboard.is_paused", return_value=True):
+            result = pilot.authorize_order(TICKER, "yes", "buy", 2, 0.50)
+        assert result.allowed is False
+        assert result.reason == "dashboard_paused"
 
     def test_live_sports_ticker_rejected(self, pilot_env, clock, monkeypatch):
         monkeypatch.setattr(pilot_env, "DRY_RUN", False)

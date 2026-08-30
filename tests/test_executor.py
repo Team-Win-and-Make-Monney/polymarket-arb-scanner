@@ -83,7 +83,7 @@ def risk_manager():
 def executor(ArbitrageExecutor, db, risk_manager):
     pm_trader = MagicMock()
     kalshi_client = MagicMock()
-    return ArbitrageExecutor(
+    instance = ArbitrageExecutor(
         pm_trader=pm_trader,
         kalshi_client=kalshi_client,
         db=db,
@@ -91,6 +91,8 @@ def executor(ArbitrageExecutor, db, risk_manager):
         dry_run=True,
         max_trade_size=5.0,
     )
+    yield instance
+    instance.close()
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +140,7 @@ class TestBuildLegs:
         assert legs[0]["side"] == "yes"
         assert legs[0]["_ticker"] == "TICKER-ABC"
         assert legs[1]["side"] == "no"
+        assert {leg["_contract_count"] for leg in legs} == {6}
 
     def test_kalshi_multi_legs(self, executor):
         opp = {
@@ -150,6 +153,7 @@ class TestBuildLegs:
         for i, leg in enumerate(legs):
             assert leg["platform"] == "kalshi"
             assert leg["_ticker"] == opp["_kalshi_tickers"][i]
+        assert {leg["_contract_count"] for leg in legs} == {6}
 
     def test_cross_pm_yes_kalshi_no(self, executor):
         opp = {
@@ -428,12 +432,13 @@ class TestOrphanedTrades:
         # Mock cancel to fail so it gets marked orphaned
         executor._cancel_leg = lambda leg: False
 
-        result = executor._execute_legs(opp, legs, 5.0)
+        with patch("executor.HEDGE_ENABLED", False):
+            result = executor._execute_legs(opp, legs, 5.0)
         assert result is False
 
         trades = db.get_trades_for_opportunity(1)
         statuses = [t["status"] for t in trades]
-        assert "orphaned" in statuses or "filled" in statuses
+        assert "orphaned" in statuses
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +552,12 @@ class TestCrossRevalidationStrategy:
         assert "PM_Y=" in opp["prices"]
         assert "K_N=" in opp["prices"]
         assert opp["net_profit"] == pytest.approx(0.12)
+        assert opp["_cross_legs"] == [
+            {"platform": "polymarket", "side": "BUY", "token": "yes",
+             "price": 0.30, "_token_id": "tok_yes"},
+            {"platform": "kalshi", "side": "no", "action": "buy",
+             "price": 0.60, "_ticker": "TICKER-XYZ"},
+        ]
 
     def test_strategy2_becomes_best(self, executor):
         """When strategy 2 (PM_NO + K_YES) becomes best, prices should flip to PM_N= and K_Y=."""
@@ -556,8 +567,15 @@ class TestCrossRevalidationStrategy:
             "type": "Cross",
             "net_profit": 0.10,
             "prices": "PM_Y=0.300 K_N=0.350",
+            "total_cost": "$0.6500",
             "_token_ids": ["tok_yes", "tok_no"],
             "_kalshi_ticker": "TICKER-XYZ",
+            "_cross_legs": [
+                {"platform": "polymarket", "side": "BUY", "token": "yes",
+                 "price": 0.30, "_token_id": "tok_yes"},
+                {"platform": "kalshi", "side": "no", "action": "buy",
+                 "price": 0.35, "_ticker": "TICKER-XYZ"},
+            ],
         }
 
         mock_book = {"asks": [{"price": "0.30", "size": "100"}]}
@@ -583,6 +601,65 @@ class TestCrossRevalidationStrategy:
         assert "PM_N=" in opp["prices"]
         assert "K_Y=" in opp["prices"]
         assert opp["net_profit"] == pytest.approx(0.14)
+        assert opp["total_cost"] == "$0.9000"
+        assert opp["net_roi"] == "15.56%"
+        assert opp["_cross_legs"] == [
+            {"platform": "polymarket", "side": "BUY", "token": "no",
+             "price": 0.30, "_token_id": "tok_no"},
+            {"platform": "kalshi", "side": "yes", "action": "buy",
+             "price": 0.60, "_ticker": "TICKER-XYZ"},
+        ]
+
+    def test_inverted_pair_revalidates_physical_sides_and_refreshes_legs(self, executor):
+        """An inverted match must score and submit the same physical contracts."""
+        from unittest.mock import call, patch as mpatch
+
+        opp = {
+            "type": "Cross(PM_YES + K_YES)",
+            "net_profit": 0.10,
+            "prices": "PM_Y=0.300 K_Y=0.350",
+            "total_cost": "$0.6500",
+            "_token_ids": ["tok_yes", "tok_no"],
+            "_kalshi_ticker": "TICKER-XYZ",
+            "_pair_inverted": True,
+            "_cross_legs": [
+                {"platform": "polymarket", "side": "BUY", "token": "yes",
+                 "price": 0.30, "_token_id": "tok_yes"},
+                {"platform": "kalshi", "side": "yes", "action": "buy",
+                 "price": 0.35, "_ticker": "TICKER-XYZ"},
+            ],
+        }
+        now = time.time()
+        price_cache = {
+            ("polymarket", "tok_yes"): {"best_ask": 0.31, "_ts": now},
+            ("polymarket", "tok_no"): {"best_ask": 0.69, "_ts": now},
+            ("kalshi", "TICKER-XYZ"): {
+                "yes_ask": 0.36,
+                "no_ask": 0.41,
+                "_ts": now,
+            },
+        }
+
+        with mpatch(
+            "executor.net_profit_cross_platform",
+            side_effect=[{"net_profit": 0.12}, {"net_profit": 0.04}],
+        ) as profit:
+            passed, reval_profit, reason = executor._revalidate_cross(
+                opp, 0.10, price_cache,
+            )
+
+        assert (passed, reval_profit, reason) == (True, pytest.approx(0.12), "passed")
+        assert profit.call_args_list == [
+            call(0.31, 0.36, "yes", "no"),
+            call(0.69, 0.41, "no", "yes"),
+        ]
+        assert opp["total_cost"] == "$0.6700"
+        assert opp["_cross_legs"] == [
+            {"platform": "polymarket", "side": "BUY", "token": "yes",
+             "price": 0.31, "_token_id": "tok_yes"},
+            {"platform": "kalshi", "side": "yes", "action": "buy",
+             "price": 0.36, "_ticker": "TICKER-XYZ"},
+        ]
 
     def test_net_profit_updated_to_winning_strategy(self, executor):
         """Verify net_profit is set to the winning strategy's value, not left at original."""
@@ -1651,6 +1728,7 @@ class TestRevalidateKalshiMulti:
         with patch("executor.net_profit_kalshi_multi", return_value={"net_profit": 0.095}):
             result = executor._revalidate(opp, None)
             assert result is True
+        assert opp["_kalshi_prices"] == pytest.approx([0.45, 0.45])
 
     def test_fails_when_no_tickers(self, executor):
         """KalshiMulti revalidation fails with empty _kalshi_tickers."""
@@ -2171,6 +2249,15 @@ class TestMinOrderSize:
         assert success is False
         executor.kalshi_client.place_order.assert_not_called()
 
+    def test_generic_live_kalshi_path_is_disabled(self, executor):
+        executor.dry_run = False
+        leg = {"platform": "kalshi", "side": "yes", "action": "buy",
+               "price": 0.50, "_ticker": "KXTEST-1"}
+        with patch("executor.ENABLED_EXECUTION_PLATFORMS", frozenset({"kalshi"})):
+            success, _, _ = executor._execute_single_leg(leg, 3.0, {"type": "KalshiBinary"})
+        assert success is False
+        executor.kalshi_client.place_order.assert_not_called()
+
     def test_cross_all_rejects_when_per_leg_size_below_minimum(self, executor):
         """Cross-all with per-leg size below platform min returns empty."""
         opp = {
@@ -2645,6 +2732,36 @@ class TestRecordFailedLeg:
         rows = db.conn.execute(
             "SELECT status FROM trades WHERE id = ?", (trade_id,)).fetchall()
         assert rows[0][0] == "failed"
+
+    def test_kalshi_indeterminate_submission_persists_client_reference(
+            self, executor, db):
+        from kalshi_api import KalshiOrderIndeterminate
+
+        trade_id = self._make_trade(db)
+        leg = {
+            "platform": "kalshi",
+            "side": "yes",
+            "action": "buy",
+            "price": 0.50,
+            "_ticker": "KXTEST-1",
+            "_trade_id": trade_id,
+        }
+
+        def raise_indeterminate(**kwargs):
+            raise KalshiOrderIndeterminate(
+                "response lost", kwargs["client_order_id"])
+
+        executor.kalshi_client.place_order.side_effect = raise_indeterminate
+        with patch("executor.ENABLED_EXECUTION_PLATFORMS", frozenset({"kalshi"})), \
+             patch("kalshi_policy.live_kalshi_submit_allowed", return_value=True):
+            with pytest.raises(KalshiOrderIndeterminate):
+                executor._execute_single_leg(
+                    leg, 3.0, {"type": "KalshiBinary"})
+
+        assert leg["_order_id"].startswith("client:")
+        executor._record_failed_leg(trade_id, leg, unknown_state=True)
+        row = [t for t in db.get_pending_trades() if t["id"] == trade_id][0]
+        assert row["order_id"] == leg["_order_id"]
 
 
 # ---------------------------------------------------------------------------

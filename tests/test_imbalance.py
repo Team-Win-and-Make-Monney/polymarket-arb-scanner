@@ -285,7 +285,7 @@ class TestRefinement:
         assert len(refined) == 3
 
     def test_handles_clob_unavailable(self):
-        """If CLOB fetch fails, keep opportunity (graceful degradation)."""
+        """If CLOB fetch fails, drop the unverified opportunity."""
         opportunities = [
             {
                 "type": "Imbalance",
@@ -303,8 +303,8 @@ class TestRefinement:
         with patch("polymarket_api.fetch_order_book", side_effect=mock_fetch_order_book):
             refined = _refine_imbalance_with_clob(opportunities)
 
-        # Should keep opportunity despite CLOB unavailable
-        assert len(refined) == 1
+        # No executable CLOB means the opportunity cannot be validated.
+        assert refined == []
 
     def test_drops_without_token_ids(self):
         """Opportunities without _token_ids should be dropped."""

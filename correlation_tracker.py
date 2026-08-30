@@ -105,10 +105,9 @@ def build_bucketed_series(
         except (TypeError, ValueError):
             continue
         # Pearson is undefined for constant-zero rows; skip.
-        if price <= 0 or price >= 1:
-            # CTF token prices live strictly inside (0, 1). Drop placeholders.
-            if price == 0 or price == 1:
-                continue
+        if not math.isfinite(price) or price <= 0 or price >= 1:
+            # CTF token prices live strictly inside (0, 1). Drop invalid values.
+            continue
         ts = _parse_iso(row.get("timestamp", ""))
         if ts is None:
             continue

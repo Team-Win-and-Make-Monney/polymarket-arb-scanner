@@ -14,6 +14,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 from config import PM_RATE_LIMIT
 from rate_limiter import PlatformCircuitBreaker
+from url_guard import assert_public_url
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,8 @@ _rate_lock = threading.Lock()
 # Proxy support — Gamma REST (requests) + authenticated CLOB writes (httpx in py-clob-client-v2)
 _session = requests.Session()
 _proxy_url = os.getenv("POLYMARKET_PROXY_URL")
+if _proxy_url:
+    _proxy_url = assert_public_url(_proxy_url, env_name="POLYMARKET_PROXY_URL")
 
 
 def _install_clob_proxy(proxy_url: str) -> None:
@@ -48,6 +51,7 @@ def _install_clob_proxy(proxy_url: str) -> None:
     undocumented internal; fail closed if the SDK layout changes rather than
     silently sending unproxied signed requests.
     """
+    proxy_url = assert_public_url(proxy_url, env_name="POLYMARKET_PROXY_URL")
     if not hasattr(_clob_http, "_http_client"):
         raise RuntimeError(
             "py-clob-client-v2 no longer exposes http_helpers.helpers._http_client; "

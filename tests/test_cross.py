@@ -13,6 +13,7 @@ from scans.cross import (
     _make_cross_fee,
     _attach_exec_metadata,
     _refine_cross_with_clob,
+    scan_cross_platform,
 )
 
 
@@ -214,6 +215,37 @@ class TestRefineCrossWithClob:
 
     @patch("scans.cross._fetch_clob_for_market")
     @patch("scans.cross.net_profit_cross_platform")
+    def test_equal_results_keep_selected_second_strategy(self, mock_fee, mock_clob):
+        """Equal-valued result dicts must not remap the chosen strategy."""
+        mock_clob.return_value = (
+            {"conditionId": "mk1"},
+            {
+                "yes_ask": 0.30,
+                "no_ask": 0.60,
+                "yes_ask_size": 100,
+                "no_ask_size": 40,
+            },
+        )
+        mock_fee.side_effect = [
+            {"net_profit": 0.10, "fees": 0.02, "gross_spread": 0.12},
+            {"net_profit": 0.10, "fees": 0.02, "gross_spread": 0.12},
+        ]
+        opp = {
+            "_market_key": "mk1",
+            "_kalshi_yes": 0.20,
+            "_kalshi_no": 0.70,
+        }
+
+        result = _refine_cross_with_clob(
+            [opp], {"mk1": {"conditionId": "mk1"}}, 0.005,
+        )
+
+        assert result[0]["prices"] == "PM_N=0.600 K_Y=0.200"
+        assert result[0]["total_cost"] == "$0.8000"
+        assert result[0]["_clob_depth"] == 40
+
+    @patch("scans.cross._fetch_clob_for_market")
+    @patch("scans.cross.net_profit_cross_platform")
     def test_drops_candidate_below_min_profit(self, mock_fee, mock_clob):
         mock_clob.return_value = (
             {"conditionId": "mk1"},
@@ -240,8 +272,60 @@ class TestRefineCrossWithClob:
         result = _refine_cross_with_clob([opp], markets_by_key, 0.005)
         assert len(result) == 0
 
+
+class TestCrossInversionMetadata:
+    @patch("scans.cross.find_lowest_fee_path", return_value=None)
+    @patch("scans.cross.filter_dust", side_effect=lambda opps: opps)
+    @patch("scans.cross._refine_cross_with_clob", side_effect=lambda opps, *_args, **_kwargs: opps)
+    @patch("scans.cross.detect_inverted", return_value=True)
+    @patch("scans.cross._within_resolution_window", return_value=True)
+    @patch("scans.cross.match_markets_to_events")
+    @patch("scans.cross.get_binary_markets")
+    def test_one_shot_scan_preserves_inverted_pair_mapping(
+        self,
+        mock_binary,
+        mock_match,
+        _mock_window,
+        _mock_inverted,
+        _mock_refine,
+        _mock_dust,
+        _mock_fee_path,
+    ):
+        poly_market = {
+            "conditionId": "poly-1",
+            "question": "Will candidate A win?",
+            "tokens": [
+                {"token_id": "tok-yes", "outcome": "Yes", "price": 0.20},
+                {"token_id": "tok-no", "outcome": "No", "price": 0.80},
+            ],
+        }
+        kalshi_event = {"event_ticker": "EVENT-1"}
+        kalshi_market = {"ticker": "K-1", "title": "Will candidate A lose?"}
+        mock_binary.return_value = [poly_market]
+        mock_match.return_value = [{
+            "polymarket": poly_market,
+            "kalshi_event": kalshi_event,
+            "similarity": 99,
+            "confidence": "HIGH",
+        }]
+        client = MagicMock()
+        client.get_market_price.return_value = (0.75, 0.15)
+
+        with patch("scans.cross.SEMANTIC_MATCHING_ENABLED", False), \
+             patch("scans.cross.parse_outcome_prices", return_value=[0.20, 0.80]):
+            result = scan_cross_platform(
+                [poly_market],
+                client,
+                min_profit=-1.0,
+                kalshi_markets_by_event={"EVENT-1": [kalshi_market]},
+                kalshi_events_preloaded=[kalshi_event],
+            )
+
+        assert len(result) == 1
+        assert result[0]["_pair_inverted"] is True
+
     @patch("scans.cross._fetch_clob_for_market")
-    def test_missing_ask_uses_bid_fallback(self, mock_clob):
+    def test_missing_ask_fails_closed(self, mock_clob):
         mock_clob.return_value = (
             {"conditionId": "mk1"},
             {
@@ -262,8 +346,7 @@ class TestRefineCrossWithClob:
         with patch("scans.cross.net_profit_cross_platform") as mock_fee:
             mock_fee.return_value = {"net_profit": 0.08, "fees": 0.01, "gross_spread": 0.09}
             result = _refine_cross_with_clob([opp], markets_by_key, 0.005)
-            if result:
-                assert result[0].get("_partial_clob") is True
+            assert result == []
 
     def test_no_market_key_drops_fail_closed(self):
         """Audit #77 round 2: no market to verify against -> drop, not

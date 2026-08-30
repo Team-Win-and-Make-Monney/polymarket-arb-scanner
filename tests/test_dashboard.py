@@ -142,9 +142,12 @@ class TestStartDashboard:
     def test_server_is_http_server_instance(self):
         from http.server import HTTPServer
         server = start_dashboard(18766)
-        assert server is not None
-        assert isinstance(server, HTTPServer)
-        server.shutdown()
+        try:
+            assert server is not None
+            assert isinstance(server, HTTPServer)
+        finally:
+            if server is not None:
+                server.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +166,21 @@ class TestBasicAuth:
             assert status == 200
         finally:
             server.shutdown()
+
+    def test_passwordless_non_loopback_request_is_rejected(self):
+        handler = MagicMock()
+        handler.client_address = ("203.0.113.10", 12345)
+        with patch("config.DASHBOARD_PASS", ""):
+            assert _check_auth(handler) is False
+        handler.send_response.assert_called_once_with(401)
+
+    def test_passwordless_loopback_peer_on_public_listener_is_rejected(self):
+        handler = MagicMock()
+        handler.client_address = ("127.0.0.1", 12345)
+        handler.server.server_address = ("0.0.0.0", 8080)
+        with patch("config.DASHBOARD_PASS", ""):
+            assert _check_auth(handler) is False
+        handler.send_response.assert_called_once_with(401)
 
     def test_401_when_no_credentials(self):
         """Returns 401 when auth is required but no credentials given."""

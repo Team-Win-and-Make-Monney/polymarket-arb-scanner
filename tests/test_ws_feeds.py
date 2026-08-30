@@ -69,6 +69,17 @@ def _make_feed(mock_callback: MagicMock) -> FeedManager:
     return FeedManager(on_price_update=mock_callback)
 
 
+class TestProxyConfiguration:
+    def test_socks_proxy_schemes_are_preserved(self, monkeypatch):
+        monkeypatch.setenv("POLYMARKET_PROXY_URL", "socks5://proxy.example.com:1080")
+        monkeypatch.setenv("KALSHI_PROXY_URL", "socks5h://proxy.example.com:1080")
+
+        feed = FeedManager(on_price_update=MagicMock())
+
+        assert feed._pm_proxy == "socks5://proxy.example.com:1080"
+        assert feed._kalshi_proxy == "socks5h://proxy.example.com:1080"
+
+
 # ---------------------------------------------------------------------------
 # _handle_kalshi_message
 # ---------------------------------------------------------------------------

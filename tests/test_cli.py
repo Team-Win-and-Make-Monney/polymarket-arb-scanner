@@ -164,8 +164,8 @@ class TestArgumentParsing:
         args = parser.parse_args(["--log-level", "DEBUG"])
         assert args.log_level == "DEBUG"
 
-    def test_all_14_modes_accepted(self):
-        """All 14 scan modes should be valid choices."""
+    def test_all_15_modes_accepted(self):
+        """All 15 scan modes should be valid choices."""
         modes = [
             "all", "binary", "negrisk", "cross", "kalshi", "cross-all",
             "spread", "betfair", "smarkets", "sxbet", "matchbook",
@@ -211,25 +211,28 @@ class TestConfigPrecedence:
     def test_dry_run_cli_true_overrides_env(self):
         """--dry-run flag overrides DRY_RUN env."""
         with patch.dict(os.environ, {"DRY_RUN": "false"}):
-            cli_dry_run = True
-            dry_run = cli_dry_run if cli_dry_run is not None else os.getenv("DRY_RUN", "true").lower() == "true"
-            assert dry_run is True
+            with patch.object(_cli_mod, "CONFIG_DRY_RUN", False):
+                assert _cli_mod._resolve_dry_run(True) is True
 
     def test_dry_run_env_false(self):
         """When CLI is None, DRY_RUN=false makes dry_run False."""
         with patch.dict(os.environ, {"DRY_RUN": "false"}):
-            cli_dry_run = None
-            dry_run = cli_dry_run if cli_dry_run is not None else os.getenv("DRY_RUN", "true").lower() == "true"
-            assert dry_run is False
+            with patch.object(_cli_mod, "CONFIG_DRY_RUN", False):
+                assert _cli_mod._resolve_dry_run(None) is False
+
+    @pytest.mark.parametrize("raw", ["1", "yes", "true"])
+    def test_dry_run_truthy_spellings_use_config_value(self, raw):
+        with patch.dict(os.environ, {"DRY_RUN": raw}):
+            with patch.object(_cli_mod, "CONFIG_DRY_RUN", True):
+                assert _cli_mod._resolve_dry_run(None) is True
 
     def test_dry_run_default_is_true(self):
         """No CLI flag, no env var -> dry_run defaults to True."""
         env = os.environ.copy()
         env.pop("DRY_RUN", None)
         with patch.dict(os.environ, env, clear=True):
-            cli_dry_run = None
-            dry_run = cli_dry_run if cli_dry_run is not None else os.getenv("DRY_RUN", "true").lower() == "true"
-            assert dry_run is True
+            with patch.object(_cli_mod, "CONFIG_DRY_RUN", True):
+                assert _cli_mod._resolve_dry_run(None) is True
 
     def test_exec_mode_cli_overrides_env(self):
         """--exec-mode flag overrides EXECUTION_MODE env."""
@@ -274,7 +277,7 @@ class TestRunOneshotModeRouting:
     @patch.object(_cli_mod, "scan_kalshi_binary", return_value=[])
     @patch.object(_cli_mod, "scan_kalshi_multi", return_value=[])
     @patch.object(_cli_mod, "_fetch_kalshi_data", return_value=([{"event_ticker": "E1"}], []))
-    def test_kalshi_mode_calls_both_kalshi_scans(self, mock_fetch, mock_binary, mock_multi, mock_dash, mock_display):
+    def test_kalshi_mode_calls_both_kalshi_scans(self, mock_fetch, mock_multi, mock_binary, mock_dash, mock_display):
         args = _make_args(mode="kalshi")
         kalshi_client = MagicMock()
         _cli_mod._run_oneshot(args, 0.01, kalshi_client, _make_executor(), _make_db())

@@ -177,9 +177,12 @@ def _print_report(db_path: str, days: int):
     end_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     start_date = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
 
-    c1 = _criterion_1(conn, since)
-    c2 = _criterion_2(conn, since)
-    c3 = _criterion_3(conn, since)
+    try:
+        c1 = _criterion_1(conn, since)
+        c2 = _criterion_2(conn, since)
+        c3 = _criterion_3(conn, since)
+    finally:
+        conn.close()
 
     status = lambda ok: _green("PASS") if ok else _red("FAIL")
 
@@ -244,9 +247,6 @@ def _print_report(db_path: str, days: int):
             failed.append("Profitable Round-Trip")
         print(f"  Failed criteria: {', '.join(failed)}")
     print(_bold(f"{'='*60}\n"))
-
-    conn.close()
-
 
 # ---------------------------------------------------------------------------
 # Main

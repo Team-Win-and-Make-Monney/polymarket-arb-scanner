@@ -174,13 +174,13 @@ class TestSupportsConcurrent:
             assert executor_concurrent._supports_concurrent(legs) is True, \
                 f"{plat} should support concurrent execution"
 
-    def test_missing_platform_key_treated_as_supported(self, executor_concurrent):
-        """Legs without a platform key default to empty string, which is not in _NO_CANCEL_PLATFORMS."""
+    def test_missing_platform_key_fails_closed(self, executor_concurrent):
+        """Legs without a platform cannot prove cancellation support."""
         legs = [
             {"price": 0.4},
             {"price": 0.5},
         ]
-        assert executor_concurrent._supports_concurrent(legs) is True
+        assert executor_concurrent._supports_concurrent(legs) is False
 
 
 # ---------------------------------------------------------------------------
@@ -472,7 +472,9 @@ class TestExecuteDispatch:
         executor_concurrent._revalidate = MagicMock(return_value=True)
         executor_concurrent._check_exit_liquidity = MagicMock(return_value=(True, ""))
         executor_concurrent.risk.check = MagicMock(return_value=(True, ""))
-        executor_concurrent._fetch_balances = MagicMock(return_value={})
+        executor_concurrent._fetch_balances = MagicMock(
+            return_value={"polymarket": 100.0}
+        )
         executor_concurrent._per_leg_budget = MagicMock(return_value=10.0)
         executor_concurrent.risk.clamp_size = MagicMock(return_value=5.0)
         executor_concurrent._print_plan = MagicMock()
@@ -491,7 +493,9 @@ class TestExecuteDispatch:
         executor_sequential._revalidate = MagicMock(return_value=True)
         executor_sequential._check_exit_liquidity = MagicMock(return_value=(True, ""))
         executor_sequential.risk.check = MagicMock(return_value=(True, ""))
-        executor_sequential._fetch_balances = MagicMock(return_value={})
+        executor_sequential._fetch_balances = MagicMock(
+            return_value={"polymarket": 100.0}
+        )
         executor_sequential._per_leg_budget = MagicMock(return_value=10.0)
         executor_sequential.risk.clamp_size = MagicMock(return_value=5.0)
         executor_sequential._print_plan = MagicMock()
@@ -538,7 +542,9 @@ class TestExecuteDispatch:
         executor._revalidate = MagicMock(return_value=True)
         executor._check_exit_liquidity = MagicMock(return_value=(True, ""))
         executor.risk.check = MagicMock(return_value=(True, ""))
-        executor._fetch_balances = MagicMock(return_value={})
+        executor._fetch_balances = MagicMock(
+            return_value={"polymarket": 100.0, "ibkr": 100.0}
+        )
         executor._per_leg_budget = MagicMock(return_value=10.0)
         executor.risk.clamp_size = MagicMock(return_value=5.0)
         executor._build_legs = MagicMock(return_value=ibkr_legs)

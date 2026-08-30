@@ -72,8 +72,7 @@ def _refine_imbalance_with_clob(opportunities: list[dict]) -> list[dict]:
             yes_book = fetch_order_book(token_ids[0])
 
             if not yes_book:
-                logger.debug("CLOB unavailable for imbalance refinement; keeping opportunity")
-                refined.append(opp)
+                logger.debug("Dropping imbalance opportunity: CLOB unavailable")
                 continue
 
             current_ratio = _calculate_imbalance_ratio(yes_book, top_levels=5)
@@ -94,8 +93,8 @@ def _refine_imbalance_with_clob(opportunities: list[dict]) -> list[dict]:
 
         except Exception as e:
             logger.debug("CLOB fetch failed for imbalance refinement: %s", e)
-            # Graceful degradation: keep opportunity if CLOB unavailable
-            refined.append(opp)
+            # Fail closed: scan-time imbalance is not executable evidence.
+            continue
 
     dropped = len(opportunities) - len(refined)
     if dropped:

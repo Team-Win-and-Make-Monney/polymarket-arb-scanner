@@ -64,6 +64,7 @@ def get_strategy_metrics(
     start_time = time.time()
     cutoff = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
 
+    conn = None
     try:
         conn = duckdb.connect(db_path, read_only=True)
 
@@ -127,8 +128,6 @@ def get_strategy_metrics(
         """
 
         results = conn.execute(query, [cutoff]).fetchall()
-        conn.close()
-
         elapsed = time.time() - start_time
         logger.debug("Fetched metrics for %d strategies in %.2fs", len(results), elapsed)
 
@@ -150,6 +149,9 @@ def get_strategy_metrics(
     except Exception as e:
         logger.error("Failed to fetch analytics from %s: %s", db_path, e)
         return []
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def main():
@@ -211,7 +213,11 @@ Examples:
                 # Simple table formatting
                 headers = ["Strategy", "Trades", "Wins", "Win Rate", "Total PnL",
                           "Avg PnL", "Sharpe", "Max DD"]
-                print("\n".join(headers))
+                print(
+                    f"{headers[0]:20} {headers[1]:6} {headers[2]:5} "
+                    f"{headers[3]:9} {headers[4]:10} {headers[5]:9} "
+                    f"{headers[6]:8} {headers[7]:9}"
+                )
                 print("-" * 80)
                 for m in metrics:
                     win_rate_str = f"{m['win_rate']:.1%}" if m['win_rate'] != "N/A" else "N/A"

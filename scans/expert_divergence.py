@@ -59,8 +59,10 @@ def scan_expert_divergence(
         logger.debug("Expert divergence scan requires SuperforecasterClient")
         return []
 
-    min_divergence = min_divergence or EXPERT_DIVERGENCE_MIN_DIVERGENCE
-    min_forecasters = min_forecasters or EXPERT_DIVERGENCE_MIN_FORECASTERS
+    if min_divergence is None:
+        min_divergence = EXPERT_DIVERGENCE_MIN_DIVERGENCE
+    if min_forecasters is None:
+        min_forecasters = EXPERT_DIVERGENCE_MIN_FORECASTERS
     opportunities = []
 
     for market in markets:
@@ -76,6 +78,9 @@ def scan_expert_divergence(
         )
 
         if expert_forecast is None:
+            continue
+
+        if expert_forecast.get("num_sources", 0) < min_forecasters:
             continue
 
         expert_prob = expert_forecast["probability"]

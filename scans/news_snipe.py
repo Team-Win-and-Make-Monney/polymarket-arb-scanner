@@ -1,6 +1,7 @@
 """News-driven resolution sniping strategy using Finnhub news headlines."""
 
 import logging
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -189,12 +190,12 @@ def _score_sentiment(text: str) -> dict:
     """
     # Search for YES keywords first
     for keyword in YES_KEYWORDS:
-        if keyword in text:
+        if re.search(rf"\b{re.escape(keyword)}\b", text):
             return {"sentiment": "YES", "confidence": 0.8}
 
     # Then search for NO keywords
     for keyword in NO_KEYWORDS:
-        if keyword in text:
+        if re.search(rf"\b{re.escape(keyword)}\b", text):
             return {"sentiment": "NO", "confidence": 0.8}
 
     return {"sentiment": None, "confidence": 0.0}

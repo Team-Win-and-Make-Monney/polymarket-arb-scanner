@@ -178,28 +178,23 @@ class TestKalshiRewardTracker:
         db = TradeDB(':memory:')
         krt = KalshiRewardTracker(db)
 
-        placed_time = time.time()
-        krt.log_order_placed(
-            order_id="order_3",
-            market_key="SPY_250101",
-            size=20.0,
-            price=0.55,
-            mid_price=0.50,
-            side="buy"
-        )
-
-        time.sleep(0.2)
-        cancelled_time = time.time()
-
-        krt.log_order_cancelled("order_3")
+        with patch("market_maker.time.time", side_effect=[1000.0, 1000.0, 1001.1, 1001.1]):
+            krt.log_order_placed(
+                order_id="order_3",
+                market_key="SPY_250101",
+                size=20.0,
+                price=0.55,
+                mid_price=0.50,
+                side="buy"
+            )
+            krt.log_order_cancelled("order_3")
 
         # Check DB for resting_seconds
         cursor = db.conn.cursor()
         cursor.execute("SELECT resting_seconds FROM reward_metrics WHERE event='cancelled'")
         resting = cursor.fetchone()[0]
 
-        expected_resting = int(cancelled_time - placed_time)
-        assert resting >= expected_resting - 1  # Within 1 second margin
+        assert resting == 1
 
         db.close()
 

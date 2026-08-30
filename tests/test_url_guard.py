@@ -25,6 +25,15 @@ class TestUrlGuard:
     def test_public_http_hostname_passes_when_allowed(self):
         assert assert_public_url("http://polygon-rpc.com", env_name="POLYGON_RPC_URL")
 
+    @pytest.mark.parametrize("scheme", ["socks5", "socks5h"])
+    def test_public_socks_proxy_passes_when_explicitly_allowed(self, scheme):
+        url = f"{scheme}://proxy.example.com:1080"
+        assert assert_public_url(
+            url,
+            env_name="POLYMARKET_PROXY_URL",
+            allow_socks=True,
+        ) == url
+
     def test_public_ip_literal_passes(self):
         assert assert_public_url("https://93.184.216.34", env_name="WEBHOOK_URL")
 

@@ -119,6 +119,31 @@ class TestScanMatchbookBackAll:
         assert "_mb_market_id" in result[0]
         assert "_mb_runner_ids" in result[0]
 
+    def test_depth_uses_selected_best_back_quotes(self):
+        scan_fn = self._import_scan()
+        client = MagicMock()
+        client.authenticated = True
+        client.fetch_all_markets.return_value = [_make_market("mkt_depth")]
+        client.list_runners.return_value = [
+            {
+                "id": "r1",
+                "prices": [
+                    {"side": "back", "odds": 2.0, "available-amount": 1},
+                    {"side": "back", "odds": 2.5, "available-amount": 80},
+                ],
+            },
+            {
+                "id": "r2",
+                "prices": [
+                    {"side": "back", "odds": 2.1, "available-amount": 2},
+                    {"side": "back", "odds": 2.5, "available-amount": 60},
+                ],
+            },
+        ]
+
+        result = scan_fn(client, min_profit=0.001)
+        assert result[0]["_clob_depth"] == 60
+
     def test_no_arb_when_overround(self):
         """Overround book: sum of implied probs > 1.0 should yield no opportunity."""
         scan_fn = self._import_scan()

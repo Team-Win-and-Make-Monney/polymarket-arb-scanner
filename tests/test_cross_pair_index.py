@@ -42,11 +42,11 @@ class TestReadCachedPrice:
         cache = {("polymarket", "tok"): {"_ts": time.time() - 120, "best_ask": 0.5}}
         assert _read_cached_price(cache, ("polymarket", "tok"), 30) is None
 
-    def test_tolerates_missing_ts(self):
-        # Entries without _ts (legacy rows) are still returned — caller decides.
+    def test_missing_ts_fails_closed(self):
+        # Entries without provenance time cannot prove freshness.
         cache = {("polymarket", "tok"): {"best_ask": 0.5}}
         e = _read_cached_price(cache, ("polymarket", "tok"), 30)
-        assert e == {"best_ask": 0.5}
+        assert e is None
 
 
 class TestKalshiPrice:
@@ -290,7 +290,7 @@ class TestEvaluate:
         assert idx.evaluate(_make_pair(), cache, min_profit=0.01) is None
 
     def test_inverted_pair_swaps_kalshi_sides(self):
-        """When the matcher flagged this pair as inverted, K_YES and K_NO are swapped."""
+        """Inversion preserves physical Kalshi fields and emits executable legs."""
         idx = CrossPairIndex()
         # Construct so the arb is on the swapped side: K is "inverted" so
         # what looks like K_YES=0.80 should be treated as K_NO=0.80, etc.
@@ -300,10 +300,23 @@ class TestEvaluate:
         _populate_cache(cache, poly_yes_ask=0.80, poly_no_ask=0.30,
                         kalshi_yes=0.30, kalshi_no=0.20)
         opp = idx.evaluate(pair, cache, min_profit=0.01)
-        # We don't assert direction, just that the swap is applied — opp may
-        # exist or not depending on fees, but it must not crash.
-        if opp is not None:
-            assert opp["net_profit"] > 0
+        assert opp is not None
+        assert opp["net_profit"] > 0
+        assert opp["_kalshi_yes"] == 0.30
+        assert opp["_kalshi_no"] == 0.20
+        assert opp["_pair_inverted"] is True
+        assert opp["_cross_legs"][1]["platform"] == "kalshi"
+        assert opp["_cross_legs"][1]["side"] == "no"
+        assert opp["_cross_legs"][1]["price"] == 0.20
+
+    def test_missing_timestamp_fails_closed(self):
+        idx = CrossPairIndex()
+        cache = {}
+        _populate_cache(cache, poly_yes_ask=0.30, poly_no_ask=0.80,
+                        kalshi_yes=0.80, kalshi_no=0.30)
+        for entry in cache.values():
+            entry.pop("_ts", None)
+        assert idx.evaluate(_make_pair(), cache, min_profit=0.01) is None
 
 
 class TestLookup:

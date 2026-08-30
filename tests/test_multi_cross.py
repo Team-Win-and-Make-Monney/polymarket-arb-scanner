@@ -160,6 +160,17 @@ class TestScanMultiCross:
             result = scan_multi_cross([], kalshi_client=MagicMock())
         assert result == []
 
+    def test_polymarket_leg_without_token_id_fails_closed(self):
+        from scans.multi_cross import _refine_multi_cross_with_clob
+
+        opp = {
+            "_outcome_legs": [
+                {"platform": "polymarket", "price": 0.30, "_token_id": ""},
+                {"platform": "kalshi", "price": 0.30, "_kalshi_ticker": "K-B"},
+            ],
+        }
+        assert _refine_multi_cross_with_clob([opp], price_cache={}, min_profit=0.001) == []
+
     def test_returns_empty_without_kalshi(self):
         from scans.multi_cross import scan_multi_cross
 

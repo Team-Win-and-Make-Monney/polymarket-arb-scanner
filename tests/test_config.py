@@ -124,7 +124,7 @@ class TestEnvNonNegativeFloat:
     @pytest.mark.parametrize("raw", ["-0.01", "nan", "inf", "-inf"])
     def test_rejects_negative_and_non_finite_values(self, monkeypatch, raw):
         monkeypatch.setenv("TEST_NON_NEGATIVE_FLOAT", raw)
-        with pytest.raises(ConfigError, match="must be finite and >= 0"):
+        with pytest.raises(ConfigError, match="must be finite"):
             _env_non_negative_float("TEST_NON_NEGATIVE_FLOAT", "5")
 
 
@@ -489,11 +489,24 @@ class TestSXBetQuarantine:
         monkeypatch.setenv("LIVE_ENVELOPE_PATH", str(write_test_envelope(tmp_path)))
         monkeypatch.setenv("ENABLED_EXECUTION_PLATFORMS", "kalshi")
         monkeypatch.setenv("DRY_RUN", "false")
+        monkeypatch.setenv("MM_KALSHI_PILOT_ENABLED", "true")
+        monkeypatch.setenv("MM_AUTO_HEDGE_ENABLED", "true")
+        monkeypatch.setenv("MM_TOXIC_FLOW_ENABLED", "true")
+        monkeypatch.setenv("MM_VOLATILITY_ADJUSTED_ENABLED", "true")
         try:
             cfg = _reload_config()  # must not raise
             assert cfg.ENABLED_EXECUTION_PLATFORMS == frozenset({"kalshi"})
         finally:
             monkeypatch.setenv("DRY_RUN", "true")
+            _reload_config()
+
+    def test_live_non_kalshi_platform_is_blocked(self, monkeypatch, tmp_path):
+        from live_envelope_fixtures import write_test_envelope
+        monkeypatch.setenv("LIVE_ENVELOPE_PATH", str(write_test_envelope(tmp_path)))
+        monkeypatch.setenv("ENABLED_EXECUTION_PLATFORMS", "kalshi,betfair")
+        monkeypatch.setenv("DRY_RUN", "false")
+        monkeypatch.setenv("MM_KALSHI_PILOT_ENABLED", "true")
+        with pytest.raises(ValueError, match="Kalshi D0 only"):
             _reload_config()
 
 

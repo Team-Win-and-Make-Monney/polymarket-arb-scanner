@@ -122,18 +122,20 @@ def _brackets_are_complete(brackets: list[dict]) -> bool:
         brackets,
         key=lambda m: m["_bracket_info"]["lower_bound"]
     )
+    if sorted_brackets[0]["_bracket_info"]["lower_bound"] != float("-inf"):
+        return False
 
     for i in range(len(sorted_brackets) - 1):
         current = sorted_brackets[i]["_bracket_info"]
         next_bracket = sorted_brackets[i + 1]["_bracket_info"]
 
         if current["upper_bound"] == float("inf"):
-            return True
+            return False
 
         if abs(current["upper_bound"] - next_bracket["lower_bound"]) > 0.01:
             return False
 
-    return True
+    return sorted_brackets[-1]["_bracket_info"]["upper_bound"] == float("inf")
 
 
 # ---------------------------------------------------------------------------

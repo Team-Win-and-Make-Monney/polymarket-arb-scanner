@@ -68,16 +68,18 @@ class CredentialHealthChecker:
         Returns:
             dict mapping platform_name → True (healthy) or False (unhealthy)
         """
+        platform_names = list(self.clients)
+        health_results = await asyncio.gather(
+            *(self._check_platform_health(name) for name in platform_names),
+            return_exceptions=True,
+        )
         results = {}
-        tasks = []
 
-        for platform_name in self.clients:
-            task = self._check_platform_health(platform_name)
-            tasks.append((platform_name, task))
-
-        for platform_name, task in tasks:
+        for platform_name, health_result in zip(platform_names, health_results):
             try:
-                is_healthy = await task
+                if isinstance(health_result, BaseException):
+                    raise health_result
+                is_healthy = bool(health_result)
                 results[platform_name] = is_healthy
 
                 if is_healthy:
@@ -85,25 +87,7 @@ class CredentialHealthChecker:
                     self._consecutive_failures[platform_name] = 0
                     self._last_check[platform_name] = time.time()
                 else:
-                    # Increment failure count
-                    self._consecutive_failures[platform_name] = \
-                        self._consecutive_failures.get(platform_name, 0) + 1
-
-                    # Fire alert after 3 consecutive failures
-                    fail_count = self._consecutive_failures[platform_name]
-                    if fail_count == 3:
-                        self._fire_credential_alert(
-                            platform_name,
-                            "CRITICAL",
-                            f"Credential health check failed 3 times: {platform_name}",
-                        )
-                    elif fail_count == 1:
-                        # Log first failure for debugging
-                        logger.warning(
-                            "Credential health check failed for %s (attempt %d)",
-                            platform_name,
-                            fail_count,
-                        )
+                    self._record_failure(platform_name)
 
             except Exception as e:
                 logger.error(
@@ -113,14 +97,30 @@ class CredentialHealthChecker:
                     exc_info=False,
                 )
                 results[platform_name] = False
-                self._consecutive_failures[platform_name] = \
-                    self._consecutive_failures.get(platform_name, 0) + 1
+                self._record_failure(platform_name)
 
         ok_count = sum(1 for v in results.values() if v)
         total = len(results)
         logger.info("Credential health check complete: %d/%d platforms OK", ok_count, total)
 
         return results
+
+    def _record_failure(self, platform_name: str) -> None:
+        """Increment one failure count and apply its alert threshold."""
+        fail_count = self._consecutive_failures.get(platform_name, 0) + 1
+        self._consecutive_failures[platform_name] = fail_count
+        if fail_count >= 3:
+            self._fire_credential_alert(
+                platform_name,
+                "CRITICAL",
+                f"Credential health check failed {fail_count} times: {platform_name}",
+            )
+        elif fail_count == 1:
+            logger.warning(
+                "Credential health check failed for %s (attempt %d)",
+                platform_name,
+                fail_count,
+            )
 
     @retry(
         stop=stop_after_attempt(2),

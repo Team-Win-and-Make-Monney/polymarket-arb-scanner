@@ -135,7 +135,7 @@ def _refine_cross_with_clob(opportunities: list[dict], markets_by_key: dict, min
 
         mid_profit = opp.get("net_profit", 0)
         if best["net_profit"] >= min_profit:
-            if best == result1:
+            if best is result1:
                 total_cost = pm_yes + k_no
                 opp["prices"] = f"PM_Y={pm_yes:.3f} K_N={k_no:.3f}"
             else:
@@ -146,7 +146,8 @@ def _refine_cross_with_clob(opportunities: list[dict], markets_by_key: dict, min
             opp["fees"] = f"${best['fees']:.4f}"
             opp["net_profit"] = best["net_profit"]
             opp["net_roi"] = f"{best['net_profit'] / total_cost * 100:.2f}%"
-            opp["_clob_depth"] = min(pm_yes_depth or 0, pm_no_depth or 0)
+            selected_pm_depth = pm_yes_depth if best is result1 else pm_no_depth
+            opp["_clob_depth"] = selected_pm_depth or 0
             if partial:
                 opp["_partial_clob"] = True
             refined.append(opp)
@@ -166,7 +167,7 @@ def _refine_cross_with_clob(opportunities: list[dict], markets_by_key: dict, min
                 from config import PROMO_NEAR_MISS_BAND
                 gap = min_profit - best["net_profit"]
                 if 0 <= gap <= PROMO_NEAR_MISS_BAND:
-                    if best == result1:
+                    if best is result1:
                         side_a, side_b = "yes", "no"
                         price_a, price_b = pm_yes, k_no
                     else:
@@ -283,7 +284,7 @@ def scan_cross_platform(
             result2 = net_profit_cross_platform(pm_no, k_yes, "no", "yes")
 
             best = result1 if result1["net_profit"] > result2["net_profit"] else result2
-            if best == result1:
+            if best is result1:
                 strategy = "PM_YES + K_NO"
                 total_cost = pm_yes + k_no
                 prices_str = f"PM_Y={pm_yes:.3f} K_N={k_no:.3f}"
@@ -316,6 +317,7 @@ def scan_cross_platform(
                         "_market_key": market_key,
                         "_kalshi_yes": best_k_yes,
                         "_kalshi_no": best_k_no,
+                        "_pair_inverted": inverted,
                         "_kalshi_ticker": km.get("ticker", ""),
                         "_token_ids": pm_token_ids,
                         "confidence": match.get("confidence", "LOW"),
@@ -504,7 +506,7 @@ def scan_cross_all(
                 best = result1 if result1["net_profit"] > result2["net_profit"] else result2
 
                 if best["net_profit"] >= min_profit:
-                    if best == result1:
+                    if best is result1:
                         total_cost = a_yes + b_no
                         prices_str = f"{pa}_Y={a_yes:.3f} {pb}_N={b_no:.3f}"
                     else:

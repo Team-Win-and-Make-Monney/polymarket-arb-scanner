@@ -106,6 +106,14 @@ class TestExecutePath:
         assert decision.status == STATUS_EXECUTED  # the action DID execute
         executors.flip_lane.assert_called_once()
         assert any("CRITICAL" in e and "persistence failed" in e for e in escalations)
+        assert broker._processing_frozen is True
+        blocked = broker.process(flip_enable("after-persist-fail"))
+        assert blocked.status == STATUS_HARD_STOP
+        assert queue.current_status(blocked.intent_id) == STATUS_HARD_STOP
+        duplicate = broker.process(flip_enable("after-persist-fail"))
+        assert duplicate.status == STATUS_HARD_STOP
+        assert duplicate.duplicate is True
+        executors.flip_lane.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

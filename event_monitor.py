@@ -268,7 +268,6 @@ class EventMonitor:
             if self.signal_aggregator:
                 market_key = market.get("condition_id") or market.get("ticker") or market_title[:40]
                 self.signal_aggregator.add_signal(market_key, "metaculus", metaculus_prob)
-                self.signal_aggregator.add_signal(market_key, platform_name, platform_price)
                 # Fetch additional signals (Manifold, etc.)
                 self.signal_aggregator.fetch_external_signals(market_key, market_title)
                 consensus = self.signal_aggregator.get_consensus(market_key)

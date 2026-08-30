@@ -44,18 +44,21 @@ def scan_matchbook_backall(matchbook_client: MatchbookClient, min_profit: float)
 
         implied_probs = []
         runner_ids = []
+        selected_depths = []
         valid = True
 
         for runner in runners:
             prices = runner.get("prices", [])
             # Find best back price
             best_back_odds = None
+            best_back_depth = 0.0
             for price_entry in prices:
                 side = price_entry.get("side", "").lower()
                 odds = price_entry.get("odds")
                 if side == "back" and odds and float(odds) > 1.0:
                     if best_back_odds is None or float(odds) > best_back_odds:
                         best_back_odds = float(odds)
+                        best_back_depth = float(price_entry.get("available-amount", 0) or 0)
 
             if best_back_odds is None or best_back_odds <= 1.0:
                 valid = False
@@ -64,6 +67,7 @@ def scan_matchbook_backall(matchbook_client: MatchbookClient, min_profit: float)
             implied = 1.0 / best_back_odds
             implied_probs.append(implied)
             runner_ids.append(runner.get("id", ""))
+            selected_depths.append(best_back_depth)
 
         if not valid or not implied_probs:
             continue
@@ -82,13 +86,7 @@ def scan_matchbook_backall(matchbook_client: MatchbookClient, min_profit: float)
             if n > 5:
                 price_summary += f"... ({n} runners)"
 
-            # Min depth = min available-amount across all runners' back prices
-            min_depth = 0
-            for runner in runners:
-                for price_entry in runner.get("prices", []):
-                    if price_entry.get("side", "").lower() == "back":
-                        size = float(price_entry.get("available-amount", 0))
-                        min_depth = min(min_depth, size) if min_depth > 0 else size
+            min_depth = min(selected_depths) if selected_depths else 0
 
             opportunities.append({
                 "type": "MatchbookBackAll",

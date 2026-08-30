@@ -182,11 +182,11 @@ class TestSpreadCollapse:
         assert out == []
 
     def test_keeps_when_spread_collapse_within_tolerance(self):
-        # Stage 1 spread 0.27. Live spread ~0.20 — collapse ~26%. Allow 50%.
+        # Live spread stays within both the configurable gate and 10% layer floor.
         opp = _make_opp(long_price=0.40, short_price=0.55, spread=0.273)
         fetch = _fake_fetch({
             "long-mkt": _book(ask=0.40, bid=0.39, ask_size=200.0),
-            "short-mkt": _book(ask=0.51, bid=0.50, bid_size=200.0),
+            "short-mkt": _book(ask=0.55, bid=0.54, bid_size=200.0),
         })
         out = _refine(
             [opp], fetch_clob=fetch, min_liquidity=10,
@@ -206,8 +206,8 @@ class TestSurvivorFields:
     def test_writes_live_quote_fields(self):
         opp = _make_opp()
         fetch = _fake_fetch({
-            "long-mkt": _book(ask=0.41, bid=0.40, ask_size=300.0),
-            "short-mkt": _book(ask=0.55, bid=0.54, bid_size=250.0),
+            "long-mkt": _book(ask=0.405, bid=0.40, ask_size=300.0),
+            "short-mkt": _book(ask=0.56, bid=0.55, bid_size=250.0),
         })
         out = _refine(
             [opp], fetch_clob=fetch,
@@ -215,8 +215,8 @@ class TestSurvivorFields:
         )
         assert len(out) == 1
         r = out[0]
-        assert r["_long_ask"] == 0.41
-        assert r["_short_bid"] == 0.54
+        assert r["_long_ask"] == 0.405
+        assert r["_short_bid"] == 0.55
         assert r["_long_depth"] == 300.0
         assert r["_short_depth"] == 250.0
         assert "_live_spread" in r
@@ -225,8 +225,8 @@ class TestSurvivorFields:
     def test_preserves_pair_source_marker(self):
         opp = _make_opp(pair_source="auto")
         fetch = _fake_fetch({
-            "long-mkt": _book(ask=0.41, bid=0.40, ask_size=300.0),
-            "short-mkt": _book(ask=0.55, bid=0.54, bid_size=250.0),
+            "long-mkt": _book(ask=0.405, bid=0.40, ask_size=300.0),
+            "short-mkt": _book(ask=0.56, bid=0.55, bid_size=250.0),
         })
         out = _refine(
             [opp], fetch_clob=fetch, min_liquidity=10, max_spread_collapse=0.50,
@@ -293,8 +293,8 @@ class TestSwappedLegOrientation:
         # available, ask missing. If the books get swapped, the long leg has
         # no ask and the short leg no bid -> the opp is wrongly dropped.
         fetch = _fake_fetch({
-            "mkt-b": _book(ask=0.41, bid=None, ask_size=300.0),
-            "mkt-a": _book(ask=None, bid=0.54, bid_size=250.0),
+            "mkt-b": _book(ask=0.405, bid=None, ask_size=300.0),
+            "mkt-a": _book(ask=None, bid=0.55, bid_size=250.0),
         })
         out = _refine(
             [opp], fetch_clob=fetch,
@@ -302,7 +302,7 @@ class TestSwappedLegOrientation:
         )
         assert len(out) == 1
         r = out[0]
-        assert r["_long_ask"] == 0.41   # from market B's book (the long leg)
-        assert r["_short_bid"] == 0.54  # from market A's book (the short leg)
+        assert r["_long_ask"] == 0.405  # from market B's book (the long leg)
+        assert r["_short_bid"] == 0.55  # from market A's book (the short leg)
         assert r["_long_depth"] == 300.0
         assert r["_short_depth"] == 250.0

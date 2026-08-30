@@ -7,13 +7,17 @@ Optional HTTP Basic Auth when DASHBOARD_PASS is set.
 
 import base64
 import hmac
+import ipaddress
 import json
 import logging
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
+
+MAX_POST_BODY = 65_536
 
 # Module start time for uptime calculation
 _start_time = time.monotonic()
@@ -245,13 +249,18 @@ def _check_auth(handler) -> bool:
     from config import DASHBOARD_USER, DASHBOARD_PASS
 
     if not DASHBOARD_PASS:
-        # Reads are allowed without a password (local/dev convenience); the
-        # dangerous state-changing POST endpoints are separately fail-closed in
-        # do_POST (audit S06). Warn loudly in full-auto, where this is unsafe.
-        from config import EXECUTION_MODE
-        if EXECUTION_MODE == "full-auto":
-            logger.warning("Dashboard auth disabled in full-auto mode — set DASHBOARD_PASS")
-        return True
+        # Passwordless reads are a local-development convenience only.
+        try:
+            peer = ipaddress.ip_address(handler.client_address[0])
+            listener = ipaddress.ip_address(handler.server.server_address[0])
+        except (AttributeError, IndexError, TypeError, ValueError):
+            peer = None
+            listener = None
+        if peer is not None and peer.is_loopback and listener is not None and listener.is_loopback:
+            return True
+        logger.warning("Rejected passwordless dashboard request from non-loopback peer")
+        _send_401(handler)
+        return False
 
     auth_header = handler.headers.get("Authorization", "")
     if not auth_header.startswith("Basic "):
@@ -289,6 +298,32 @@ def _send_401(handler):
     handler.wfile.write(body)
 
 
+def _check_post_origin(handler) -> bool:
+    """Require a non-simple JSON request and reject explicit cross-site origins."""
+    content_type = handler.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+    if content_type != "application/json":
+        _send_json(handler, {"error": "Content-Type must be application/json"}, 415)
+        return False
+
+    fetch_site = handler.headers.get("Sec-Fetch-Site", "").strip().lower()
+    if fetch_site == "cross-site":
+        _send_json(handler, {"error": "cross-site POST denied"}, 403)
+        return False
+
+    origin = handler.headers.get("Origin", "").strip()
+    if not origin:
+        # Non-browser clients do not send Origin. Strict JSON still prevents a
+        # cross-origin simple-form request, and this server exposes no CORS
+        # preflight handler that would permit attacker-authored JSON.
+        return True
+    parsed = urlsplit(origin)
+    host = handler.headers.get("Host", "").strip().lower()
+    if parsed.scheme not in ("http", "https") or parsed.netloc.lower() != host:
+        _send_json(handler, {"error": "origin does not match Host"}, 403)
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Response helpers
 # ---------------------------------------------------------------------------
@@ -319,11 +354,21 @@ def _send_html(handler, html: str, status: int = 200):
 # Database helper (lazy import to avoid circular deps)
 # ---------------------------------------------------------------------------
 
+_dashboard_db = None
+_dashboard_db_lock = threading.Lock()
+
+
 def _get_db():
-    """Get a TradeDB instance. Returns None on error."""
+    """Get the process-wide TradeDB instance. Returns None on error."""
+    global _dashboard_db
+    if _dashboard_db is not None:
+        return _dashboard_db
     try:
-        from db import TradeDB
-        return TradeDB()
+        with _dashboard_db_lock:
+            if _dashboard_db is None:
+                from db import TradeDB
+                _dashboard_db = TradeDB()
+        return _dashboard_db
     except Exception as e:
         logger.debug("Error creating TradeDB for dashboard: %s", e)
         return None
@@ -397,11 +442,16 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if not _check_auth(self):
             return
+        if not _check_post_origin(self):
+            return
 
         # Read the full request body (after auth) to avoid connection resets.
         post_body = b""
         try:
             content_len = int(self.headers.get("Content-Length", 0))
+            if content_len < 0 or content_len > MAX_POST_BODY:
+                _send_json(self, {"error": "request body too large"}, 413)
+                return
             if content_len > 0:
                 post_body = self.rfile.read(content_len)
         except Exception as e:

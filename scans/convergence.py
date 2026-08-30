@@ -76,14 +76,9 @@ def scan_convergence(
             if abs(divergence_from_loo) < min_divergence:
                 continue
 
-            # Estimate profit: convergence to median minus fees
+            # Estimate profit: convergence to median minus a conservative
+            # fee charged against capital at risk, not against the edge.
             gross_profit = abs(divergence_from_loo)
-            estimated_fee = gross_profit * 0.05  # Conservative 5% fee estimate
-            net_profit = gross_profit - estimated_fee
-
-            if net_profit < min_profit:
-                continue
-
             # Direction: if platform is cheap (below median), buy YES there.
             # If platform is expensive (above median), buy NO there.
             if divergence_from_loo < 0:
@@ -92,6 +87,11 @@ def scan_convergence(
             else:
                 direction = "BUY_NO"
                 trade_price = 1.0 - price
+
+            estimated_fee = trade_price * 0.05
+            net_profit = gross_profit - estimated_fee
+            if net_profit < min_profit:
+                continue
 
             net_roi = net_profit / trade_price if trade_price > 0 else 0
 

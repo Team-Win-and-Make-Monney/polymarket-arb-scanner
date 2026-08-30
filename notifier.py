@@ -56,14 +56,14 @@ class WebhookNotifier:
         # Telegram support
         self._telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
         self._telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
-        self._is_telegram = url.startswith("telegram")
+        self._is_telegram = url in ("telegram", "telegram://")
         if self._is_telegram and (not self._telegram_token or not self._telegram_chat_id):
             logger.warning("WEBHOOK_URL set to telegram but TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set.")
 
         # CallMeBot WhatsApp support
         self._callmebot_phone = os.getenv("CALLMEBOT_PHONE")
         self._callmebot_apikey = os.getenv("CALLMEBOT_APIKEY")
-        self._is_callmebot = url.startswith("callmebot")
+        self._is_callmebot = url in ("callmebot", "callmebot://")
         if self._is_callmebot and (not self._callmebot_phone or not self._callmebot_apikey):
             logger.warning("WEBHOOK_URL set to callmebot but CALLMEBOT_PHONE / CALLMEBOT_APIKEY not set.")
 
@@ -229,7 +229,6 @@ class WebhookNotifier:
         payload = {
             "chat_id": self._telegram_chat_id,
             "text": text,
-            "parse_mode": "Markdown",
             "disable_web_page_preview": True,
         }
         try:

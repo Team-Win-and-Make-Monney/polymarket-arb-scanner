@@ -2,7 +2,7 @@
 
 Python CLI for detecting and paper-evaluating prediction-market arbitrage. The repository contains multiple venue adapters and execution code, but the project is currently paused for broad expansion and is dry-run by default.
 
-> **Current operating state (2026-08-24):** Railway is still running a dry-run worker. The only verified live operating target is a narrowly gated Kalshi D0 launcher. No generic multi-venue live command is authorized. See [`docs/STATE.md`](docs/STATE.md).
+> **Current operating state (2026-08-29):** PR #134 is merged and Railway is running the merged Kalshi-only dry-run line. PR #135 contains the remaining audit reconciliation and security remediation; it is not merged or deployed. The only verified live operating target remains the separately gated Kalshi D0 launcher, and generic live execution now fails closed in configuration. See [`docs/STATE.md`](docs/STATE.md).
 >
 > Renamed from `polymarket-arb-scanner` on 2026-05-09. The new name reflects the actual scope — a grid of platforms × layers × strategies, not a Polymarket-only scanner. Local clones may keep the old directory name without any functional impact.
 
@@ -40,20 +40,20 @@ The strategy taxonomy is an implementation inventory, not a live-readiness claim
 ## Quick Start
 
 ```bash
-# Install
-pip install -r requirements.txt
-pip install -r requirements-dev.txt   # pytest, dev tools
+# Create the same Python line used by CI, then install all dependencies.
+python3.12 -m venv .venv
+.venv/bin/pip install -r requirements.txt -r requirements-dev.txt
 
 # One-shot scan (all strategies, dry-run)
-python scanner.py
+.venv/bin/python scanner.py
 
 # Continuous mode
-python scanner.py --continuous --interval 60
+.venv/bin/python scanner.py --continuous --interval 60
 
 # Single strategy
-python scanner.py --mode kalshi
-python scanner.py --mode cross-all
-python scanner.py --mode mm
+.venv/bin/python scanner.py --mode kalshi
+.venv/bin/python scanner.py --mode cross-all
+.venv/bin/python scanner.py --mode mm
 
 # Live Kalshi D0 only; do not run until the five-field operator envelope,
 # account/credential/jurisdiction checks, physical kill switch, and
@@ -92,8 +92,8 @@ All settings are env vars with defaults defined in `config.py`. `validate_config
 Key groups:
 
 - **Platform credentials** — `POLYMARKET_PRIVATE_KEY`, `KALSHI_API_KEY_ID` + `KALSHI_PRIVATE_KEY_PATH`, `BETFAIR_*`, `SMARKETS_API_KEY`, `SXBET_API_KEY`, `MATCHBOOK_USERNAME`/`MATCHBOOK_PASSWORD`, `GEMINI_API_KEY`/`GEMINI_API_SECRET`, explicit `IBKR_HOST`/`IBKR_PORT`/`IBKR_CLIENT_ID`, and `METACULUS_API_KEY` plus `METACULUS_COMMERCIAL_USE_APPROVED=true` only after written commercial API permission.
-- **Execution** — `DRY_RUN` (default `true`), `EXECUTION_MODE`, `MAX_TRADE_SIZE`. `DRY_RUN=false` is not sufficient authority by itself.
-- **Risk** — `DAILY_LOSS_LIMIT`, `MAX_OPEN_POSITIONS`, `MIN_LIQUIDITY`, `MIN_NET_ROI`.
+- **Execution** — `DRY_RUN` (default `true`), `EXECUTION_MODE`, `MAX_TRADE_SIZE`. `DRY_RUN=false` requires the guarded Kalshi MM pilot and is not sufficient authority by itself.
+- **Risk** — `DAILY_LOSS_LIMIT`, `MAX_OPEN_POSITIONS`, `MIN_LIQUIDITY`, `MIN_NET_ROI`, and the pilot's per-market, aggregate-inventory, and UTC-day loss caps.
 - **Feature flags** (default `false`) — `MM_ENABLED`, `SNAPSHOT_ENABLED`, `DYNAMIC_FEE_ENABLED`, `EVENT_MONITOR_ENABLED`, `MM_AUTO_HEDGE_ENABLED`, `FEE_PROMO_ENABLED`, `CROSS_MM_ENABLED`, `AUTO_REBALANCE_ENABLED`.
 - **Infra** — `WEBHOOK_URL`, `DASHBOARD_PORT`, `DASHBOARD_HOST`, `DASHBOARD_PASS`, `DATA_DIR`, `LOG_LEVEL`, `LOG_FILE`.
 
@@ -102,9 +102,9 @@ Production deploys should set the feature flags explicitly. Full env-var referen
 ## Testing
 
 ```bash
-pytest tests/ -v                                        # full suite
-pytest tests/test_fees.py -v                            # one file
-pytest tests/test_executor.py::TestExecutor -v          # one class
+.venv/bin/python -m pytest tests/ -v                    # full suite
+.venv/bin/python -m pytest tests/test_fees.py -v        # one file
+.venv/bin/python -m pytest tests/test_executor.py::TestExecutor -v
 ```
 
 Tests use `pytest` + `unittest.mock`. External SDKs are mocked via `sys.modules` stubs. No `conftest.py` — per-file `autouse` fixtures provide shared setup.
@@ -117,14 +117,16 @@ CI runs correctness lint plus `pytest` on every PR to `master` (Python 3.12) and
 - Default container worker: `python scanner.py --continuous --mode kalshi` in dry-run. Broad `all` scans remain an explicit local choice, not the unattended Railway default.
 - Health check: `/healthz` on port 8080.
 - Persistent state (`trades.db`) lives under `DATA_DIR`.
+- The primary image runs as an unprivileged `scanner` user. The separate SX Bet proxy image requires a deployment-provided `SXBET_PROXY_TOKEN` and refuses to start without a strong token.
 
 IBKR connectivity requires a reachable IB Gateway socket — not viable from Railway without a persistent gateway host.
 
 ## Project Status
 
 - Broad multi-venue expansion is parked while safety and reproducibility work is consolidated.
-- Recovery work is being prepared on `codex/project-recovery-20260824`; it is not merged or deployed yet.
-- Railway remains active in dry-run mode, so the project is paused but not resource-free.
+- PR #134 is merged on `master`; its Railway deployment is healthy, Kalshi-only, and dry-run.
+- The remaining audit reconciliation and security remediation are in PR #135; it is not merged or deployed.
+- Railway still runs both `arb-scanner` and the legacy `polymarket-egress-proxy`, so the parked project is not resource-free.
 - Verified live readiness: Kalshi D0 only, subject to all operator gates and separate action-time approval.
 - This is a personal trading tool. **Out of scope:** public-facing product, SaaS, user accounts, selling access.
 
@@ -144,6 +146,7 @@ IBKR connectivity requires a reachable IB Gateway socket — not viable from Rai
 | [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Deploy, post-deploy checklist, observability contract, rollback. |
 | [`docs/BACKTESTING.md`](docs/BACKTESTING.md) | Snapshot → replay → tuning (#20) methodology. |
 | [`docs/SECURITY.md`](docs/SECURITY.md) | Secrets, custody-grade keys, dashboard exposure (ENFORCED vs TODO). |
+| [`docs/AUDIT-RECONCILIATION-2026-08-26.md`](docs/AUDIT-RECONCILIATION-2026-08-26.md) | Disposition of PR #130's 125 findings and the completion review. |
 | [`TASK_CONTRACT.md`](TASK_CONTRACT.md) | Definition of done, opportunity-dict schema, execution legs, exceptions. |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Branching, style, testing, how to add a strategy. |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release history (Keep a Changelog). |

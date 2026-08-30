@@ -297,7 +297,8 @@ class TestRewardsDashboard:
         html_30 = get_dashboard_html(refresh_seconds=30)
 
         # Verify refresh interval is substituted
-        assert "15" in html_15 or "15" not in html_30
+        assert "15" in html_15
+        assert html_15 != html_30
         assert "30" in html_30
 
     def test_rewards_exposure_zero_by_default(self):

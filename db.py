@@ -76,6 +76,7 @@ class TradeDB:
                 size REAL NOT NULL,
                 hedge_status TEXT NOT NULL DEFAULT 'pending',
                 hedge_attempts INTEGER DEFAULT 0,
+                hedge_order_id TEXT,
                 created_at TEXT NOT NULL,
                 resolved_at TEXT
             );
@@ -173,6 +174,20 @@ class TradeDB:
                 self.conn.commit()
             except sqlite3.OperationalError:
                 logger.debug("Migration: %s column already exists on partial_fills", col)
+        try:
+            self.conn.execute("ALTER TABLE partial_fills ADD COLUMN _max_contracts INTEGER")
+            self.conn.commit()
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
+            logger.debug("Migration: _max_contracts column already exists on partial_fills")
+        try:
+            self.conn.execute("ALTER TABLE partial_fills ADD COLUMN hedge_order_id TEXT")
+            self.conn.commit()
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
+            logger.debug("Migration: hedge_order_id column already exists on partial_fills")
 
     def log_opportunity(
         self,
@@ -473,6 +488,7 @@ class TradeDB:
         runner_id: str | None = None,
         outcome_id: str | None = None,
         symbol: str | None = None,
+        max_contracts: int | None = None,
     ) -> int | None:
         """Log a partial fill for hedging. Returns partial_fill ID.
 
@@ -484,11 +500,13 @@ class TradeDB:
             cur = self.conn.execute(
                 """INSERT INTO partial_fills
                    (trade_id, opportunity_id, platform, token_id, side, fill_price, size, created_at,
-                    _market_id, _selection_id, _contract_id, _market_hash, _runner_id, _outcome_id, _symbol)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    _market_id, _selection_id, _contract_id, _market_hash, _runner_id, _outcome_id, _symbol,
+                    _max_contracts)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (trade_id, opportunity_id, platform, token_id, side, fill_price, size,
                  datetime.now(timezone.utc).isoformat(),
-                 market_id, selection_id, contract_id, market_hash, runner_id, outcome_id, symbol),
+                 market_id, selection_id, contract_id, market_hash, runner_id, outcome_id, symbol,
+                 max_contracts),
             )
             self.conn.commit()
             return cur.lastrowid
@@ -500,6 +518,39 @@ class TradeDB:
                 "SELECT * FROM partial_fills WHERE hedge_status = 'pending' ORDER BY id"
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def get_indeterminate_partial_fills(self) -> list[dict]:
+        """Get Kalshi hedges whose submission outcome requires reconciliation."""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM partial_fills WHERE hedge_status = 'indeterminate' ORDER BY id"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def set_partial_fill_hedge_order(
+        self,
+        pf_id: int,
+        order_id: str | None,
+        status: str | None = None,
+    ) -> None:
+        """Persist a hedge order reference before or after venue submission."""
+        with self._lock:
+            if status is None:
+                self.conn.execute(
+                    "UPDATE partial_fills SET hedge_order_id = ? WHERE id = ?",
+                    (order_id, pf_id),
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE partial_fills SET hedge_order_id = ?, hedge_status = ? WHERE id = ?",
+                    (order_id, status, pf_id),
+                )
+                if status in ("hedged", "failed"):
+                    self.conn.execute(
+                        "UPDATE partial_fills SET resolved_at = ? WHERE id = ?",
+                        (datetime.now(timezone.utc).isoformat(), pf_id),
+                    )
+            self.conn.commit()
 
     def update_partial_fill(self, pf_id: int, status: str, attempts: int | None = None):
         """Update partial fill hedge status."""

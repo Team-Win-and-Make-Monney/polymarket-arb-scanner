@@ -339,7 +339,7 @@ class TestClampSize:
         result = rm.clamp_size(desired_size=-1.0, depth=100.0, balance=100.0)
         assert result == 0.0
 
-    def test_zero_balance_returns_zero(self, rm):
+    def test_zero_balance_skips_balance_constraint(self, rm):
         # balance=0 means balance > 0 is False, so balance constraint is skipped
         result = rm.clamp_size(desired_size=5.0, depth=100.0, balance=0)
         assert result == 5.0

@@ -1,5 +1,6 @@
 """SX Bet Exchange API client for market data and trading."""
 
+from collections.abc import Mapping
 import logging
 import os
 import threading
@@ -9,11 +10,16 @@ import requests
 
 from config import SXBET_RATE_LIMIT
 from rate_limiter import PlatformCircuitBreaker
+from url_guard import assert_public_url
 
 logger = logging.getLogger(__name__)
 
 # Base URL: overridable via env var for reverse-proxy routing (e.g. Singapore)
-SXBET_API_URL = os.getenv("SXBET_API_BASE_URL", "https://api.sx.bet")
+SXBET_API_URL = assert_public_url(
+    os.getenv("SXBET_API_BASE_URL", "https://api.sx.bet"),
+    env_name="SXBET_API_BASE_URL",
+    allow_http=False,
+)
 
 # Rate limiting (thread-safe)
 _last_request_time = 0
@@ -82,10 +88,9 @@ def _rate_limit():
 class SXBetClient:
     """SX Bet Exchange API client.
 
-    SX Bet REST API is unauthenticated for read endpoints.  Trading
-    (posting/filling orders) requires Ethereum wallet signatures in the
-    request body — not header-based auth.  The ``X-Api-Key`` header is only
-    needed for WebSocket token requests and heartbeat.
+    Public market-data reads are unauthenticated. Account reads require the
+    ``x-sx-api-key`` header, while trading additionally requires a wallet
+    signature.
     """
 
     def __init__(self):
@@ -94,36 +99,40 @@ class SXBetClient:
         # SXBET_API_BASE_URL (reverse proxy). Kept for backward compat.
         proxy_url = os.getenv("SXBET_PROXY_URL", "").strip().strip('"')
         if proxy_url:
+            proxy_url = assert_public_url(proxy_url, env_name="SXBET_PROXY_URL")
             self.session.proxies = {"http": proxy_url, "https": proxy_url}
         self.session.headers.update({
             "Accept": "application/json",
             "Content-Type": "application/json",
         })
+        proxy_token = os.getenv("SXBET_PROXY_TOKEN", "").strip()
+        if SXBET_API_URL.rstrip("/") != "https://api.sx.bet" and proxy_token:
+            self.session.headers["X-Proxy-Token"] = proxy_token
+        self.api_key: str | None = None
         self.wallet_address: str | None = None
-        self.private_key: str | None = None
         self.authenticated = False
 
-    def login(self, api_key: str = None, private_key: str = None) -> bool:
+    def login(self, api_key: str | None = None, private_key: str | None = None) -> bool:
         """Connect to SX Bet and verify API reachability.
 
-        SX Bet read endpoints require no authentication.  The ``api_key``
-        parameter (or ``SXBET_API_KEY`` env var) is treated as the wallet
-        address for trading.  The optional ``private_key`` (or
-        ``SXBET_PRIVATE_KEY`` env var) is stored for order signing.
+        Public SX Bet market-data endpoints require no authentication. The
+        API key authenticates account reads and is distinct from the optional
+        ``SXBET_WALLET_ADDRESS`` identifier. Private keys are deliberately not
+        loaded until signed EIP-712 order support exists.
 
         Args:
-            api_key: Wallet address (0x…).  Falls back to env var.
-            private_key: Private key for signing.  Falls back to env var.
+            api_key: Account API key. Falls back to ``SXBET_API_KEY``.
+            private_key: Ignored. Reserved for a future signed-order client.
 
         Returns:
             True if the SX Bet API is reachable.
         """
-        self.wallet_address = api_key or os.getenv("SXBET_API_KEY")
-        self.private_key = private_key or os.getenv("SXBET_PRIVATE_KEY")
-
-        if not self.wallet_address:
-            logger.error("SX Bet wallet address not provided")
-            return False
+        self.api_key = api_key or os.getenv("SXBET_API_KEY")
+        self.wallet_address = os.getenv("SXBET_WALLET_ADDRESS")
+        if private_key or os.getenv("SXBET_PRIVATE_KEY"):
+            logger.warning(
+                "SXBET_PRIVATE_KEY is ignored while trading remains read-only"
+            )
 
         # Verify by fetching sports list (no auth header needed)
         _rate_limit()
@@ -131,8 +140,7 @@ class SXBetClient:
             resp = self.session.get(f"{SXBET_API_URL}/sports", timeout=15)
             if resp.status_code == 200:
                 self.authenticated = True
-                logger.info("SX Bet connected (wallet=%s…%s)",
-                            self.wallet_address[:6], self.wallet_address[-4:])
+                logger.info("SX Bet connected")
                 return True
             logger.error("SX Bet API reachability check failed: %s", resp.status_code)
             return False
@@ -156,10 +164,6 @@ class SXBetClient:
         Returns:
             Response JSON or None on failure.
         """
-        if not self.authenticated:
-            logger.error("SX Bet: must login before making API calls")
-            return None
-
         if _circuit.is_open():
             raise _RateLimitError("Circuit open -- sxbet in backoff")
         _rate_limit()
@@ -348,57 +352,49 @@ class SXBetClient:
         Returns:
             Order response dict or None on failure.
         """
-        if not self.authenticated:
-            return None
-
-        _rate_limit()
-        try:
-            resp = self.session.post(
-                f"{SXBET_API_URL}/orders",
-                json={
-                    "marketHash": market_hash,
-                    "outcomeId": outcome_id,
-                    "side": side,
-                    "price": str(price),
-                    "size": str(size),
-                    "orderType": "limit",
-                },
-                timeout=30,
-            )
-            if resp.status_code in (200, 201):
-                return resp.json()
-            logger.error("SX Bet place_order: %s %s",
-                         resp.status_code, resp.text[:200])
-            return None
-        except requests.RequestException as exc:
-            logger.error("SX Bet place_order failed: %s", exc)
-            return None
+        logger.error(
+            "SX Bet order rejected locally: EIP-712 signing is not implemented"
+        )
+        return None
 
     def get_balance(self) -> float | None:
         """Get available account balance.
 
-        The ``/user/balance`` endpoint requires a real UUID API key
-        (``X-Api-Key`` header), which is separate from the wallet address.
-        We make a best-effort attempt; callers should tolerate ``None``.
+        The v3 balance endpoint requires the account API key in the
+        ``x-sx-api-key`` header. ``availableAmount`` is denominated in the
+        token's six-decimal base units.
 
         Returns:
             Balance as float or None on failure.
         """
-        if not self.authenticated:
+        if not self.authenticated or not self.api_key:
             return None
 
-        # The balance endpoint requires X-Api-Key (UUID), not wallet address.
-        # Try the documented endpoint; fall back gracefully.
         _rate_limit()
         try:
-            resp = self.session.get(f"{SXBET_API_URL}/user/balance", timeout=15)
+            resp = self.session.get(
+                f"{SXBET_API_URL}/user/balance-v3",
+                headers={"x-sx-api-key": self.api_key},
+                timeout=15,
+            )
             if resp.status_code == 200:
-                data = resp.json()
-                return float(data.get("balance", data.get("availableBalance", 0)))
-            logger.debug("SX Bet balance unavailable (requires API key UUID): %s",
-                         resp.status_code)
+                payload = resp.json()
+                if not isinstance(payload, Mapping):
+                    logger.debug("SX Bet balance response root was not an object")
+                    return None
+                data = payload.get("data")
+                if not isinstance(data, Mapping):
+                    logger.debug("SX Bet balance response data was not an object")
+                    return None
+                balances = data.get("balances")
+                if not isinstance(balances, list) or not balances:
+                    logger.debug("SX Bet balance response contained no balances")
+                    return None
+                available = sum(float(row["availableAmount"]) for row in balances)
+                return available / 1_000_000
+            logger.debug("SX Bet balance unavailable: %s", resp.status_code)
             return None
-        except requests.RequestException as exc:
+        except (KeyError, TypeError, ValueError, requests.RequestException) as exc:
             logger.debug("SX Bet balance request failed: %s", exc)
             return None
 
@@ -435,7 +431,7 @@ class SXBetClient:
         Returns:
             True if cancellation succeeded.
         """
-        if not self.authenticated:
+        if not self.authenticated or not self.api_key:
             return False
         _rate_limit()
         try:

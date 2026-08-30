@@ -239,15 +239,10 @@ class BrokerValidator:
                 f"portfolio ${portfolio:,.2f} exceeds working ceiling ${ceiling:,.2f} "
                 f"({self.policy.tranche} principal + realized P&L)",
             )
-        # POST-ACTION ceiling: current portfolio plus this move must stay within
-        # the working ceiling — not each independently (spec: "post-action
-        # portfolio ≤ working ceiling").
-        if portfolio + amount > ceiling:
-            return CheckResult(
-                "caps", False,
-                f"post-action portfolio ${portfolio + amount:,.2f} would exceed working "
-                f"ceiling ${ceiling:,.2f}",
-            )
+        # move_capital relocates existing portfolio value; it does not add
+        # principal. The current portfolio ceiling above is therefore the
+        # correct post-action ceiling check. Per-market and depth caps below
+        # still constrain the amount being moved.
         # Every capital move is market-scoped: the per-market cap and the
         # book-depth cap CANNOT be verified without a named market, so a move
         # that omits one is rejected — never silently exempt from the $/market

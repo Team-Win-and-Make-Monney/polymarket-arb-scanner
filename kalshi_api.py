@@ -6,6 +6,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -19,6 +20,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from config import KALSHI_RATE_LIMIT
 from kalshi_policy import live_kalshi_submit_allowed
 from rate_limiter import PlatformCircuitBreaker
+from url_guard import assert_public_url
 
 KALSHI_BASE_URL = "https://api.elections.kalshi.com"
 KALSHI_API_PATH = "/trade-api/v2"
@@ -48,9 +50,6 @@ def _load_private_key(file_path: str):
             f.read(),
             password=None,
             backend=default_backend(),
-            # Kalshi-generated keys may have non-standard CRT parameters
-            # that fail strict validation in newer cryptography versions.
-            unsafe_skip_rsa_key_validation=True,
         )
 
 
@@ -61,7 +60,6 @@ def _load_private_key_from_base64(b64_string: str):
         pem_bytes,
         password=None,
         backend=default_backend(),
-        unsafe_skip_rsa_key_validation=True,
     )
 
 
@@ -83,6 +81,11 @@ class _RateLimitError(Exception):
     pass
 
 
+class _RequestNotSent(RuntimeError):
+    """Raised when a local guard rejects a request before network I/O."""
+    pass
+
+
 class KalshiPortfolioQueryError(Exception):
     """Raised by portfolio-state reads (fills/positions/orders) when the
     caller opts into ``raise_on_error=True`` and the request fails.
@@ -95,6 +98,14 @@ class KalshiPortfolioQueryError(Exception):
     pass
 
 
+class KalshiOrderIndeterminate(RuntimeError):
+    """Raised when an order may have reached Kalshi but no verdict returned."""
+
+    def __init__(self, message: str, client_order_id: str | None = None):
+        super().__init__(message)
+        self.client_order_id = client_order_id
+
+
 class KalshiClient:
     """Kalshi API client with RSA-PSS API key authentication."""
 
@@ -103,6 +114,7 @@ class KalshiClient:
         # Proxy support
         proxy_url = os.getenv("KALSHI_PROXY_URL")
         if proxy_url:
+            proxy_url = assert_public_url(proxy_url, env_name="KALSHI_PROXY_URL")
             self.session.proxies = {"http": proxy_url, "https": proxy_url}
         self.session.mount("https://", HTTPAdapter(pool_connections=1, pool_maxsize=10))
         self.api_key_id = None
@@ -152,16 +164,50 @@ class KalshiClient:
             "Accept": "application/json",
         }
 
+    def _request(self, method: str, path: str, params: dict | None = None,
+                 json_body: dict | None = None) -> requests.Response | None:
+        """Make one logical request, counting exhausted retries once."""
+        if _circuit.is_open():
+            raise _RateLimitError("Circuit open -- kalshi in backoff")
+        try:
+            return self._request_with_retry(method, path, params=params, json_body=json_body)
+        except (_RateLimitError, requests.ConnectionError, requests.Timeout):
+            _circuit.record_failure()
+            raise
+
+    def _request_once(self, method: str, path: str,
+                      params: dict | None = None,
+                      json_body: dict | None = None) -> requests.Response | None:
+        """Make one non-retried request, recording one circuit outcome.
+
+        Order submissions use this boundary because a timeout after Kalshi
+        accepts a POST must never cause an automatic second submission.
+        """
+        if _circuit.is_open():
+            raise _RequestNotSent("Circuit open -- kalshi in backoff")
+        try:
+            return self._request_attempt(method, path, params=params,
+                                         json_body=json_body)
+        except (_RateLimitError, requests.ConnectionError, requests.Timeout):
+            _circuit.record_failure()
+            raise
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
         retry=retry_if_exception_type((_RateLimitError, requests.ConnectionError, requests.Timeout)),
         reraise=True,
     )
-    def _request(self, method: str, path: str, params: dict | None = None, json_body: dict | None = None) -> requests.Response | None:
-        """Make an authenticated request to Kalshi API with retry."""
-        if _circuit.is_open():
-            raise _RateLimitError("Circuit open -- kalshi in backoff")
+    def _request_with_retry(self, method: str, path: str, params: dict | None = None,
+                            json_body: dict | None = None) -> requests.Response | None:
+        """Execute one retried request without double-counting attempts."""
+        return self._request_attempt(method, path, params=params,
+                                     json_body=json_body)
+
+    def _request_attempt(self, method: str, path: str,
+                         params: dict | None = None,
+                         json_body: dict | None = None) -> requests.Response | None:
+        """Execute exactly one HTTP attempt."""
         _rate_limit()
         headers = self._auth_headers(method, path)
         url = KALSHI_BASE_URL + KALSHI_API_PATH + path
@@ -176,11 +222,13 @@ class KalshiClient:
             )
             if resp.status_code == 429:
                 raise _RateLimitError(f"Rate limited: {method} {path}")
-            _circuit.record_success()
+            if 200 <= resp.status_code < 300:
+                _circuit.record_success()
+            else:
+                _circuit.record_failure()
             return resp
         except (requests.ConnectionError, requests.Timeout) as e:
             logger.warning("Kalshi request failed (%s %s): %s", method, path, e)
-            _circuit.record_failure()
             raise
         except requests.RequestException as e:
             logger.warning("Kalshi request failed (%s %s): %s", method, path, e)
@@ -627,6 +675,7 @@ class KalshiClient:
         price_dollars: float,
         time_in_force: str = "fill_or_kill",
         reducing: bool = False,
+        client_order_id: str | None = None,
     ) -> dict | None:
         """Place a limit order on Kalshi.
 
@@ -638,16 +687,26 @@ class KalshiClient:
             price_dollars: Price per contract in dollars (0.01-0.99)
             time_in_force: "fill_or_kill" (default for arb safety) or "gtc"
             reducing: Whether the order strictly reduces an existing position.
+            client_order_id: Stable caller-generated UUID used by Kalshi to
+                deduplicate and reconcile the submission. A UUID is generated
+                before submission when omitted.
 
         Returns:
-            Order response dict or None on failure.
+            Order response dict on acceptance, or None after a confirmed rejection.
+
+        Raises:
+            KalshiOrderIndeterminate: If the submission outcome cannot be confirmed.
+                Callers must reconcile the order before retrying.
         """
         if not live_kalshi_submit_allowed(ticker, reducing=reducing):
             logger.warning("Kalshi place_order blocked by live policy: %s", ticker)
             return None
 
+        client_order_id = client_order_id or str(uuid.uuid4())
+
         body = {
             "ticker": ticker,
+            "client_order_id": client_order_id,
             "side": side,
             "action": action,
             "count": count,
@@ -661,17 +720,91 @@ class KalshiClient:
             body["no_price"] = int(round(price_dollars * 100))
 
         try:
-            resp = self._request("POST", "/portfolio/orders", json_body=body)
+            resp = self._request_once("POST", "/portfolio/orders", json_body=body)
+        except _RequestNotSent as e:
+            logger.warning(
+                "Kalshi place_order blocked before submission: %s (ticker=%s)",
+                e, ticker,
+            )
+            return None
         except Exception as e:
             logger.error("Kalshi place_order exception: %s (ticker=%s)", e, ticker)
-            return None
+            raise KalshiOrderIndeterminate(
+                f"Kalshi order outcome is indeterminate for {ticker}",
+                client_order_id=client_order_id,
+            ) from e
         if resp is None:
             logger.warning("Kalshi place_order got no response (ticker=%s body=%s)", ticker, body)
-            return None
+            raise KalshiOrderIndeterminate(
+                f"Kalshi order outcome is indeterminate for {ticker}: no response",
+                client_order_id=client_order_id,
+            )
         if resp.status_code in (200, 201):
-            return resp.json()
+            try:
+                data = resp.json()
+            except (TypeError, ValueError) as e:
+                raise KalshiOrderIndeterminate(
+                    f"Kalshi accepted {ticker} but returned an unreadable order response",
+                    client_order_id=client_order_id,
+                ) from e
+            order = data.get("order", data) if isinstance(data, dict) else {}
+            if (not isinstance(order, dict)
+                    or not (order.get("order_id") or order.get("id"))):
+                raise KalshiOrderIndeterminate(
+                    f"Kalshi accepted {ticker} but returned no order identity",
+                    client_order_id=client_order_id,
+                )
+            return data
         logger.error("Kalshi place_order HTTP %s: %s (ticker=%s)", resp.status_code, resp.text[:300], ticker)
-        return None
+        if 400 <= resp.status_code < 500:
+            return None
+        raise KalshiOrderIndeterminate(
+            f"Kalshi order outcome is indeterminate for {ticker}: "
+            f"HTTP {resp.status_code}",
+            client_order_id=client_order_id,
+        )
+
+    def find_order_by_client_order_id(
+        self,
+        client_order_id: str,
+        ticker: str | None = None,
+        limit: int = 200,
+        max_pages: int = 5,
+    ) -> dict | None:
+        """Find a recent order by the caller's durable idempotency key.
+
+        A complete, successful pagination pass returning None means Kalshi did
+        not expose a matching recent order. Any ambiguous fetch raises so a
+        recovery caller cannot mistake an incomplete response for absence.
+        """
+        params: dict = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker
+        cursor = None
+        for _ in range(max_pages):
+            if cursor:
+                params["cursor"] = cursor
+            resp = self._request("GET", "/portfolio/orders", params=params)
+            if not resp or resp.status_code != 200:
+                status = resp.status_code if resp is not None else "no response"
+                raise KalshiPortfolioQueryError(
+                    f"find_order_by_client_order_id fetch failed ({status})")
+            try:
+                data = resp.json()
+            except (TypeError, ValueError) as e:
+                raise KalshiPortfolioQueryError(
+                    "find_order_by_client_order_id returned unreadable JSON"
+                ) from e
+            page = data.get("orders", []) if isinstance(data, dict) else []
+            for order in page:
+                if order.get("client_order_id") == client_order_id:
+                    return order
+            cursor = data.get("cursor") if isinstance(data, dict) else None
+            if not cursor or not page:
+                return None
+        raise KalshiPortfolioQueryError(
+            f"find_order_by_client_order_id exhausted max_pages={max_pages} "
+            "while more orders remained")
 
     def get_fills(self, limit: int = 200, max_pages: int = 5,
                   min_ts: int | None = None,

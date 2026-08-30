@@ -9,7 +9,7 @@ The standalone command is fail-closed and not imported by scanners or execution 
 
 ```sh
 FIRECRAWL_EVIDENCE_ALLOW_EXTERNAL_DISPATCH=1 \
-  python scripts/firecrawl_resolution_evidence.py \
+  infisical run --env dev -- python scripts/firecrawl_resolution_evidence.py \
   --max-credits 10 \
   "Did the named official agency publish the final result?"
 ```

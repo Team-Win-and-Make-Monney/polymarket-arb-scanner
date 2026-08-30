@@ -5,9 +5,6 @@
   "engines": {
     "node": ">=22"
   },
-  "scripts": {
-    "plan": "railway config plan --detailed-exit-code"
-  },
   "dependencies": {
     "railway": "3.11.0"
   }

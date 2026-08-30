@@ -53,7 +53,9 @@ def init_sentry() -> None:
         return
 
     env = os.environ.get("ENV", os.environ.get("NODE_ENV", "development"))
-    release = os.environ.get("SENTRY_RELEASE") or os.environ.get("RAILWAY_GIT_COMMIT_SHA")
+    # Railway's immutable deployment SHA must match the GitHub release workflow.
+    # SENTRY_RELEASE remains a fallback for non-Railway environments.
+    release = os.environ.get("RAILWAY_GIT_COMMIT_SHA") or os.environ.get("SENTRY_RELEASE")
     sentry_sdk.init(
         dsn=dsn,
         environment=env,

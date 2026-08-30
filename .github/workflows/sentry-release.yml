@@ -35,6 +35,7 @@ jobs:
 
       - name: Associate commits
         if: env.SENTRY_AUTH_TOKEN != ''
+        continue-on-error: true
         run: npx --yes @sentry/cli@2.58.6 releases set-commits "$GITHUB_SHA" --auto --ignore-missing
 
       - name: Finalize release

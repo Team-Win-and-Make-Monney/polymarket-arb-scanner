@@ -1,0 +1,42 @@
+# Creates a Sentry release for each commit delivered to master. The runtime
+# uses the same Railway commit SHA, allowing issues to resolve to exact code.
+name: Sentry release
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+      SENTRY_ORG: dynamics-group
+      SENTRY_PROJECT: polymarket-arb-scanner
+    steps:
+      - name: Note missing Sentry token
+        if: env.SENTRY_AUTH_TOKEN == ''
+        run: echo "SENTRY_AUTH_TOKEN is not configured; skipping Sentry release creation."
+
+      - name: Checkout full history
+        if: env.SENTRY_AUTH_TOKEN != ''
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Create release
+        if: env.SENTRY_AUTH_TOKEN != ''
+        run: npx --yes @sentry/cli@2.58.6 releases new "$GITHUB_SHA"
+
+      - name: Associate commits
+        if: env.SENTRY_AUTH_TOKEN != ''
+        run: npx --yes @sentry/cli@2.58.6 releases set-commits "$GITHUB_SHA" --auto --ignore-missing
+
+      - name: Finalize release
+        if: env.SENTRY_AUTH_TOKEN != ''
+        run: npx --yes @sentry/cli@2.58.6 releases finalize "$GITHUB_SHA"

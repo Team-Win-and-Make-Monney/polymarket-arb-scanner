@@ -53,9 +53,11 @@ def init_sentry() -> None:
         return
 
     env = os.environ.get("ENV", os.environ.get("NODE_ENV", "development"))
+    release = os.environ.get("SENTRY_RELEASE") or os.environ.get("RAILWAY_GIT_COMMIT_SHA")
     sentry_sdk.init(
         dsn=dsn,
         environment=env,
+        release=release,
         traces_sample_rate=0.2 if env == "production" else 1.0,
         send_default_pii=False,
         # Never capture exception-frame locals: venue credentials are in

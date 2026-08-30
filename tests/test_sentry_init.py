@@ -49,6 +49,18 @@ class TestInitKwargs:
         kwargs = self._init_kwargs(monkeypatch)
         assert kwargs.get("send_default_pii") is False
 
+    def test_release_prefers_railway_commit(self, monkeypatch):
+        monkeypatch.setenv("SENTRY_RELEASE", "release-override")
+        monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "railway-sha")
+        kwargs = self._init_kwargs(monkeypatch)
+        assert kwargs.get("release") == "railway-sha"
+
+    def test_release_uses_explicit_fallback_outside_railway(self, monkeypatch):
+        monkeypatch.setenv("SENTRY_RELEASE", "release-override")
+        monkeypatch.delenv("RAILWAY_GIT_COMMIT_SHA", raising=False)
+        kwargs = self._init_kwargs(monkeypatch)
+        assert kwargs.get("release") == "release-override"
+
     def test_no_dsn_no_init(self, monkeypatch):
         monkeypatch.delenv("SENTRY_DSN", raising=False)
         monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)

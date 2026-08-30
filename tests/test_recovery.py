@@ -86,7 +86,7 @@ class TestReconcilePendingTrades:
         db.set_trade_order_id.assert_called_once_with(1, "venue-order-1")
         db.update_trade_status.assert_called_once_with(1, "filled")
 
-    def test_unresolved_kalshi_client_order_reference_blocks_retry(self):
+    def test_unresolved_kalshi_client_order_reference_stays_pending(self):
         db = MagicMock()
         trades = [{
             "id": 1,
@@ -98,7 +98,23 @@ class TestReconcilePendingTrades:
 
         _reconcile_pending_trades(db, trades, kalshi_client=kalshi)
 
-        db.update_trade_status.assert_called_once_with(1, "orphaned")
+        db.update_trade_status.assert_not_called()
+        kalshi.get_order_status.assert_not_called()
+
+    def test_kalshi_lookup_error_stays_pending(self):
+        db = MagicMock()
+        trades = [{
+            "id": 1,
+            "platform": "kalshi",
+            "order_id": "client:durable-id",
+        }]
+        kalshi = MagicMock()
+        kalshi.find_order_by_client_order_id.side_effect = RuntimeError(
+            "temporary outage")
+
+        _reconcile_pending_trades(db, trades, kalshi_client=kalshi)
+
+        db.update_trade_status.assert_not_called()
         kalshi.get_order_status.assert_not_called()
 
 

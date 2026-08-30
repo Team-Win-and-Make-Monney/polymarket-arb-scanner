@@ -767,6 +767,23 @@ class TestPlaceOrderCounter:
             "hedge-client-1", ticker=TICKER,
         )["order_id"] == "k_1"
 
+    def test_hedger_proxy_does_not_invent_submission_after_gate_rejection(
+            self, pilot_env, clock):
+        from mm_pilot import _PilotKalshiProxy
+
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client, reconciled=False)
+        proxy = _PilotKalshiProxy(pilot)
+
+        response = proxy.place_order(
+            TICKER, "yes", "sell", 5, 0.48,
+            reducing=True, client_order_id="never-submitted",
+        )
+
+        assert response is None
+        assert client.place_order_calls == 0
+        assert "never-submitted" not in pilot._pending_submissions
+
 
 # ---------------------------------------------------------------------------
 # Finding #2: cancel confirms on the exchange before the registry pop;

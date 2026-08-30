@@ -75,27 +75,32 @@ def _reconcile_pending_trades(
 
         if platform == "kalshi" and str(order_id).startswith("client:"):
             client_order_id = str(order_id).split(":", 1)[1]
+            if kalshi_client is None:
+                logger.warning(
+                    "Trade #%d: Kalshi client unavailable; submission %s "
+                    "remains pending for reconciliation.",
+                    trade_id, client_order_id,
+                )
+                continue
             try:
                 order = kalshi_client.find_order_by_client_order_id(
-                    client_order_id) if kalshi_client else None
+                    client_order_id)
             except Exception as e:
                 logger.warning(
-                    "Trade #%d: Kalshi client-order reconciliation failed: %s",
-                    trade_id, e,
+                    "Trade #%d: Kalshi client-order reconciliation failed; "
+                    "submission remains pending: %s", trade_id, e,
                 )
-                order = None
+                continue
             venue_order_id = (
                 order.get("order_id") or order.get("id")
                 if isinstance(order, dict) else None
             )
             if not venue_order_id:
-                db.update_trade_status(trade_id, "orphaned")
                 logger.warning(
                     "Trade #%d: Kalshi submission %s remains indeterminate; "
-                    "retry blocked and manual reconciliation required.",
+                    "pending state retained and automatic retry blocked.",
                     trade_id, client_order_id,
                 )
-                resolved += 1
                 continue
             order_id = str(venue_order_id)
             db.set_trade_order_id(trade_id, order_id)

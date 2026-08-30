@@ -302,6 +302,20 @@ class TestKalshiOrders:
         assert exc_info.value.client_order_id == "4c355b9e-08d8-4ff5-b8ef-59a12b0e4561"
 
     @patch("kalshi_api._rate_limit")
+    def test_place_order_open_circuit_is_confirmed_not_sent(self, mock_rl,
+                                                             client):
+        for _ in range(3):
+            kalshi_api._circuit.record_failure()
+
+        result = client.place_order(
+            "TICK", "yes", "buy", 1, 0.50,
+            client_order_id="bedf94af-36ee-4124-b93b-a02502429ea1",
+        )
+
+        assert result is None
+        client.session.request.assert_not_called()
+
+    @patch("kalshi_api._rate_limit")
     def test_place_order_malformed_success_is_indeterminate(self, mock_rl, client):
         response = _mock_response(201, {"order": {"order_id": "o1"}})
         response.json.side_effect = ValueError("malformed JSON")

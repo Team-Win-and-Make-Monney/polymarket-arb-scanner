@@ -81,6 +81,11 @@ class _RateLimitError(Exception):
     pass
 
 
+class _RequestNotSent(RuntimeError):
+    """Raised when a local guard rejects a request before network I/O."""
+    pass
+
+
 class KalshiPortfolioQueryError(Exception):
     """Raised by portfolio-state reads (fills/positions/orders) when the
     caller opts into ``raise_on_error=True`` and the request fails.
@@ -179,7 +184,7 @@ class KalshiClient:
         accepts a POST must never cause an automatic second submission.
         """
         if _circuit.is_open():
-            raise _RateLimitError("Circuit open -- kalshi in backoff")
+            raise _RequestNotSent("Circuit open -- kalshi in backoff")
         try:
             return self._request_attempt(method, path, params=params,
                                          json_body=json_body)
@@ -716,6 +721,12 @@ class KalshiClient:
 
         try:
             resp = self._request_once("POST", "/portfolio/orders", json_body=body)
+        except _RequestNotSent as e:
+            logger.warning(
+                "Kalshi place_order blocked before submission: %s (ticker=%s)",
+                e, ticker,
+            )
+            return None
         except Exception as e:
             logger.error("Kalshi place_order exception: %s (ticker=%s)", e, ticker)
             raise KalshiOrderIndeterminate(

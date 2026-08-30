@@ -409,7 +409,12 @@ class _PilotKalshiProxy:
             client_order_id=client_order_id,
         )
         if order_id is None:
-            if not self._pilot._reconciled:
+            with self._pilot._lock:
+                submission_pending = (
+                    client_order_id in self._pilot._pending_submissions
+                    if client_order_id else False
+                )
+            if submission_pending:
                 from kalshi_api import KalshiOrderIndeterminate
                 raise KalshiOrderIndeterminate(
                     f"MM pilot hedge outcome is indeterminate for {ticker}",

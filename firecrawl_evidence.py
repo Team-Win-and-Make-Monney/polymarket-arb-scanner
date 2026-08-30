@@ -133,9 +133,16 @@ class FirecrawlEvidenceClient:
                             raise RuntimeError(
                                 "Firecrawl reported usage above the requested credit cap."
                             )
+                        data = payload.get("data")
+                        if not isinstance(data, dict) or not isinstance(
+                            data.get("evidence"), list
+                        ):
+                            raise RuntimeError(
+                                "Firecrawl completed without a structured evidence array."
+                            )
                         return normalize_evidence(
                             question,
-                            payload.get("data"),
+                            data,
                             max_age_hours=max_age_hours,
                             max_credits=self._max_credits,
                             credits_used=credits_used,

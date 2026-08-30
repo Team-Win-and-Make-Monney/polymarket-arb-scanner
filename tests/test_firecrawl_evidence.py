@@ -114,8 +114,15 @@ class TestFirecrawlEvidence:
         assert result.returncode == 2
         assert "Refusing external dispatch" in result.stderr
 
-    def test_non_terminal_job_is_cancelled_at_deadline(self):
+    def test_non_terminal_job_is_cancelled_at_deadline(self, monkeypatch):
         requests: list[httpx.Request] = []
+        clock = {"now": 100.0}
+
+        monkeypatch.setattr("firecrawl_evidence.time.monotonic", lambda: clock["now"])
+        monkeypatch.setattr(
+            "firecrawl_evidence.time.sleep",
+            lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+        )
 
         def handler(request: httpx.Request) -> httpx.Response:
             requests.append(request)
@@ -127,8 +134,8 @@ class TestFirecrawlEvidence:
 
         client = FirecrawlEvidenceClient(
             "fixture-key",
-            timeout_seconds=0.01,
-            poll_interval_seconds=0.02,
+            timeout_seconds=2,
+            poll_interval_seconds=2,
             transport=httpx.MockTransport(handler),
         )
 
@@ -140,6 +147,35 @@ class TestFirecrawlEvidence:
             ("GET", "/v2/agent/job-timeout"),
             ("DELETE", "/v2/agent/job-timeout"),
         ]
+
+    @pytest.mark.parametrize("data", [None, [], {}, {"evidence": {}}])
+    def test_completed_job_requires_structured_evidence_array(self, data):
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.method == "POST":
+                return httpx.Response(200, json={"success": True, "id": "job-invalid"})
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "status": "completed",
+                    "creditsUsed": 1,
+                    "data": data,
+                },
+            )
+
+        client = FirecrawlEvidenceClient(
+            "fixture-key",
+            poll_interval_seconds=0,
+            transport=httpx.MockTransport(handler),
+        )
+
+        with pytest.raises(RuntimeError, match="structured evidence array"):
+            client.discover("Did the official result publish?")
+
+        assert [request.url.path for request in requests] == ["/v2/agent", "/v2/agent/job-invalid"]
 
     def test_invalid_agent_creation_json_fails_closed(self):
         client = FirecrawlEvidenceClient(

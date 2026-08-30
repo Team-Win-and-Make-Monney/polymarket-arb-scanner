@@ -10,7 +10,14 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import kalshi_api
-from kalshi_api import KalshiClient, _rate_limit, _RateLimitError, KALSHI_BASE_URL, KALSHI_API_PATH
+from kalshi_api import (
+    KalshiClient,
+    KalshiOrderIndeterminate,
+    _rate_limit,
+    _RateLimitError,
+    KALSHI_BASE_URL,
+    KALSHI_API_PATH,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -269,12 +276,12 @@ class TestKalshiOrders:
         assert result is None
 
     @patch("kalshi_api._rate_limit")
-    def test_place_order_returns_none_on_exception(self, mock_rl, client):
-        """Exception during request returns None."""
+    def test_place_order_raises_indeterminate_on_exception(self, mock_rl, client):
+        """A response-boundary failure cannot be confused with rejection."""
         import requests as _req
         client.session.request.side_effect = _req.ConnectionError("down")
-        result = client.place_order("TICK", "yes", "buy", 1, 0.50)
-        assert result is None
+        with pytest.raises(KalshiOrderIndeterminate):
+            client.place_order("TICK", "yes", "buy", 1, 0.50)
 
     @patch("kalshi_api._rate_limit")
     def test_place_order_blocks_disallowed_ticker_at_client_boundary(self, mock_rl, client):

@@ -211,25 +211,28 @@ class TestConfigPrecedence:
     def test_dry_run_cli_true_overrides_env(self):
         """--dry-run flag overrides DRY_RUN env."""
         with patch.dict(os.environ, {"DRY_RUN": "false"}):
-            cli_dry_run = True
-            dry_run = cli_dry_run if cli_dry_run is not None else os.getenv("DRY_RUN", "true").lower() == "true"
-            assert dry_run is True
+            with patch.object(_cli_mod, "CONFIG_DRY_RUN", False):
+                assert _cli_mod._resolve_dry_run(True) is True
 
     def test_dry_run_env_false(self):
         """When CLI is None, DRY_RUN=false makes dry_run False."""
         with patch.dict(os.environ, {"DRY_RUN": "false"}):
-            cli_dry_run = None
-            dry_run = cli_dry_run if cli_dry_run is not None else os.getenv("DRY_RUN", "true").lower() == "true"
-            assert dry_run is False
+            with patch.object(_cli_mod, "CONFIG_DRY_RUN", False):
+                assert _cli_mod._resolve_dry_run(None) is False
+
+    @pytest.mark.parametrize("raw", ["1", "yes", "true"])
+    def test_dry_run_truthy_spellings_use_config_value(self, raw):
+        with patch.dict(os.environ, {"DRY_RUN": raw}):
+            with patch.object(_cli_mod, "CONFIG_DRY_RUN", True):
+                assert _cli_mod._resolve_dry_run(None) is True
 
     def test_dry_run_default_is_true(self):
         """No CLI flag, no env var -> dry_run defaults to True."""
         env = os.environ.copy()
         env.pop("DRY_RUN", None)
         with patch.dict(os.environ, env, clear=True):
-            cli_dry_run = None
-            dry_run = cli_dry_run if cli_dry_run is not None else os.getenv("DRY_RUN", "true").lower() == "true"
-            assert dry_run is True
+            with patch.object(_cli_mod, "CONFIG_DRY_RUN", True):
+                assert _cli_mod._resolve_dry_run(None) is True
 
     def test_exec_mode_cli_overrides_env(self):
         """--exec-mode flag overrides EXECUTION_MODE env."""

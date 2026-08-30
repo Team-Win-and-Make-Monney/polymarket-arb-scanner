@@ -15,6 +15,19 @@ RUN apt-get update && \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Run the networked scanner with a dedicated identity. Dependency installation
+# stays privileged, while models, application files, and runtime state are
+# owned only by the scanner user.
+RUN groupadd --system scanner && \
+    useradd --system --gid scanner --create-home --home-dir /home/scanner scanner && \
+    mkdir -p /data && \
+    chown -R scanner:scanner /data /home/scanner
+
+ENV HOME=/home/scanner \
+    DATA_DIR=/data
+
+USER scanner
+
 # ---------------------------------------------------------------------------
 # Pre-download the fastembed model so it's baked into the image.
 # Avoids a ~90 MB download on first scan (cold-start penalty in Fargate).
@@ -24,12 +37,9 @@ RUN python -c "from fastembed import TextEmbedding; TextEmbedding('sentence-tran
 # ---------------------------------------------------------------------------
 # Application code (changes most often — last layer for cache efficiency).
 # ---------------------------------------------------------------------------
-COPY *.py ./
-COPY scans/ ./scans/
-COPY scripts/ ./scripts/
-
-# Create data directory for EFS mount (trades.db will live here)
-RUN mkdir -p /data
+COPY --chown=scanner:scanner *.py ./
+COPY --chown=scanner:scanner scans/ ./scans/
+COPY --chown=scanner:scanner scripts/ ./scripts/
 
 # Health check via unauthenticated healthz endpoint.
 # Port resolution mirrors config.py: prefer DASHBOARD_PORT, fall back to Railway's

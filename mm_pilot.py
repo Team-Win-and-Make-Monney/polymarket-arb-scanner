@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -480,6 +481,8 @@ class KalshiMMPilot:
         self.canary_graduated = False
         self.canary_clean_fills = 0
         self._live_started_ts = self._time_fn()
+        self._daily_pnl_date = self._utc_date()
+        self._daily_pnl_opening_total = self.inventory.realized_pnl_total()
 
         self._decision_writer = decision_writer
         self._decision_fh = None
@@ -661,6 +664,36 @@ class KalshiMMPilot:
                        for info in self._orders.values()
                        if info["ticker"] == ticker)
 
+    def _total_resting_notional(self) -> float:
+        """Return aggregate notional reserved by every resting pilot order."""
+        with self._lock:
+            return sum(
+                info["count"] * info["price"] for info in self._orders.values()
+            )
+
+    def _utc_date(self) -> str:
+        """Return the current UTC date using the injectable wall clock."""
+        return datetime.fromtimestamp(self._time_fn(), tz=timezone.utc).date().isoformat()
+
+    def _daily_realized_pnl(self) -> float:
+        """Return realized P&L since the persisted opening total for this UTC day."""
+        day = self._utc_date()
+        total = self.inventory.realized_pnl_total()
+        with self._lock:
+            if self._daily_pnl_date != day:
+                self._daily_pnl_date = day
+                self._daily_pnl_opening_total = total
+            return total - self._daily_pnl_opening_total
+
+    @staticmethod
+    def _dashboard_paused() -> bool:
+        """Fail closed when the dashboard's operator pause is engaged."""
+        try:
+            from dashboard import is_paused
+        except ImportError:
+            return False
+        return bool(is_paused())
+
     # -- restart persistence / startup reconciliation (finding #4) -----------
 
     def _persist_state(self) -> None:
@@ -684,6 +717,8 @@ class KalshiMMPilot:
             "orders": orders_snapshot,
             "inventory": self.inventory.snapshot(),
             "seen_fill_ids": list(self._seen_fill_ids.keys())[-200:],
+            "daily_pnl_date": self._daily_pnl_date,
+            "daily_pnl_opening_total": self._daily_pnl_opening_total,
             "saved_at": self._time_fn(),
         }
         self._state_store.save(state)
@@ -864,6 +899,23 @@ class KalshiMMPilot:
         self.inventory.restore({"net": net_map, "avg": avg_map,
                                "realized": realized_map})
 
+        current_total = self.inventory.realized_pnl_total()
+        current_day = self._utc_date()
+        persisted_day = (persisted or {}).get("daily_pnl_date")
+        persisted_opening = (persisted or {}).get("daily_pnl_opening_total")
+        if persisted_day == current_day:
+            try:
+                opening_total = float(persisted_opening)
+            except (TypeError, ValueError):
+                opening_total = current_total
+            if not math.isfinite(opening_total):
+                opening_total = current_total
+        else:
+            opening_total = current_total
+        with self._lock:
+            self._daily_pnl_date = current_day
+            self._daily_pnl_opening_total = opening_total
+
         with self._lock:
             self._orders = {}
             for fill in fills or []:
@@ -929,6 +981,8 @@ class KalshiMMPilot:
             return GateResult(False, "kill_switch_env")
         if not self._controls.is_enabled():
             return GateResult(False, "kill_switch")
+        if self._dashboard_paused():
+            return GateResult(False, "dashboard_paused")
         # 2. Platform allowlist + hardcoded venue
         if PLATFORM not in config.ENABLED_EXECUTION_PLATFORMS:
             return GateResult(False, "platform_not_allowlisted")
@@ -949,6 +1003,9 @@ class KalshiMMPilot:
             and (signed > 0) != (net_ct > 0)
             and count <= abs(net_ct)
         )
+        if (not derived_reducing
+                and self._daily_realized_pnl() <= -config.MM_MAX_DAILY_LOSS_USD):
+            return GateResult(False, "daily_loss_limit")
         from kalshi_policy import live_kalshi_submit_allowed
         if not live_kalshi_submit_allowed(
             ticker, reducing=reducing or derived_reducing
@@ -996,6 +1053,13 @@ class KalshiMMPilot:
             if (self.inventory.total_net_usd() + notional
                     > config.MM_MAX_TOTAL_INVENTORY_USD):
                 return GateResult(False, "total_inventory_cap")
+            aggregate = (
+                self.inventory.total_net_usd()
+                + self._total_resting_notional()
+                + notional
+            )
+            if aggregate > config.MM_MAX_TOTAL_INVENTORY_USD:
+                return GateResult(False, "aggregate_notional_cap")
         # 7. Gross cap: inventory at cost + resting quote notional + this order
         gross = net_usd + self._resting_notional(ticker) + notional
         if gross > config.MM_MAX_GROSS_PER_MARKET_USD:
@@ -1290,7 +1354,11 @@ class KalshiMMPilot:
             gate("G0b_fill_sight", False, "fills_blind")
             return {"action": "pull", "reason": "fills_blind"}
         # G1 kill switch
-        g1 = config.MM_KALSHI_PILOT_ENABLED and self._controls.is_enabled()
+        g1 = (
+            config.MM_KALSHI_PILOT_ENABLED
+            and self._controls.is_enabled()
+            and not self._dashboard_paused()
+        )
         if not gate("G1_kill_switch", g1, "ok" if g1 else "kill_switch"):
             self.halt_all("kill switch off or control plane stale")
             return {"action": "halted", "reason": "kill_switch"}
@@ -1753,9 +1821,19 @@ class KalshiMMPilot:
                 if self.halted:
                     return
 
-        # 3. Canary accounting (deviation checks halt the whole pilot).
-        # Realized-loss ceiling considers ALL fills — hedge exits are where
-        # canary losses actually crystallize.
+        # 3. Always-on UTC-day loss accounting. The operator envelope is a
+        # permanent ceiling, not a canary-only rollout threshold.
+        daily_realized = self._daily_realized_pnl()
+        if daily_realized <= -config.MM_MAX_DAILY_LOSS_USD:
+            label = "canary realized P&L" if not self.canary_graduated else "daily realized P&L"
+            self.halt_all(
+                f"{label} ${daily_realized:.2f} at or below daily ceiling "
+                f"-${config.MM_MAX_DAILY_LOSS_USD:.2f}"
+            )
+            return
+
+        # Canary accounting (deviation checks halt the whole pilot).
+        # The canary keeps its own tighter lifetime ceiling until graduation.
         if not self.canary_graduated:
             realized = self.inventory.realized_pnl_total()
             if realized < -config.MM_CANARY_MAX_LOSS_USD:

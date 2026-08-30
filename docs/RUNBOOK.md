@@ -13,11 +13,12 @@
   - All platform credentials (see `PLATFORM-MATRIX.md`)
 - Health check: `GET /healthz` on 8080. The Dockerfile healthcheck reads Railway's `PORT` before falling back to 8080 (PR #19).
 - Persistent state: `DATA_DIR` holds `trades.db` + `snapshots.db`.
+- The primary container runs as the unprivileged `scanner` user. The separate SX Bet proxy requires `SXBET_PROXY_TOKEN` (32+ URL-safe characters), accepts only authenticated GET requests, and strips caller `Authorization` before proxying.
 - IBKR needs a reachable IB Gateway socket — not viable from Railway without a persistent gateway host.
 
 ## Live Kalshi D0 gate
 
-Generic `--exec-mode full-auto` is not an approved runbook. The only verified live path is `scripts/launch-kalshi-d0-live.sh`. Before invoking it, verify the account and credentials, current jurisdiction/product eligibility, limits, physical emergency stop, and one operator message containing all five envelope fields: `venue`, `pair`, `max_notional_usd`, `max_daily_loss_usd`, and `kill_switch`. Obtain separate action-time approval immediately before launch.
+Generic `--exec-mode full-auto` is disabled and is not an approved runbook. The only verified live path is `scripts/launch-kalshi-d0-live.sh`. Before invoking it, verify the account and credentials, current jurisdiction/product eligibility, limits, physical emergency stop, and one operator message containing all five envelope fields: `venue`, `pair`, `max_notional_usd`, `max_daily_loss_usd`, and `kill_switch`. The envelope bounds both aggregate resting/inventory notional and UTC-day realized loss. Obtain separate action-time approval immediately before launch.
 
 ## Post-deploy checklist (run before trusting live trading)
 1. `/healthz` returns 200.
@@ -26,6 +27,7 @@ Generic `--exec-mode full-auto` is not an approved runbook. The only verified li
 4. Exactly one worker (no duplicate).
 5. Balances / open orders reconciled by `recovery.py:reconcile_orphaned_positions()` (runs on startup).
 6. `validate_config()` passed (startup log) and execution flags match intent.
+7. Authenticated dashboard JSON pause/resume works, and pausing causes the MM pilot to cancel resting quotes.
 
 ## Safe feature-flag enablement
 Enable one research flag at a time with `DRY_RUN=true` and watch a full cycle. Feature flags and credentials do not authorize `DRY_RUN=false`.

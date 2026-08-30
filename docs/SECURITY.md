@@ -17,6 +17,12 @@
 - **[ENFORCED]** `DASHBOARD_HOST` defaults to `127.0.0.1` (loopback). `DASHBOARD_PASS` default is empty (= no auth, loopback only).
 - **[ENFORCED]** `validate_config()` raises `ConfigError` if `DASHBOARD_HOST` is non-loopback (e.g. `0.0.0.0` for Railway) while `DASHBOARD_PASS` is empty — you cannot expose the dashboard publicly without a password.
 - **[ENFORCED]** Dashboard XSS surface in `dashboard_ui.py` was closed (Sprint 1, PR #28) — DOM construction via `textContent`, regression-guarded by `tests/test_dashboard_ui.py`.
+- **[ENFORCED]** State-changing dashboard endpoints require authenticated `application/json` requests and reject explicit cross-site browser origins. The MM pilot checks the dashboard pause state before authorizing or placing quotes.
+
+## Runtime and supply-chain boundaries
+- **[ENFORCED]** The primary scanner container runs as the unprivileged `scanner` user.
+- **[ENFORCED]** The SX proxy requires a strong deployment-provided token, rate-limits requests, accepts only GET, and removes caller `Authorization` before forwarding.
+- **[ENFORCED]** Third-party GitHub Actions are pinned to full commit SHAs; the public-data LIP workflow has zero token permissions and checkout credentials are not persisted.
 
 ## Error monitoring & redaction
 - **[ENFORCED]** Sentry is wired at scanner entry points (PR #26).

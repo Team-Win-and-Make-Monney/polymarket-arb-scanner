@@ -2,7 +2,7 @@
 
 Python CLI for detecting and paper-evaluating prediction-market arbitrage. The repository contains multiple venue adapters and execution code, but the project is currently paused for broad expansion and is dry-run by default.
 
-> **Current operating state (2026-08-27):** PR #134 is merged and Railway is running that exact commit as a healthy Kalshi-only dry-run worker. Draft PR #135 contains the remaining audit reconciliation and is not merged or deployed. The only verified live operating target remains the separately gated Kalshi D0 launcher. No generic multi-venue live command is authorized. See [`docs/STATE.md`](docs/STATE.md).
+> **Current operating state (2026-08-29):** PR #134 is merged and Railway is running the merged Kalshi-only dry-run line. PR #135 contains the remaining audit reconciliation and security remediation; it is not merged or deployed. The only verified live operating target remains the separately gated Kalshi D0 launcher, and generic live execution now fails closed in configuration. See [`docs/STATE.md`](docs/STATE.md).
 >
 > Renamed from `polymarket-arb-scanner` on 2026-05-09. The new name reflects the actual scope — a grid of platforms × layers × strategies, not a Polymarket-only scanner. Local clones may keep the old directory name without any functional impact.
 
@@ -92,8 +92,8 @@ All settings are env vars with defaults defined in `config.py`. `validate_config
 Key groups:
 
 - **Platform credentials** — `POLYMARKET_PRIVATE_KEY`, `KALSHI_API_KEY_ID` + `KALSHI_PRIVATE_KEY_PATH`, `BETFAIR_*`, `SMARKETS_API_KEY`, `SXBET_API_KEY`, `MATCHBOOK_USERNAME`/`MATCHBOOK_PASSWORD`, `GEMINI_API_KEY`/`GEMINI_API_SECRET`, explicit `IBKR_HOST`/`IBKR_PORT`/`IBKR_CLIENT_ID`, and `METACULUS_API_KEY` plus `METACULUS_COMMERCIAL_USE_APPROVED=true` only after written commercial API permission.
-- **Execution** — `DRY_RUN` (default `true`), `EXECUTION_MODE`, `MAX_TRADE_SIZE`. `DRY_RUN=false` is not sufficient authority by itself.
-- **Risk** — `DAILY_LOSS_LIMIT`, `MAX_OPEN_POSITIONS`, `MIN_LIQUIDITY`, `MIN_NET_ROI`.
+- **Execution** — `DRY_RUN` (default `true`), `EXECUTION_MODE`, `MAX_TRADE_SIZE`. `DRY_RUN=false` requires the guarded Kalshi MM pilot and is not sufficient authority by itself.
+- **Risk** — `DAILY_LOSS_LIMIT`, `MAX_OPEN_POSITIONS`, `MIN_LIQUIDITY`, `MIN_NET_ROI`, and the pilot's per-market, aggregate-inventory, and UTC-day loss caps.
 - **Feature flags** (default `false`) — `MM_ENABLED`, `SNAPSHOT_ENABLED`, `DYNAMIC_FEE_ENABLED`, `EVENT_MONITOR_ENABLED`, `MM_AUTO_HEDGE_ENABLED`, `FEE_PROMO_ENABLED`, `CROSS_MM_ENABLED`, `AUTO_REBALANCE_ENABLED`.
 - **Infra** — `WEBHOOK_URL`, `DASHBOARD_PORT`, `DASHBOARD_HOST`, `DASHBOARD_PASS`, `DATA_DIR`, `LOG_LEVEL`, `LOG_FILE`.
 
@@ -117,6 +117,7 @@ CI runs correctness lint plus `pytest` on every PR to `master` (Python 3.12) and
 - Default container worker: `python scanner.py --continuous --mode kalshi` in dry-run. Broad `all` scans remain an explicit local choice, not the unattended Railway default.
 - Health check: `/healthz` on port 8080.
 - Persistent state (`trades.db`) lives under `DATA_DIR`.
+- The primary image runs as an unprivileged `scanner` user. The separate SX Bet proxy image requires a deployment-provided `SXBET_PROXY_TOKEN` and refuses to start without a strong token.
 
 IBKR connectivity requires a reachable IB Gateway socket — not viable from Railway without a persistent gateway host.
 
@@ -124,7 +125,7 @@ IBKR connectivity requires a reachable IB Gateway socket — not viable from Rai
 
 - Broad multi-venue expansion is parked while safety and reproducibility work is consolidated.
 - PR #134 is merged on `master`; its Railway deployment is healthy, Kalshi-only, and dry-run.
-- The remaining audit reconciliation is published as draft PR #135; it is not merged or deployed.
+- The remaining audit reconciliation and security remediation are in PR #135; it is not merged or deployed.
 - Railway still runs both `arb-scanner` and the legacy `polymarket-egress-proxy`, so the parked project is not resource-free.
 - Verified live readiness: Kalshi D0 only, subject to all operator gates and separate action-time approval.
 - This is a personal trading tool. **Out of scope:** public-facing product, SaaS, user accounts, selling access.

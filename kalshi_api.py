@@ -92,6 +92,10 @@ class KalshiPortfolioQueryError(Exception):
     pass
 
 
+class KalshiOrderIndeterminate(RuntimeError):
+    """Raised when an order may have reached Kalshi but no verdict returned."""
+
+
 class KalshiClient:
     """Kalshi API client with RSA-PSS API key authentication."""
 
@@ -666,10 +670,14 @@ class KalshiClient:
             resp = self._request("POST", "/portfolio/orders", json_body=body)
         except Exception as e:
             logger.error("Kalshi place_order exception: %s (ticker=%s)", e, ticker)
-            return None
+            raise KalshiOrderIndeterminate(
+                f"Kalshi order outcome is indeterminate for {ticker}"
+            ) from e
         if resp is None:
             logger.warning("Kalshi place_order got no response (ticker=%s body=%s)", ticker, body)
-            return None
+            raise KalshiOrderIndeterminate(
+                f"Kalshi order outcome is indeterminate for {ticker}: no response"
+            )
         if resp.status_code in (200, 201):
             return resp.json()
         logger.error("Kalshi place_order HTTP %s: %s (ticker=%s)", resp.status_code, resp.text[:300], ticker)

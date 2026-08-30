@@ -13,6 +13,7 @@ import logging
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -297,6 +298,32 @@ def _send_401(handler):
     handler.wfile.write(body)
 
 
+def _check_post_origin(handler) -> bool:
+    """Require a non-simple JSON request and reject explicit cross-site origins."""
+    content_type = handler.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+    if content_type != "application/json":
+        _send_json(handler, {"error": "Content-Type must be application/json"}, 415)
+        return False
+
+    fetch_site = handler.headers.get("Sec-Fetch-Site", "").strip().lower()
+    if fetch_site == "cross-site":
+        _send_json(handler, {"error": "cross-site POST denied"}, 403)
+        return False
+
+    origin = handler.headers.get("Origin", "").strip()
+    if not origin:
+        # Non-browser clients do not send Origin. Strict JSON still prevents a
+        # cross-origin simple-form request, and this server exposes no CORS
+        # preflight handler that would permit attacker-authored JSON.
+        return True
+    parsed = urlsplit(origin)
+    host = handler.headers.get("Host", "").strip().lower()
+    if parsed.scheme not in ("http", "https") or parsed.netloc.lower() != host:
+        _send_json(handler, {"error": "origin does not match Host"}, 403)
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Response helpers
 # ---------------------------------------------------------------------------
@@ -414,6 +441,8 @@ class _Handler(BaseHTTPRequestHandler):
             _send_401(self)
             return
         if not _check_auth(self):
+            return
+        if not _check_post_origin(self):
             return
 
         # Read the full request body (after auth) to avoid connection resets.

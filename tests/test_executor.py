@@ -140,6 +140,7 @@ class TestBuildLegs:
         assert legs[0]["side"] == "yes"
         assert legs[0]["_ticker"] == "TICKER-ABC"
         assert legs[1]["side"] == "no"
+        assert {leg["_contract_count"] for leg in legs} == {6}
 
     def test_kalshi_multi_legs(self, executor):
         opp = {
@@ -152,6 +153,7 @@ class TestBuildLegs:
         for i, leg in enumerate(legs):
             assert leg["platform"] == "kalshi"
             assert leg["_ticker"] == opp["_kalshi_tickers"][i]
+        assert {leg["_contract_count"] for leg in legs} == {6}
 
     def test_cross_pm_yes_kalshi_no(self, executor):
         opp = {
@@ -1726,6 +1728,7 @@ class TestRevalidateKalshiMulti:
         with patch("executor.net_profit_kalshi_multi", return_value={"net_profit": 0.095}):
             result = executor._revalidate(opp, None)
             assert result is True
+        assert opp["_kalshi_prices"] == pytest.approx([0.45, 0.45])
 
     def test_fails_when_no_tickers(self, executor):
         """KalshiMulti revalidation fails with empty _kalshi_tickers."""
@@ -2243,6 +2246,15 @@ class TestMinOrderSize:
         with patch("executor.ENABLED_EXECUTION_PLATFORMS",
                    frozenset(["polymarket", "kalshi"])):
             success, _, _ = executor._execute_single_leg(leg, 3.0, opp)
+        assert success is False
+        executor.kalshi_client.place_order.assert_not_called()
+
+    def test_generic_live_kalshi_path_is_disabled(self, executor):
+        executor.dry_run = False
+        leg = {"platform": "kalshi", "side": "yes", "action": "buy",
+               "price": 0.50, "_ticker": "KXTEST-1"}
+        with patch("executor.ENABLED_EXECUTION_PLATFORMS", frozenset({"kalshi"})):
+            success, _, _ = executor._execute_single_leg(leg, 3.0, {"type": "KalshiBinary"})
         assert success is False
         executor.kalshi_client.place_order.assert_not_called()
 

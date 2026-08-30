@@ -1,6 +1,7 @@
 """Risk management gates for arbitrage execution."""
 
 import logging
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -77,17 +78,23 @@ class RiskManager:
             if "Kalshi" in opp_type and "Cross" not in opp_type:
                 # Kalshi-only arb: entire cost is on Kalshi
                 k_balance = balances.get("kalshi", 0)
-                if k_balance is not None and k_balance < trade_cost:
+                if not isinstance(k_balance, (int, float)) or not math.isfinite(k_balance):
+                    return False, "Kalshi balance unavailable"
+                if k_balance < trade_cost:
                     return False, f"Insufficient Kalshi balance (${k_balance:.2f})"
             elif opp_type.startswith("Gemini"):
                 # Gemini-only arb: entire cost is on Gemini
                 g_balance = balances.get("gemini", 0)
-                if g_balance is not None and g_balance < trade_cost:
+                if not isinstance(g_balance, (int, float)) or not math.isfinite(g_balance):
+                    return False, "Gemini balance unavailable"
+                if g_balance < trade_cost:
                     return False, f"Insufficient Gemini balance (${g_balance:.2f})"
             elif opp_type.startswith("IBKR"):
                 # IBKR-only arb: entire cost is on IBKR
                 i_balance = balances.get("ibkr", 0)
-                if i_balance is not None and i_balance < trade_cost:
+                if not isinstance(i_balance, (int, float)) or not math.isfinite(i_balance):
+                    return False, "IBKR balance unavailable"
+                if i_balance < trade_cost:
                     return False, f"Insufficient IBKR balance (${i_balance:.2f})"
             elif "Cross" in opp_type:
                 # Cross-platform: check both participating platforms
@@ -101,11 +108,15 @@ class RiskManager:
                     # A missing per-leg notional must not be guessed as 50/50.
                     # Requiring each venue to cover the full bounded size is
                     # conservative and cannot authorize an underfunded leg.
-                    if bal is not None and bal < trade_cost:
+                    if not isinstance(bal, (int, float)) or not math.isfinite(bal):
+                        return False, f"{plat.capitalize()} balance unavailable"
+                    if bal < trade_cost:
                         return False, f"Insufficient {plat.capitalize()} balance (${bal:.2f})"
             else:
                 pm_balance = balances.get("polymarket", 0)
-                if pm_balance is not None and pm_balance < trade_cost:
+                if not isinstance(pm_balance, (int, float)) or not math.isfinite(pm_balance):
+                    return False, "Polymarket balance unavailable"
+                if pm_balance < trade_cost:
                     return False, f"Insufficient Polymarket balance (${pm_balance:.2f})"
 
         # 4. Order book depth check (tiered by ROI)

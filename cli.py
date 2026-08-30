@@ -105,6 +105,7 @@ from config import (
     polymarket_reward_fetch_enabled,
     DEFAULT_MIN_PROFIT,
     MAX_TRADE_SIZE as CONFIG_MAX_TRADE_SIZE,
+    DRY_RUN as CONFIG_DRY_RUN,
     DAILY_LOSS_LIMIT as CONFIG_DAILY_LOSS_LIMIT,
     MAX_OPEN_POSITIONS as CONFIG_MAX_OPEN_POSITIONS,
     MAX_DAILY_TRADES as CONFIG_MAX_DAILY_TRADES,
@@ -131,6 +132,11 @@ from config import (
     CONCURRENT_EXECUTION as CONFIG_CONCURRENT_EXECUTION,
     REWARDS_ENABLED as CONFIG_REWARDS_ENABLED,
 )
+
+
+def _resolve_dry_run(cli_value: bool | None) -> bool:
+    """Return the single config-parsed execution mode unless CLI overrides it."""
+    return CONFIG_DRY_RUN if cli_value is None else cli_value
 
 # Project-local .env only — never merge personal/global env files (e.g.
 # ~/.claude/.env) into the bot environment.
@@ -1308,7 +1314,7 @@ def main():
     min_profit = args.min_profit or float(os.getenv("MIN_PROFIT_THRESHOLD", DEFAULT_MIN_PROFIT))
 
     # Resolve execution settings from CLI > .env > defaults
-    dry_run = args.dry_run if args.dry_run is not None else os.getenv("DRY_RUN", "true").lower() == "true"
+    dry_run = _resolve_dry_run(args.dry_run)
     exec_mode = args.exec_mode or os.getenv("EXECUTION_MODE", "semi-auto")
     max_trade = args.max_trade or float(os.getenv("MAX_TRADE_SIZE", "5.0"))
 

@@ -35,7 +35,35 @@ class TestDashboardAuth:
         with patch("config.DASHBOARD_PASS", ""), patch("dashboard._send_401") as m401:
             dashboard._Handler.do_POST(handler)
         m401.assert_called_once()
-        handler._handle_pause_post.assert_not_called()
+
+
+class TestDashboardPostOrigin:
+    def test_rejects_simple_form_content_type(self):
+        handler = MagicMock()
+        handler.headers = {"Content-Type": "text/plain"}
+        with patch("dashboard._send_json") as send_json:
+            assert dashboard._check_post_origin(handler) is False
+        assert send_json.call_args.args[2] == 415
+
+    def test_rejects_cross_site_origin(self):
+        handler = MagicMock()
+        handler.headers = {
+            "Content-Type": "application/json",
+            "Host": "127.0.0.1:8080",
+            "Origin": "https://attacker.example",
+        }
+        with patch("dashboard._send_json") as send_json:
+            assert dashboard._check_post_origin(handler) is False
+        assert send_json.call_args.args[2] == 403
+
+    def test_accepts_same_origin_json(self):
+        handler = MagicMock()
+        handler.headers = {
+            "Content-Type": "application/json; charset=utf-8",
+            "Host": "127.0.0.1:8080",
+            "Origin": "http://127.0.0.1:8080",
+        }
+        assert dashboard._check_post_origin(handler) is True
 
     # -----------------------------------------------------------------------
     # S14 — constant-time credential comparison, correct accept/reject

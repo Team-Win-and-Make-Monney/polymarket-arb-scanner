@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -237,6 +238,7 @@ class ArbitrageExecutor:
         # Prevents catastrophic loops when the same bogus opportunity keeps
         # failing (e.g. insufficient liquidity) and is re-presented.
         self._failed_cooldowns: dict[str, float] = {}
+        self._kalshi_reconciliation_required = False
         self._FAILED_COOLDOWN_SECS = FAILED_TRADE_COOLDOWN
         # HARDEN-03: structured decision log (JSONL)
         _data_dir = os.getenv("DATA_DIR", ".")
@@ -305,6 +307,13 @@ class ArbitrageExecutor:
                 return False
         except ImportError:
             pass  # Dashboard not available (e.g. tests)
+
+        if not self.dry_run and self._kalshi_reconciliation_required:
+            logger.error(
+                "Kalshi execution is halted pending explicit venue reconciliation"
+            )
+            self._log_skipped(opportunity, "kalshi_reconciliation_required")
+            return False
 
         # 0b. Failed-trade cooldown — prevent re-execution loops
         cooldown_key = opportunity.get("_kalshi_ticker") or market
@@ -378,6 +387,10 @@ class ArbitrageExecutor:
 
         # 2. Risk gate (uses cached balances to avoid redundant API calls)
         balances = self._get_cached_balances(opp_type)
+        if not self.dry_run and not balances:
+            logger.warning("Live execution blocked: required venue balances are unknown")
+            self._log_skipped(opportunity, "balance_unavailable")
+            return False
         allowed, reason = self.risk.check(opportunity, self.db, balances)
         if not allowed:
             logger.info(f"{prefix}Risk blocked: {reason}")
@@ -413,6 +426,17 @@ class ArbitrageExecutor:
             logger.info(f"{prefix}Could not build execution legs. Skipping.")
             self._log_skipped(opportunity, "no_legs")
             return False
+        if not self.dry_run:
+            for platform in {leg["platform"] for leg in legs}:
+                balance = (balances or {}).get(platform)
+                if (not isinstance(balance, (int, float))
+                        or not math.isfinite(balance) or balance < 0):
+                    logger.warning(
+                        "Live execution blocked: %s balance is unknown or invalid",
+                        platform,
+                    )
+                    self._log_skipped(opportunity, f"balance_unavailable:{platform}")
+                    return False
 
         # 4b. Entry-discipline gate: never enter positions the market won't
         # buy back (penny longshots have no exit liquidity; see hedger.py).
@@ -1187,6 +1211,8 @@ class ArbitrageExecutor:
             )
             return False, reval_profit, "profit_below_floor"
         opp["net_profit"] = reval_profit
+        opp["_kalshi_yes"] = k_yes
+        opp["_kalshi_no"] = k_no
         return True, reval_profit, "passed"
 
     def _revalidate_kalshi_multi(
@@ -1240,6 +1266,7 @@ class ArbitrageExecutor:
             )
             return False, reval_profit, "profit_below_floor"
         opp["net_profit"] = reval_profit
+        opp["_kalshi_prices"] = list(yes_prices)
         return True, reval_profit, "passed"
 
     def _revalidate_triangular(
@@ -1694,22 +1721,31 @@ class ArbitrageExecutor:
 
         if opp_type == "KalshiBinary":
             # Buy YES + NO on same Kalshi market
+            prices = [opportunity["_kalshi_yes"], opportunity["_kalshi_no"]]
+            package_cost = sum(prices)
+            contract_count = max(1, int(size / package_cost)) if package_cost > 0 else 0
             legs = [
                 {"platform": "kalshi", "side": "yes", "action": "buy",
                  "price": opportunity["_kalshi_yes"],
-                 "_ticker": opportunity["_kalshi_ticker"]},
+                 "_ticker": opportunity["_kalshi_ticker"],
+                 "_contract_count": contract_count},
                 {"platform": "kalshi", "side": "no", "action": "buy",
                  "price": opportunity["_kalshi_no"],
-                 "_ticker": opportunity["_kalshi_ticker"]},
+                 "_ticker": opportunity["_kalshi_ticker"],
+                 "_contract_count": contract_count},
             ]
         elif opp_type.startswith("KalshiMulti"):
             # Buy YES on every outcome in a Kalshi event
+            prices = list(opportunity["_kalshi_prices"])
+            package_cost = sum(prices)
+            contract_count = max(1, int(size / package_cost)) if package_cost > 0 else 0
             legs = [
                 {"platform": "kalshi", "side": "yes", "action": "buy",
-                 "price": price, "_ticker": ticker}
+                 "price": price, "_ticker": ticker,
+                 "_contract_count": contract_count}
                 for ticker, price in zip(
                     opportunity["_kalshi_tickers"],
-                    opportunity["_kalshi_prices"],
+                    prices,
                 )
             ]
         elif opp_type == "Binary":
@@ -2693,12 +2729,13 @@ class ArbitrageExecutor:
         for leg in legs:
             price = leg.get("price", 0)
             if price > 0:
-                count = int(size / price)
+                count = leg.get("_contract_count", int(size / price))
                 plat = leg["platform"]
                 cost_per_platform[plat] = cost_per_platform.get(plat, 0) + count * price
         for plat, cost in cost_per_platform.items():
             bal = cached_balances.get(plat)
-            if bal is not None and isinstance(bal, (int, float)) and cost > bal * 0.95:
+            if (isinstance(bal, (int, float)) and math.isfinite(bal)
+                    and bal >= 0 and cost > bal * 0.95):
                 logger.warning(
                     "Pre-flight: %s cost $%.2f exceeds 95%% of balance $%.2f. Skipping.",
                     plat, cost, bal,
@@ -3112,11 +3149,18 @@ class ArbitrageExecutor:
         elif platform == "kalshi":
             if not self.kalshi_client:
                 return False, None, None
+            if not self.dry_run:
+                logger.error(
+                    "Generic live Kalshi execution is disabled; use the guarded MM pilot launcher"
+                )
+                return False, None, None
             ticker = leg.get("_ticker", "")
             side = leg.get("side", "yes")
             action = leg.get("action", "buy")
             # Convert dollar size to contracts (1 contract = $1 payout)
-            count = max(1, int(size / price)) if price > 0 else 1
+            count = leg.get("_contract_count")
+            if not isinstance(count, int) or count < 1:
+                count = max(1, int(size / price)) if price > 0 else 1
             leg["_max_contracts"] = count
 
             # Determine time-in-force based on config and leg position

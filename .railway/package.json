@@ -1,0 +1,11 @@
+{
+  "name": "polymarket-railway-iac",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "plan": "railway config plan --detailed-exit-code"
+  },
+  "dependencies": {
+    "railway": "3.11.0"
+  }
+}

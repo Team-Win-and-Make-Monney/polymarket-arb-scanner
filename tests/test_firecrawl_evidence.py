@@ -6,11 +6,13 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import Mock
 
 import httpx
 import pytest
 
 from firecrawl_evidence import FirecrawlEvidenceClient, normalize_evidence
+from scripts.firecrawl_resolution_evidence import main
 
 
 class TestFirecrawlEvidence:
@@ -111,6 +113,60 @@ class TestFirecrawlEvidence:
         )
         assert result.returncode == 2
         assert "Refusing external dispatch" in result.stderr
+
+    def test_non_terminal_job_is_cancelled_at_deadline(self):
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.method == "POST":
+                return httpx.Response(200, json={"success": True, "id": "job-timeout"})
+            if request.method == "DELETE":
+                return httpx.Response(200, json={"success": True})
+            return httpx.Response(200, json={"success": True, "status": "processing"})
+
+        client = FirecrawlEvidenceClient(
+            "fixture-key",
+            timeout_seconds=0.01,
+            poll_interval_seconds=0.02,
+            transport=httpx.MockTransport(handler),
+        )
+
+        with pytest.raises(TimeoutError, match="timed out"):
+            client.discover("Did the official result publish?")
+
+        assert [(request.method, request.url.path) for request in requests] == [
+            ("POST", "/v2/agent"),
+            ("GET", "/v2/agent/job-timeout"),
+            ("DELETE", "/v2/agent/job-timeout"),
+        ]
+
+    def test_cli_accepts_only_exact_gate_and_emits_complete_artifact(self, monkeypatch, capsys):
+        client = Mock()
+        client.discover.return_value = {"evidence": [], "authorizes_trading": False}
+        factory = Mock(return_value=client)
+        monkeypatch.setenv("FIRECRAWL_EVIDENCE_ALLOW_EXTERNAL_DISPATCH", "1")
+        monkeypatch.setenv("FIRECRAWL_API_KEY", "fixture-key")
+
+        assert main(["Approved question"], client_factory=factory) == 0
+        assert json.loads(capsys.readouterr().out)["authorizes_trading"] is False
+        client.discover.assert_called_once_with("Approved question", max_age_hours=72)
+
+        monkeypatch.setenv("FIRECRAWL_EVIDENCE_ALLOW_EXTERNAL_DISPATCH", "0")
+        stale_factory = Mock()
+        assert main(["Stale question"], client_factory=stale_factory) == 2
+        stale_factory.assert_not_called()
+
+    def test_cli_failure_emits_no_partial_artifact(self, monkeypatch, capsys):
+        client = Mock()
+        client.discover.side_effect = RuntimeError("provider failed")
+        monkeypatch.setenv("FIRECRAWL_EVIDENCE_ALLOW_EXTERNAL_DISPATCH", "1")
+        monkeypatch.setenv("FIRECRAWL_API_KEY", "fixture-key")
+
+        assert main(["Approved question"], client_factory=Mock(return_value=client)) == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "no artifact emitted" in captured.err
 
     def test_module_does_not_import_trading_or_market_clients(self):
         source = Path("firecrawl_evidence.py").read_text()

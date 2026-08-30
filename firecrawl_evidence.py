@@ -79,48 +79,70 @@ class FirecrawlEvidenceClient:
         )
         headers = {"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"}
         deadline = time.monotonic() + self._timeout_seconds
+        job_id: str | None = None
+        terminal = False
 
-        with httpx.Client(timeout=30, transport=self._transport) as client:
-            response = client.post(
-                "https://api.firecrawl.dev/v2/agent",
-                headers=headers,
-                json={
-                    "prompt": prompt,
-                    "schema": EVIDENCE_SCHEMA,
-                    "maxCredits": self._max_credits,
-                    "model": "spark-1-mini",
-                },
-            )
-            response.raise_for_status()
-            job_id = response.json().get("id")
-            if not job_id:
-                raise RuntimeError("Firecrawl did not return an agent job id.")
-
-            while time.monotonic() < deadline:
-                status_response = client.get(
-                    f"https://api.firecrawl.dev/v2/agent/{job_id}", headers=headers
+        with httpx.Client(transport=self._transport) as client:
+            try:
+                response = client.post(
+                    "https://api.firecrawl.dev/v2/agent",
+                    headers=headers,
+                    json={
+                        "prompt": prompt,
+                        "schema": EVIDENCE_SCHEMA,
+                        "maxCredits": self._max_credits,
+                        "model": "spark-1-mini",
+                    },
+                    timeout=_remaining_seconds(deadline),
                 )
-                status_response.raise_for_status()
-                payload = status_response.json()
-                status = payload.get("status")
-                if status == "completed":
-                    credits_used = payload.get("creditsUsed")
-                    if isinstance(credits_used, (int, float)) and credits_used > self._max_credits:
-                        raise RuntimeError("Firecrawl reported usage above the requested credit cap.")
-                    return normalize_evidence(
-                        question,
-                        payload.get("data"),
-                        max_age_hours=max_age_hours,
-                        max_credits=self._max_credits,
-                        credits_used=credits_used,
-                    )
-                if status == "failed":
-                    raise RuntimeError("Firecrawl evidence discovery failed.")
-                if status != "processing":
-                    raise RuntimeError("Firecrawl returned an unknown agent status.")
-                time.sleep(self._poll_interval_seconds)
+                response.raise_for_status()
+                job_id_value = response.json().get("id")
+                if not isinstance(job_id_value, str) or not job_id_value:
+                    raise RuntimeError("Firecrawl did not return an agent job id.")
+                job_id = job_id_value
 
-        raise TimeoutError("Firecrawl evidence discovery timed out.")
+                while True:
+                    status_response = client.get(
+                        f"https://api.firecrawl.dev/v2/agent/{job_id}",
+                        headers=headers,
+                        timeout=_remaining_seconds(deadline),
+                    )
+                    status_response.raise_for_status()
+                    payload = status_response.json()
+                    status = payload.get("status")
+                    if status == "completed":
+                        terminal = True
+                        credits_used = payload.get("creditsUsed")
+                        if (
+                            isinstance(credits_used, (int, float))
+                            and credits_used > self._max_credits
+                        ):
+                            raise RuntimeError(
+                                "Firecrawl reported usage above the requested credit cap."
+                            )
+                        return normalize_evidence(
+                            question,
+                            payload.get("data"),
+                            max_age_hours=max_age_hours,
+                            max_credits=self._max_credits,
+                            credits_used=credits_used,
+                        )
+                    if status in {"failed", "cancelled"}:
+                        terminal = True
+                        raise RuntimeError(f"Firecrawl evidence discovery {status}.")
+                    if status != "processing":
+                        raise RuntimeError("Firecrawl returned an unknown agent status.")
+                    remaining = _remaining_seconds(deadline)
+                    if self._poll_interval_seconds > 0:
+                        time.sleep(min(self._poll_interval_seconds, remaining))
+            finally:
+                if job_id and not terminal:
+                    cancel_response = client.delete(
+                        f"https://api.firecrawl.dev/v2/agent/{job_id}",
+                        headers=headers,
+                        timeout=5.0,
+                    )
+                    cancel_response.raise_for_status()
 
 
 def normalize_evidence(
@@ -216,3 +238,11 @@ def _freshness(published_at: datetime | None, now: datetime, max_age_hours: int)
     if published_at < now - timedelta(hours=max_age_hours):
         return "stale"
     return "current"
+
+
+def _remaining_seconds(deadline: float) -> float:
+    """Return a positive per-request timeout within the discovery deadline."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Firecrawl evidence discovery timed out.")
+    return min(30.0, remaining)

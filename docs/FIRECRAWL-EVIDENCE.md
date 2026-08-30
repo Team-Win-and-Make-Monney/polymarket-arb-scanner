@@ -15,6 +15,9 @@ FIRECRAWL_EVIDENCE_ALLOW_EXTERNAL_DISPATCH=1 \
 ```
 
 Do not run it without separate approval for the exact query and Firecrawl credit cap.
+Supply `FIRECRAWL_API_KEY` through the approved runtime secret mechanism; never
+commit or print it. A non-terminal Agent job is cancelled when the local discovery
+deadline expires, with a bounded five-second cancellation request.
 The maximum accepted cap is 25 credits. Output strips URL credentials, queries, and
 fragments; ignores price-like provider fields; hashes retained evidence; and labels
 missing publication dates `unknown` rather than treating retrieval time as freshness.

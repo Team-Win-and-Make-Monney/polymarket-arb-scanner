@@ -215,6 +215,37 @@ class TestRefineCrossWithClob:
 
     @patch("scans.cross._fetch_clob_for_market")
     @patch("scans.cross.net_profit_cross_platform")
+    def test_equal_results_keep_selected_second_strategy(self, mock_fee, mock_clob):
+        """Equal-valued result dicts must not remap the chosen strategy."""
+        mock_clob.return_value = (
+            {"conditionId": "mk1"},
+            {
+                "yes_ask": 0.30,
+                "no_ask": 0.60,
+                "yes_ask_size": 100,
+                "no_ask_size": 40,
+            },
+        )
+        mock_fee.side_effect = [
+            {"net_profit": 0.10, "fees": 0.02, "gross_spread": 0.12},
+            {"net_profit": 0.10, "fees": 0.02, "gross_spread": 0.12},
+        ]
+        opp = {
+            "_market_key": "mk1",
+            "_kalshi_yes": 0.20,
+            "_kalshi_no": 0.70,
+        }
+
+        result = _refine_cross_with_clob(
+            [opp], {"mk1": {"conditionId": "mk1"}}, 0.005,
+        )
+
+        assert result[0]["prices"] == "PM_N=0.600 K_Y=0.200"
+        assert result[0]["total_cost"] == "$0.8000"
+        assert result[0]["_clob_depth"] == 40
+
+    @patch("scans.cross._fetch_clob_for_market")
+    @patch("scans.cross.net_profit_cross_platform")
     def test_drops_candidate_below_min_profit(self, mock_fee, mock_clob):
         mock_clob.return_value = (
             {"conditionId": "mk1"},

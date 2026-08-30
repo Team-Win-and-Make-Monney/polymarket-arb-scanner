@@ -172,6 +172,8 @@ class TestKalshiRequest:
             client._request("GET", "/markets")
         # tenacity retried 3 times
         assert client.session.request.call_count == 3
+        assert kalshi_api._circuit._failures == 1
+        assert not kalshi_api._circuit.is_open()
 
     @patch("kalshi_api._rate_limit")
     def test_retry_on_connection_error(self, mock_rl, client):

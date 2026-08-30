@@ -789,10 +789,10 @@ if args.mode in ("all", "whale-copy") and CONFIG_WHALE_COPY_ENABLED:
 ### Primary (HIGH confidence)
 
 - [Polymarket CLOB contract on Polygon](https://polygonscan.com/address/0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e) — confirmed via on-chain verification
-- Phase 8 scan architecture: [imbalance](../../../scans/imbalance.py), [news snipe](../../../scans/news_snipe.py), [correlated](../../../scans/correlated.py), and [time decay](../../../scans/time_decay.py) — verified from codebase lines 1-201
-- [Executor `_build_legs` pattern](../../../executor.py#L1135) — verified from codebase lines 1135-1550
-- [Config feature flag pattern](../../../config.py) — verified Phase 8 (IMBALANCE_ENABLED, NEWS_SNIPE_ENABLED, CORRELATED_ENABLED, TIME_DECAY_ENABLED)
-- [Continuous mode integration](../../../continuous.py#L1163) — verified Phase 8 scan handlers through line 1242
+- [Phase 8 scan architecture](scans/imbalance.py, scans/news_snipe.py, scans/correlated.py, scans/time_decay.py) — verified from codebase lines 1-201
+- [Executor _build_legs pattern](executor.py:1135) — verified from codebase lines 1135-1550
+- [Config feature flag pattern](config.py) — verified Phase 8 (IMBALANCE_ENABLED, NEWS_SNIPE_ENABLED, CORRELATED_ENABLED, TIME_DECAY_ENABLED)
+- [Continuous mode integration](continuous.py:1163-1242) — verified Phase 8 scan handlers
 
 ### Secondary (MEDIUM confidence)
 
@@ -802,8 +802,8 @@ if args.mode in ("all", "whale-copy") and CONFIG_WHALE_COPY_ENABLED:
 
 ### Tertiary (LOW confidence)
 
-- CLOB transaction parsing complexity (`docs.polymarket.com` not directly consulted) — assumed from py-clob-client usage; needs Phase 10 verification
-- [Semantic rule JSON format](09-CONTEXT.md) — assumption based on the phase context; not verified against an external spec and may need adjustment
+- [CLOB transaction parsing complexity](docs.polymarket.com not directly consulted) — assumed from py-clob-client usage; needs Phase 10 verification
+- [Semantic rule JSON format](assumption based on CONTEXT.md) — not verified against external spec; user may need adjustment
 
 ## Metadata
 

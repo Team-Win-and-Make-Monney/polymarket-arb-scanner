@@ -154,16 +154,26 @@ class KalshiClient:
             "Accept": "application/json",
         }
 
+    def _request(self, method: str, path: str, params: dict | None = None,
+                 json_body: dict | None = None) -> requests.Response | None:
+        """Make one logical request, counting exhausted retries once."""
+        if _circuit.is_open():
+            raise _RateLimitError("Circuit open -- kalshi in backoff")
+        try:
+            return self._request_with_retry(method, path, params=params, json_body=json_body)
+        except (_RateLimitError, requests.ConnectionError, requests.Timeout):
+            _circuit.record_failure()
+            raise
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
         retry=retry_if_exception_type((_RateLimitError, requests.ConnectionError, requests.Timeout)),
         reraise=True,
     )
-    def _request(self, method: str, path: str, params: dict | None = None, json_body: dict | None = None) -> requests.Response | None:
-        """Make an authenticated request to Kalshi API with retry."""
-        if _circuit.is_open():
-            raise _RateLimitError("Circuit open -- kalshi in backoff")
+    def _request_with_retry(self, method: str, path: str, params: dict | None = None,
+                            json_body: dict | None = None) -> requests.Response | None:
+        """Execute one retried request without double-counting attempts."""
         _rate_limit()
         headers = self._auth_headers(method, path)
         url = KALSHI_BASE_URL + KALSHI_API_PATH + path
@@ -177,7 +187,6 @@ class KalshiClient:
                 timeout=30,
             )
             if resp.status_code == 429:
-                _circuit.record_failure()
                 raise _RateLimitError(f"Rate limited: {method} {path}")
             if 200 <= resp.status_code < 300:
                 _circuit.record_success()
@@ -186,7 +195,6 @@ class KalshiClient:
             return resp
         except (requests.ConnectionError, requests.Timeout) as e:
             logger.warning("Kalshi request failed (%s %s): %s", method, path, e)
-            _circuit.record_failure()
             raise
         except requests.RequestException as e:
             logger.warning("Kalshi request failed (%s %s): %s", method, path, e)

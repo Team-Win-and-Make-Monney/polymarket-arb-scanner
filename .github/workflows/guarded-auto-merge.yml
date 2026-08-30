@@ -1,0 +1,70 @@
+name: Enable guarded auto-merge
+
+on:
+  pull_request_target:
+    types: [labeled, unlabeled, synchronize, converted_to_draft]
+
+concurrency:
+  group: guarded-auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  manage-auto-merge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Disable native auto-merge when authorization is invalidated
+        if: >-
+          github.event.action == 'synchronize' ||
+          github.event.action == 'converted_to_draft' ||
+          (github.event.action == 'unlabeled' && github.event.label.name == 'automerge')
+        env:
+          EVENT_ACTION: ${{ github.event.action }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [[ "$EVENT_ACTION" == "unlabeled" ]] &&
+             [[ "$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq 'any(.labels[]; .name == "automerge")')" == "true" ]]; then
+            exit 0
+          fi
+
+          if [[ "$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.auto_merge != null')" == "true" ]]; then
+            gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --disable-auto
+          fi
+
+      - name: Remove stale authorization after a head change
+        if: >-
+          github.event.action == 'synchronize' &&
+          contains(github.event.pull_request.labels.*.name, 'automerge')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh api --method DELETE "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/automerge"
+
+      - name: Enable native auto-merge at the current head
+        if: >-
+          github.event.action == 'labeled' &&
+          github.event.label.name == 'automerge' &&
+          github.event.pull_request.draft == false
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LABEL_ACTOR: ${{ github.event.sender.login }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          permission="$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$LABEL_ACTOR/permission" --jq '.permission')"
+          case "$permission" in
+            push|maintain|admin) ;;
+            *) echo "Actor $LABEL_ACTOR lacks merge-level repository permission"; exit 1 ;;
+          esac
+
+          gh pr merge "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --match-head-commit "$PR_HEAD_SHA" \
+            --auto \
+            --squash \
+            --delete-branch

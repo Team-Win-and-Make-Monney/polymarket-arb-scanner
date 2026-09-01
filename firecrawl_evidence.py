@@ -117,16 +117,23 @@ class FirecrawlEvidenceClient:
                     raise RuntimeError("Firecrawl did not return an agent job id.")
                 job_id = job_id_value
 
-                final_poll = time.monotonic() >= deadline
+                final_poll = False
                 while True:
-                    status_response = client.get(
-                        f"https://api.firecrawl.dev/v2/agent/{job_id}",
-                        headers=headers,
-                        # Permit one bounded readback after the discovery deadline. A paid
-                        # job may finish during the final sleep, and skipping that readback
-                        # would incorrectly report a completed run as a timeout.
-                        timeout=5.0 if final_poll else _remaining_seconds(deadline),
-                    )
+                    if not final_poll and time.monotonic() >= deadline:
+                        final_poll = True
+                    try:
+                        status_response = client.get(
+                            f"https://api.firecrawl.dev/v2/agent/{job_id}",
+                            headers=headers,
+                            # Permit one bounded readback after the discovery deadline. A
+                            # paid job may finish during the final sleep or status request.
+                            timeout=5.0 if final_poll else _remaining_seconds(deadline),
+                        )
+                    except httpx.TimeoutException:
+                        if final_poll or time.monotonic() < deadline:
+                            raise
+                        final_poll = True
+                        continue
                     status_response.raise_for_status()
                     payload = _response_object(status_response, "agent status")
                     status = payload.get("status")
@@ -168,8 +175,6 @@ class FirecrawlEvidenceClient:
                     if self._poll_interval_seconds > 0:
                         sleep_seconds = min(self._poll_interval_seconds, remaining)
                         time.sleep(sleep_seconds)
-                        if sleep_seconds >= remaining:
-                            final_poll = True
             finally:
                 if job_id and not terminal:
                     _cancel_non_terminal_job(client, job_id, headers)

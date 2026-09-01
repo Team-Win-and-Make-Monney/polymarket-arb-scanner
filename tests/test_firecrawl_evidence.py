@@ -199,6 +199,89 @@ class TestFirecrawlEvidence:
             ("GET", "/v2/agent/job-final-poll"),
         ]
 
+    def test_sleep_overrun_still_allows_final_deadline_poll(self, monkeypatch):
+        requests: list[httpx.Request] = []
+        clock = {"now": 100.0}
+        status_polls = 0
+
+        monkeypatch.setattr("firecrawl_evidence.time.monotonic", lambda: clock["now"])
+        monkeypatch.setattr(
+            "firecrawl_evidence.time.sleep",
+            lambda seconds: clock.__setitem__("now", clock["now"] + seconds + 1),
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal status_polls
+            requests.append(request)
+            if request.method == "POST":
+                return httpx.Response(200, json={"success": True, "id": "job-sleep-overrun"})
+            status_polls += 1
+            if status_polls == 1:
+                return httpx.Response(200, json={"success": True, "status": "processing"})
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "status": "completed",
+                    "creditsUsed": 1,
+                    "data": {"evidence": []},
+                },
+            )
+
+        client = FirecrawlEvidenceClient(
+            "fixture-key",
+            timeout_seconds=2,
+            poll_interval_seconds=1,
+            transport=httpx.MockTransport(handler),
+        )
+
+        assert client.discover("Did the official result publish?")["evidence"] == []
+        assert [(request.method, request.url.path) for request in requests] == [
+            ("POST", "/v2/agent"),
+            ("GET", "/v2/agent/job-sleep-overrun"),
+            ("GET", "/v2/agent/job-sleep-overrun"),
+        ]
+
+    def test_status_timeout_at_deadline_still_allows_final_poll(self, monkeypatch):
+        requests: list[httpx.Request] = []
+        clock = {"now": 100.0}
+        status_polls = 0
+
+        monkeypatch.setattr("firecrawl_evidence.time.monotonic", lambda: clock["now"])
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal status_polls
+            requests.append(request)
+            if request.method == "POST":
+                return httpx.Response(200, json={"success": True, "id": "job-status-timeout"})
+            status_polls += 1
+            if status_polls == 1:
+                clock["now"] = 102.0
+                raise httpx.ReadTimeout("status request reached deadline", request=request)
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "status": "completed",
+                    "creditsUsed": 1,
+                    "data": {"evidence": []},
+                },
+            )
+
+        client = FirecrawlEvidenceClient(
+            "fixture-key",
+            timeout_seconds=2,
+            poll_interval_seconds=0,
+            transport=httpx.MockTransport(handler),
+        )
+
+        assert client.discover("Did the official result publish?")["evidence"] == []
+        assert [(request.method, request.url.path) for request in requests] == [
+            ("POST", "/v2/agent"),
+            ("GET", "/v2/agent/job-status-timeout"),
+            ("GET", "/v2/agent/job-status-timeout"),
+        ]
+
     def test_cancel_conflict_does_not_replace_original_failure(self):
         requests: list[httpx.Request] = []
 

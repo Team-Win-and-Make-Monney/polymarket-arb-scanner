@@ -9,12 +9,15 @@ market state.
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 MAX_CREDITS = 25
 MAX_EVIDENCE_ITEMS = 8
@@ -114,11 +117,15 @@ class FirecrawlEvidenceClient:
                     raise RuntimeError("Firecrawl did not return an agent job id.")
                 job_id = job_id_value
 
+                final_poll = time.monotonic() >= deadline
                 while True:
                     status_response = client.get(
                         f"https://api.firecrawl.dev/v2/agent/{job_id}",
                         headers=headers,
-                        timeout=_remaining_seconds(deadline),
+                        # Permit one bounded readback after the discovery deadline. A paid
+                        # job may finish during the final sleep, and skipping that readback
+                        # would incorrectly report a completed run as a timeout.
+                        timeout=5.0 if final_poll else _remaining_seconds(deadline),
                     )
                     status_response.raise_for_status()
                     payload = _response_object(status_response, "agent status")
@@ -152,17 +159,20 @@ class FirecrawlEvidenceClient:
                         raise RuntimeError(f"Firecrawl evidence discovery {status}.")
                     if status != "processing":
                         raise RuntimeError("Firecrawl returned an unknown agent status.")
-                    remaining = _remaining_seconds(deadline)
+                    if final_poll:
+                        raise TimeoutError("Firecrawl evidence discovery timed out.")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        final_poll = True
+                        continue
                     if self._poll_interval_seconds > 0:
-                        time.sleep(min(self._poll_interval_seconds, remaining))
+                        sleep_seconds = min(self._poll_interval_seconds, remaining)
+                        time.sleep(sleep_seconds)
+                        if sleep_seconds >= remaining:
+                            final_poll = True
             finally:
                 if job_id and not terminal:
-                    cancel_response = client.delete(
-                        f"https://api.firecrawl.dev/v2/agent/{job_id}",
-                        headers=headers,
-                        timeout=5.0,
-                    )
-                    cancel_response.raise_for_status()
+                    _cancel_non_terminal_job(client, job_id, headers)
 
 
 # ---------------------------------------------------------------------------
@@ -268,3 +278,29 @@ def _remaining_seconds(deadline: float) -> float:
     if remaining <= 0:
         raise TimeoutError("Firecrawl evidence discovery timed out.")
     return min(30.0, remaining)
+
+
+def _cancel_non_terminal_job(
+    client: httpx.Client,
+    job_id: str,
+    headers: dict[str, str],
+) -> None:
+    """Best-effort cleanup that never replaces the discovery failure."""
+    try:
+        cancel_response = client.delete(
+            f"https://api.firecrawl.dev/v2/agent/{job_id}",
+            headers=headers,
+            timeout=5.0,
+        )
+        cancel_response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 409:
+            logger.debug("Firecrawl job %s was already terminal during cleanup", job_id)
+        else:
+            logger.warning(
+                "Firecrawl job %s cleanup returned HTTP %d",
+                job_id,
+                exc.response.status_code,
+            )
+    except httpx.HTTPError as exc:
+        logger.warning("Firecrawl job %s cleanup failed: %s", job_id, exc)

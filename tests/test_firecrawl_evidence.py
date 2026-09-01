@@ -145,7 +145,79 @@ class TestFirecrawlEvidence:
         assert [(request.method, request.url.path) for request in requests] == [
             ("POST", "/v2/agent"),
             ("GET", "/v2/agent/job-timeout"),
+            ("GET", "/v2/agent/job-timeout"),
             ("DELETE", "/v2/agent/job-timeout"),
+        ]
+
+    def test_final_deadline_poll_can_observe_completion(self, monkeypatch):
+        requests: list[httpx.Request] = []
+        clock = {"now": 100.0}
+        status_polls = 0
+
+        monkeypatch.setattr("firecrawl_evidence.time.monotonic", lambda: clock["now"])
+        monkeypatch.setattr(
+            "firecrawl_evidence.time.sleep",
+            lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal status_polls
+            requests.append(request)
+            if request.method == "POST":
+                return httpx.Response(200, json={"success": True, "id": "job-final-poll"})
+            status_polls += 1
+            if status_polls == 1:
+                return httpx.Response(200, json={"success": True, "status": "processing"})
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "status": "completed",
+                    "creditsUsed": 1,
+                    "data": {"evidence": []},
+                },
+            )
+
+        client = FirecrawlEvidenceClient(
+            "fixture-key",
+            timeout_seconds=2,
+            poll_interval_seconds=2,
+            transport=httpx.MockTransport(handler),
+        )
+
+        artifact = client.discover("Did the official result publish?")
+
+        assert artifact["evidence"] == []
+        assert [(request.method, request.url.path) for request in requests] == [
+            ("POST", "/v2/agent"),
+            ("GET", "/v2/agent/job-final-poll"),
+            ("GET", "/v2/agent/job-final-poll"),
+        ]
+
+    def test_cancel_conflict_does_not_replace_original_failure(self):
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.method == "POST":
+                return httpx.Response(200, json={"success": True, "id": "job-raced-terminal"})
+            if request.method == "DELETE":
+                return httpx.Response(409, json={"success": False})
+            return httpx.Response(200, json=[])
+
+        client = FirecrawlEvidenceClient(
+            "fixture-key",
+            poll_interval_seconds=0,
+            transport=httpx.MockTransport(handler),
+        )
+
+        with pytest.raises(TypeError, match="non-object JSON for agent status"):
+            client.discover("Did the official result publish?")
+
+        assert [(request.method, request.url.path) for request in requests] == [
+            ("POST", "/v2/agent"),
+            ("GET", "/v2/agent/job-raced-terminal"),
+            ("DELETE", "/v2/agent/job-raced-terminal"),
         ]
 
     @pytest.mark.parametrize("data", [None, [], {}, {"evidence": {}}])

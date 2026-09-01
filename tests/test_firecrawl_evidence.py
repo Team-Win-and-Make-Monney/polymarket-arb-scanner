@@ -1,0 +1,414 @@
+from __future__ import annotations
+
+import ast
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import Mock
+
+import httpx
+import pytest
+
+from firecrawl_evidence import FirecrawlEvidenceClient, normalize_evidence
+from scripts.firecrawl_resolution_evidence import main
+
+
+class TestFirecrawlEvidence:
+    def test_agent_request_is_credit_capped_and_evidence_only(self):
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.method == "POST":
+                return httpx.Response(200, json={"success": True, "id": "job-1"})
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "status": "completed",
+                    "creditsUsed": 6,
+                    "data": {
+                        "evidence": [
+                            {
+                                "title": "Official result",
+                                "url": "https://agency.example.gov/result?token=remove#section",
+                                "summary": "The agency published the final result.",
+                                "published_at": "2026-08-29T12:00:00Z",
+                                "price": 0.99,
+                            }
+                        ]
+                    },
+                },
+            )
+
+        client = FirecrawlEvidenceClient(
+            "fixture-key",
+            max_credits=10,
+            poll_interval_seconds=0,
+            transport=httpx.MockTransport(handler),
+        )
+        artifact = client.discover("Did the agency publish the result?", max_age_hours=72)
+
+        assert artifact["scope"] == "resolution_evidence_only"
+        assert artifact["authorizes_trading"] is False
+        assert artifact["market_api_remains_authoritative"] is True
+        assert artifact["max_credits"] == 10
+        assert artifact["credits_used"] == 6
+        assert artifact["evidence"][0]["url"] == "https://agency.example.gov/result"
+        assert "price" not in artifact["evidence"][0]
+        body = json.loads(requests[0].content)
+        assert body["maxCredits"] == 10
+        assert body["model"] == "spark-1-mini"
+        assert (
+            "Exclude market prices, probabilities, order books, positions, trading advice, "
+            "and execution instructions."
+            in body["prompt"]
+        )
+        assert "fixture-key" not in requests[0].content.decode()
+        assert [request.url.path for request in requests] == ["/v2/agent", "/v2/agent/job-1"]
+
+    def test_missing_dates_are_unknown_not_fresh_and_urls_dedupe(self):
+        artifact = normalize_evidence(
+            "Question",
+            {
+                "evidence": [
+                    {
+                        "title": "Undated source",
+                        "url": "https://example.gov/update?a=1",
+                        "summary": "No publication date is present.",
+                        "published_at": None,
+                    },
+                    {
+                        "title": "Duplicate",
+                        "url": "https://example.gov/update?a=2#x",
+                        "summary": "Same canonical URL.",
+                        "published_at": "2026-08-29T10:00:00Z",
+                    },
+                    {
+                        "title": "Insecure",
+                        "url": "http://example.gov/update",
+                        "summary": "Rejected.",
+                    },
+                ]
+            },
+            max_age_hours=72,
+            max_credits=10,
+            now=datetime(2026, 8, 29, 12, tzinfo=timezone.utc),
+        )
+        assert len(artifact["evidence"]) == 1
+        assert artifact["evidence"][0]["freshness"] == "unknown"
+        assert artifact["evidence"][0]["published_at"] is None
+
+    def test_credit_bounds_fail_closed(self):
+        with pytest.raises(ValueError, match="max_credits"):
+            FirecrawlEvidenceClient("fixture", max_credits=26)
+
+    def test_cli_refuses_dispatch_by_default(self):
+        env = {"PATH": os.environ.get("PATH", "")}
+        result = subprocess.run(
+            [sys.executable, "scripts/firecrawl_resolution_evidence.py", "Test question"],
+            cwd=Path.cwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 2
+        assert "Refusing external dispatch" in result.stderr
+
+    def test_non_terminal_job_is_cancelled_at_deadline(self, monkeypatch):
+        requests: list[httpx.Request] = []
+        clock = {"now": 100.0}
+
+        monkeypatch.setattr("firecrawl_evidence.time.monotonic", lambda: clock["now"])
+        monkeypatch.setattr(
+            "firecrawl_evidence.time.sleep",
+            lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.method == "POST":
+                return httpx.Response(200, json={"success": True, "id": "job-timeout"})
+            if request.method == "DELETE":
+                return httpx.Response(200, json={"success": True})
+            return httpx.Response(200, json={"success": True, "status": "processing"})
+
+        client = FirecrawlEvidenceClient(
+            "fixture-key",
+            timeout_seconds=2,
+            poll_interval_seconds=2,
+            transport=httpx.MockTransport(handler),
+        )
+
+        with pytest.raises(TimeoutError, match="timed out"):
+            client.discover("Did the official result publish?")
+
+        assert [(request.method, request.url.path) for request in requests] == [
+            ("POST", "/v2/agent"),
+            ("GET", "/v2/agent/job-timeout"),
+            ("GET", "/v2/agent/job-timeout"),
+            ("DELETE", "/v2/agent/job-timeout"),
+        ]
+
+    def test_final_deadline_poll_can_observe_completion(self, monkeypatch):
+        requests: list[httpx.Request] = []
+        clock = {"now": 100.0}
+        status_polls = 0
+
+        monkeypatch.setattr("firecrawl_evidence.time.monotonic", lambda: clock["now"])
+        monkeypatch.setattr(
+            "firecrawl_evidence.time.sleep",
+            lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal status_polls
+            requests.append(request)
+            if request.method == "POST":
+                return httpx.Response(200, json={"success": True, "id": "job-final-poll"})
+            status_polls += 1
+            if status_polls == 1:
+                return httpx.Response(200, json={"success": True, "status": "processing"})
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "status": "completed",
+                    "creditsUsed": 1,
+                    "data": {"evidence": []},
+                },
+            )
+
+        client = FirecrawlEvidenceClient(
+            "fixture-key",
+            timeout_seconds=2,
+            poll_interval_seconds=2,
+            transport=httpx.MockTransport(handler),
+        )
+
+        artifact = client.discover("Did the official result publish?")
+
+        assert artifact["evidence"] == []
+        assert [(request.method, request.url.path) for request in requests] == [
+            ("POST", "/v2/agent"),
+            ("GET", "/v2/agent/job-final-poll"),
+            ("GET", "/v2/agent/job-final-poll"),
+        ]
+
+    def test_sleep_overrun_still_allows_final_deadline_poll(self, monkeypatch):
+        requests: list[httpx.Request] = []
+        clock = {"now": 100.0}
+        status_polls = 0
+
+        monkeypatch.setattr("firecrawl_evidence.time.monotonic", lambda: clock["now"])
+        monkeypatch.setattr(
+            "firecrawl_evidence.time.sleep",
+            lambda seconds: clock.__setitem__("now", clock["now"] + seconds + 1),
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal status_polls
+            requests.append(request)
+            if request.method == "POST":
+                return httpx.Response(200, json={"success": True, "id": "job-sleep-overrun"})
+            status_polls += 1
+            if status_polls == 1:
+                return httpx.Response(200, json={"success": True, "status": "processing"})
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "status": "completed",
+                    "creditsUsed": 1,
+                    "data": {"evidence": []},
+                },
+            )
+
+        client = FirecrawlEvidenceClient(
+            "fixture-key",
+            timeout_seconds=2,
+            poll_interval_seconds=1,
+            transport=httpx.MockTransport(handler),
+        )
+
+        assert client.discover("Did the official result publish?")["evidence"] == []
+        assert [(request.method, request.url.path) for request in requests] == [
+            ("POST", "/v2/agent"),
+            ("GET", "/v2/agent/job-sleep-overrun"),
+            ("GET", "/v2/agent/job-sleep-overrun"),
+        ]
+
+    def test_status_timeout_at_deadline_still_allows_final_poll(self, monkeypatch):
+        requests: list[httpx.Request] = []
+        clock = {"now": 100.0}
+        status_polls = 0
+
+        monkeypatch.setattr("firecrawl_evidence.time.monotonic", lambda: clock["now"])
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal status_polls
+            requests.append(request)
+            if request.method == "POST":
+                return httpx.Response(200, json={"success": True, "id": "job-status-timeout"})
+            status_polls += 1
+            if status_polls == 1:
+                clock["now"] = 102.0
+                raise httpx.ReadTimeout("status request reached deadline", request=request)
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "status": "completed",
+                    "creditsUsed": 1,
+                    "data": {"evidence": []},
+                },
+            )
+
+        client = FirecrawlEvidenceClient(
+            "fixture-key",
+            timeout_seconds=2,
+            poll_interval_seconds=0,
+            transport=httpx.MockTransport(handler),
+        )
+
+        assert client.discover("Did the official result publish?")["evidence"] == []
+        assert [(request.method, request.url.path) for request in requests] == [
+            ("POST", "/v2/agent"),
+            ("GET", "/v2/agent/job-status-timeout"),
+            ("GET", "/v2/agent/job-status-timeout"),
+        ]
+
+    def test_cancel_conflict_does_not_replace_original_failure(self):
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.method == "POST":
+                return httpx.Response(200, json={"success": True, "id": "job-raced-terminal"})
+            if request.method == "DELETE":
+                return httpx.Response(409, json={"success": False})
+            return httpx.Response(200, json=[])
+
+        client = FirecrawlEvidenceClient(
+            "fixture-key",
+            poll_interval_seconds=0,
+            transport=httpx.MockTransport(handler),
+        )
+
+        with pytest.raises(TypeError, match="non-object JSON for agent status"):
+            client.discover("Did the official result publish?")
+
+        assert [(request.method, request.url.path) for request in requests] == [
+            ("POST", "/v2/agent"),
+            ("GET", "/v2/agent/job-raced-terminal"),
+            ("DELETE", "/v2/agent/job-raced-terminal"),
+        ]
+
+    @pytest.mark.parametrize("data", [None, [], {}, {"evidence": {}}])
+    def test_completed_job_requires_structured_evidence_array(self, data):
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.method == "POST":
+                return httpx.Response(200, json={"success": True, "id": "job-invalid"})
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "status": "completed",
+                    "creditsUsed": 1,
+                    "data": data,
+                },
+            )
+
+        client = FirecrawlEvidenceClient(
+            "fixture-key",
+            poll_interval_seconds=0,
+            transport=httpx.MockTransport(handler),
+        )
+
+        with pytest.raises(RuntimeError, match="structured evidence array"):
+            client.discover("Did the official result publish?")
+
+        assert [request.url.path for request in requests] == ["/v2/agent", "/v2/agent/job-invalid"]
+
+    def test_invalid_agent_creation_json_fails_closed(self):
+        client = FirecrawlEvidenceClient(
+            "fixture-key",
+            poll_interval_seconds=0,
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, text="{not-json", request=request)
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="invalid JSON for agent creation"):
+            client.discover("Did the official result publish?")
+
+    def test_non_object_status_json_fails_closed_and_cancels(self):
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.method == "POST":
+                return httpx.Response(200, json={"success": True, "id": "job-invalid"})
+            if request.method == "DELETE":
+                return httpx.Response(200, json={"success": True})
+            return httpx.Response(200, json=[])
+
+        client = FirecrawlEvidenceClient(
+            "fixture-key",
+            poll_interval_seconds=0,
+            transport=httpx.MockTransport(handler),
+        )
+
+        with pytest.raises(TypeError, match="non-object JSON for agent status"):
+            client.discover("Did the official result publish?")
+
+        assert [(request.method, request.url.path) for request in requests] == [
+            ("POST", "/v2/agent"),
+            ("GET", "/v2/agent/job-invalid"),
+            ("DELETE", "/v2/agent/job-invalid"),
+        ]
+
+    def test_cli_accepts_only_exact_gate_and_emits_complete_artifact(self, monkeypatch, capsys):
+        client = Mock()
+        client.discover.return_value = {"evidence": [], "authorizes_trading": False}
+        factory = Mock(return_value=client)
+        monkeypatch.setenv("FIRECRAWL_EVIDENCE_ALLOW_EXTERNAL_DISPATCH", "1")
+        monkeypatch.setenv("FIRECRAWL_API_KEY", "fixture-key")
+
+        assert main(["Approved question"], client_factory=factory) == 0
+        assert json.loads(capsys.readouterr().out)["authorizes_trading"] is False
+        client.discover.assert_called_once_with("Approved question", max_age_hours=72)
+
+        monkeypatch.setenv("FIRECRAWL_EVIDENCE_ALLOW_EXTERNAL_DISPATCH", "0")
+        stale_factory = Mock()
+        assert main(["Stale question"], client_factory=stale_factory) == 2
+        stale_factory.assert_not_called()
+
+    def test_cli_failure_emits_no_partial_artifact(self, monkeypatch, capsys):
+        client = Mock()
+        client.discover.side_effect = RuntimeError("provider failed")
+        monkeypatch.setenv("FIRECRAWL_EVIDENCE_ALLOW_EXTERNAL_DISPATCH", "1")
+        monkeypatch.setenv("FIRECRAWL_API_KEY", "fixture-key")
+
+        assert main(["Approved question"], client_factory=Mock(return_value=client)) == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "no artifact emitted" in captured.err
+
+    def test_module_does_not_import_trading_or_market_clients(self):
+        source = Path("firecrawl_evidence.py").read_text()
+        forbidden = ("executor", "polymarket_api", "orderbook", "continuous", "risk_manager")
+        imported_modules: set[str] = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                imported_modules.update(alias.name.split(".", maxsplit=1)[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported_modules.add(node.module.split(".", maxsplit=1)[0])
+        assert imported_modules.isdisjoint(forbidden)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import subprocess
@@ -61,7 +62,11 @@ class TestFirecrawlEvidence:
         body = json.loads(requests[0].content)
         assert body["maxCredits"] == 10
         assert body["model"] == "spark-1-mini"
-        assert "prices" in body["prompt"]
+        assert (
+            "Exclude market prices, probabilities, order books, positions, trading advice, "
+            "and execution instructions."
+            in body["prompt"]
+        )
         assert "fixture-key" not in requests[0].content.decode()
         assert [request.url.path for request in requests] == ["/v2/agent", "/v2/agent/job-1"]
 
@@ -317,4 +322,10 @@ class TestFirecrawlEvidence:
     def test_module_does_not_import_trading_or_market_clients(self):
         source = Path("firecrawl_evidence.py").read_text()
         forbidden = ("executor", "polymarket_api", "orderbook", "continuous", "risk_manager")
-        assert all(f"import {name}" not in source for name in forbidden)
+        imported_modules: set[str] = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                imported_modules.update(alias.name.split(".", maxsplit=1)[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported_modules.add(node.module.split(".", maxsplit=1)[0])
+        assert imported_modules.isdisjoint(forbidden)

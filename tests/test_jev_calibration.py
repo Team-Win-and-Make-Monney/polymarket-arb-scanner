@@ -15,7 +15,6 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -31,7 +30,7 @@ from jev_calibration import (
     generate_calibration_report,
     render_ascii_reliability_diagram,
 )
-from scripts.sync_jev_resolutions import parse_resolution_outcome, sync_resolutions
+from scripts.sync_jev_resolutions import parse_resolution_outcome
 
 
 class TestBrierMath:

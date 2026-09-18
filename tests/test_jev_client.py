@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 # Ensure repo root is on sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from jev_client import JevClient, JevError, JevRateLimitError
+from jev_client import JevClient, JevError
 
 
 class TestJevClient(unittest.TestCase):

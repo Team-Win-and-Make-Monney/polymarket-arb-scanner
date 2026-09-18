@@ -271,7 +271,7 @@ def verify_cross_platform_equivalence_jev(
         from jev_client import get_jev_client
         j_client = client or get_jev_client()
         if not j_client.is_available():
-            return True, 0.5, "Jev unavailable; bypassed"
+            return False, 0.0, "Jev unavailable; fail-closed safety gate"
 
         title_a = _get_title(market_a)
         title_b = _get_title(market_b)
@@ -321,6 +321,8 @@ def match_cross_platform(
     platform_b: str,
     threshold: int = 80,
     min_confidence: str = "LOW",
+    verify_with_jev: bool = False,
+    jev_client=None,
 ) -> list[dict]:
     """Platform-agnostic cross-platform matching between any two market lists.
 
@@ -399,6 +401,13 @@ def match_cross_platform(
             )
             if CONFIDENCE_ORDER.get(confidence, 0) < min_conf_level:
                 continue
+            if verify_with_jev:
+                is_eq, _, reason = verify_cross_platform_equivalence_jev(
+                    ma, best_match, platform_a, platform_b, client=jev_client
+                )
+                if not is_eq:
+                    logger.debug("Jev rejected equivalence: %s", reason)
+                    continue
             matches.append({
                 "market_a": ma,
                 "market_b": best_match,

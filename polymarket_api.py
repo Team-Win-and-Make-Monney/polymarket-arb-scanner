@@ -384,7 +384,7 @@ class PolymarketTrader:
             if isinstance(resp, dict):
                 canceled = resp.get("canceled") or resp.get("cancelled") or []
                 if isinstance(canceled, list):
-                    return order_id in canceled or bool(canceled)
+                    return order_id in canceled or any(order_id == str(item) for item in canceled)
                 return bool(canceled)
             return True
         except Exception as e:

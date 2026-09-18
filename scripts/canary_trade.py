@@ -297,8 +297,9 @@ def main() -> int:
                 opp.get("net_profit"), opp.get("net_roi"),
             )
 
+    attempts = 0
     for opp in opps:
-        if acted >= CANARY_MAX_TRADES:
+        if acted >= CANARY_MAX_TRADES or attempts >= CANARY_MAX_TRADES:
             break
         roi = _parse_roi(opp)
         if roi < CANARY_MIN_NET_ROI:
@@ -312,6 +313,7 @@ def main() -> int:
         if platforms != {"polymarket", "kalshi"}:
             continue
 
+        attempts += 1
         row = {
             "market": opp.get("market"),
             "type": opp.get("type"),
@@ -360,6 +362,7 @@ def main() -> int:
     result = {
         "mode": args.mode,
         "candidates_acted": acted,
+        "attempts": attempts,
         "max_trades": CANARY_MAX_TRADES,
         "max_trade_size": CANARY_MAX_TRADE_SIZE,
         "min_roi": CANARY_MIN_NET_ROI,

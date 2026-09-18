@@ -11,7 +11,6 @@ Calculates:
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 from typing import Any
@@ -39,9 +38,17 @@ def calculate_brier_score(forecasts: list[float], outcomes: list[float]) -> floa
     Returns:
         Brier score between 0.0 (perfect prediction) and 1.0 (total divergence).
         Returns 0.0 if lists are empty.
+
+    Raises:
+        ValueError: If non-empty lists have mismatched lengths.
     """
-    if not forecasts or not outcomes or len(forecasts) != len(outcomes):
+    if not forecasts or not outcomes:
         return 0.0
+
+    if len(forecasts) != len(outcomes):
+        raise ValueError(
+            f"Mismatched input lengths: forecasts({len(forecasts)}) != outcomes({len(outcomes)})"
+        )
 
     total_sq_err = sum((f - o) ** 2 for f, o in zip(forecasts, outcomes))
     return total_sq_err / len(forecasts)

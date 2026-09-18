@@ -48,7 +48,7 @@ def fetch_market_by_question(question: str) -> dict | None:
             for m in markets:
                 if m.get("question", "").strip().lower() == question.strip().lower():
                     return m
-            return markets[0]
+            return None
     except Exception as e:
         logger.debug("Failed to fetch market for question '%s': %s", question, e)
         return None

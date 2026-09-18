@@ -911,6 +911,7 @@ def _scan_jev_crypto_continuous(
         min_profit=min_profit,
         jev_client=jev_client,
         db=db,
+        force=is_explicit,
     )
 
 

@@ -112,6 +112,21 @@ class TestMarketDiscoveryJev(unittest.TestCase):
         self.assertTrue(equiv)
         self.assertAlmostEqual(conf, 0.90)
 
+    def test_verify_cross_platform_equivalence_jev_fails_closed_when_unavailable(self):
+        """Test matcher gate fails closed when Jev is unavailable."""
+        mock_client = MagicMock()
+        mock_client.is_available.return_value = False
+
+        equiv, conf, reason = verify_cross_platform_equivalence_jev(
+            {"question": "Will Fed cut rates in Dec 2026?"},
+            {"title": "Fed rate cut at December 2026 meeting?"},
+            "polymarket",
+            "kalshi",
+            client=mock_client,
+        )
+        self.assertFalse(equiv)
+        self.assertIn("fail-closed", reason)
+
 
 if __name__ == "__main__":
     unittest.main()

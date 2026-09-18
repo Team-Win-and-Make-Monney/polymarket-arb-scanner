@@ -99,15 +99,16 @@ def _extract_strike_and_asset(question: str) -> tuple[str | None, float | None, 
     Returns:
         Tuple of (asset, strike_usd, direction: 'reach' or 'dip').
     """
+    import re
     q_lower = question.lower()
     asset = None
-    if "bitcoin" in q_lower or "btc" in q_lower:
+    if re.search(r"\b(bitcoin|btc)\b", q_lower):
         asset = "BTC"
-    elif "ethereum" in q_lower or "eth" in q_lower:
+    elif re.search(r"\b(ethereum|eth)\b", q_lower):
         asset = "ETH"
-    elif "solana" in q_lower or "sol" in q_lower:
+    elif re.search(r"\b(solana|sol)\b", q_lower):
         asset = "SOL"
-    elif "ripple" in q_lower or "xrp" in q_lower:
+    elif re.search(r"\b(ripple|xrp)\b", q_lower):
         asset = "XRP"
 
     if not asset:
@@ -115,7 +116,6 @@ def _extract_strike_and_asset(question: str) -> tuple[str | None, float | None, 
 
     direction = "dip" if ("dip" in q_lower or "below" in q_lower) else "reach"
 
-    import re
     match = re.search(r"\$([0-9,]+(?:\.[0-9]+)?)", question)
     if not match:
         return None, None, None
@@ -133,6 +133,7 @@ def scan_jev_crypto(
     min_profit: float = MIN_NET_ROI,
     jev_client: JevClient | None = None,
     db=None,
+    force: bool = False,
 ) -> list[dict]:
     """Scan Polymarket crypto markets and refine using Jev decisions.
 
@@ -142,12 +143,13 @@ def scan_jev_crypto(
         min_profit: Minimum net ROI threshold.
         jev_client: Optional JevClient instance (defaults to module singleton).
         db: Optional TradeDB instance for empirical calibration logging.
+        force: If True, bypasses JEV_CRYPTO_ENABLED flag (e.g. for explicit CLI/continuous mode).
 
     Returns:
         List of refined JevCrypto opportunity dicts.
     """
-    if not JEV_CRYPTO_ENABLED:
-        logger.debug("JEV_CRYPTO_ENABLED is False; skipping Jev scan")
+    if not (JEV_CRYPTO_ENABLED or force):
+        logger.debug("JEV_CRYPTO_ENABLED is False and not forced; skipping Jev scan")
         return []
 
     client = jev_client or get_jev_client()
@@ -255,12 +257,16 @@ def _refine_jev_crypto_with_clob(
         else:
             clob_data = None
 
-        if clob_data:
-            best_yes_ask = clob_data.get("yes_ask") or clob_data.get("best_ask") or cand["yes_price"]
-            best_no_ask = clob_data.get("no_ask") or cand["no_price"]
-        else:
-            best_yes_ask = cand["yes_price"]
-            best_no_ask = cand["no_price"]
+        if not clob_data:
+            # Stage 2 requires real CLOB order book data; fail closed
+            continue
+
+        best_yes_ask = clob_data.get("yes_ask") or clob_data.get("best_ask")
+        best_no_ask = clob_data.get("no_ask")
+
+        # Refinement requires verified positive ask prices
+        if not best_yes_ask or not best_no_ask or best_yes_ask <= 0 or best_no_ask <= 0:
+            continue
 
         spot_info = cand["spot_info"]
         end_date_str = market.get("endDate", "2026-12-31T23:59:59Z")
@@ -379,9 +385,11 @@ def _refine_jev_crypto_with_clob(
         if action == "buy_yes":
             exec_price = best_yes_ask
             prob_target = model_prob
+            clob_depth = float(clob_data.get("yes_ask_size") or clob_data.get("best_ask_size", 0) or 0)
         else:  # buy_no
             exec_price = best_no_ask
             prob_target = 1.0 - model_prob
+            clob_depth = float(clob_data.get("no_ask_size", 0) or 0)
 
         if raw_edge < JEV_MIN_EDGE:
             continue
@@ -404,6 +412,7 @@ def _refine_jev_crypto_with_clob(
             "net_roi": net_calc["net_roi"],
             "_market_key": cand["market_key"],
             "_token_ids": token_ids,
+            "_clob_depth": clob_depth,
             "_action": action,
             "_exec_price": exec_price,
             "_model_prob": model_prob,

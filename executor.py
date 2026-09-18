@@ -1043,6 +1043,23 @@ class ArbitrageExecutor:
         token_ids = opp.get("_token_ids", [])
         kalshi_ticker = opp.get("_kalshi_ticker", "")
 
+        # Cross-platform resolution equivalence gate via Jev System One
+        import config as _config
+        if getattr(_config, "JEV_CROSS_EQUIVALENCE_ENABLED", False):
+            from matcher import verify_cross_platform_equivalence_jev
+            ma = {"question": opp.get("market", "")}
+            mb = {"title": opp.get("kalshi", "")}
+            conf_thresh = getattr(_config, "JEV_CONFIDENCE_THRESHOLD", 0.70)
+            is_eq, conf, reason = verify_cross_platform_equivalence_jev(
+                ma, mb, "polymarket", "kalshi", min_confidence=conf_thresh
+            )
+            if not is_eq:
+                logger.warning(
+                    "Revalidation: Jev rejected cross-platform equivalence for %s vs %s: %s (conf=%.2f)",
+                    opp.get("market", ""), opp.get("kalshi", ""), reason, conf
+                )
+                return False, 0.0, f"jev_divergence: {reason}"
+
         # Re-fetch PM prices
         pm_yes = pm_no = None
         if len(token_ids) >= 2:

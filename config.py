@@ -766,11 +766,10 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 # ---------------------------------------------------------------------------
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 JEV_MODEL = os.getenv("JEV_MODEL", "typesafe/jev-1.13")
-JEV_CONFIDENCE_THRESHOLD = _env_float("JEV_CONFIDENCE_THRESHOLD", "0.50")
+JEV_CONFIDENCE_THRESHOLD = _env_float("JEV_CONFIDENCE_THRESHOLD", "0.70")
 JEV_MIN_EDGE = _env_float("JEV_MIN_EDGE", "0.04")
-JEV_CRYPTO_ENABLED = _env_bool(
-    "JEV_CRYPTO_ENABLED", "true" if os.getenv("OPENROUTER_API_KEY") else "false"
-)
+JEV_CRYPTO_ENABLED = _env_bool("JEV_CRYPTO_ENABLED", "false")
+JEV_CROSS_EQUIVALENCE_ENABLED = _env_bool("JEV_CROSS_EQUIVALENCE_ENABLED", "false")
 
 # Fee model: "expected_value" uses probability-weighted average fees,
 # "worst_case" uses max(case1, case2) — more conservative but overfilters.

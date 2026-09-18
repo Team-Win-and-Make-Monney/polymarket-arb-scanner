@@ -853,15 +853,14 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
             logger.info("--- Jev System One Crypto Scan ---")
             try:
                 from scans.jev_crypto import scan_jev_crypto
-                from db import TradeDB
-                db = TradeDB()
                 markets_by_key = {}
                 if poly_markets:
                     for mkt in poly_markets:
                         cid = mkt.get("condition_id", "") or mkt.get("conditionId", "") or mkt.get("question", "")
                         if cid:
                             markets_by_key[cid] = mkt
-                jev_opps = scan_jev_crypto(markets_by_key, min_profit=min_profit, db=db)
+                is_forced = (args.mode == "jev-crypto")
+                jev_opps = scan_jev_crypto(markets_by_key, min_profit=min_profit, db=db, force=is_forced)
                 all_opportunities.extend(jev_opps)
                 logger.info("Found %d Jev crypto opportunities.", len(jev_opps))
             except Exception as e:

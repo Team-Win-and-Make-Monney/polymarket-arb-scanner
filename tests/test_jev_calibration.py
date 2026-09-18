@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -55,8 +55,10 @@ class TestBrierMath:
 
     def test_empty_or_mismatched_inputs_safe(self):
         assert calculate_brier_score([], []) == 0.0
-        assert calculate_brier_score([0.5], [1.0, 0.0]) == 0.0
         assert calculate_brier_score([0.5], []) == 0.0
+        assert calculate_brier_score([], [1.0]) == 0.0
+        with pytest.raises(ValueError, match="Mismatched input lengths"):
+            calculate_brier_score([0.5], [1.0, 0.0])
 
     def test_brier_skill_score_positive_when_model_better(self):
         # Model predicted 0.90 for YES (outcome 1.0)

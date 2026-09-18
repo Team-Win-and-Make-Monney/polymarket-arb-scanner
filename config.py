@@ -131,7 +131,8 @@ KELLY_MAX_FRACTION = _env_float("KELLY_MAX_FRACTION", "0.25")
 
 # Execution
 DRY_RUN = _env_bool("DRY_RUN", "true")
-EXECUTION_MODE = os.getenv("EXECUTION_MODE", "semi-auto")
+_raw_exec_mode = os.getenv("EXECUTION_MODE", "semi-auto")
+EXECUTION_MODE = "full-auto" if _raw_exec_mode == "auto" else _raw_exec_mode
 
 # Canary / paper gates (used by scripts/canary_trade.py and optional CLI)
 # CANARY_MODE=paper  → scan real matched pairs, build legs, log only (no orders)
@@ -156,9 +157,12 @@ _VALID_PLATFORMS = frozenset([
     "sxbet", "matchbook", "gemini", "ibkr",
 ])
 _raw_enabled = os.getenv("ENABLED_EXECUTION_PLATFORMS", "polymarket,kalshi")
-ENABLED_EXECUTION_PLATFORMS: frozenset[str] = frozenset(
-    p.strip().lower() for p in _raw_enabled.split(",") if p.strip()
-)
+if _raw_enabled.strip().lower() in ("all", "all platforms", "*"):
+    ENABLED_EXECUTION_PLATFORMS: frozenset[str] = _VALID_PLATFORMS
+else:
+    ENABLED_EXECUTION_PLATFORMS: frozenset[str] = frozenset(
+        p.strip().lower() for p in _raw_enabled.split(",") if p.strip()
+    )
 
 # Platform minimum order sizes (USD). Orders below these are rejected
 # client-side to prevent API rejections and costly partial-fill hedging.
@@ -756,6 +760,17 @@ DISCOVERY_VERIFIED_PATH = os.getenv(
     "DISCOVERY_VERIFIED_PATH", os.path.join(DATA_DIR, "discovery", "verified_pairs.yaml")
 )
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+# ---------------------------------------------------------------------------
+# Jev System One Decision Engine
+# ---------------------------------------------------------------------------
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+JEV_MODEL = os.getenv("JEV_MODEL", "typesafe/jev-1.13")
+JEV_CONFIDENCE_THRESHOLD = _env_float("JEV_CONFIDENCE_THRESHOLD", "0.50")
+JEV_MIN_EDGE = _env_float("JEV_MIN_EDGE", "0.04")
+JEV_CRYPTO_ENABLED = _env_bool(
+    "JEV_CRYPTO_ENABLED", "true" if os.getenv("OPENROUTER_API_KEY") else "false"
+)
 
 # Fee model: "expected_value" uses probability-weighted average fees,
 # "worst_case" uses max(case1, case2) — more conservative but overfilters.

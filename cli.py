@@ -846,6 +846,27 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
         except Exception as e:
             logger.error("Kalshi rewards scan failed: %s", e)
 
+    # Jev System One Crypto Decision Scan
+    if args.mode in ("all", "jev-crypto"):
+        from config import JEV_CRYPTO_ENABLED, OPENROUTER_API_KEY
+        if (args.mode == "jev-crypto") or (JEV_CRYPTO_ENABLED and OPENROUTER_API_KEY):
+            logger.info("--- Jev System One Crypto Scan ---")
+            try:
+                from scans.jev_crypto import scan_jev_crypto
+                from db import TradeDB
+                db = TradeDB()
+                markets_by_key = {}
+                if poly_markets:
+                    for mkt in poly_markets:
+                        cid = mkt.get("condition_id", "") or mkt.get("conditionId", "") or mkt.get("question", "")
+                        if cid:
+                            markets_by_key[cid] = mkt
+                jev_opps = scan_jev_crypto(markets_by_key, min_profit=min_profit, db=db)
+                all_opportunities.extend(jev_opps)
+                logger.info("Found %d Jev crypto opportunities.", len(jev_opps))
+            except Exception as e:
+                logger.error("Jev crypto scan failed: %s", e)
+
     # Filter by minimum depth if specified
     if args.min_depth > 0:
         before = len(all_opportunities)
@@ -1126,9 +1147,9 @@ def main():
                  "imbalance", "news-snipe", "correlated", "time-decay",
                  "logical-arb", "whale-copy",
                  "fee-promo", "cross-mm",
-                 "lead-lag-mm", "toxic-flow", "vol-mm"],
+                 "lead-lag-mm", "toxic-flow", "vol-mm", "jev-crypto"],
         default="all",
-        help="Scan mode: all, binary, negrisk, negrisk-no, cross, kalshi, cross-all, spread, betfair, smarkets, sxbet, matchbook, gemini, ibkr, event, triangular, stale, resolution, convergence, mm, rewards, imbalance, news-snipe, correlated, time-decay, fee-promo, cross-mm",
+        help="Scan mode: all, binary, negrisk, negrisk-no, cross, kalshi, cross-all, spread, betfair, smarkets, sxbet, matchbook, gemini, ibkr, event, triangular, stale, resolution, convergence, mm, rewards, imbalance, news-snipe, correlated, time-decay, fee-promo, cross-mm, jev-crypto",
     )
     parser.add_argument(
         "--min-profit",

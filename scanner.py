@@ -45,6 +45,7 @@ from scans.resolution import scan_resolution_snipes  # noqa: F401
 from scans.convergence import scan_convergence  # noqa: F401
 from scans.fee_promo import scan_fee_promo  # noqa: F401
 from scans.cross_mm import scan_cross_mm  # noqa: F401
+from scans.jev_crypto import scan_jev_crypto, _refine_jev_crypto_with_clob  # noqa: F401
 from display import display_results as _display_results  # noqa: F401
 from continuous import check_settlements as _check_settlements, run_continuous as _run_continuous  # noqa: F401
 from cli import main, _run_oneshot  # noqa: F401

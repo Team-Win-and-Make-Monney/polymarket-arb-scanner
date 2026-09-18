@@ -1289,6 +1289,7 @@ class ToxicFlowDetector:
         self.toxicity_threshold = toxicity_threshold
         self._fills: dict[str, list[dict]] = {}
         self._pause_until: dict[str, float] = {}
+        self._pause_reasons: dict[str, str] = {}
         self._lock = threading.Lock()
 
     def record_fill(
@@ -1371,12 +1372,14 @@ class ToxicFlowDetector:
         self,
         market_key: str,
         pause_seconds: float | None = None,
+        reason: str = "",
     ) -> None:
         """Trigger a quoting pause for a market.
 
         Args:
             market_key: Market identifier.
             pause_seconds: Duration of pause (default from config).
+            reason: Optional human/system reason for the pause.
         """
         from config import MM_TOXIC_FLOW_PAUSE_SECONDS
 
@@ -1384,15 +1387,90 @@ class ToxicFlowDetector:
         toxicity = self.get_toxicity(market_key)
         with self._lock:
             self._pause_until[market_key] = time.time() + pause_seconds
+            if reason:
+                self._pause_reasons[market_key] = reason
         logger.warning(
-            "Toxic flow detected on %s (%.1f%%), pausing for %.0fs",
-            market_key, toxicity * 100, pause_seconds,
+            "Toxic flow detected on %s (%.1f%%)%s, pausing for %.0fs",
+            market_key, toxicity * 100, f" [{reason}]" if reason else "", pause_seconds,
         )
 
     def get_pause_remaining(self, market_key: str) -> float:
         """Get remaining pause time in seconds."""
         with self._lock:
             return max(0, self._pause_until.get(market_key, 0) - time.time())
+
+    def get_pause_reason(self, market_key: str) -> str:
+        """Get pause reason if set, or empty string."""
+        with self._lock:
+            return self._pause_reasons.get(market_key, "")
+
+    def evaluate_spot_toxicity_with_jev(
+        self,
+        market_key: str,
+        asset: str,
+        spot_delta_pct: float,
+        recent_fill_skew: float = 0.0,
+        client=None,
+    ) -> tuple[bool, float, str]:
+        """Evaluate whether an external spot jump constitutes toxic flow using Jev System One.
+
+        Args:
+            market_key: Market identifier.
+            asset: Underlying asset (e.g. 'BTC').
+            spot_delta_pct: Recent spot price % change (e.g. +3.2%).
+            recent_fill_skew: Recent fill skew (-1.0 to +1.0).
+            client: Optional JevClient instance.
+
+        Returns:
+            Tuple of (should_pause: bool, toxicity_score: float, reason: str).
+        """
+        try:
+            from jev_client import get_jev_client
+            j_client = client or get_jev_client()
+            if not j_client.is_available():
+                return False, 0.0, "Jev unavailable"
+
+            state = {
+                "market_key": market_key,
+                "asset": asset,
+                "spot_delta_pct": spot_delta_pct,
+                "recent_fill_skew": recent_fill_skew,
+            }
+            questions = {
+                "adverse_selection": {
+                    "type": "noul",
+                    "instructions": (
+                        "Given an abrupt `spot_delta_pct` move in `asset` and orderbook fill skew, "
+                        "does this market-making environment present acute adverse selection / toxic flow risk?"
+                    ),
+                },
+                "toxicity_score": {
+                    "type": "score",
+                    "instructions": "Rate the adverse selection severity for market makers.",
+                    "criteria": [
+                        "0: Benign retail noise / safe to quote",
+                        "1: Moderate directional drift / widen spreads",
+                        "2: Toxic informed sweep / pull quotes immediately",
+                    ],
+                },
+            }
+
+            resp = j_client.query_decisions(state, questions)
+            answers = resp.get("answers", {})
+            noul_p = float(answers.get("adverse_selection", {}).get("noul", 0.0))
+            score = float(answers.get("toxicity_score", {}).get("score", 0.0))
+            conf = float(answers.get("toxicity_score", {}).get("confidence", 0.0))
+
+            is_toxic = (noul_p >= 0.70) or (score >= 1.4)
+            reason = f"Jev toxicity: P(toxic)={noul_p:.2f}, score={score:.2f}, conf={conf:.2f}"
+
+            if is_toxic:
+                self.trigger_pause(market_key, reason=reason)
+
+            return is_toxic, score, reason
+        except Exception as e:
+            logger.debug("Jev spot toxicity evaluation failed: %s", e)
+            return False, 0.0, f"Error: {e}"
 
 
 # Module-level instances for convenience

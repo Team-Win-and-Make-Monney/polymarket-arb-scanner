@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,6 +19,8 @@ from config import (
     REVAL_FLOORS, get_layer,
     NEWS_SNIPE_CONFIDENCE_THRESHOLD, TIME_DECAY_MIN_CONSENSUS,
     MIN_ENTRY_PRICE, EXIT_LIQUIDITY_GATE_ENABLED, MIN_EXIT_BID_DEPTH,
+    JEV_CROSS_EQUIVALENCE_ENABLED, JEV_CONFIDENCE_THRESHOLD,
+    KALSHI_MULTI_MIN_DEPTH, MULTI_CROSS_MIN_DEPTH,
 )
 
 
@@ -1130,12 +1133,13 @@ class ArbitrageExecutor:
         kalshi_ticker = opp.get("_kalshi_ticker", "")
 
         # Cross-platform resolution equivalence gate via Jev System One
-        import config as _config
-        if getattr(_config, "JEV_CROSS_EQUIVALENCE_ENABLED", False):
+        _cfg = sys.modules.get("config")
+        jev_cross_enabled = getattr(_cfg, "JEV_CROSS_EQUIVALENCE_ENABLED", JEV_CROSS_EQUIVALENCE_ENABLED) if _cfg else JEV_CROSS_EQUIVALENCE_ENABLED
+        if jev_cross_enabled:
             from matcher import verify_cross_platform_equivalence_jev
             ma = {"question": opp.get("market", "")}
             mb = {"title": opp.get("kalshi", "")}
-            conf_thresh = getattr(_config, "JEV_CONFIDENCE_THRESHOLD", 0.70)
+            conf_thresh = getattr(_cfg, "JEV_CONFIDENCE_THRESHOLD", JEV_CONFIDENCE_THRESHOLD) if _cfg else JEV_CONFIDENCE_THRESHOLD
             is_eq, conf, reason = verify_cross_platform_equivalence_jev(
                 ma, mb, "polymarket", "kalshi", min_confidence=conf_thresh
             )
@@ -1275,8 +1279,8 @@ class ArbitrageExecutor:
         Returns:
             (passed, reval_profit, reason)
         """
-        import config as _config
-        min_depth = getattr(_config, "KALSHI_MULTI_MIN_DEPTH", 10)
+        _cfg = sys.modules.get("config")
+        min_depth = getattr(_cfg, "KALSHI_MULTI_MIN_DEPTH", KALSHI_MULTI_MIN_DEPTH) if _cfg else KALSHI_MULTI_MIN_DEPTH
 
         tickers = opp.get("_kalshi_tickers", [])
         if not tickers or not self.kalshi_client:
@@ -1392,8 +1396,8 @@ class ArbitrageExecutor:
         Returns:
             (passed, reval_profit, reason)
         """
-        import config as _config
-        min_depth = getattr(_config, "MULTI_CROSS_MIN_DEPTH", 10)
+        _cfg = sys.modules.get("config")
+        min_depth = getattr(_cfg, "MULTI_CROSS_MIN_DEPTH", MULTI_CROSS_MIN_DEPTH) if _cfg else MULTI_CROSS_MIN_DEPTH
 
         outcome_legs = opp.get("_outcome_legs", [])
         if not outcome_legs:

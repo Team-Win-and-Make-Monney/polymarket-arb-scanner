@@ -8,7 +8,6 @@ Disabled by default; see FIRECRAWL_NEWS_ENABLED in config.py.
 
 import logging
 import os
-import time
 from datetime import datetime, timezone
 
 import requests

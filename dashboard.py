@@ -122,6 +122,7 @@ class _DashboardState:
         self.stale_detections = 0
         self.resolution_snipes = 0
         self.convergence_signals = 0
+        self.jev_crypto_opps = 0
         self.signal_sources_active = 0
         # Analytics (MON-01): per-strategy P&L metrics
         self.strategy_metrics: list[dict] = []
@@ -162,6 +163,7 @@ class _DashboardState:
             "stale_detections": self.stale_detections,
             "resolution_snipes": self.resolution_snipes,
             "convergence_signals": self.convergence_signals,
+            "jev_crypto_opps": self.jev_crypto_opps,
             "signal_sources_active": self.signal_sources_active,
             "strategy_metrics": self.strategy_metrics,
             "platform_health": self.platform_health,
@@ -370,6 +372,7 @@ class _Handler(BaseHTTPRequestHandler):
             "/api/balances": self._handle_balances,
             "/api/rebalance": self._handle_rebalance,
             "/api/validation": self._handle_validation,
+            "/api/jev/calibration": self._handle_jev_calibration,
         }
 
         handler_fn = routes.get(path)
@@ -827,6 +830,29 @@ class _Handler(BaseHTTPRequestHandler):
             "overall_pass": c1_pass and c2_pass and c3_pass,
             "milestone_status": "ACHIEVED" if (c1_pass and c2_pass and c3_pass) else "NOT ACHIEVED",
         })
+
+    def _handle_jev_calibration(self):
+        """GET /api/jev/calibration — empirical calibration report for Jev decisions."""
+        db = _get_db()
+        if not db:
+            _send_json(self, {"error": "No database available"}, 500)
+            return
+
+        try:
+            from jev_calibration import generate_calibration_report
+            asset = "all"
+            if "?" in self.path:
+                query_str = self.path.split("?", 1)[1]
+                for part in query_str.split("&"):
+                    if part.startswith("asset="):
+                        asset = part.split("=", 1)[1]
+            report = generate_calibration_report(db, asset=asset)
+            _send_json(self, report)
+        except Exception as e:
+            logger.warning("Error generating Jev calibration report: %s", e)
+            _send_json(self, {"error": str(e)}, 500)
+        finally:
+            db.close()
 
     def _handle_pause_get(self):
         """GET /api/pause — return current kill switch state."""

@@ -72,6 +72,9 @@ if _proxy_url:
     # missing SDK internal aborts only when the authenticated write path is
     # actually constructed, not any dry-run/read-only import of this module.
     _session.proxies = {"http": _proxy_url, "https": _proxy_url}
+    # py-clob-client-v2 uses a module-level httpx client that otherwise bypasses
+    # POLYMARKET_PROXY_URL (critical for US/MI geoblock on CLOB writes).
+    _clob_http._http_client = httpx.Client(http2=True, proxy=_proxy_url)
 _session.mount("https://", HTTPAdapter(pool_connections=2, pool_maxsize=10))
 
 _ORDER_TYPE_MAP = {
@@ -615,7 +618,7 @@ class PolymarketTrader:
                     order_id, resp)
                 return False
             canceled = resp.get("canceled") or resp.get("cancelled")
-            if not isinstance(canceled, list) or order_id not in canceled:
+            if not isinstance(canceled, list) or (order_id not in canceled and not any(order_id == str(item) for item in canceled)):
                 logger.warning(
                     "Polymarket cancel_order: %s not confirmed in canceled list %r",
                     order_id, canceled)

@@ -146,7 +146,23 @@ KELLY_MAX_FRACTION = _env_float("KELLY_MAX_FRACTION", "0.25")
 
 # Execution
 DRY_RUN = _env_bool("DRY_RUN", "true")
-EXECUTION_MODE = os.getenv("EXECUTION_MODE", "semi-auto")
+_raw_exec_mode = os.getenv("EXECUTION_MODE", "semi-auto")
+EXECUTION_MODE = "full-auto" if _raw_exec_mode == "auto" else _raw_exec_mode
+
+# Canary / paper gates (used by scripts/canary_trade.py and optional CLI)
+# CANARY_MODE=paper  → scan real matched pairs, build legs, log only (no orders)
+# CANARY_MODE=live   → place real orders with hard size/count caps below
+CANARY_MODE = os.getenv("CANARY_MODE", "").strip().lower()  # "", "paper", "live"
+CANARY_MAX_TRADE_SIZE = _env_float("CANARY_MAX_TRADE_SIZE", "1.0")
+CANARY_MAX_TRADES = _env_int("CANARY_MAX_TRADES", "1")
+CANARY_MIN_NET_ROI = _env_float("CANARY_MIN_NET_ROI", "0.01")  # 1%
+CANARY_PLATFORMS = frozenset(
+    p.strip().lower()
+    for p in os.getenv("CANARY_PLATFORMS", "polymarket,kalshi").split(",")
+    if p.strip()
+)
+# Live canary requires explicit acknowledgement to prevent accidental live runs.
+CANARY_LIVE_ACK = os.getenv("CANARY_LIVE_ACK", "").strip()
 
 # Platform execution whitelist — only these platforms can place live orders.
 # Comma-separated list of platform names. Platforms not listed here will still
@@ -156,9 +172,12 @@ _VALID_PLATFORMS = frozenset([
     "sxbet", "matchbook", "gemini", "ibkr",
 ])
 _raw_enabled = os.getenv("ENABLED_EXECUTION_PLATFORMS", "kalshi")
-ENABLED_EXECUTION_PLATFORMS: frozenset[str] = frozenset(
-    p.strip().lower() for p in _raw_enabled.split(",") if p.strip()
-)
+if _raw_enabled.strip().lower() in ("all", "all platforms", "*"):
+    ENABLED_EXECUTION_PLATFORMS: frozenset[str] = _VALID_PLATFORMS
+else:
+    ENABLED_EXECUTION_PLATFORMS: frozenset[str] = frozenset(
+        p.strip().lower() for p in _raw_enabled.split(",") if p.strip()
+    )
 
 # Scan-venue pin (SCAN_VENUES preferred; PAPER_SCAN_VENUES is the legacy name).
 # When set to kalshi / kalshi-only, skip Polymarket fetches even if --mode all.
@@ -551,6 +570,16 @@ NEWS_SNIPE_CONFIDENCE_THRESHOLD = _env_float("NEWS_SNIPE_CONFIDENCE_THRESHOLD", 
 # Stage 2 refiner: drop signals where the headline is older than this window.
 NEWS_SNIPE_MAX_AGE_MINUTES = _env_int("NEWS_SNIPE_MAX_AGE_MINUTES", "60")
 
+# Firecrawl web-search news source — alternative/supplemental to Finnhub for
+# STRAT-02. Fills the specced-but-unbuilt news_monitor.py slot
+# (.planning/research/ARCHITECTURE.md Pattern 6). Disabled by default; when
+# enabled it is passed into scan_news_snipe() as an alternate client, NOT
+# auto-wired into signal_aggregator.py's live source weights — that wiring
+# is a separate, explicit decision (see DEFAULT_SOURCE_WEIGHTS).
+FIRECRAWL_NEWS_ENABLED = _env_bool("FIRECRAWL_NEWS_ENABLED", "false")
+FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY", "")
+FIRECRAWL_NEWS_REQUEST_TIMEOUT = _env_float("FIRECRAWL_NEWS_REQUEST_TIMEOUT", "15.0")
+
 # STRAT-06: Correlated Market Pairs
 CORRELATED_ENABLED = _env_bool("CORRELATED_ENABLED", "false")
 CORRELATED_PAIRS = os.getenv("CORRELATED_PAIRS", "[]")  # JSON list of [market_a, market_b] pairs
@@ -862,6 +891,16 @@ DISCOVERY_VERIFIED_PATH = os.getenv(
     "DISCOVERY_VERIFIED_PATH", os.path.join(DATA_DIR, "discovery", "verified_pairs.yaml")
 )
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+# ---------------------------------------------------------------------------
+# Jev System One Decision Engine
+# ---------------------------------------------------------------------------
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+JEV_MODEL = os.getenv("JEV_MODEL", "typesafe/jev-1.13")
+JEV_CONFIDENCE_THRESHOLD = _env_float("JEV_CONFIDENCE_THRESHOLD", "0.70")
+JEV_MIN_EDGE = _env_float("JEV_MIN_EDGE", "0.04")
+JEV_CRYPTO_ENABLED = _env_bool("JEV_CRYPTO_ENABLED", "false")
+JEV_CROSS_EQUIVALENCE_ENABLED = _env_bool("JEV_CROSS_EQUIVALENCE_ENABLED", "false")
 
 # Fee model: "expected_value" uses probability-weighted average fees,
 # "worst_case" uses max(case1, case2) — more conservative but overfilters.
@@ -1188,6 +1227,8 @@ _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 _VALID_EXECUTION_MODES = {"semi-auto", "full-auto"}
 _VALID_FEE_MODELS = {"expected_value", "worst_case"}
 _VALID_GEMINI_ORDER_TYPES = {"ioc", "gtc"}
+_VALID_CANARY_MODES = {"", "paper", "live"}
+_CANARY_LIVE_ACK_TOKEN = "I_ACCEPT_LIVE_CANARY"
 
 
 def validate_config() -> list[str]:
@@ -1459,6 +1500,13 @@ def validate_config() -> list[str]:
             f"must be in (0, 1]"
         )
 
+    # Firecrawl news source (alternative/supplemental to Finnhub for STRAT-02)
+    if FIRECRAWL_NEWS_ENABLED and not FIRECRAWL_API_KEY:
+        warnings.append(
+            "Firecrawl news enabled (FIRECRAWL_NEWS_ENABLED=true) but "
+            "FIRECRAWL_API_KEY not set; disabling Firecrawl news"
+        )
+
     # STRAT-06: Correlated Market Pairs
     if CORRELATED_ENABLED and CORRELATED_PAIRS == "[]":
         warnings.append(
@@ -1490,6 +1538,29 @@ def validate_config() -> list[str]:
         warnings.append(
             "EXECUTION_MODE=full-auto but DRY_RUN=true — "
             "no trades will be executed"
+        )
+
+    if CANARY_MODE and CANARY_MODE not in _VALID_CANARY_MODES:
+        raise ConfigError(
+            f"CANARY_MODE={CANARY_MODE!r} is not valid "
+            f"(expected one of {{'paper', 'live'}} or empty)"
+        )
+
+    if CANARY_MODE == "live" and CANARY_LIVE_ACK != _CANARY_LIVE_ACK_TOKEN:
+        raise ConfigError(
+            "CANARY_MODE=live requires "
+            f"CANARY_LIVE_ACK={_CANARY_LIVE_ACK_TOKEN!r} "
+            "(refusing accidental live canary)"
+        )
+
+    if CANARY_MODE == "live" and CANARY_MAX_TRADE_SIZE > 5.0:
+        raise ConfigError(
+            f"CANARY_MAX_TRADE_SIZE={CANARY_MAX_TRADE_SIZE} exceeds hard cap $5.00"
+        )
+
+    if CANARY_MODE == "live" and CANARY_MAX_TRADES > 3:
+        raise ConfigError(
+            f"CANARY_MAX_TRADES={CANARY_MAX_TRADES} exceeds hard cap 3"
         )
 
     # --- Live envelope: DRY_RUN=false requires an operator five-item file ---

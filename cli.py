@@ -752,22 +752,45 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
             except Exception as e:
                 logger.error("Imbalance scan failed: %s", e)
 
-    # STRAT-02: News-Driven Resolution Sniping
+    # STRAT-02: News-Driven Resolution Sniping (Finnhub and/or Firecrawl sources)
     if args.mode in ("all", "news-snipe"):
-        from config import NEWS_SNIPE_ENABLED, FINNHUB_API_KEY
-        if NEWS_SNIPE_ENABLED and FINNHUB_API_KEY:
+        from config import (
+            NEWS_SNIPE_ENABLED,
+            FINNHUB_API_KEY,
+            FIRECRAWL_NEWS_ENABLED,
+            FIRECRAWL_API_KEY,
+        )
+        finnhub_on = NEWS_SNIPE_ENABLED and FINNHUB_API_KEY
+        firecrawl_on = FIRECRAWL_NEWS_ENABLED and FIRECRAWL_API_KEY
+        if finnhub_on or firecrawl_on:
             logger.info("--- News-Driven Sniping Scan ---")
             try:
                 from scans.news_snipe import scan_news_snipe
-                from finnhub_api import FinnhubNewsClient
-                finnhub = FinnhubNewsClient(FINNHUB_API_KEY)
                 markets_by_key = {}
                 if poly_markets:
                     for mkt in poly_markets:
                         cid = mkt.get("condition_id", "")
                         if cid:
                             markets_by_key[cid] = mkt
-                news_opps = scan_news_snipe(markets_by_key, finnhub, cooldown_cache={})
+                news_clients = []
+                if finnhub_on:
+                    from finnhub_api import FinnhubNewsClient
+                    news_clients.append(FinnhubNewsClient(FINNHUB_API_KEY))
+                if firecrawl_on:
+                    from firecrawl_news_client import FirecrawlNewsClient
+                    news_clients.append(FirecrawlNewsClient(FIRECRAWL_API_KEY))
+                news_opps = []
+                for client in news_clients:
+                    try:
+                        news_opps.extend(
+                            scan_news_snipe(markets_by_key, client, cooldown_cache={})
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "News snipe scan failed for %s: %s",
+                            type(client).__name__,
+                            e,
+                        )
                 all_opportunities.extend(news_opps)
                 logger.info("Found %d news snipe opportunities.", len(news_opps))
             except Exception as e:
@@ -910,6 +933,26 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
                 logger.info("Found %d Kalshi reward opportunities.", len(k_reward_opps))
         except Exception as e:
             logger.error("Kalshi rewards scan failed: %s", e)
+
+    # Jev System One Crypto Decision Scan
+    if args.mode in ("all", "jev-crypto"):
+        from config import JEV_CRYPTO_ENABLED, OPENROUTER_API_KEY
+        if (args.mode == "jev-crypto") or (JEV_CRYPTO_ENABLED and OPENROUTER_API_KEY):
+            logger.info("--- Jev System One Crypto Scan ---")
+            try:
+                from scans.jev_crypto import scan_jev_crypto
+                markets_by_key = {}
+                if poly_markets:
+                    for mkt in poly_markets:
+                        cid = mkt.get("condition_id", "") or mkt.get("conditionId", "") or mkt.get("question", "")
+                        if cid:
+                            markets_by_key[cid] = mkt
+                is_forced = (args.mode == "jev-crypto")
+                jev_opps = scan_jev_crypto(markets_by_key, min_profit=min_profit, db=db, force=is_forced)
+                all_opportunities.extend(jev_opps)
+                logger.info("Found %d Jev crypto opportunities.", len(jev_opps))
+            except Exception as e:
+                logger.error("Jev crypto scan failed: %s", e)
 
     # Filter by minimum depth if specified
     if args.min_depth > 0:
@@ -1194,9 +1237,9 @@ def main():
                  "imbalance", "news-snipe", "correlated", "time-decay",
                  "logical-arb", "whale-copy",
                  "fee-promo", "cross-mm",
-                 "lead-lag-mm", "toxic-flow", "vol-mm", "mm-pilot"],
+                 "lead-lag-mm", "toxic-flow", "vol-mm", "mm-pilot", "jev-crypto"],
         default="all",
-        help="Scan mode; mm-pilot isolates the continuous Kalshi reward-MM pilot from unrelated scans",
+        help="Scan mode: all, binary, negrisk, negrisk-no, cross, kalshi, cross-all, spread, betfair, smarkets, sxbet, matchbook, gemini, ibkr, event, triangular, stale, resolution, convergence, mm, mm-pilot, rewards, imbalance, news-snipe, correlated, time-decay, fee-promo, cross-mm, jev-crypto",
     )
     parser.add_argument(
         "--min-profit",

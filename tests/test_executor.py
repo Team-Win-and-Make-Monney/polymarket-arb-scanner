@@ -219,6 +219,92 @@ class TestTokenIdPropagation:
         # Price count (3) != token ID count (1) → returns empty legs
         assert legs == []
 
+    def test_build_legs_jev_crypto_buy_yes(self, executor):
+        opp = {
+            "type": "JevCrypto",
+            "_action": "buy_yes",
+            "_token_ids": ["tok_yes", "tok_no"],
+            "_exec_price": 0.45,
+        }
+        legs = executor._build_legs(opp, 10.0)
+        assert len(legs) == 1
+        assert legs[0]["platform"] == "polymarket"
+        assert legs[0]["side"] == "BUY"
+        assert legs[0]["token"] == "yes"
+        assert legs[0]["price"] == 0.45
+        assert legs[0]["_token_id"] == "tok_yes"
+
+    def test_build_legs_jev_crypto_buy_no(self, executor):
+        opp = {
+            "type": "JevCrypto",
+            "_action": "buy_no",
+            "_token_ids": ["tok_yes", "tok_no"],
+            "_exec_price": 0.55,
+        }
+        legs = executor._build_legs(opp, 10.0)
+        assert len(legs) == 1
+        assert legs[0]["platform"] == "polymarket"
+        assert legs[0]["side"] == "BUY"
+        assert legs[0]["token"] == "no"
+        assert legs[0]["price"] == 0.55
+        assert legs[0]["_token_id"] == "tok_no"
+
+    def test_revalidate_jev_crypto(self, executor):
+        now = time.time()
+        price_cache = {("polymarket", "tok_yes"): {"best_ask": 0.40, "_ts": now}}
+        opp_pass = {
+            "type": "JevCrypto", "net_profit": 0.10, "total_cost": "$1.00",
+            "_confidence": 0.75, "_token_ids": ["tok_yes", "tok_no"],
+            "_model_prob": 0.65, "_action": "buy_yes",
+        }
+        assert executor._revalidate(opp_pass, price_cache) is True
+
+        opp_fail = {
+            "type": "JevCrypto", "net_profit": 0.10, "total_cost": "$1.00",
+            "_confidence": 0.30, "_token_ids": ["tok_yes", "tok_no"],
+            "_model_prob": 0.65, "_action": "buy_yes",
+        }
+        assert executor._revalidate(opp_fail, price_cache) is False
+
+    def test_revalidate_jev_crypto_price_and_edge(self, executor):
+        # Opportunity with target token and model probability 0.65 (raw edge = 0.65 - 0.40 = 0.25 >= JEV_MIN_EDGE)
+        opp = {
+            "type": "JevCrypto",
+            "net_profit": 0.10,
+            "total_cost": 50.0,
+            "_confidence": 0.85,
+            "_action": "buy_yes",
+            "_token_ids": ["tok_yes", "tok_no"],
+            "_model_prob": 0.65,
+        }
+        now = time.time()
+        price_cache = {("polymarket", "tok_yes"): {"best_ask": 0.40, "_ts": now}}
+        assert executor._revalidate(opp, price_cache) is True
+        assert opp["_exec_price"] == 0.40
+
+        # Now suppose price moved up to 0.64 (edge = 0.65 - 0.64 = 0.01 < JEV_MIN_EDGE 0.04)
+        price_cache_collapsed = {("polymarket", "tok_yes"): {"best_ask": 0.64, "_ts": now}}
+        assert executor._revalidate(opp, price_cache_collapsed) is False
+
+    def test_revalidate_jev_crypto_fails_closed_when_price_unavailable(self, executor):
+        opp = {
+            "type": "JevCrypto", "net_profit": 0.10, "total_cost": 50.0,
+            "_confidence": 0.85, "_action": "buy_yes",
+            "_token_ids": ["tok_yes", "tok_no"], "_model_prob": 0.65,
+        }
+        with patch("executor.fetch_order_book", return_value=None):
+            assert executor._revalidate(opp, None) is False
+
+    def test_revalidate_jev_crypto_size_clamping(self, executor):
+        opp = {
+            "type": "JevCrypto", "net_profit": 0.10, "total_cost": 1000.0,
+            "_clob_depth": 50.0, "_confidence": 0.85, "_action": "buy_yes",
+            "_token_ids": ["tok_yes", "tok_no"], "_model_prob": 0.65,
+        }
+        now = time.time()
+        price_cache = {("polymarket", "tok_yes"): {"best_ask": 0.40, "_ts": now}}
+        assert executor._revalidate(opp, price_cache) is True
+
 
 # ---------------------------------------------------------------------------
 # _parse_price
@@ -2098,6 +2184,43 @@ class TestPlatformWhitelist:
         assert success is True
         assert order_id == "ord1"
 
+    def test_persist_order_id_before_fill_poll(self, executor):
+        """Order ID must be written to DB before fill confirmation completes."""
+        leg = {
+            "platform": "polymarket",
+            "side": "BUY",
+            "price": 0.50,
+            "_token_id": "tok123",
+            "_trade_id": 42,
+            "_idempotency_key": "idem-xyz",
+        }
+        opp = {"type": "Binary"}
+        executor.pm_trader.place_order.return_value = {
+            "success": True, "orderID": "ord-persist-1",
+        }
+        call_order: list[str] = []
+        update_mock = MagicMock()
+
+        def _track_update(*a, **kw):
+            call_order.append("update")
+            update_mock(*a, **kw)
+
+        def _track_confirm(*a, **kw):
+            call_order.append("confirm")
+            return 0.50
+
+        with patch("executor.ENABLED_EXECUTION_PLATFORMS", frozenset(["polymarket", "kalshi"])), \
+             patch.object(executor.db, "update_trade_status", side_effect=_track_update), \
+             patch.object(executor, "_confirm_fill_pm", side_effect=_track_confirm):
+            success, order_id, fill_price = executor._execute_single_leg(leg, 5.0, opp)
+        assert success is True
+        assert order_id == "ord-persist-1"
+        assert "update" in call_order and "confirm" in call_order
+        assert call_order.index("update") < call_order.index("confirm")
+        # First update must carry the order_id while still pending
+        first_kw = update_mock.call_args_list[0].kwargs
+        assert first_kw.get("order_id") == "ord-persist-1"
+
     def test_cross_all_legs_rejected_when_platform_not_whitelisted(self, executor):
         """Cross-all with a non-whitelisted platform returns empty legs."""
         opp = {
@@ -2394,13 +2517,13 @@ class TestMakerRouting:
              mpatch.object(executor, "_confirm_fill_pm", return_value=0.45):
             executor.dry_run = False
             success, order_id, fill_price = executor._execute_single_leg(leg, 5.0, opp)
-        # Verify place_order was called with order_type="GTC"
+        # Verify place_order was called with order_type="GTC" and share qty
         assert executor.pm_trader.place_order.called
         call_kwargs = executor.pm_trader.place_order.call_args
-        order_type = (call_kwargs.kwargs or {}).get("order_type") or (
-            call_kwargs.args[4] if len(call_kwargs.args) > 4 else None
-        )
-        # The important assertion: it was called (GTC routing invoked), and fill succeeded
+        order_type = (call_kwargs.kwargs or {}).get("order_type")
+        assert order_type == "GTC"
+        # $5 @ $0.45 → floor(5/0.45) = 11 shares (not dollar size)
+        assert call_kwargs.kwargs.get("size") == 11.0
         assert success is True
         assert order_id == "order_gtc_123"
 

@@ -6,6 +6,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -19,6 +20,54 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from config import KALSHI_RATE_LIMIT
 from kalshi_policy import live_kalshi_submit_allowed
 from rate_limiter import PlatformCircuitBreaker
+
+
+def _fp_dollars(price: float) -> str:
+    """Format a dollar price as Kalshi fixed-point dollars (up to 4 dp)."""
+    return f"{float(price):.4f}"
+
+
+def _fp_count(count: int | float) -> str:
+    """Format contract count as Kalshi fixed-point count (2 dp)."""
+    return f"{float(count):.2f}"
+
+
+def _legacy_side_action_to_v2(
+    side: str, action: str, price_dollars: float,
+) -> tuple[str, float]:
+    """Map legacy yes/no + buy/sell to V2 YES-book bid/ask + YES price.
+
+    V2 quotes everything from the YES side:
+      - bid = buy YES
+      - ask = sell YES
+    Buying NO at P is economically sell YES at (1 - P).
+    Selling NO at P is economically buy YES at (1 - P).
+    """
+    side_l = (side or "").lower()
+    action_l = (action or "").lower()
+    if side_l not in ("yes", "no"):
+        raise ValueError(f"Unsupported Kalshi side: {side!r}")
+    if action_l not in ("buy", "sell"):
+        raise ValueError(f"Unsupported Kalshi action: {action!r}")
+    if side_l == "yes":
+        if action_l == "buy":
+            return "bid", price_dollars
+        return "ask", price_dollars
+    # NO side — flip to YES book
+    yes_price = round(1.0 - price_dollars, 4)
+    if action_l == "buy":
+        return "ask", yes_price
+    return "bid", yes_price
+
+
+def _normalize_kalshi_tif(time_in_force: str) -> str:
+    """Map scanner TIF aliases to Kalshi V2 enum values."""
+    tif = (time_in_force or "fill_or_kill").lower()
+    if tif in ("gtc", "good_till_canceled", "good_till_cancelled"):
+        return "good_till_canceled"
+    if tif in ("ioc", "immediate_or_cancel"):
+        return "immediate_or_cancel"
+    return "fill_or_kill"
 
 KALSHI_BASE_URL = "https://api.elections.kalshi.com"
 KALSHI_API_PATH = "/trade-api/v2"
@@ -626,42 +675,46 @@ class KalshiClient:
         count: int,
         price_dollars: float,
         time_in_force: str = "fill_or_kill",
+        client_order_id: str | None = None,
         reducing: bool = False,
     ) -> dict | None:
-        """Place a limit order on Kalshi.
+        """Place a limit order on Kalshi via V2 /portfolio/events/orders.
+
+        Accepts the scanner's legacy yes/no + buy/sell interface and maps it
+        to the V2 YES-book bid/ask + fixed-point dollar schema.
 
         Args:
             ticker: Market ticker (e.g. "KXBTC-26FEB07-T101999.99")
-            side: "yes" or "no"
+            side: "yes" or "no" (legacy scanner semantics)
             action: "buy" or "sell"
-            count: Number of contracts
-            price_dollars: Price per contract in dollars (0.01-0.99)
-            time_in_force: "fill_or_kill" (default for arb safety) or "gtc"
+            count: Number of contracts (integer; sent as fixed-point string)
+            price_dollars: Price per contract in dollars on the requested side
+            time_in_force: "fill_or_kill" (default), "gtc", or "immediate_or_cancel"
+            client_order_id: Optional idempotency key (UUID generated if omitted)
             reducing: Whether the order strictly reduces an existing position.
 
         Returns:
-            Order response dict or None on failure.
+            Order response dict (normalized with an ``order`` wrapper when the
+            V2 flat response is returned) or None on failure.
         """
         if not live_kalshi_submit_allowed(ticker, reducing=reducing):
             logger.warning("Kalshi place_order blocked by live policy: %s", ticker)
             return None
 
+        book_side, yes_price = _legacy_side_action_to_v2(side, action, price_dollars)
+        tif = _normalize_kalshi_tif(time_in_force)
         body = {
             "ticker": ticker,
-            "side": side,
-            "action": action,
-            "count": count,
-            "type": "limit",
-            "time_in_force": time_in_force,
+            "client_order_id": client_order_id or str(uuid.uuid4()),
+            "side": book_side,
+            "count": _fp_count(count),
+            "price": _fp_dollars(yes_price),
+            "time_in_force": tif,
+            "self_trade_prevention_type": "taker_at_cross",
         }
-        # Kalshi expects price in the appropriate side field
-        if side == "yes":
-            body["yes_price"] = int(round(price_dollars * 100))
-        else:
-            body["no_price"] = int(round(price_dollars * 100))
 
         try:
-            resp = self._request("POST", "/portfolio/orders", json_body=body)
+            resp = self._request("POST", "/portfolio/events/orders", json_body=body)
         except Exception as e:
             logger.error("Kalshi place_order exception: %s (ticker=%s)", e, ticker)
             return None
@@ -669,8 +722,32 @@ class KalshiClient:
             logger.warning("Kalshi place_order got no response (ticker=%s body=%s)", ticker, body)
             return None
         if resp.status_code in (200, 201):
-            return resp.json()
-        logger.error("Kalshi place_order HTTP %s: %s (ticker=%s)", resp.status_code, resp.text[:300], ticker)
+            data = resp.json()
+            # Normalize V2 flat response into the legacy {"order": {...}} shape
+            # so executor fill polling keeps working.
+            if isinstance(data, dict) and "order" not in data and "order_id" in data:
+                order = dict(data)
+                fill_count = float(order.get("fill_count") or 0)
+                remaining = float(order.get("remaining_count") or 0)
+                if fill_count > 0 and remaining <= 0:
+                    order["status"] = "executed"
+                elif remaining > 0:
+                    order["status"] = "resting"
+                else:
+                    order["status"] = order.get("status", "canceled")
+                avg = order.get("average_fill_price")
+                if avg is not None:
+                    try:
+                        # Executor historically divides avg_price by 100 (cents).
+                        order["avg_price"] = float(avg) * 100.0
+                    except (TypeError, ValueError):
+                        pass
+                return {"order": order}
+            return data
+        logger.error(
+            "Kalshi place_order HTTP %s: %s (ticker=%s)",
+            resp.status_code, resp.text[:300], ticker,
+        )
         return None
 
     def get_fills(self, limit: int = 200, max_pages: int = 5,
@@ -757,19 +834,38 @@ class KalshiClient:
 
         Returns dict with order details including 'status' field, or None.
         """
+        # GET /portfolio/orders/{id} remains the read path; V2 mutations use
+        # /portfolio/events/orders but status reads are still on the classic path.
         resp = self._request("GET", f"/portfolio/orders/{order_id}")
         if resp is not None and resp.status_code == 200:
             data = resp.json()
-            return data.get("order", data)
+            order = data.get("order", data)
+            # Normalize dollar avg fill into legacy cents avg_price when present.
+            if isinstance(order, dict) and order.get("avg_price") is None:
+                for key in ("average_fill_price", "yes_price_dollars", "avg_price_dollars"):
+                    if order.get(key) is not None:
+                        try:
+                            order["avg_price"] = float(order[key]) * 100.0
+                            break
+                        except (TypeError, ValueError):
+                            pass
+            return order
         return None
 
     def cancel_order(self, order_id: str) -> bool:
-        """Cancel an open order."""
-        resp = self._request("DELETE", f"/portfolio/orders/{order_id}")
+        """Cancel an open order via V2 events endpoint."""
+        resp = self._request("DELETE", f"/portfolio/events/orders/{order_id}")
         if resp is not None and resp.status_code in (200, 204):
             return True
-        logger.warning("Kalshi cancel_order failed for %s: %s", order_id,
-                       resp.status_code if resp is not None else 'no response')
+        # Fallback: legacy cancel path during migration window
+        if resp is not None and resp.status_code in (404, 405, 410):
+            legacy = self._request("DELETE", f"/portfolio/orders/{order_id}")
+            if legacy is not None and legacy.status_code in (200, 204):
+                return True
+        logger.warning(
+            "Kalshi cancel_order failed for %s: %s",
+            order_id, resp.status_code if resp is not None else "no response",
+        )
         return False
 
     def get_order_book_depth(self, ticker: str) -> dict | None:

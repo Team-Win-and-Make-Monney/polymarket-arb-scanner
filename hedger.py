@@ -138,7 +138,10 @@ class PartialFillHedger:
         return False
 
     def _hedge_polymarket(self, token_id: str, fill_price: float, size: float, max_loss: float) -> bool:
-        """Sell a Polymarket position at current bid."""
+        """Sell a Polymarket position at current bid.
+
+        ``size`` is the filled share quantity (not dollars).
+        """
         if not self.pm_trader:
             return False
         from polymarket_api import fetch_order_book, get_best_bid_ask
@@ -154,8 +157,29 @@ class PartialFillHedger:
             logger.info("Polymarket hedge: bid $%.3f too far from fill $%.3f (loss $%.3f > max $%.3f)",
                         bid, fill_price, loss, max_loss)
             return False
-        resp = self.pm_trader.place_order(token_id=token_id, side="SELL", price=bid, size=size)
-        return bool(resp and resp.get("success"))
+        if size <= 0:
+            return False
+        resp = self.pm_trader.place_order(
+            token_id=token_id, side="SELL", price=bid, size=float(size),
+            order_type="FOK",
+        )
+        if not resp or not resp.get("success"):
+            return False
+        order_id = resp.get("orderID") or resp.get("order_id")
+        if not order_id:
+            logger.warning("Polymarket hedge order placed without order_id: %s", resp)
+            return False
+        if hasattr(self.pm_trader, "get_order_status"):
+            try:
+                status = self.pm_trader.get_order_status(order_id)
+                if isinstance(status, dict):
+                    return str(status.get("status", "")).lower() in ("matched", "filled")
+                logger.warning("Polymarket hedge order %s status non-dict or unavailable: %s", order_id, status)
+                return False
+            except Exception as e:
+                logger.warning("Failed to check Polymarket hedge order status %s: %s", order_id, e)
+                return False
+        return True
 
     def _hedge_kalshi(self, ticker: str, fill_price: float, size: float, max_loss: float,
                       side: str, action: str = "sell",
@@ -226,7 +250,6 @@ class PartialFillHedger:
                                                count=count, price_dollars=touch,
                                                reducing=True)
         return resp is not None
-
     def _hedge_betfair(self, pf: dict, fill_price: float, size: float, max_loss: float) -> bool:
         """Hedge a Betfair position with an opposing bet."""
         if not self.betfair_client or not self.betfair_client.authenticated:

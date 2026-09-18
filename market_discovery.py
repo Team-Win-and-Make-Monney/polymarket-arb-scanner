@@ -268,6 +268,80 @@ class MarketJudge:
         return []
 
 
+class JevJudge:
+    """Fast, calibrated System One judge for cross-venue market equivalence using Jev.
+
+    Evaluates market pairs in ~100ms with calibrated noul and choice primitives,
+    at a fraction of the cost of standard LLMs.
+    """
+
+    def __init__(self, client=None):
+        if client is not None:
+            self.client = client
+        else:
+            from jev_client import get_jev_client
+            self.client = get_jev_client()
+
+    def judge_pair(self, pair: CandidatePair) -> Judgment:
+        """Evaluate whether a candidate pair is resolution-equivalent."""
+        state = {
+            "venue_a": pair.venue_a,
+            "question_a": pair.question_a,
+            "venue_b": pair.venue_b,
+            "question_b": pair.question_b,
+        }
+        questions = {
+            "resolution_equivalence": {
+                "type": "choice",
+                "instructions": (
+                    "Do the questions from `venue_a` ('question_a') and `venue_b` ('question_b') "
+                    "refer to the exact same underlying event and resolve to identical outcomes across all edge cases?"
+                ),
+                "criteria": {
+                    "identical": "Guaranteed identical settlement in all scenarios",
+                    "divergent": "Subtly different definitions, dates, or criteria with potential divergence",
+                    "different_events": "Completely different events or entities",
+                },
+            },
+            "equivalence_probability": {
+                "type": "noul",
+                "instructions": "Is `question_a` strictly equivalent in resolution outcome to `question_b`?",
+            },
+        }
+
+        try:
+            resp = self.client.query_decisions(state, questions)
+            answers = resp.get("answers", {})
+            choice_ans = answers.get("resolution_equivalence", {})
+            noul_ans = answers.get("equivalence_probability", {})
+
+            choice = choice_ans.get("choice", "different_events")
+            conf = float(choice_ans.get("confidence", 0.0))
+            noul_p = float(noul_ans.get("noul", 0.0))
+
+            is_equivalent = (choice == "identical") and (noul_p >= 0.85)
+            reasoning = f"Jev: choice={choice}, P(equiv)={noul_p:.2f}, conf={conf:.2f}"
+
+            return Judgment(
+                pair_id=pair.pair_id,
+                equivalent=is_equivalent,
+                confidence=conf,
+                reasoning=reasoning,
+            )
+        except Exception as e:
+            logger.warning("Jev equivalence evaluation failed for pair %s: %s", pair.pair_id, e)
+            return Judgment(
+                pair_id=pair.pair_id,
+                equivalent=False,
+                confidence=0.0,
+                reasoning=f"Jev evaluation error: {e}",
+            )
+
+    async def judge_batch(self, pairs: list[CandidatePair]) -> list[Judgment]:
+        """Judge a list of candidate pairs using Jev."""
+        return [self.judge_pair(p) for p in pairs]
+
+
 def _format_pairs(pairs: list[CandidatePair]) -> str:
     lines = ["Judge equivalence for each of the following pairs:\n"]
     for p in pairs:

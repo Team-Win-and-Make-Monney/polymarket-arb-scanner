@@ -10,9 +10,11 @@ Python CLI tool (`arbgrid`) that scans for arbitrage and trading opportunities a
 
 **Platforms**: Polymarket, Kalshi, Betfair, Smarkets, SX Bet, Matchbook, Gemini Predictions, IBKR ForecastEx (+ Metaculus and Manifold as read-only signal sources)
 
-**Strategy framework:** see [`docs/strategy-framework-v2.md`](docs/strategy-framework-v2.md) for the canonical 29-strategy / 5-layer reconciliation. The summary block below is informative; the framework doc is authoritative.
+**Portfolio context:** arbgrid is **Lane A (prediction markets)** of the *Financial Markets — Algorithmic Capture* command center (`~/Financial Markets with AI/`). The command center owns portfolio-level strategy, capital, tax, secrets, and cross-engine P&L across all lanes; **this repo owns detection + execution code only.** Do not duplicate capital/tax/risk/secrets policy here — it lives in the command center (docs `00`–`15` + `GLOSSARY`). Linear: engine code backlog → the *Polymarket Arb Scanner* project; portfolio milestones (M1–M5) → the *Financial Markets — Algorithmic Capture* project.
 
-**Documentation index:** [`docs/PRD.md`](docs/PRD.md) (requirements/done) · [`docs/ROADMAP.md`](docs/ROADMAP.md) · [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · [`docs/PLATFORM-MATRIX.md`](docs/PLATFORM-MATRIX.md) (canonical platform/auth/fee source of truth) · [`docs/RISK-POLICY.md`](docs/RISK-POLICY.md) · [`docs/RUNBOOK.md`](docs/RUNBOOK.md) · [`docs/BACKTESTING.md`](docs/BACKTESTING.md) · [`docs/SECURITY.md`](docs/SECURITY.md) · [`TASK_CONTRACT.md`](TASK_CONTRACT.md) (definition of done) · [`CONTRIBUTING.md`](CONTRIBUTING.md) · [`CHANGELOG.md`](CHANGELOG.md) · [`docs/PLATFORM-RECOMMENDATION.md`](docs/PLATFORM-RECOMMENDATION.md) (expansion memo). Audit evidence: [`docs/audit/`](docs/audit/).
+**Strategy framework:** see [`docs/strategy-framework-v2.md`](docs/strategy-framework-v2.md) for the canonical 29-strategy / 5-layer reconciliation. The summary block below is informative; the framework doc is authoritative. Mode↔strategy bridge: [`docs/MODE-STRATEGY-MAP.md`](docs/MODE-STRATEGY-MAP.md). Per-strategy economics: [`docs/STRATEGY-FINANCIAL-FORECAST.md`](docs/STRATEGY-FINANCIAL-FORECAST.md).
+
+**Documentation index:** [`docs/PRD.md`](docs/PRD.md) (requirements/done) · [`docs/ROADMAP.md`](docs/ROADMAP.md) · [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · [`docs/PLATFORM-MATRIX.md`](docs/PLATFORM-MATRIX.md) (canonical platform/auth/fee source of truth) · [`docs/RISK-POLICY.md`](docs/RISK-POLICY.md) · [`docs/RUNBOOK.md`](docs/RUNBOOK.md) · [`docs/BACKTESTING.md`](docs/BACKTESTING.md) · [`docs/SECURITY.md`](docs/SECURITY.md) · [`docs/MODE-STRATEGY-MAP.md`](docs/MODE-STRATEGY-MAP.md) (mode↔strategy reconciliation) · [`docs/STRATEGY-FINANCIAL-FORECAST.md`](docs/STRATEGY-FINANCIAL-FORECAST.md) (per-strategy economics) · [`TASK_CONTRACT.md`](TASK_CONTRACT.md) (definition of done) · [`CONTRIBUTING.md`](CONTRIBUTING.md) · [`CHANGELOG.md`](CHANGELOG.md) · [`docs/PLATFORM-RECOMMENDATION.md`](docs/PLATFORM-RECOMMENDATION.md) (expansion memo). Audit evidence: [`docs/audit/`](docs/audit/).
 
 ## Project Scope
 
@@ -55,8 +57,8 @@ Python CLI tool (`arbgrid`) that scans for arbitrage and trading opportunities a
 
 All original-framework strategies (#1-#20) are first-class as of the May 2026 milestone (PR #10, commit `1e5087b`). The codebase additionally implements 9 strategies that grew beyond the original framework (#21 spread detection, #22-#23 liquidity rewards, #24-#29 Layer 4 informed-trading variants). Per the v2 framework status table:
 
-- **26 BUILT** — distinct opp type, scan/detection module, executor branch, tests (#1-5, 7-17, 19, 21-29)
-- **3 PARTIAL** — #6 (SX Bet quarantined for unsigned-JSON bug pending EIP-712 signing), #18 (Gemini↔Polymarket auto-corridor only by design), #20 (tuning-loop pending)
+- **27 BUILT** — distinct opp type, scan/detection module, executor branch, tests (#1-5, 7-17, 19-29)
+- **2 PARTIAL** — #6 (SX Bet quarantined for unsigned-JSON bug pending EIP-712 signing), #18 (Gemini↔Polymarket auto-corridor only by design)
 - **0 STUB** — none remaining
 
 *Updated 2026-05-20 after audit revealed #26 / #27 / #28 / #29 all have first-class Stage 2 refiners with substantial test coverage (48 / 36 / 76 / 58 passing tests respectively) — the prior PARTIAL/STUB labels were stale.*
@@ -88,10 +90,10 @@ Remaining gaps and the build sequence to close them are documented in the v2 fra
 
 ## Current Status
 
-- **Last updated**: 2026-05-31
-- **Branch**: `feat/sprint-6-correlated-pairs`
-- **Worked on**: Sprint 6 — correlated-pairs (#29, BUILT) shipped; Strategy #20 backtesting-driven tuning loop (impl-complete, not yet production-wired into continuous mode). Content/doc audit in progress (`docs/audit/`).
-- **Next recommended**: wire `config.apply_backtest_recommendations()` into continuous-mode startup (#20); continue doc truth-alignment workstream.
+- **Last updated**: 2026-06-13
+- **Branch**: `master`
+- **Worked on**: PRs #45–#48 shipped (NegRisk NO-side scan; exit-liquidity gate + authoritative Kalshi settlement; Polymarket maker-rebate model; #20 tuning-loop age-gate + startup visibility → **#20 now BUILT**, 27 BUILT / 2 PARTIAL). Engine docs added: [`docs/MODE-STRATEGY-MAP.md`](docs/MODE-STRATEGY-MAP.md) + [`docs/STRATEGY-FINANCIAL-FORECAST.md`](docs/STRATEGY-FINANCIAL-FORECAST.md). Engine backlog stood up in the *Polymarket Arb Scanner* Linear project (milestones E1–E5, JOH-78–98).
+- **Next recommended**: E1 quick wins — WS-5 dead `GEMINI_FEE_RATE` cleanup (JOH-78), mode-count 33→34 + `seerium` slot (JOH-79), `continuous.py` dead-scan kwargs fix (JOH-80).
 - **Project type**: dev-only
 ## Commands
 
@@ -387,3 +389,17 @@ Avoid two teammates editing the same module. `cli.py` and `continuous.py` are la
 
 ## Secrets (Infisical)
 Secrets for this project live in Infisical (env `dev`), linked via `.infisical.json`. Run anything needing secrets with `infisical run --env dev -- <cmd>`; inspect with `infisical secrets --env dev`. The local `.env` is retained as a fallback — retire it once the run command is switched. Pre-commit secret scanning is active.
+
+## Agent skills
+
+### Issue tracker
+
+Issues tracked in GitHub Issues (`gh` CLI). External PRs are not a triage surface. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default label vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context repo. See `docs/agents/domain.md`.

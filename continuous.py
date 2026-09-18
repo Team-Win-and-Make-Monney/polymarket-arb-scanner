@@ -92,9 +92,17 @@ from scans import (
     scan_lead_lag_mm,
     scan_toxic_flow_pause,
     scan_volatility_adjusted_mm,
+    scan_jev_crypto,
     _fetch_kalshi_data,
     capital_efficiency_score,
 )
+# Layer-4 informed-trading scans — imported at module level (not lazily inside
+# the loop) so the continuous-mode wiring is patchable in tests. These power the
+# _scan_*_layer4 helpers below.
+from scans.imbalance import scan_imbalance
+from scans.news_snipe import scan_news_snipe
+from scans.correlated import scan_correlated
+from scans.time_decay import scan_time_decay
 
 logger = logging.getLogger(__name__)
 
@@ -263,10 +271,18 @@ class OpportunityIndex:
         opp_type = opp.get("type", "")
 
         # Polymarket token IDs
-        token_ids = opp.get("_token_ids", [])
-        for tid in token_ids:
-            if tid:
-                keys.append(("polymarket", tid))
+        if opp_type == "JevCrypto":
+            action = opp.get("_action", "buy_yes")
+            token_ids = opp.get("_token_ids", [])
+            if action == "buy_yes" and len(token_ids) > 0 and token_ids[0]:
+                keys.append(("polymarket", token_ids[0]))
+            elif action == "buy_no" and len(token_ids) > 1 and token_ids[1]:
+                keys.append(("polymarket", token_ids[1]))
+        else:
+            token_ids = opp.get("_token_ids", [])
+            for tid in token_ids:
+                if tid:
+                    keys.append(("polymarket", tid))
 
         # Kalshi tickers
         kalshi_ticker = opp.get("_kalshi_ticker", "")
@@ -822,6 +838,29 @@ def _recalc_profit(opp: dict, platform: str, ticker: str, new_price: float, pric
                 platform_a=pa, platform_b=pb,
             )
             return result["net_profit"]
+        elif opp_type == "JevCrypto":
+            from fees import net_profit_jev_crypto
+            model_prob = opp.get("_model_prob")
+            action = opp.get("_action", "buy_yes")
+            token_ids = opp.get("_token_ids", [])
+            if model_prob is None or len(token_ids) < 2:
+                return None
+            if action == "buy_yes" and ticker == token_ids[0]:
+                exec_price = new_price
+                prob_target = model_prob
+            elif action == "buy_no" and ticker == token_ids[1]:
+                exec_price = new_price
+                prob_target = 1.0 - model_prob
+            else:
+                return None
+
+            trade_size = 50.0
+            res = net_profit_jev_crypto(
+                price=exec_price,
+                model_prob=prob_target,
+                size=trade_size,
+            )
+            return res["net_profit"]
     except Exception as e:
         logger.debug("Error recalculating profit: %s", e)
         return None
@@ -846,6 +885,7 @@ def _get_market_lock(market: str) -> threading.Lock:
 _PRIORITY_WEIGHTS = {
     "StalePriceOpp": 3.0,       # Most time-sensitive: stale prices disappear quickly
     "ResolutionSnipeOpp": 2.5,  # Resolution imminent: price converges fast
+    "JevCrypto": 2.2,           # Model-calibrated crypto strike edge: priority execution
     "Binary": 2.0,              # Pure arb: guaranteed profit, execute quickly
     "KalshiBinary": 2.0,
     "Cross": 2.0,
@@ -1002,6 +1042,197 @@ def _feed_sprint3_trackers(platform: str, ticker: str, data: dict) -> None:
             get_lead_lag_mm().record_price(ticker, platform, price_f)
     except Exception as exc:
         logger.debug("VolatilityTracker/LeadLagMM WS feed failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Layer 4 informed-trading scans (flag-gated; disabled by default)
+#
+# These four scans were silently disabled in continuous mode: the inline loop
+# blocks called them with stale kwargs (poly_markets=/kalshi_data=/min_profit=)
+# and wrong config names, and a broad ``except`` swallowed every resulting
+# TypeError/ImportError — so flipping the feature flag did nothing. Extracted
+# into helpers with the correct, current signatures so the wiring is unit-
+# testable (each scan is patched and asserted invoked).
+# ---------------------------------------------------------------------------
+
+def _build_poly_markets_by_key(poly_markets) -> dict[str, dict]:
+    """Index Polymarket markets by ``polymarket-<condition_id>``.
+
+    Shared by the Layer-4 scans, which all take a ``markets_by_key`` dict.
+    Mirrors the inline pattern the imbalance block used previously; these
+    scans do not fetch Kalshi order books, so only Polymarket is indexed.
+    """
+    markets_by_key: dict[str, dict] = {}
+    for mkt in poly_markets or []:
+        cid = mkt.get("condition_id") or mkt.get("conditionId") or ""
+        if cid:
+            markets_by_key[f"polymarket-{cid}"] = mkt
+    return markets_by_key
+
+
+def _parse_correlated_pairs(raw) -> list[tuple[str, str]]:
+    """Parse the ``CORRELATED_PAIRS`` config (a JSON string of ``[a, b]``
+    pairs) into the ``list[tuple[str, str]]`` ``scan_correlated`` expects.
+    Returns ``[]`` on malformed input rather than raising."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            return []
+    pairs: list[tuple[str, str]] = []
+    for item in raw or []:
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            pairs.append((str(item[0]), str(item[1])))
+    return pairs
+
+
+def _scan_imbalance_layer4(poly_markets, price_cache, mode) -> list[dict]:
+    """STRAT-01 order-book imbalance. Returns ``[]`` when the flag/mode gate
+    is off or there are no Polymarket markets to scan."""
+    if mode not in ("all", "imbalance") or not config.IMBALANCE_ENABLED:
+        return []
+    markets_by_key = _build_poly_markets_by_key(poly_markets)
+    if not markets_by_key:
+        return []
+    return scan_imbalance(
+        markets_by_key,
+        min_ratio=config.IMBALANCE_RATIO,
+        price_cache=price_cache,
+    )
+
+
+def _scan_news_snipe_layer4(poly_markets, mode, cooldown_cache=None) -> list[dict]:
+    """STRAT-02 news-driven resolution sniping.
+
+    Runs the scan once per enabled news source and merges the results. Two
+    independent gates:
+      * NEWS_SNIPE_ENABLED + FINNHUB_API_KEY       -> Finnhub headlines
+      * FIRECRAWL_NEWS_ENABLED + FIRECRAWL_API_KEY  -> Firecrawl web search
+    Either, both, or neither may be active. Returns ``[]`` when no source is
+    enabled/configured or there are no markets. A failure building or running
+    one client does not disable the other."""
+    if mode not in ("all", "news-snipe"):
+        return []
+
+    finnhub_on = config.NEWS_SNIPE_ENABLED and bool(config.FINNHUB_API_KEY)
+    firecrawl_on = config.FIRECRAWL_NEWS_ENABLED and bool(config.FIRECRAWL_API_KEY)
+    if not (finnhub_on or firecrawl_on):
+        return []
+
+    markets_by_key = _build_poly_markets_by_key(poly_markets)
+    if not markets_by_key:
+        return []
+
+    clients: list[object] = []
+    if finnhub_on:
+        try:
+            from finnhub_api import FinnhubNewsClient
+            clients.append(FinnhubNewsClient(api_key=config.FINNHUB_API_KEY))
+        except ImportError:
+            logger.debug("finnhub_api module not available")
+        except Exception as exc:  # noqa: BLE001 - one client failing must not kill the other
+            logger.warning("Finnhub news client init failed: %s", exc)
+    if firecrawl_on:
+        try:
+            from firecrawl_news_client import FirecrawlNewsClient
+            clients.append(FirecrawlNewsClient(api_key=config.FIRECRAWL_API_KEY))
+        except ImportError:
+            logger.debug("firecrawl_news_client module not available")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Firecrawl news client init failed: %s", exc)
+
+    opportunities: list[dict] = []
+    for client in clients:
+        try:
+            opportunities.extend(
+                scan_news_snipe(
+                    markets_by_key,
+                    client,
+                    cooldown_cache=cooldown_cache,
+                    fuzzy_threshold=config.FUZZY_MATCH_THRESHOLD,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "News-snipe scan failed for %s: %s", type(client).__name__, exc
+            )
+    return opportunities
+
+
+def _scan_correlated_layer4(poly_markets, price_cache, mode) -> list[dict]:
+    """STRAT-06 correlated market pairs. Returns ``[]`` when the gate is off,
+    no valid pairs are configured, or there are no markets."""
+    if mode not in ("all", "correlated") or not config.CORRELATED_ENABLED:
+        return []
+    pairs = _parse_correlated_pairs(config.CORRELATED_PAIRS)
+    if not pairs:
+        logger.debug("CORRELATED_ENABLED but CORRELATED_PAIRS has no valid pairs")
+        return []
+    markets_by_key = _build_poly_markets_by_key(poly_markets)
+    if not markets_by_key:
+        return []
+    return scan_correlated(
+        markets_by_key,
+        pairs,
+        min_spread=config.CORRELATION_DIVERGENCE_THRESHOLD,
+        price_cache=price_cache,
+    )
+
+
+def _scan_time_decay_layer4(poly_markets, price_cache, mode,
+                            signal_aggregator=None) -> list[dict]:
+    """STRAT-07 time-decay convergence. Returns ``[]`` when the gate is off or
+    there are no markets. ``signal_aggregator`` is injectable for testing; a
+    fresh ``SignalAggregator`` is built when not supplied."""
+    if mode not in ("all", "time-decay") or not config.TIME_DECAY_ENABLED:
+        return []
+    markets_by_key = _build_poly_markets_by_key(poly_markets)
+    if not markets_by_key:
+        return []
+    if signal_aggregator is None:
+        from signal_aggregator import SignalAggregator
+        signal_aggregator = SignalAggregator()
+    return scan_time_decay(
+        markets_by_key,
+        signal_aggregator,
+        min_hours_to_expiry=config.TIME_DECAY_MIN_HOURS_EXPIRY,
+        min_consensus=config.TIME_DECAY_MIN_CONSENSUS,
+        buy_below_price=config.TIME_DECAY_BUY_BELOW_PRICE,
+        price_cache=price_cache,
+    )
+
+
+def _scan_jev_crypto_continuous(
+    poly_markets,
+    mode: str,
+    min_profit: float,
+    db=None,
+    jev_client=None,
+    spot_prices=None,
+) -> list[dict]:
+    """Continuous-mode runner for Jev-powered crypto prediction market scanner.
+
+    Evaluates BTC, ETH, SOL, XRP strike contracts against live spot prices.
+    Returns [] when disabled, mode doesn't match ('all' or 'jev-crypto'),
+    or if no markets are provided.
+    """
+    if mode not in ("all", "jev-crypto"):
+        return []
+    is_explicit = (mode == "jev-crypto")
+    enabled = getattr(config, "JEV_CRYPTO_ENABLED", False)
+    if not is_explicit and not enabled:
+        return []
+    markets_by_key = _build_poly_markets_by_key(poly_markets)
+    if not markets_by_key:
+        return []
+    return scan_jev_crypto(
+        markets_by_key,
+        spot_prices=spot_prices,
+        min_profit=min_profit,
+        jev_client=jev_client,
+        db=db,
+        force=is_explicit,
+    )
 
 
 def heal_kalshi_client(executor, platform_clients, hedger, notifier):
@@ -2130,89 +2361,49 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                     except Exception as exc:
                         logger.debug("Kalshi VIP tracking error: %s", exc)
 
-                # STRAT-01: Order Book Imbalance
-                if args.mode in ("all", "imbalance") and CONFIG_IMBALANCE_ENABLED:
-                    try:
-                        from scans.imbalance import scan_imbalance
-                        from config import IMBALANCE_RATIO, IMBALANCE_MAX_TRADE
-                        # Build markets_by_key dict for CLOB refinement
-                        _markets_by_key_imbalance: dict[str, dict] = {}
-                        if poly_markets:
-                            for mkt in poly_markets:
-                                cid = mkt.get("condition_id", "")
-                                if cid:
-                                    _markets_by_key_imbalance[f"polymarket-{cid}"] = mkt
-                        imbalance_opps = scan_imbalance(
-                            poly_markets=poly_markets if poly_markets else [],
-                            kalshi_data=kalshi_data,
-                            markets_by_key=_markets_by_key_imbalance,
-                            min_profit=min_profit,
-                        )
-                        all_opportunities.extend(imbalance_opps)
-                    except Exception as exc:
-                        logger.debug("Imbalance scan failed: %s", exc)
+                # Layer 4: informed-trading scans (flag-gated; disabled by
+                # default). Each helper gates on its own config flag + mode and
+                # returns [] when off. Failures log at WARNING (not the old
+                # silent debug) so an enabled-but-broken strategy stays visible.
+                try:
+                    all_opportunities.extend(
+                        _scan_imbalance_layer4(poly_markets, price_cache, args.mode)
+                    )
+                except Exception as exc:
+                    logger.warning("Imbalance scan failed: %s", exc)
 
-                # STRAT-02: News-Driven Resolution Sniping
-                if args.mode in ("all", "news-snipe") and CONFIG_NEWS_SNIPE_ENABLED:
-                    try:
-                        from scans.news_snipe import scan_news_snipe
-                        from config import NEWS_SNIPE_CONFIDENCE_THRESHOLD, NEWS_SNIPE_MAX_TRADE, FINNHUB_API_KEY
-                        if not FINNHUB_API_KEY:
-                            logger.debug("NEWS_SNIPE_ENABLED but FINNHUB_API_KEY not set")
-                        else:
-                            try:
-                                from finnhub_api import FinnhubNewsClient
-                                news_client = FinnhubNewsClient(api_key=FINNHUB_API_KEY)
-                                news_snipe_opps = scan_news_snipe(
-                                    poly_markets=poly_markets if poly_markets else [],
-                                    kalshi_data=kalshi_data,
-                                    news_client=news_client,
-                                    confidence_threshold=NEWS_SNIPE_CONFIDENCE_THRESHOLD,
-                                    min_profit=min_profit,
-                                )
-                                all_opportunities.extend(news_snipe_opps)
-                            except ImportError:
-                                logger.debug("finnhub_api module not available")
-                    except Exception as exc:
-                        logger.debug("News snipe scan failed: %s", exc)
+                try:
+                    all_opportunities.extend(
+                        _scan_news_snipe_layer4(poly_markets, args.mode)
+                    )
+                except Exception as exc:
+                    logger.warning("News-snipe scan failed: %s", exc)
 
-                # STRAT-06: Correlated Market Pairs
-                if args.mode in ("all", "correlated") and CONFIG_CORRELATED_ENABLED:
-                    try:
-                        from scans.correlated import scan_correlated
-                        from config import CORRELATION_DIVERGENCE_THRESHOLD, CORRELATED_PAIRS_CONFIG
-                        correlated_opps = scan_correlated(
-                            poly_markets=poly_markets if poly_markets else [],
-                            kalshi_data=kalshi_data,
-                            correlated_pairs=CORRELATED_PAIRS_CONFIG,
-                            divergence_threshold=CORRELATION_DIVERGENCE_THRESHOLD,
-                            min_profit=min_profit,
-                        )
-                        all_opportunities.extend(correlated_opps)
-                    except Exception as exc:
-                        logger.debug("Correlated pairs scan failed: %s", exc)
+                try:
+                    all_opportunities.extend(
+                        _scan_correlated_layer4(poly_markets, price_cache, args.mode)
+                    )
+                except Exception as exc:
+                    logger.warning("Correlated-pairs scan failed: %s", exc)
 
-                # STRAT-07: Time Decay Convergence
-                if args.mode in ("all", "time-decay") and CONFIG_TIME_DECAY_ENABLED:
-                    try:
-                        from scans.time_decay import scan_time_decay
-                        from config import (
-                            TIME_DECAY_HOURS_THRESHOLD, TIME_DECAY_MIN_CONSENSUS,
-                            TIME_DECAY_MAX_TRADE
+                try:
+                    all_opportunities.extend(
+                        _scan_time_decay_layer4(poly_markets, price_cache, args.mode)
+                    )
+                except Exception as exc:
+                    logger.warning("Time-decay scan failed: %s", exc)
+
+                try:
+                    all_opportunities.extend(
+                        _scan_jev_crypto_continuous(
+                            poly_markets,
+                            args.mode,
+                            min_profit,
+                            db=db,
                         )
-                        from signal_aggregator import SignalAggregator
-                        _time_decay_aggregator = SignalAggregator()
-                        time_decay_opps = scan_time_decay(
-                            poly_markets=poly_markets if poly_markets else [],
-                            kalshi_data=kalshi_data,
-                            signal_aggregator=_time_decay_aggregator,
-                            hours_threshold=TIME_DECAY_HOURS_THRESHOLD,
-                            min_consensus=TIME_DECAY_MIN_CONSENSUS,
-                            min_profit=min_profit,
-                        )
-                        all_opportunities.extend(time_decay_opps)
-                    except Exception as exc:
-                        logger.debug("Time decay scan failed: %s", exc)
+                    )
+                except Exception as exc:
+                    logger.warning("Jev crypto scan failed: %s", exc)
 
                 # Structural alpha: Combinatorial logical arbitrage (Phase 9)
                 if args.mode in ("all", "logical-arb"):
@@ -2431,6 +2622,8 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                     1 for o in all_opportunities if o.get("type") == "ResolutionSnipeOpp")
                 dashboard_state.convergence_signals = sum(
                     1 for o in all_opportunities if o.get("type") == "ConvergenceOpp")
+                dashboard_state.jev_crypto_opps = sum(
+                    1 for o in all_opportunities if o.get("type") == "JevCrypto")
                 if _market_maker:
                     mm_status = _market_maker.get_status()
                     dashboard_state.mm_active_markets = mm_status["active_markets"]

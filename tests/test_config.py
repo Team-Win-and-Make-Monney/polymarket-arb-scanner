@@ -396,6 +396,7 @@ class TestValidateConfigWarnings:
 class TestPlatformWhitelistConfig:
 
     def test_default_whitelist_is_kalshi_only(self, monkeypatch):
+        monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **kw: None)
         monkeypatch.delenv("ENABLED_EXECUTION_PLATFORMS", raising=False)
         cfg = _reload_config()
         assert cfg.ENABLED_EXECUTION_PLATFORMS == frozenset({"kalshi"})

@@ -47,6 +47,7 @@ def scan_news_snipe(
     finnhub_client,
     cooldown_cache: dict | None = None,
     fuzzy_threshold: int = 70,
+    jev_client=None,
 ) -> list[dict]:
     """Stage 1: Scan news headlines and extract trading signals.
 
@@ -57,6 +58,7 @@ def scan_news_snipe(
         finnhub_client: FinnhubNewsClient instance for fetching news.
         cooldown_cache: Dict tracking market_key -> last_execution_time for deduplication.
         fuzzy_threshold: Fuzzy match threshold (0-100, default 70).
+        jev_client: Optional JevClient instance.
 
     Returns:
         List of opportunity dicts with type='NewsSnipe', _headline, _sentiment, _confidence.
@@ -84,7 +86,9 @@ def scan_news_snipe(
             continue
 
     # Extract signals from headlines
-    signals = extract_news_signals(all_headlines, markets_by_key, fuzzy_threshold)
+    signals = extract_news_signals(
+        all_headlines, markets_by_key, fuzzy_threshold, jev_client=jev_client
+    )
 
     # Apply cooldown filter
     for signal in signals:
@@ -112,6 +116,7 @@ def extract_news_signals(
     headlines: list[dict],
     markets_by_key: dict,
     fuzzy_threshold: int = 70,
+    jev_client=None,
 ) -> list[dict]:
     """Extract trading signals from news headlines via fuzzy matching.
 
@@ -147,8 +152,10 @@ def extract_news_signals(
             if similarity < fuzzy_threshold:
                 continue
 
-            # Score sentiment
-            sentiment_result = _score_sentiment(full_text)
+            # Score sentiment using Jev semantic resolution with keyword fallback
+            sentiment_result = _score_sentiment_with_jev(
+                headline_text, summary_text, market.get("question", ""), client=jev_client
+            )
             if sentiment_result["sentiment"] is None:
                 continue
 
@@ -162,10 +169,12 @@ def extract_news_signals(
                 "_confidence": sentiment_result["confidence"],
                 "_market_key": market_key,
                 "_news_timestamp": headline.get("datetime"),
+                "_sentiment_source": sentiment_result.get("source", "keyword"),
             }
             signals.append(signal)
             logger.info(
-                "Sentiment matched: %s in '%s' (confidence: %.2f)",
+                "Sentiment matched (%s): %s in '%s' (confidence: %.2f)",
+                sentiment_result.get("source", "keyword"),
                 sentiment_result["sentiment"],
                 headline_text[:100],
                 sentiment_result["confidence"],
@@ -173,6 +182,71 @@ def extract_news_signals(
             break  # One market per headline
 
     return signals
+
+
+def _score_sentiment_with_jev(
+    headline: str,
+    summary: str,
+    market_question: str,
+    client=None,
+) -> dict:
+    """Score sentiment using Jev System One semantic evaluation, with keyword fallback.
+
+    Args:
+        headline: News headline text.
+        summary: News article summary text.
+        market_question: Target prediction market question.
+        client: Optional JevClient instance.
+
+    Returns:
+        Dict with 'sentiment' ('YES', 'NO', None) and 'confidence' (float).
+    """
+    try:
+        from jev_client import get_jev_client
+        j_client = client or get_jev_client()
+        if j_client.is_available():
+            try:
+                state = {
+                    "headline": headline,
+                    "summary": summary,
+                    "market_question": market_question,
+                }
+                questions = {
+                    "outcome_resolution": {
+                        "type": "choice",
+                        "instructions": (
+                            "Given the headline and summary, does this breaking news event definitively "
+                            "confirm the resolution outcome for `market_question` to resolve YES, NO, or is it neutral/inconclusive?"
+                        ),
+                        "criteria": {
+                            "resolves_yes": "The news explicitly confirms the market condition occurred or passed (YES outcome)",
+                            "resolves_no": "The news explicitly confirms the market condition failed, was rejected, or cancelled (NO outcome)",
+                            "neutral_unclear": "The news is speculative, ongoing, unrelated, or inconclusive",
+                        },
+                    }
+                }
+                res = j_client.query_decisions(state, questions)
+                q_ans = res.get("answers", {}).get("outcome_resolution", {})
+                choice = q_ans.get("choice", "neutral_unclear")
+                conf = float(q_ans.get("confidence", 0.0))
+
+                if choice == "resolves_yes":
+                    return {"sentiment": "YES", "confidence": conf, "source": "jev"}
+                elif choice == "resolves_no":
+                    return {"sentiment": "NO", "confidence": conf, "source": "jev"}
+                else:
+                    return {"sentiment": None, "confidence": 0.0, "source": "jev"}
+            except Exception as e:
+                logger.warning("Active Jev sentiment scoring failed (failing closed): %s", e)
+                return {"sentiment": None, "confidence": 0.0, "source": "jev_failed"}
+    except Exception as e:
+        logger.debug("Jev client not available: %s", e)
+
+    # Fallback to keyword matching only when Jev client is not configured/available
+    full_text = (headline + " " + summary).lower()
+    kw_res = _score_sentiment(full_text)
+    kw_res["source"] = "keyword"
+    return kw_res
 
 
 def _score_sentiment(text: str) -> dict:

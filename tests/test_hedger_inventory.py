@@ -80,7 +80,8 @@ class TestHedgeInventoryDispatch:
     def test_polymarket_dispatch(self, db):
         PartialFillHedger = _import_hedger()
         pm_trader = MagicMock()
-        pm_trader.place_order.return_value = {"success": True}
+        pm_trader.place_order.return_value = {"success": True, "order_id": "pm_h1"}
+        pm_trader.get_order_status.return_value = {"status": "matched"}
 
         # Patch fetch_order_book / get_best_bid_ask in the polymarket_api stub
         sys.modules["polymarket_api"].fetch_order_book = MagicMock(

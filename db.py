@@ -114,7 +114,9 @@ class TradeDB:
                 action TEXT NOT NULL,
                 edge REAL,
                 confidence REAL,
-                details TEXT
+                details TEXT,
+                resolved_outcome REAL,
+                resolved_at TEXT
             );
         """)
         self.conn.commit()
@@ -208,6 +210,14 @@ class TradeDB:
                 self.conn.commit()
             except sqlite3.OperationalError:
                 logger.debug("Migration: %s column already exists on partial_fills", col)
+
+        # Migration: Add resolved_outcome and resolved_at to jev_decisions
+        for col, col_type in [("resolved_outcome", "REAL"), ("resolved_at", "TEXT")]:
+            try:
+                self.conn.execute(f"ALTER TABLE jev_decisions ADD COLUMN {col} {col_type}")
+                self.conn.commit()
+            except sqlite3.OperationalError:
+                logger.debug("Migration: %s column already exists on jev_decisions", col)
 
     def log_opportunity(
         self,
@@ -1113,6 +1123,95 @@ class TradeDB:
                        ORDER BY id DESC LIMIT ?""",
                     (limit,),
                 )
+            return [dict(row) for row in cur.fetchall()]
+
+    def update_jev_resolution(
+        self,
+        decision_id: int,
+        outcome: float,
+        resolved_at: str | None = None,
+    ) -> bool:
+        """Update a recorded Jev decision with its final ground truth resolution outcome.
+
+        Args:
+            decision_id: Database ID of the decision record.
+            outcome: Final resolved outcome (1.0 = YES won, 0.0 = NO won).
+            resolved_at: Optional ISO 8601 timestamp of resolution (defaults to now).
+
+        Returns:
+            True if a record was updated, False otherwise.
+        """
+        now = resolved_at or datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            cur = self.conn.execute(
+                """UPDATE jev_decisions
+                   SET resolved_outcome = ?, resolved_at = ?
+                   WHERE id = ?""",
+                (float(outcome), now, decision_id),
+            )
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def update_jev_resolutions_by_market(
+        self,
+        identifier: str,
+        outcome: float,
+        resolved_at: str | None = None,
+    ) -> int:
+        """Batch update unresolved decisions matching a market question or token ID.
+
+        Args:
+            identifier: Market question substring or token ID found in `details`.
+            outcome: Final resolved outcome (1.0 = YES, 0.0 = NO).
+            resolved_at: Optional ISO 8601 timestamp of resolution.
+
+        Returns:
+            Number of decision rows updated.
+        """
+        now = resolved_at or datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            cur = self.conn.execute(
+                """UPDATE jev_decisions
+                   SET resolved_outcome = ?, resolved_at = ?
+                   WHERE resolved_outcome IS NULL AND details LIKE ?""",
+                (float(outcome), now, f"%{identifier}%"),
+            )
+            self.conn.commit()
+            return cur.rowcount
+
+    def get_jev_calibration_data(
+        self,
+        asset: str | None = None,
+        only_resolved: bool = True,
+        limit: int = 1000,
+    ) -> list[dict]:
+        """Fetch decisions for statistical calibration and Brier score evaluation.
+
+        Args:
+            asset: Optional asset filter (e.g. 'BTC', 'ETH', 'SOL', 'XRP').
+            only_resolved: If True, only returns records with non-NULL resolved_outcome.
+            limit: Maximum records to return.
+
+        Returns:
+            List of decision dicts with probabilities and resolution outcomes.
+        """
+        conditions = ["jev_prob IS NOT NULL"]
+        params: list[object] = []
+
+        if only_resolved:
+            conditions.append("resolved_outcome IS NOT NULL")
+        if asset and asset.lower() != "all":
+            conditions.append("asset = ?")
+            params.append(asset.upper())
+
+        where_clause = " AND ".join(conditions)
+        sql = f"""SELECT * FROM jev_decisions
+                  WHERE {where_clause}
+                  ORDER BY id ASC LIMIT ?"""
+        params.append(limit)
+
+        with self._lock:
+            cur = self.conn.execute(sql, tuple(params))
             return [dict(row) for row in cur.fetchall()]
 
     def close(self):

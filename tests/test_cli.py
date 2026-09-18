@@ -104,6 +104,12 @@ class TestArgumentParsing:
         args = parser.parse_args(["--mode", "kalshi"])
         assert args.mode == "kalshi"
 
+    def test_mode_mm_pilot(self):
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--mode", choices=["all", "mm-pilot"], default="all")
+        args = parser.parse_args(["--mode", "mm-pilot"])
+        assert args.mode == "mm-pilot"
+
     def test_min_profit_float(self):
         parser = argparse.ArgumentParser()
         parser.add_argument("--min-profit", type=float, default=None)
@@ -341,6 +347,22 @@ class TestRunOneshotModeRouting:
                               extra_clients={"ibkr": ibkr_client})
         mock_ibkr.assert_called_once()
 
+    @patch.object(_cli_mod, "display_results")
+    @patch.object(_cli_mod, "dashboard_state")
+    @patch.object(_cli_mod, "scan_polymarket_rewards", return_value=[])
+    @patch.object(_cli_mod, "fetch_reward_markets", return_value=[{"conditionId": "reward"}])
+    @patch.object(_cli_mod, "fetch_all_markets")
+    def test_rewards_mode_uses_dedicated_reward_feed(
+        self, mock_fetch_all, mock_fetch_rewards, mock_scan, mock_dash, mock_display,
+    ):
+        with patch.object(_cli_mod, "CONFIG_REWARDS_ENABLED", True):
+            _cli_mod._run_oneshot(
+                _make_args(mode="rewards"), 0.01, None, _make_executor(), _make_db(),
+            )
+        mock_fetch_all.assert_not_called()
+        mock_fetch_rewards.assert_called_once_with()
+        assert mock_scan.call_args.args[0] == [{"conditionId": "reward"}]
+
 
 # ---------------------------------------------------------------------------
 # _run_oneshot — filtering and execution
@@ -393,6 +415,19 @@ class TestRunOneshotFilteringAndExecution:
         args = _make_args()
         _cli_mod._run_oneshot(args, 0.01, None, executor, _make_db())
         assert executor.execute.call_count == 2
+
+    @patch.object(_cli_mod, "display_results")
+    @patch.object(_cli_mod, "dashboard_state")
+    @patch.object(_cli_mod, "scan_binary_internal")
+    @patch.object(_cli_mod, "fetch_all_markets", return_value=[{"question": "test"}])
+    def test_monitoring_only_opportunity_is_not_executed(self, mock_fetch, mock_scan, mock_dash, mock_display):
+        mock_scan.return_value = [
+            {"type": "BinaryInternal", "net_profit": 0.05},
+            {"type": "PolymarketRewards", "net_profit": 0.0, "_execution_eligible": False},
+        ]
+        executor = _make_executor(dry_run=True)
+        _cli_mod._run_oneshot(_make_args(), 0.01, None, executor, _make_db())
+        executor.execute.assert_called_once_with(mock_scan.return_value[0])
 
     @patch.object(_cli_mod, "display_results")
     @patch.object(_cli_mod, "dashboard_state")
@@ -493,6 +528,31 @@ class TestMainBranching:
 
         mock_continuous.assert_called_once()
         mock_oneshot.assert_not_called()
+        mock_db.close.assert_called_once()
+
+    @patch.object(_cli_mod, "start_dashboard", return_value=None)
+    @patch.object(_cli_mod, "run_continuous")
+    @patch.object(_cli_mod, "_run_oneshot")
+    @patch.object(_cli_mod, "ArbitrageExecutor")
+    @patch.object(_cli_mod, "RiskManager")
+    @patch.object(_cli_mod, "TradeDB")
+    @patch.object(_cli_mod, "setup_logging")
+    @patch.object(_cli_mod, "load_dotenv")
+    def test_mm_pilot_mode_dispatches_only_continuous(
+        self, mock_dotenv, mock_logging, mock_db_cls, mock_risk_cls,
+        mock_exec_cls, mock_oneshot, mock_continuous, mock_dashboard,
+    ):
+        mock_db = MagicMock()
+        mock_db_cls.return_value = mock_db
+
+        with patch("sys.argv", ["scanner.py", "--continuous", "--mode", "mm-pilot", "--dry-run"]):
+            with patch.dict(os.environ, {}, clear=False):
+                _cli_mod.main()
+
+        mock_continuous.assert_called_once()
+        mock_oneshot.assert_not_called()
+        assert mock_continuous.call_args.args[0].mode == "mm-pilot"
+        assert mock_exec_cls.call_args.kwargs["dry_run"] is True
         mock_db.close.assert_called_once()
 
 
@@ -701,3 +761,73 @@ class TestPhase9CLIModes:
         captured = capsys.readouterr()
         assert "logical-arb" in captured.out or "logical-arb" in captured.err
         assert "whale-copy" in captured.out or "whale-copy" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Optional external-source startup gates
+# ---------------------------------------------------------------------------
+
+class TestOptionalClientStartup:
+    def test_ibkr_does_not_probe_localhost_without_explicit_host(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with patch.object(_cli_mod, "IBKRClient") as client_cls:
+                result = _cli_mod._initialize_ibkr_client("all")
+
+        assert result is None
+        client_cls.assert_not_called()
+
+    def test_ibkr_connects_to_explicit_gateway(self):
+        client = MagicMock()
+        client.login.return_value = True
+
+        with patch.dict(
+            os.environ,
+            {"IBKR_HOST": "gateway.internal", "IBKR_PORT": "4002", "IBKR_CLIENT_ID": "7"},
+            clear=True,
+        ):
+            with patch.object(_cli_mod, "IBKRClient", return_value=client):
+                result = _cli_mod._initialize_ibkr_client("ibkr")
+
+        assert result is client
+        client.login.assert_called_once_with("gateway.internal", 4002, 7)
+
+    def test_metaculus_requires_event_monitor(self):
+        with patch.object(_cli_mod, "CONFIG_EVENT_MONITOR", False):
+            with patch.object(_cli_mod, "MetaculusClient") as client_cls:
+                result = _cli_mod._initialize_metaculus_client()
+
+        assert result is None
+        client_cls.assert_not_called()
+
+    def test_metaculus_requires_token_and_commercial_approval(self):
+        with patch.object(_cli_mod, "CONFIG_EVENT_MONITOR", True):
+            with patch.object(_cli_mod, "CONFIG_METACULUS_COMMERCIAL_USE_APPROVED", False):
+                with patch.dict(os.environ, {"METACULUS_API_KEY": "token"}, clear=True):
+                    with patch.object(_cli_mod, "MetaculusClient") as client_cls:
+                        result = _cli_mod._initialize_metaculus_client()
+
+        assert result is None
+        client_cls.assert_not_called()
+
+    def test_metaculus_approved_access_still_requires_token(self):
+        with patch.object(_cli_mod, "CONFIG_EVENT_MONITOR", True):
+            with patch.object(_cli_mod, "CONFIG_METACULUS_COMMERCIAL_USE_APPROVED", True):
+                with patch.dict(os.environ, {}, clear=True):
+                    with patch.object(_cli_mod, "MetaculusClient") as client_cls:
+                        result = _cli_mod._initialize_metaculus_client()
+
+        assert result is None
+        client_cls.assert_not_called()
+
+    def test_metaculus_initializes_after_both_access_gates(self):
+        client = MagicMock()
+        client.login.return_value = True
+
+        with patch.object(_cli_mod, "CONFIG_EVENT_MONITOR", True):
+            with patch.object(_cli_mod, "CONFIG_METACULUS_COMMERCIAL_USE_APPROVED", True):
+                with patch.dict(os.environ, {"METACULUS_API_KEY": "token"}, clear=True):
+                    with patch.object(_cli_mod, "MetaculusClient", return_value=client):
+                        result = _cli_mod._initialize_metaculus_client()
+
+        assert result is client
+        client.login.assert_called_once_with(api_key="token")

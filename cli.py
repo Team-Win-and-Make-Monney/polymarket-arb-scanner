@@ -9,6 +9,7 @@ import logging
 import os
 import sys
 import time
+from pathlib import Path
 
 # Fix Windows console encoding for Unicode market names
 if sys.stdout.encoding != "utf-8":
@@ -17,14 +18,41 @@ if sys.stdout.encoding != "utf-8":
 
 from dotenv import load_dotenv
 
+# CLI --dry-run must win over DRY_RUN=false before any config import.
+if "--dry-run" in sys.argv:
+    os.environ["DRY_RUN"] = "true"
+
 logger = logging.getLogger(__name__)
+
+_TRUTHY = ("1", "true", "yes")
+
+
+def require_kalshi_or_exit(kalshi_client) -> None:
+    """Abort at boot when REQUIRE_KALSHI is set but Kalshi auth failed.
+
+    Kalshi-only runs (D0 soaks, kalshi-only production) must not degrade to a
+    Polymarket-only scan when Kalshi is unreachable — a 48h soak that silently
+    drops its subject exchange produces void evidence (2026-07-23 incident).
+    """
+    if os.getenv("REQUIRE_KALSHI", "").strip().lower() not in _TRUTHY:
+        return
+    if kalshi_client is not None:
+        return
+    logger.error(
+        "REQUIRE_KALSHI is set but Kalshi auth failed or credentials are missing — "
+        "aborting instead of degrading (exchange may be in its maintenance window; "
+        "check GET /trade-api/v2/exchange/status before relaunching)."
+    )
+    sys.exit(1)
+
 
 from polymarket_api import (
     fetch_all_markets,
     fetch_events,
+    fetch_reward_markets,
     PolymarketTrader,
 )
-from kalshi_api import KalshiClient
+from kalshi_api import build_client_from_env, kalshi_creds_configured
 from betfair_api import BetfairClient
 from smarkets_api import SmarketsClient
 from sxbet_api import SXBetClient
@@ -56,8 +84,7 @@ from scans import (
     scan_betfair_backlay,
     scan_smarkets_backall,
     scan_smarkets_backlay,
-    scan_sxbet_backall,
-    scan_sxbet_backlay,
+    scan_sxbet,
     scan_matchbook_backall,
     scan_matchbook_backlay,
     scan_gemini_binary,
@@ -74,6 +101,8 @@ from scans import (
 )
 import config
 from config import (
+    polymarket_scan_enabled,
+    polymarket_reward_fetch_enabled,
     DEFAULT_MIN_PROFIT,
     MAX_TRADE_SIZE as CONFIG_MAX_TRADE_SIZE,
     DAILY_LOSS_LIMIT as CONFIG_DAILY_LOSS_LIMIT,
@@ -98,13 +127,67 @@ from config import (
     GAS_PRICE_CACHE_TTL as CONFIG_GAS_CACHE_TTL,
     EVENT_DIVERGENCE_THRESHOLD as CONFIG_EVENT_DIVERGENCE,
     EVENT_MONITOR_ENABLED as CONFIG_EVENT_MONITOR,
+    METACULUS_COMMERCIAL_USE_APPROVED as CONFIG_METACULUS_COMMERCIAL_USE_APPROVED,
     CONCURRENT_EXECUTION as CONFIG_CONCURRENT_EXECUTION,
     REWARDS_ENABLED as CONFIG_REWARDS_ENABLED,
 )
 
-# Load .env from project dir first, then ~/.claude/.env as fallback
-load_dotenv()
-load_dotenv(os.path.expanduser("~/.claude/.env"))
+# Project-local .env only — never merge personal/global env files (e.g.
+# ~/.claude/.env) into the bot environment.
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+
+
+def _initialize_ibkr_client(mode: str):
+    """Initialize IBKR only when its gateway host is explicitly configured."""
+    if mode not in ("all", "cross-all", "ibkr"):
+        return None
+
+    ibkr_host = os.getenv("IBKR_HOST")
+    if not ibkr_host:
+        log = logger.warning if mode == "ibkr" else logger.info
+        log("IBKR disabled: set IBKR_HOST when an IB Gateway or TWS endpoint is available.")
+        return None
+
+    ibkr_port = int(os.getenv("IBKR_PORT", "4001"))
+    ibkr_cid = int(os.getenv("IBKR_CLIENT_ID", "1"))
+    client = IBKRClient()
+    if not client.login(ibkr_host, ibkr_port, ibkr_cid):
+        logger.warning(
+            "IBKR connection failed (is IB Gateway running at %s:%d?).",
+            ibkr_host,
+            ibkr_port,
+        )
+        return None
+
+    logger.info("IBKR connected successfully.")
+    return client
+
+
+def _initialize_metaculus_client():
+    """Initialize Metaculus only after its access and commercial-use gates."""
+    if not CONFIG_EVENT_MONITOR:
+        return None
+
+    api_key = os.getenv("METACULUS_API_KEY")
+    if not api_key:
+        logger.warning(
+            "Metaculus disabled: EVENT_MONITOR_ENABLED requires METACULUS_API_KEY."
+        )
+        return None
+    if not CONFIG_METACULUS_COMMERCIAL_USE_APPROVED:
+        logger.warning(
+            "Metaculus disabled: set METACULUS_COMMERCIAL_USE_APPROVED=true only after "
+            "Metaculus grants written commercial API/data permission."
+        )
+        return None
+
+    client = MetaculusClient()
+    if not client.login(api_key=api_key):
+        logger.warning("Metaculus authentication or API-access verification failed.")
+        return None
+
+    logger.info("Metaculus client initialized with approved API access.")
+    return client
 
 
 def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=None,
@@ -118,15 +201,18 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
     # Stage 1: Fetch data from all platforms in parallel
     poly_markets = None
     poly_events = None
+    poly_reward_markets = None
     kalshi_data = None
 
     fetch_futures = {}
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        if args.mode not in ("kalshi", "betfair", "smarkets", "sxbet", "matchbook", "gemini", "ibkr", "triangular"):
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        if polymarket_scan_enabled(args.mode):
             fetch_futures["poly_markets"] = pool.submit(fetch_all_markets)
-        if args.mode in ("all", "negrisk", "negrisk-no"):
+        if polymarket_scan_enabled(args.mode) and args.mode in ("all", "negrisk", "negrisk-no"):
             fetch_futures["poly_events"] = pool.submit(fetch_events)
-        if args.mode in ("all", "kalshi", "cross", "spread") and kalshi_client:
+        if polymarket_reward_fetch_enabled(args.mode) and CONFIG_REWARDS_ENABLED:
+            fetch_futures["poly_reward_markets"] = pool.submit(fetch_reward_markets)
+        if args.mode in ("all", "kalshi", "cross", "spread", "rewards") and kalshi_client:
             fetch_futures["kalshi_data"] = pool.submit(_fetch_kalshi_data, kalshi_client)
 
         for key, future in fetch_futures.items():
@@ -142,6 +228,8 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
                     poly_events = result
                     if poly_events:
                         logger.info("Fetched %d events.", len(poly_events))
+                elif key == "poly_reward_markets":
+                    poly_reward_markets = result
                 elif key == "kalshi_data":
                     kalshi_data = result
             except Exception as e:
@@ -253,10 +341,9 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
         sxbet = extra_clients.get("sxbet")
         if sxbet:
             logger.info("--- SX Bet Scan ---")
-            sx_backall = scan_sxbet_backall(sxbet, min_profit)
+            sx_backall, sx_backlay = scan_sxbet(sxbet, min_profit)
             all_opportunities.extend(sx_backall)
             logger.info("Found %d SX Bet back-all opportunities.", len(sx_backall))
-            sx_backlay = scan_sxbet_backlay(sxbet, min_profit)
             all_opportunities.extend(sx_backlay)
             logger.info("Found %d SX Bet back-lay opportunities.", len(sx_backlay))
 
@@ -822,11 +909,11 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
         logger.info("--- Rewards Scan ---")
         try:
             # Polymarket rewards scan
-            if poly_markets:
+            if poly_reward_markets:
                 from market_maker import RewardTracker
                 reward_tracker = RewardTracker()
                 pm_reward_opps = scan_polymarket_rewards(
-                    poly_markets, reward_tracker, min_pool_usdc=10.0
+                    poly_reward_markets, reward_tracker, min_pool_usdc=10.0
                 )
                 all_opportunities.extend(pm_reward_opps)
                 logger.info("Found %d Polymarket reward opportunities.", len(pm_reward_opps))
@@ -839,7 +926,8 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
                 from market_maker import KalshiRewardTracker
                 kalshi_reward_tracker = KalshiRewardTracker()
                 k_reward_opps = scan_kalshi_rewards(
-                    kalshi_client, kalshi_reward_tracker, min_pool_usdc=10.0
+                    kalshi_client, kalshi_reward_tracker, min_pool_usdc=10.0,
+                    kalshi_data=kalshi_data,
                 )
                 all_opportunities.extend(k_reward_opps)
                 logger.info("Found %d Kalshi reward opportunities.", len(k_reward_opps))
@@ -897,13 +985,16 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
     dashboard_state.daily_pnl = db.get_daily_pnl()
 
     # Execute opportunities if not display-only
-    if all_opportunities and (executor.dry_run or executor.exec_mode in ("semi-auto", "full-auto")):
+    execution_opportunities = [
+        opp for opp in all_opportunities if opp.get("_execution_eligible", True)
+    ]
+    if execution_opportunities and (executor.dry_run or executor.exec_mode in ("semi-auto", "full-auto")):
         logger.info("--- Execution Pass ---")
         executed = 0
-        for opp in all_opportunities:
+        for opp in execution_opportunities:
             if executor.execute(opp):
                 executed += 1
-        logger.info("Executed: %d/%d", executed, len(all_opportunities))
+        logger.info("Executed: %d/%d", executed, len(execution_opportunities))
 
 
 def _run_report(json_output: bool = False):
@@ -1146,9 +1237,9 @@ def main():
                  "imbalance", "news-snipe", "correlated", "time-decay",
                  "logical-arb", "whale-copy",
                  "fee-promo", "cross-mm",
-                 "lead-lag-mm", "toxic-flow", "vol-mm", "jev-crypto"],
+                 "lead-lag-mm", "toxic-flow", "vol-mm", "mm-pilot", "jev-crypto"],
         default="all",
-        help="Scan mode: all, binary, negrisk, negrisk-no, cross, kalshi, cross-all, spread, betfair, smarkets, sxbet, matchbook, gemini, ibkr, event, triangular, stale, resolution, convergence, mm, rewards, imbalance, news-snipe, correlated, time-decay, fee-promo, cross-mm, jev-crypto",
+        help="Scan mode: all, binary, negrisk, negrisk-no, cross, kalshi, cross-all, spread, betfair, smarkets, sxbet, matchbook, gemini, ibkr, event, triangular, stale, resolution, convergence, mm, mm-pilot, rewards, imbalance, news-snipe, correlated, time-decay, fee-promo, cross-mm, jev-crypto",
     )
     parser.add_argument(
         "--min-profit",
@@ -1291,21 +1382,29 @@ def main():
     kalshi_api_key_id = os.getenv("KALSHI_API_KEY_ID")
     kalshi_private_key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
     kalshi_private_key_b64 = os.getenv("KALSHI_PRIVATE_KEY_BASE64")
-    if kalshi_api_key_id and (kalshi_private_key_path or kalshi_private_key_b64):
-        kalshi_client = KalshiClient()
+    if kalshi_private_key_path:
+        kalshi_private_key_path = os.path.expanduser(kalshi_private_key_path)
+    if kalshi_creds_configured():
         logger.info("Authenticating with Kalshi (API key)...")
-        if kalshi_private_key_b64:
-            success = kalshi_client.login_with_api_key(kalshi_api_key_id, private_key_base64=kalshi_private_key_b64)
-        else:
-            kalshi_private_key_path = os.path.expanduser(kalshi_private_key_path)
-            success = kalshi_client.login_with_api_key(kalshi_api_key_id, private_key_path=kalshi_private_key_path)
-        if not success:
-            kalshi_client = None
-            logger.warning("Kalshi auth failed.")
+        kalshi_client = build_client_from_env(
+            attempts=config.KALSHI_AUTH_BOOT_ATTEMPTS,
+            retry_wait=config.KALSHI_AUTH_BOOT_RETRY_WAIT,
+        )
+        if kalshi_client is None:
+            logger.warning(
+                "Kalshi auth failed after %d attempts — continuing without "
+                "Kalshi; continuous mode will keep retrying every %.0fs.",
+                config.KALSHI_AUTH_BOOT_ATTEMPTS, config.KALSHI_REAUTH_INTERVAL,
+            )
         else:
             logger.info("Kalshi authenticated successfully.")
     else:
-        logger.info("KALSHI_API_KEY_ID/KALSHI_PRIVATE_KEY_PATH not set in .env")
+        logger.info("KALSHI_API_KEY_ID + KALSHI_PRIVATE_KEY_PATH (or KALSHI_PRIVATE_KEY_BASE64) not set — Kalshi disabled")
+
+    # Kalshi-only runs (D0 soaks, kalshi-only production) must not degrade to a
+    # Polymarket-only scan when Kalshi is unreachable — a 48h soak that silently
+    # drops its subject exchange produces void evidence (2026-07-23 incident).
+    require_kalshi_or_exit(kalshi_client)
 
     pm_trader = None
     pm_private_key = os.getenv("POLYMARKET_PRIVATE_KEY")
@@ -1385,27 +1484,11 @@ def main():
             else:
                 logger.info("Gemini authenticated successfully.")
 
-    ibkr_client = None
-    if args.mode in ("all", "cross-all", "ibkr"):
-        ibkr_host = os.getenv("IBKR_HOST", "127.0.0.1")
-        ibkr_port = int(os.getenv("IBKR_PORT", "4001"))
-        ibkr_cid = int(os.getenv("IBKR_CLIENT_ID", "1"))
-        ibkr_client = IBKRClient()
-        if not ibkr_client.login(ibkr_host, ibkr_port, ibkr_cid):
-            ibkr_client = None
-            logger.warning("IBKR connection failed (is IB Gateway running at %s:%d?).",
-                           ibkr_host, ibkr_port)
-        else:
-            logger.info("IBKR connected successfully.")
+    ibkr_client = _initialize_ibkr_client(args.mode)
 
-    # Initialize Metaculus client (read-only signal source, public API works without key)
-    metaculus_client = None
-    mc_key = os.getenv("METACULUS_API_KEY")
-    metaculus_client = MetaculusClient()
-    if metaculus_client.login(api_key=mc_key):
-        logger.info("Metaculus client initialized%s.", " (with API key)" if mc_key else " (public)")
-    else:
-        metaculus_client = None
+    # Metaculus is read-only, but authentication and written commercial API
+    # permission are both required by its current terms.
+    metaculus_client = _initialize_metaculus_client()
 
     # Initialize GasMonitor for dynamic fee thresholds
     gas_monitor = None
@@ -1428,7 +1511,8 @@ def main():
             metaculus_client=metaculus_client,
             manifold_client=manifold_client,
         )
-        logger.info("Multi-source signal aggregator enabled (Metaculus + Manifold).")
+        sources = "Metaculus + Manifold" if metaculus_client else "Manifold"
+        logger.info("Signal aggregator enabled (%s).", sources)
     except Exception as exc:
         logger.debug("Signal aggregator not available: %s", exc)
 
@@ -1441,6 +1525,8 @@ def main():
             signal_aggregator=sig_aggregator,
         )
         logger.info("Event-driven speed trading enabled (EventMonitor active).")
+    elif CONFIG_EVENT_MONITOR:
+        logger.warning("EventMonitor disabled because approved Metaculus access is unavailable.")
 
     # Price cache updated by WebSocket feeds (shared with executor for revalidation)
     price_cache = {}

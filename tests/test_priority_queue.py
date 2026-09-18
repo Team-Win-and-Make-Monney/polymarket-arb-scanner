@@ -116,3 +116,43 @@ class TestPriorityExecution:
         asyncio.run(_main())
         assert len(received) == 1, f"Expected 1 result, got {len(received)}"
         assert received[0]["type"] == "StalePriceOpp"
+
+
+class TestWSTriggerDeduper:
+    def test_rejects_same_trigger_during_cooldown(self):
+        from continuous import _WSTriggerDeduper
+
+        deduper = _WSTriggerDeduper(5.0)
+        opp = {
+            "type": "Cross(PM_NO + K_YES)",
+            "_source": "ws_cross_pair",
+            "_market_key": "example-market",
+        }
+
+        assert deduper.admit(opp, now=100.0) is True
+        assert deduper.admit(opp, now=104.99) is False
+        assert deduper.admit(opp, now=105.0) is True
+
+    def test_direction_change_uses_separate_key(self):
+        from continuous import _WSTriggerDeduper
+
+        deduper = _WSTriggerDeduper(5.0)
+        first = {
+            "type": "Cross(PM_NO + K_YES)",
+            "_source": "ws_cross_pair",
+            "_market_key": "example-market",
+        }
+        flipped = {**first, "type": "Cross(PM_YES + K_NO)"}
+
+        assert deduper.admit(first, now=100.0) is True
+        assert deduper.admit(flipped, now=100.0) is True
+
+    def test_forget_releases_failed_queue_claim(self):
+        from continuous import _WSTriggerDeduper
+
+        deduper = _WSTriggerDeduper(5.0)
+        opp = {"type": "Binary", "market": "Example"}
+
+        assert deduper.admit(opp, now=100.0) is True
+        deduper.forget(opp)
+        assert deduper.admit(opp, now=100.1) is True

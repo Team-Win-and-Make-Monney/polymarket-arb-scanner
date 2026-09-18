@@ -49,7 +49,8 @@ class TradeDB:
                 size REAL NOT NULL,
                 status TEXT NOT NULL,
                 fill_price REAL,
-                order_id TEXT
+                order_id TEXT,
+                outcome TEXT
             );
 
             CREATE TABLE IF NOT EXISTS positions (
@@ -187,6 +188,15 @@ class TradeDB:
         except sqlite3.OperationalError:
             logger.debug("Migration: idx_trades_order_id already exists")
 
+        # Safe migration: add outcome to trades. Polymarket BUY_NO legs are
+        # logged with side="BUY", so settlement cannot recover the traded
+        # outcome (yes/no) from the side column — persist it explicitly.
+        try:
+            self.conn.execute("ALTER TABLE trades ADD COLUMN outcome TEXT")
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            logger.debug("Migration: outcome column already exists on trades")
+
         # Safe migration: add market_ticker to positions. Settlement checks
         # query the platform API by ticker (e.g. KXEPLSPREAD-...), but
         # market_identifier holds the human title (e.g. "Chelsea: Spreads").
@@ -261,13 +271,18 @@ class TradeDB:
         status: str,
         fill_price: float | None = None,
         order_id: str | None = None,
+        outcome: str | None = None,
     ) -> int | None:
-        """Log a trade leg. Returns the trade ID."""
+        """Log a trade leg. Returns the trade ID.
+
+        outcome is the traded market outcome (e.g. "yes"/"no") — distinct
+        from side (BUY/SELL) so settlement can score Polymarket BUY_NO legs.
+        """
         with self._lock:
             cur = self.conn.execute(
                 """INSERT INTO trades
-                   (opportunity_id, timestamp, platform, side, price, size, status, fill_price, order_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (opportunity_id, timestamp, platform, side, price, size, status, fill_price, order_id, outcome)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     opportunity_id,
                     datetime.now(timezone.utc).isoformat(),
@@ -278,6 +293,7 @@ class TradeDB:
                     status,
                     fill_price,
                     order_id,
+                    outcome,
                 ),
             )
             self.conn.commit()
@@ -329,6 +345,20 @@ class TradeDB:
                     "UPDATE trades SET client_order_id = ? WHERE id = ?",
                     (client_order_id, trade_id),
                 )
+            self.conn.commit()
+
+    def set_trade_order_id(self, trade_id: int, order_id: str | None):
+        """Persist the exchange order ID on a trade row.
+
+        Used when a leg fails with an unconfirmed cancel: the order may still
+        be live at the venue, so the ID must survive restarts for
+        recovery.reconcile_orphaned_positions() to find it.
+        """
+        with self._lock:
+            self.conn.execute(
+                "UPDATE trades SET order_id = ? WHERE id = ?",
+                (order_id, trade_id),
+            )
             self.conn.commit()
 
     def get_daily_pnl(self) -> float:
@@ -625,8 +655,9 @@ class TradeDB:
         """Get realized P&L per strategy type by joining trades with opportunities.
 
         Uses the opportunities.net_profit column as a proxy for trade P&L since
-        the trades table does not have a dedicated pnl column. Each trade leg is
-        counted; win_count is based on the parent opportunity's net_profit > 0.
+        the trades table does not have a dedicated pnl column. net_profit and
+        win_count are aggregated once per opportunity (de-duplicated across its
+        trade legs); trade_count is the number of trade legs.
 
         Returns:
             List of dicts with keys: strategy, trade_count, win_count,
@@ -634,14 +665,27 @@ class TradeDB:
         """
         with self._lock:
             rows = self.conn.execute(
-                """SELECT o.type AS strategy,
-                          COUNT(t.id) AS trade_count,
-                          SUM(CASE WHEN o.net_profit > 0 THEN 1 ELSE 0 END) AS win_count,
-                          COALESCE(SUM(o.net_profit), 0) AS total_pnl,
-                          COALESCE(AVG(o.net_profit), 0) AS avg_profit
-                   FROM trades t
-                   JOIN opportunities o ON t.opportunity_id = o.id
-                   GROUP BY o.type
+                """WITH opp_pnl AS (
+                       SELECT DISTINCT o.id, o.type, o.net_profit
+                       FROM opportunities o
+                       WHERE EXISTS (
+                           SELECT 1 FROM trades t WHERE t.opportunity_id = o.id
+                       )
+                   ),
+                   leg_counts AS (
+                       SELECT o.type AS type, COUNT(t.id) AS trade_count
+                       FROM trades t
+                       JOIN opportunities o ON t.opportunity_id = o.id
+                       GROUP BY o.type
+                   )
+                   SELECT p.type AS strategy,
+                          lc.trade_count AS trade_count,
+                          SUM(CASE WHEN p.net_profit > 0 THEN 1 ELSE 0 END) AS win_count,
+                          COALESCE(SUM(p.net_profit), 0) AS total_pnl,
+                          COALESCE(AVG(p.net_profit), 0) AS avg_profit
+                   FROM opp_pnl p
+                   JOIN leg_counts lc ON lc.type = p.type
+                   GROUP BY p.type, lc.trade_count
                    ORDER BY total_pnl DESC"""
             ).fetchall()
             return [
@@ -654,6 +698,18 @@ class TradeDB:
                 }
                 for r in rows
             ]
+
+    def get_opportunities_after(self, after_id: int, limit: int = 500) -> list[dict]:
+        """Return opportunities with id > after_id, oldest first (for mirroring)."""
+        with self._lock:
+            cur = self.conn.execute(
+                """SELECT id, timestamp, type, market, prices, total_cost,
+                          net_profit, net_roi, depth, action
+                   FROM opportunities WHERE id > ? ORDER BY id ASC LIMIT ?""",
+                (after_id, limit),
+            )
+            cols = [c[0] for c in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
 
     def get_opportunity_stats_by_type(self) -> list[dict]:
         """Get opportunity statistics grouped by type.
@@ -967,6 +1023,30 @@ class TradeDB:
             )
             self.conn.commit()
 
+    def get_reward_metrics(self, since_ts: int = 0) -> list[dict]:
+        """Read reward_metrics rows for cross-engine sync.
+
+        Args:
+            since_ts: Only return rows with timestamp at or after this
+                Unix-seconds value (default 0 = all rows). Inclusive so rows
+                written in the same second as the last sync are not skipped;
+                the downstream upsert dedupes on (engine, source_key).
+
+        Returns:
+            A list of dicts, oldest first, each with id, platform, market_key,
+            order_id, event, size, spread, resting_seconds, timestamp.
+        """
+        with self._lock:
+            cursor = self.conn.execute(
+                """SELECT id, platform, market_key, order_id, event, size, spread,
+                          resting_seconds, timestamp
+                   FROM reward_metrics
+                   WHERE timestamp >= ?
+                   ORDER BY timestamp ASC, id ASC""",
+                (since_ts,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
     # ---------------------------------------------------------------------
     # Treasury / auto-rebalance audit (Strategy #18)
     # ---------------------------------------------------------------------
@@ -1031,6 +1111,103 @@ class TradeDB:
                 (status, tx_hash, error, transfer_id),
             )
             self.conn.commit()
+
+    def claim_transfer(
+        self,
+        from_platform: str,
+        to_platform: str,
+        amount_usd: float,
+        idempotency_key: str,
+    ) -> tuple[int | None, bool]:
+        """Atomically claim an idempotency key for a pending transfer."""
+        with self._lock:
+            cur = self.conn.execute(
+                """INSERT OR IGNORE INTO transfers
+                   (timestamp, from_platform, to_platform, amount_usd,
+                    status, idempotency_key)
+                   VALUES (?, ?, ?, ?, 'pending', ?)""",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    from_platform,
+                    to_platform,
+                    amount_usd,
+                    idempotency_key,
+                ),
+            )
+            created = cur.rowcount == 1
+            row = self.conn.execute(
+                "SELECT id FROM transfers WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            self.conn.commit()
+            return (row["id"] if row else None), created
+
+    def claim_transfer_with_daily_limit(
+        self,
+        from_platform: str,
+        to_platform: str,
+        amount_usd: float,
+        idempotency_key: str,
+        max_daily_usd: float,
+    ) -> tuple[int | None, bool, float | None]:
+        """Atomically enforce the rolling daily cap and claim a transfer.
+
+        Returns the transfer id and whether this call created it. The third
+        value is the amount already used when the daily cap rejects the claim,
+        otherwise ``None``. ``BEGIN IMMEDIATE`` serializes the read-and-insert
+        across separate SQLite connections as well as this instance's lock.
+        """
+        cutoff = datetime.now(timezone.utc).timestamp() - 86400
+        with self._lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self.conn.execute(
+                    "SELECT id FROM transfers WHERE idempotency_key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if existing:
+                    self.conn.commit()
+                    return existing["id"], False, None
+
+                row = self.conn.execute(
+                    """SELECT COALESCE(SUM(amount_usd), 0.0) AS used_usd
+                       FROM transfers
+                       WHERE strftime('%s', timestamp) >= ?
+                         AND status IN ('succeeded', 'pending', 'dry_run')""",
+                    (str(int(cutoff)),),
+                ).fetchone()
+                used_today = float(row["used_usd"] if row else 0.0)
+                if used_today + amount_usd > max_daily_usd:
+                    self.conn.commit()
+                    return None, False, used_today
+
+                cur = self.conn.execute(
+                    """INSERT INTO transfers
+                       (timestamp, from_platform, to_platform, amount_usd,
+                        status, idempotency_key)
+                       VALUES (?, ?, ?, ?, 'pending', ?)""",
+                    (
+                        datetime.now(timezone.utc).isoformat(),
+                        from_platform,
+                        to_platform,
+                        amount_usd,
+                        idempotency_key,
+                    ),
+                )
+                self.conn.commit()
+                return cur.lastrowid, True, None
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def get_transfer_by_idempotency_key(self, idempotency_key: str) -> dict | None:
+        """Return the transfer already associated with an idempotency key."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM transfers WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+        return dict(row) if row else None
 
     def get_transfers_today(self) -> list[dict]:
         """Return transfers initiated in the last 24h. Used for daily limits."""

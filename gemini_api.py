@@ -14,6 +14,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 from config import GEMINI_RATE_LIMIT
 from rate_limiter import PlatformCircuitBreaker
+from url_guard import assert_public_url
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +83,7 @@ class GeminiClient:
         self.api_key = None
         self.api_secret = None
         self.authenticated = False
-        self.base_url = GEMINI_BASE_URL
+        self.base_url = assert_public_url(GEMINI_BASE_URL, env_name="GEMINI_BASE_URL", allow_http=False)
         self._account = None  # Set to "primary" for master API keys
         # Markets cache: shared between binary + multi scans within a cycle.
         self._markets_cache: list[dict] | None = None

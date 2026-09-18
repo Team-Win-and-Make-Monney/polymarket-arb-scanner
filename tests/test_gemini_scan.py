@@ -149,11 +149,12 @@ class TestScanGeminiMulti:
         scan_fn = self._import_scan()
         client = MagicMock()
         client.authenticated = True
-        # 4 outcomes at 0.20 each -> total=0.80, profit=0.20
+        # 4 outcomes at 0.22 each -> total=0.88 (above the implausible-sum
+        # floor), profit=0.12
         client.fetch_all_markets.return_value = [
-            _make_categorical_event("E1", "Who wins?", [0.20, 0.20, 0.20, 0.20]),
+            _make_categorical_event("E1", "Who wins?", [0.22, 0.22, 0.22, 0.22]),
         ]
-        client.get_order_book.return_value = {"asks": [{"price": 0.20, "amount": 50}]}
+        client.get_order_book.return_value = {"asks": [{"price": 0.22, "amount": 50}]}
 
         result = scan_fn(client, min_profit=0.001)
         assert len(result) >= 1
@@ -196,3 +197,55 @@ class TestScanGeminiMulti:
 
         result = scan_fn(client, min_profit=0.001)
         assert result == []
+
+
+class TestGeminiMultiImplausibleSumGate:
+    """GEMINI_MULTI_MIN_SUM: outcome sets summing far below $1 are not
+    exhaustive MECE sets (point-spread alternative lines) — buying them all
+    does not guarantee a $1 payout. 2026-07-24 paper-window FP class."""
+
+    def _import_scan(self):
+        if "scans.gemini" in sys.modules:
+            del sys.modules["scans.gemini"]
+        from scans.gemini import scan_gemini_multi
+        return scan_gemini_multi
+
+    def test_non_exhaustive_point_spread_filtered(self):
+        scan_fn = self._import_scan()
+        client = MagicMock()
+        client.authenticated = True
+        # Alternative spread lines summing to 0.52 — the prod phantom that
+        # showed as a ~90% ROI riskless arb.
+        client.fetch_all_markets.return_value = [
+            _make_categorical_event("E1", "Toronto vs D.C.: Point Spread",
+                                    [0.20, 0.17, 0.15]),
+        ]
+        result = scan_fn(client, min_profit=0.001)
+        assert result == []
+
+    def test_sum_just_above_floor_passes(self):
+        scan_fn = self._import_scan()
+        client = MagicMock()
+        client.authenticated = True
+        client.fetch_all_markets.return_value = [
+            _make_categorical_event("E1", "Election winner",
+                                    [0.30, 0.30, 0.27]),
+        ]
+        client.get_order_book.return_value = {"asks": [{"price": 0.30, "amount": 50}]}
+        result = scan_fn(client, min_profit=0.001)
+        assert len(result) == 1
+        assert result[0]["type"] == "GeminiMulti"
+
+    def test_floor_respects_config_override(self, monkeypatch):
+        import config
+        monkeypatch.setattr(config, "GEMINI_MULTI_MIN_SUM", 0.40)
+        scan_fn = self._import_scan()
+        client = MagicMock()
+        client.authenticated = True
+        client.fetch_all_markets.return_value = [
+            _make_categorical_event("E1", "Toronto vs D.C.: Point Spread",
+                                    [0.20, 0.17, 0.15]),
+        ]
+        client.get_order_book.return_value = {"asks": [{"price": 0.20, "amount": 50}]}
+        result = scan_fn(client, min_profit=0.001)
+        assert len(result) == 1

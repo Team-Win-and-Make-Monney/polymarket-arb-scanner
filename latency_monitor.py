@@ -309,7 +309,8 @@ class RegionRouter:
     def __init__(self, local_region: str = ""):
         self.local_region = local_region or os.getenv("DEPLOYMENT_REGION", "us-east")
         self._region_latencies: dict[str, dict[str, float]] = {}
-        self._lock = threading.Lock()
+        # Routing decisions call get_best_region while holding this lock.
+        self._lock = threading.RLock()
 
     def record_region_latency(
         self,

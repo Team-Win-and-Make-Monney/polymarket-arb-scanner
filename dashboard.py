@@ -6,6 +6,7 @@ Optional HTTP Basic Auth when DASHBOARD_PASS is set.
 """
 
 import base64
+import hmac
 import json
 import logging
 import threading
@@ -125,6 +126,7 @@ class _DashboardState:
         self.signal_sources_active = 0
         # Analytics (MON-01): per-strategy P&L metrics
         self.strategy_metrics: list[dict] = []
+        self.platform_health: dict = {}
         # Leaderboard (MON-02): strategy leaderboard state
         self.strategy_leaderboard: list[dict] = []
         self.leaderboard_updated_at: float = 0
@@ -164,6 +166,7 @@ class _DashboardState:
             "jev_crypto_opps": self.jev_crypto_opps,
             "signal_sources_active": self.signal_sources_active,
             "strategy_metrics": self.strategy_metrics,
+            "platform_health": self.platform_health,
             "rewards": rewards_metrics,
         }
 
@@ -244,11 +247,13 @@ def _check_auth(handler) -> bool:
     from config import DASHBOARD_USER, DASHBOARD_PASS
 
     if not DASHBOARD_PASS:
-        # Warn but allow — recommend setting DASHBOARD_PASS in production
+        # Reads are allowed without a password (local/dev convenience); the
+        # dangerous state-changing POST endpoints are separately fail-closed in
+        # do_POST (audit S06). Warn loudly in full-auto, where this is unsafe.
         from config import EXECUTION_MODE
         if EXECUTION_MODE == "full-auto":
             logger.warning("Dashboard auth disabled in full-auto mode — set DASHBOARD_PASS")
-        return True  # Auth disabled
+        return True
 
     auth_header = handler.headers.get("Authorization", "")
     if not auth_header.startswith("Basic "):
@@ -263,7 +268,12 @@ def _check_auth(handler) -> bool:
         _send_401(handler)
         return False
 
-    if user == DASHBOARD_USER and pwd == DASHBOARD_PASS:
+    # Constant-time comparison (audit S14): plain == leaks length/prefix via
+    # timing, enabling offline credential enumeration on a network-reachable
+    # dashboard. Compare both fields as bytes, unconditionally.
+    user_ok = hmac.compare_digest(user.encode("utf-8"), (DASHBOARD_USER or "").encode("utf-8"))
+    pwd_ok = hmac.compare_digest(pwd.encode("utf-8"), DASHBOARD_PASS.encode("utf-8"))
+    if user_ok and pwd_ok:
         return True
 
     _send_401(handler)
@@ -379,7 +389,19 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split("?")[0]
 
-        # Read the full request body upfront to avoid connection resets
+        # Fail closed BEFORE reading the body (audit S06): state-changing
+        # endpoints (kill-switch, resume, purge, fund-transfer) require a
+        # configured password, and an unauthenticated client must not be able to
+        # make the server read an arbitrarily large POST body first.
+        from config import DASHBOARD_PASS
+        if not DASHBOARD_PASS:
+            logger.error("Dashboard POST %s denied — DASHBOARD_PASS is not set", path)
+            _send_401(self)
+            return
+        if not _check_auth(self):
+            return
+
+        # Read the full request body (after auth) to avoid connection resets.
         post_body = b""
         try:
             content_len = int(self.headers.get("Content-Length", 0))
@@ -387,9 +409,6 @@ class _Handler(BaseHTTPRequestHandler):
                 post_body = self.rfile.read(content_len)
         except Exception as e:
             logger.debug("Dashboard POST body read error: %s", e)
-
-        if not _check_auth(self):
-            return
 
         post_routes = {
             "/api/pause": self._handle_pause_post,

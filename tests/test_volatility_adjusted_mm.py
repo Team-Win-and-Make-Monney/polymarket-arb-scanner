@@ -112,3 +112,46 @@ class TestQuoteEngineVolatilityHook:
         base = engine.calculate_quotes(0.50)
         widened = engine.calculate_quotes(0.50, market_key="vol-market")
         assert widened["spread"] > base["spread"]
+
+
+# ---------------------------------------------------------------------------
+# Finding #9: VolatilityTracker.has_min_samples — distinguishes "genuinely
+# calm" from "not enough data yet" so a safety gate (mm_pilot's G8) can fail
+# closed on the latter instead of trusting get_volatility()'s 0.0 default.
+# Fail-before: has_min_samples did not exist on VolatilityTracker at all.
+# ---------------------------------------------------------------------------
+
+class TestVolatilityTrackerHasMinSamples:
+    def test_false_before_min_samples_recorded(self):
+        from market_maker import VolatilityTracker
+        tracker = VolatilityTracker(min_samples=5)
+        for _ in range(4):
+            tracker.record_price("m1", 0.50)
+        assert tracker.has_min_samples("m1") is False
+        # get_volatility agrees this is "no reading yet" — has_min_samples
+        # must reflect the SAME threshold get_volatility uses internally.
+        assert tracker.get_volatility("m1") == 0.0
+
+    def test_true_at_exactly_min_samples(self):
+        from market_maker import VolatilityTracker
+        tracker = VolatilityTracker(min_samples=5)
+        for _ in range(5):
+            tracker.record_price("m1", 0.50)
+        assert tracker.has_min_samples("m1") is True
+
+    def test_false_for_never_seen_market(self):
+        from market_maker import VolatilityTracker
+        tracker = VolatilityTracker(min_samples=5)
+        assert tracker.has_min_samples("never-seen") is False
+
+    def test_true_does_not_mean_nonzero_volatility(self):
+        """A market can have enough samples AND genuinely be calm (constant
+        price) — has_min_samples and "reads as calm" are independent axes;
+        this just confirms enough-samples alone doesn't force a false
+        positive on volatility."""
+        from market_maker import VolatilityTracker
+        tracker = VolatilityTracker(min_samples=3)
+        for _ in range(5):
+            tracker.record_price("m1", 0.50)  # constant price, zero variance
+        assert tracker.has_min_samples("m1") is True
+        assert tracker.get_volatility("m1") == 0.0

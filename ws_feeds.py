@@ -41,6 +41,9 @@ POLYMARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 RECONNECT_DELAY = 5  # initial seconds before reconnect attempt
 RECONNECT_MAX_DELAY = 60  # maximum backoff delay
+# Bound a single Betfair stream message (audit S13): cap the StreamReader buffer
+# so a server that never sends CRLF can't grow it unboundedly toward OOM.
+_STREAM_LIMIT = 4 * 1024 * 1024  # 4 MiB
 KEEPALIVE_INTERVAL = 10  # seconds between pings
 
 
@@ -93,6 +96,11 @@ class FeedManager:
         self._pending_kalshi_subs: list[str] = []
         self._pending_betfair_subs: list[str] = []
         self._kalshi_ws = None
+        self._kalshi_task_started = False
+        self._kalshi_late_task: asyncio.Task | None = None
+        # Per-ticker Kalshi book state: {ticker: {"yes": {price_cents: qty}, "no": {...}}}.
+        # Needed because orderbook_delta messages carry single-level changes, not ladders.
+        self._kalshi_books: dict[str, dict[str, dict[int, float]]] = {}
         self._poly_ws = None
         self._last_message_time: dict[str, float] = {}  # platform -> timestamp
 
@@ -188,6 +196,7 @@ class FeedManager:
         self._running = True
         tasks = []
         if self._kalshi_tickers and self.kalshi_api_key_id and self.kalshi_private_key:
+            self._kalshi_task_started = True
             tasks.append(self._run_kalshi())
         if self._poly_token_ids:
             tasks.append(self._run_polymarket())
@@ -205,6 +214,30 @@ class FeedManager:
             len(self._betfair_market_ids),
         )
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    def start_kalshi_feed_late(self) -> bool:
+        """Start the Kalshi WS task after run() began without any Kalshi tickers.
+
+        Covers the self-heal path: when Kalshi auth fails at boot, run() starts
+        with zero Kalshi tickers and never spawns _run_kalshi. Once re-auth
+        succeeds and tickers arrive via update_subscriptions, this spawns the
+        feed task into the running loop. Idempotent; returns True only when a
+        task was actually started. Must be called from the event loop thread.
+        """
+        if self._kalshi_task_started:
+            return False
+        if not (self._running and self._kalshi_tickers
+                and self.kalshi_api_key_id and self.kalshi_private_key):
+            return False
+        self._kalshi_task_started = True
+        # _connect_kalshi's initial loop subscribes everything already in
+        # _kalshi_tickers; drop queued pending subs to avoid a duplicate
+        # subscribe message right after connect.
+        self._pending_kalshi_subs.clear()
+        self._kalshi_late_task = asyncio.create_task(self._run_kalshi())
+        logger.info("Kalshi WS feed started late (%d tickers) after re-auth.",
+                    len(self._kalshi_tickers))
+        return True
 
     def get_stale_feeds(self, max_silent_seconds: float = 120.0) -> list[str]:
         """Return list of platform names that have gone silent beyond threshold.
@@ -362,6 +395,7 @@ class FeedManager:
 
         async with websockets.connect(KALSHI_WS_URL, **connect_kwargs) as ws:
             logger.info("Kalshi connected. Subscribing to %d tickers...", len(self._kalshi_tickers))
+            self._reset_kalshi_books()
 
             # Subscribe to orderbook updates for each ticker
             for ticker in self._kalshi_tickers:
@@ -406,6 +440,14 @@ class FeedManager:
 
             self._kalshi_ws = None
 
+    def _reset_kalshi_books(self):
+        """Drop all cached Kalshi book state.
+
+        Called on (re)connect: after a connection gap the cached ladders are
+        stale, and deltas must not be applied until a fresh snapshot arrives.
+        """
+        self._kalshi_books.clear()
+
     def _handle_kalshi_message(self, data: dict):
         """Process a Kalshi WebSocket message.
 
@@ -422,15 +464,42 @@ class FeedManager:
             if not ticker:
                 return
 
-            # Parse best yes/no ask from the ladder arrays.
-            # Kalshi ladders: [[price_cents, quantity], ...] sorted best-first.
+            # Kalshi WS "yes"/"no" ladders are BID ladders ([price_cents, qty],
+            # ascending); the executable ask for one side is 100c minus the best
+            # bid on the opposite side. Deltas carry a single (side, price, delta)
+            # change, so a per-ticker book is maintained across messages.
+            book = self._kalshi_books.get(ticker)
+            if msg_type == "orderbook_snapshot":
+                book = {"yes": {}, "no": {}}
+                self._kalshi_books[ticker] = book
+                for side in ("yes", "no"):
+                    ladder = msg.get(side) or []
+                    book[side] = {
+                        int(level[0]): level[1]
+                        for level in ladder
+                        if isinstance(level, (list, tuple)) and len(level) >= 2
+                    }
+            elif book is not None:
+                side = msg.get("side")
+                price = msg.get("price")
+                delta = msg.get("delta")
+                if side in ("yes", "no") and isinstance(price, (int, float)) and isinstance(delta, (int, float)):
+                    levels = book[side]
+                    qty = levels.get(int(price), 0) + delta
+                    if qty > 0:
+                        levels[int(price)] = qty
+                    else:
+                        levels.pop(int(price), None)
+
             normalised = dict(msg)  # keep raw fields for backward compat
-            for side in ("yes", "no"):
-                ladder = msg.get(side, [])
-                if ladder and isinstance(ladder, list) and len(ladder[0]) >= 2:
-                    # Price is in cents (0-100); convert to dollars (0-1)
-                    normalised[f"{side}_ask"] = ladder[0][0] / 100.0
-                    normalised[f"{side}_ask_size"] = ladder[0][1]
+            for side, opposite in (("yes", "no"), ("no", "yes")):
+                # A delta before the ticker's snapshot leaves book=None: the
+                # ladder is unknown, so publish no executable prices at all.
+                opposite_levels = book[opposite] if book is not None else {}
+                if opposite_levels:
+                    best_bid = max(opposite_levels)
+                    normalised[f"{side}_ask"] = (100 - best_bid) / 100.0
+                    normalised[f"{side}_ask_size"] = opposite_levels[best_bid]
                 else:
                     normalised[f"{side}_ask"] = None
                     normalised[f"{side}_ask_size"] = 0
@@ -861,7 +930,7 @@ class BetfairFeed:
         ssl_ctx = ssl.create_default_context()
 
         self._reader, self._writer = await asyncio.open_connection(
-            self._host, self._port, ssl=ssl_ctx,
+            self._host, self._port, ssl=ssl_ctx, limit=_STREAM_LIMIT,
         )
         logger.info("Betfair stream: TCP connected to %s:%d", self._host, self._port)
 
@@ -928,7 +997,16 @@ class BetfairFeed:
         """Read one CRLF-delimited JSON message from the stream."""
         if self._reader is None:
             raise ConnectionError("Betfair stream: not connected")
-        raw = await self._reader.readuntil(b"\r\n")
+        try:
+            raw = await self._reader.readuntil(b"\r\n")
+        except asyncio.LimitOverrunError as exc:
+            # Audit S13: a line larger than the buffer limit (e.g. a server that
+            # never sends CRLF) must not grow unbounded — force a reconnect.
+            raise ConnectionError(
+                f"Betfair stream: message exceeded {_STREAM_LIMIT} bytes — reconnecting"
+            ) from exc
+        except asyncio.IncompleteReadError as exc:
+            raise ConnectionError("Betfair stream: connection closed mid-message") from exc
         return json.loads(raw.strip())
 
     async def _subscribe(self, market_ids: list[str]):

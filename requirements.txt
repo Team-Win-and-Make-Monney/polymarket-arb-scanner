@@ -4,6 +4,7 @@ tabulate==0.9.0
 thefuzz[speedup]==0.22.1
 cryptography==46.0.4
 py-clob-client-v2==1.0.2
+httpx[http2]>=0.27
 websockets==16.0
 tenacity==9.1.4
 python-socks[asyncio]==2.8.0
@@ -19,3 +20,4 @@ firecrawl-py>=4.0,<5.0
 sentry-sdk>=2.60.0
 anthropic>=0.40.0
 PyYAML>=6.0
+defusedxml==0.7.1

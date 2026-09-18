@@ -666,8 +666,9 @@ class TestKillSwitchEndpoints:
     def test_post_pause_engages_kill_switch(self):
         server, url = _start_test_server(18831)
         try:
-            with patch("config.DASHBOARD_PASS", ""):
-                status, body, _ = _post(url, "/api/pause")
+            with patch("config.DASHBOARD_PASS", "secret"), \
+                 patch("config.DASHBOARD_USER", "admin"):
+                status, body, _ = _post(url, "/api/pause", auth=_auth_header())
             assert status == 200
             data = json.loads(body)
             assert data["paused"] is True
@@ -678,9 +679,10 @@ class TestKillSwitchEndpoints:
     def test_post_pause_with_reason(self):
         server, url = _start_test_server(18832)
         try:
-            with patch("config.DASHBOARD_PASS", ""):
+            with patch("config.DASHBOARD_PASS", "secret"), \
+                 patch("config.DASHBOARD_USER", "admin"):
                 status, body, _ = _post(url, "/api/pause",
-                                        body_data={"reason": "emergency"})
+                                        body_data={"reason": "emergency"}, auth=_auth_header())
             data = json.loads(body)
             assert data["reason"] == "emergency"
         finally:
@@ -690,8 +692,9 @@ class TestKillSwitchEndpoints:
         pause("test")
         server, url = _start_test_server(18833)
         try:
-            with patch("config.DASHBOARD_PASS", ""):
-                status, body, _ = _post(url, "/api/resume")
+            with patch("config.DASHBOARD_PASS", "secret"), \
+                 patch("config.DASHBOARD_USER", "admin"):
+                status, body, _ = _post(url, "/api/resume", auth=_auth_header())
             assert status == 200
             data = json.loads(body)
             assert data["paused"] is False
@@ -722,8 +725,9 @@ class TestKillSwitchEndpoints:
     def test_post_unknown_route_returns_404(self):
         server, url = _start_test_server(18836)
         try:
-            with patch("config.DASHBOARD_PASS", ""):
-                status, _, _ = _post(url, "/api/nonexistent")
+            with patch("config.DASHBOARD_PASS", "secret"), \
+                 patch("config.DASHBOARD_USER", "admin"):
+                status, _, _ = _post(url, "/api/nonexistent", auth=_auth_header())
             assert status == 404
         finally:
             server.shutdown()

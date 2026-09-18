@@ -183,7 +183,10 @@ class TestPortfolioSettlementsReconciliation(unittest.TestCase):
 
     def test_winning_side_from_feed_drives_pnl(self):
         # Directional YES position, market resolved NO → realized loss, not
-        # the legacy arb assumption of 1.0 − cost.
+        # the legacy arb assumption of 1.0 - cost. Kalshi trades.size is the
+        # requested DOLLAR amount; the executor places
+        # max(1, int(size/price)) contracts: int(1.00/0.40) = 2 contracts at
+        # 0.40 → cost 0.80. Losing settlement = -0.80.
         self._position("KXTEST-5", side="yes", price=0.40)
         client = MagicMock()
         client.get_settlements.return_value = [
@@ -195,7 +198,7 @@ class TestPortfolioSettlementsReconciliation(unittest.TestCase):
         row = self.db.conn.execute(
             "SELECT realized_pnl FROM positions WHERE market_ticker='KXTEST-5'"
         ).fetchone()
-        self.assertAlmostEqual(row[0], -0.40, places=4)
+        self.assertAlmostEqual(row[0], -0.80, places=4)
 
 
 if __name__ == "__main__":

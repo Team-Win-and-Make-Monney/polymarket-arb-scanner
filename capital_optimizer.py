@@ -205,7 +205,9 @@ class TaxOptimizer:
 
     def __init__(self):
         self._cost_basis: dict[str, dict] = {}
-        self._lock = threading.Lock()
+        # Public read helpers may be called while a compound operation already
+        # holds the instance lock (for example, harvest candidate evaluation).
+        self._lock = threading.RLock()
 
     def record_entry(
         self,

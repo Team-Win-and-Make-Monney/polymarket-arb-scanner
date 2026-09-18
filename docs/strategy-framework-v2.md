@@ -67,6 +67,7 @@ Provide liquidity and earn bid-ask spreads, plus capture exchange-paid liquidity
 | 12 | Inventory-hedged MM | **BUILT** ✱ | `market_maker.py` (`InventoryTracker`) + `hedger.hedge_inventory()` | **PR #10** — `MarketMaker.on_fill` now wires the auto-hedge action when `needs_hedge()` is True. Pre-PR-10 the trigger fired but no action took place; this v2 had previously over-marked it BUILT. Default off (`MM_AUTO_HEDGE_ENABLED=false`). |
 | 22 | Liquidity reward farming — Polymarket | BUILT | `scans/rewards.py` | `PolymarketRewards` opp type |
 | 23 | Liquidity reward farming — Kalshi | BUILT | `scans/rewards.py` | `KalshiRewards` opp type |
+| 23a | Kalshi reward-MM pilot (safety layer) | **BUILT** | `mm_pilot.py` (`KalshiMMPilot`) | Execution variant of #23 — NOT a separate counted strategy (taxonomy stays 29). Plan 10 (`docs/plans/10-mm-pilot-prep.md`) — live LIP/VIP quoting hardening: `authorize_order` choke point, hard inventory caps, fill polling + auto-hedge, toxic/vol gates in the hot path, Supabase `bot_controls.mm_pilot_enabled` kill switch, canary phase. Kalshi ONLY. Default off (`MM_KALSHI_PILOT_ENABLED=false`); live start additionally requires `MM_AUTO_HEDGE_ENABLED` + `MM_TOXIC_FLOW_ENABLED` + `MM_VOLATILITY_ADJUSTED_ENABLED` and market selection from PR #43's `scans/lip_select.py`. |
 
 ✱ Status changed (or made truly accurate) after PR #10.
 

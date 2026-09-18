@@ -18,6 +18,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from config import KALSHI_RATE_LIMIT
+from kalshi_policy import live_kalshi_submit_allowed
 from rate_limiter import PlatformCircuitBreaker
 
 
@@ -124,6 +125,18 @@ def _sign_pss(private_key, message: str) -> str:
 
 class _RateLimitError(Exception):
     """Raised on HTTP 429 to trigger retry."""
+    pass
+
+
+class KalshiPortfolioQueryError(Exception):
+    """Raised by portfolio-state reads (fills/positions/orders) when the
+    caller opts into ``raise_on_error=True`` and the request fails.
+
+    A bare ``[]`` on HTTP failure is indistinguishable from "confirmed
+    empty" to any caller that cannot see inside this method — that
+    ambiguity is unsafe for the MM pilot's fill polling and startup
+    reconciliation, which must never mistake "unknown" for "zero".
+    """
     pass
 
 
@@ -264,6 +277,134 @@ class KalshiClient:
             return []
         return resp.json().get("markets", [])
 
+    def fetch_market(self, ticker: str) -> dict | None:
+        """Fetch a single market's current state from GET /markets/{ticker}.
+
+        Additive, read-only, general-purpose lookup (any status — open,
+        closed, settled) for any ticker. Unlike get_settlements(), which hits
+        the account-scoped /portfolio/settlements and only covers markets
+        this account actually traded, this works for any ticker.
+
+        Returns:
+            The market dict (includes 'status' and, once resolved, 'result')
+            or None on failure/not-found.
+        """
+        try:
+            resp = self._request("GET", f"/markets/{ticker}")
+        except Exception as exc:
+            logger.warning("Kalshi fetch_market failed for %s: %s", ticker, exc)
+            return None
+        if resp is not None and resp.status_code == 200:
+            data = resp.json()
+            return data.get("market", data)
+        return None
+
+    def fetch_settled_markets(self, min_close_ts: int, limit: int = 1000, max_pages: int = 50) -> list[dict]:
+        """Fetch settled markets closed at/after min_close_ts, cursor-paginated.
+
+        The discovery step of the "T-24h/T-6h candle reconstruction" method
+        (docs/plans/08-earnings-mention-oos.md, T1-pm-dispersion-novelty.md
+        §a): find WHAT settled since the caller's last watermark, then
+        reconstruct each one's historical price separately via
+        fetch_candlesticks. Mirrors fetch_all_events' pagination shape but
+        hits /markets directly with status=settled (same pattern validated
+        by the command-center's longshot_fade_pull.py full-history pull).
+
+        Kalshi settles on the order of millions of markets per year across
+        all categories, so min_close_ts is load-bearing: callers MUST track
+        and advance their own watermark forward each run rather than
+        omitting it or passing a stale/epoch value, or this will attempt to
+        page through the platform's entire settlement history every call.
+
+        Returns:
+            The complete list of settled market dicts (each carries
+            'result', 'ticker', 'event_ticker', 'close_time', etc.).
+
+        Raises:
+            RuntimeError: if any page request fails, or if
+                max_pages is exhausted while the cursor is still live —
+                never returns a silently-partial list.
+        """
+        out: list[dict] = []
+        cursor = None
+        for _ in range(max_pages):
+            params: dict = {"status": "settled", "limit": limit, "min_close_ts": min_close_ts}
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                resp = self._request("GET", "/markets", params=params)
+            except Exception as exc:
+                raise RuntimeError(
+                    "Kalshi settled-markets request failed mid-pagination: "
+                    f"{type(exc).__name__} ({len(out)} markets fetched so far)"
+                ) from exc
+            if not resp or resp.status_code != 200:
+                raise RuntimeError(
+                    f"Kalshi settled-markets request failed mid-pagination: "
+                    f"{resp.status_code if resp else 'no response'} ({len(out)} markets fetched so far)"
+                )
+            data = resp.json()
+            markets = data.get("markets", [])
+            out.extend(markets)
+            cursor = data.get("cursor")
+            if not cursor:
+                break
+        else:
+            raise RuntimeError(
+                f"Kalshi settled-markets pagination did not finish within max_pages={max_pages} "
+                f"({len(out)} markets fetched, cursor still live) — raise max_pages or narrow min_close_ts"
+            )
+        return out
+
+    def fetch_candlesticks(self, series_ticker: str, ticker: str, start_ts: int, end_ts: int,
+                           period_interval: int = 60) -> list[dict] | None:
+        """Fetch candlesticks via GET /series/{series_ticker}/markets/{ticker}/candlesticks.
+
+        Reconstructs a settled market's YES price at a specific historical
+        instant (e.g. T-24h before close) after the fact — the OOS logger's
+        core method, since a weekly cron cannot reliably catch every market
+        live during its narrow open T-24h..T-6h window. Price fields in the
+        response are ``*_dollars`` strings (e.g. ``close_dollars="0.2200"``),
+        NOT bare cents — confirmed gotcha from the in-sample pilot
+        (T1-pm-dispersion-novelty.md methodology note); callers must read the
+        dollar fields.
+
+        Args:
+            series_ticker: The market's series ticker (NOT its event or
+                market ticker — passing the wrong one 404s this endpoint).
+            ticker: The market ticker.
+            start_ts: Unix seconds, inclusive window start.
+            end_ts: Unix seconds, inclusive window end.
+            period_interval: Candle width in minutes (default 60 = hourly).
+
+        Returns:
+            The raw 'candlesticks' list — [] if the request succeeded but
+            found no candles in the window (e.g. the market didn't exist
+            yet), or None if the request itself failed: a non-200 response,
+            or a network/timeout/rate-limit exception that _request's
+            internal retry (see the @retry decorator above) re-raises once
+            exhausted (reraise=True). Callers MUST distinguish [] from None
+            — they mean opposite things (permanent no-data vs. transient
+            failure) and are not interchangeable.
+        """
+        try:
+            resp = self._request(
+                "GET",
+                f"/series/{series_ticker}/markets/{ticker}/candlesticks",
+                params={"start_ts": start_ts, "end_ts": end_ts, "period_interval": period_interval},
+            )
+        except (requests.RequestException, _RateLimitError) as exc:
+            # _request already retried transient errors internally; this is
+            # only reached once those retries are exhausted, so it's a real,
+            # currently-unrecoverable failure. Convert to this method's own
+            # None sentinel instead of propagating tenacity's implementation
+            # detail up through price_at_t24h and crashing the OOS cycle.
+            logger.warning("Kalshi candlesticks request failed for %s/%s: %s", series_ticker, ticker, exc)
+            return None
+        if resp is not None and resp.status_code == 200:
+            return resp.json().get("candlesticks", [])
+        return None
+
     def fetch_order_book(self, ticker: str) -> dict | None:
         """Fetch order book for a given market ticker."""
         resp = self._request("GET", f"/markets/{ticker}/orderbook")
@@ -314,13 +455,133 @@ class KalshiClient:
         balance_cents = data.get("balance", 0)
         return balance_cents / 100.0
 
-    def get_positions(self) -> list[dict]:
-        """Get open positions."""
-        resp = self._request("GET", "/portfolio/positions", params={"limit": 200})
-        if not resp or resp.status_code != 200:
-            return []
-        data = resp.json()
-        return data.get("market_positions", [])
+    def get_positions(self, limit: int = 200, max_pages: int = 10,
+                      raise_on_error: bool = False) -> list[dict]:
+        """Get open positions, walking cursor pagination across all pages.
+
+        Codex round-2 finding: this used to fetch a single page (limit=200)
+        and silently ignore the documented ``cursor`` field, exactly like
+        ``get_fills``/``get_settlements``/``get_open_orders`` already
+        pattern-match elsewhere in this file. An account with more than
+        ``limit`` resting positions would have had a pilot-market position
+        land on page 2 and never be seen — ``reconcile()`` would then mark
+        itself successful off an incomplete picture. Pagination now mirrors
+        ``get_open_orders``'s cursor loop exactly.
+
+        Args:
+            limit: Page size per request.
+            max_pages: Maximum pages to walk (cursor pagination).
+            raise_on_error: When True, ANY page fetch failure — including
+                one on page 2+, after earlier pages looked fine — raises
+                ``KalshiPortfolioQueryError`` instead of returning whatever
+                positions were accumulated so far. A partial cross-page
+                result is exactly as ambiguous as a single-page failure:
+                the MM pilot's startup reconciliation (mm_pilot.py) must
+                never mistake "some pages missing" for "confirmed
+                complete". Default False preserves the original
+                silent-partial-return behavior for other callers.
+
+        Raises:
+            KalshiPortfolioQueryError: Only when ``raise_on_error`` is True
+                and a page fetch fails.
+        """
+        positions: list[dict] = []
+        cursor = None
+        for _ in range(max_pages):
+            params: dict = {"limit": limit}
+            if cursor:
+                params["cursor"] = cursor
+            resp = self._request("GET", "/portfolio/positions", params=params)
+            if not resp or resp.status_code != 200:
+                status = resp.status_code if resp is not None else "no response"
+                logger.warning("Kalshi get_positions failed: %s", status)
+                if raise_on_error:
+                    raise KalshiPortfolioQueryError(
+                        f"get_positions page fetch failed ({status}) after "
+                        f"{len(positions)} position(s) already accumulated "
+                        f"this call — result would be ambiguous (partial "
+                        f"vs. complete)")
+                break
+            data = resp.json()
+            page = data.get("market_positions", [])
+            positions.extend(page)
+            cursor = data.get("cursor")
+            if not cursor or not page:
+                break
+        else:
+            # Codex round-3 finding: the for-loop exhausted every
+            # max_pages iteration without ever hitting a `break` above —
+            # meaning every page fetch SUCCEEDED and the cursor was STILL
+            # non-empty after the very last one. More data genuinely
+            # exists beyond max_pages*limit; we only stopped because of
+            # our own bound. This is NOT "confirmed complete" (empty
+            # cursor) — silently returning `positions` here would let a
+            # caller (reconcile()) mistake an incomplete fetch for a full
+            # one and mark itself successfully reconciled anyway.
+            if cursor:
+                logger.warning(
+                    "Kalshi get_positions exhausted max_pages=%d while "
+                    "more data was still available (cursor non-empty) — "
+                    "%d position(s) accumulated is a PARTIAL result",
+                    max_pages, len(positions))
+                if raise_on_error:
+                    raise KalshiPortfolioQueryError(
+                        f"get_positions exhausted max_pages={max_pages} "
+                        f"while the cursor still had more data — "
+                        f"{len(positions)} position(s) accumulated is an "
+                        f"incomplete result")
+        return positions
+
+    def get_open_orders(self, ticker: str | None = None,
+                        limit: int = 200, max_pages: int = 5) -> list[dict]:
+        """Fetch this account's resting (unfilled) orders.
+
+        Used by the MM pilot's startup reconciliation gate
+        (docs/plans/10-mm-pilot-prep.md, restart-persistence fix): a prior
+        process crash can leave live GTC orders resting on Kalshi that a
+        fresh in-memory registry knows nothing about. Unlike
+        ``get_positions``, this always raises on failure — there is no
+        pre-existing caller relying on a silent-empty result, and a caller
+        that needs this list (reconciliation) must never treat "request
+        failed" as "confirmed no resting orders".
+
+        Raises:
+            KalshiPortfolioQueryError: On any page-fetch HTTP failure.
+        """
+        params: dict = {"status": "resting", "limit": limit}
+        if ticker:
+            params["ticker"] = ticker
+        orders: list[dict] = []
+        cursor = None
+        for _ in range(max_pages):
+            if cursor:
+                params["cursor"] = cursor
+            resp = self._request("GET", "/portfolio/orders", params=params)
+            if not resp or resp.status_code != 200:
+                status = resp.status_code if resp is not None else "no response"
+                logger.warning("Kalshi get_open_orders failed: %s", status)
+                raise KalshiPortfolioQueryError(
+                    f"get_open_orders page fetch failed ({status})")
+            data = resp.json()
+            page = data.get("orders", [])
+            orders.extend(page)
+            cursor = data.get("cursor")
+            if not cursor or not page:
+                break
+        else:
+            # Codex round-3 finding: exhausted max_pages while every page
+            # fetch succeeded and the cursor was STILL non-empty — more
+            # resting orders genuinely exist beyond max_pages*limit. This
+            # method's whole contract is "never silently return zero/
+            # partial on failure"; a partial result from hitting our own
+            # page bound is exactly as unsafe as an HTTP failure would be.
+            if cursor:
+                raise KalshiPortfolioQueryError(
+                    f"get_open_orders exhausted max_pages={max_pages} "
+                    f"while the cursor still had more data — "
+                    f"{len(orders)} order(s) accumulated is an incomplete "
+                    f"result")
+        return orders
 
     def get_settlements(self, limit: int = 200, max_pages: int = 5) -> list[dict]:
         """Fetch account settlement history from /portfolio/settlements.
@@ -354,6 +615,54 @@ class KalshiClient:
                 break
         return settlements
 
+    def fetch_incentive_programs(self, status: str = "active",
+                                 incentive_type: str = "liquidity",
+                                 max_pages: int = 50) -> list[dict]:
+        """Fetch Kalshi incentive programs (the per-market LIP pool list).
+
+        GET /incentive_programs with cursor pagination. Each program dict
+        gains a normalized ``period_reward_dollars`` field — the API's
+        ``period_reward`` is in centi-cents (verified live 2026-06-11:
+        1150000 -> $115.00). Other fields of interest: ``market_ticker``,
+        ``discount_factor_bps``, ``target_size_fp``, ``start_date``,
+        ``end_date``, ``incentive_description``.
+
+        Args:
+            status: Program status filter (default "active").
+            incentive_type: Program type filter (default "liquidity" = LIP).
+            max_pages: Pagination safety cap (200 programs/page).
+
+        Returns:
+            List of program dicts; empty list on request failure.
+        """
+        programs: list[dict] = []
+        cursor = None
+        for _ in range(max_pages):
+            params: dict = {"status": status, "type": incentive_type, "limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+            resp = self._request("GET", "/incentive_programs", params=params)
+            if resp is None or resp.status_code != 200:
+                logger.warning("Kalshi fetch_incentive_programs failed: %s",
+                               resp.status_code if resp is not None else "no response")
+                return []
+            data = resp.json()
+            page = data.get("incentive_programs", [])
+            for p in page:
+                p["period_reward_dollars"] = (p.get("period_reward") or 0) / 10000.0
+            programs.extend(page)
+            cursor = data.get("next_cursor")
+            if not cursor:
+                break
+        else:
+            logger.warning(
+                "Kalshi fetch_incentive_programs exhausted max_pages=%d with a live cursor; "
+                "discarding partial results",
+                max_pages,
+            )
+            return []
+        return programs
+
     def place_order(
         self,
         ticker: str,
@@ -363,6 +672,7 @@ class KalshiClient:
         price_dollars: float,
         time_in_force: str = "fill_or_kill",
         client_order_id: str | None = None,
+        reducing: bool = False,
     ) -> dict | None:
         """Place a limit order on Kalshi via V2 /portfolio/events/orders.
 
@@ -377,11 +687,16 @@ class KalshiClient:
             price_dollars: Price per contract in dollars on the requested side
             time_in_force: "fill_or_kill" (default), "gtc", or "immediate_or_cancel"
             client_order_id: Optional idempotency key (UUID generated if omitted)
+            reducing: Whether the order strictly reduces an existing position.
 
         Returns:
             Order response dict (normalized with an ``order`` wrapper when the
             V2 flat response is returned) or None on failure.
         """
+        if not live_kalshi_submit_allowed(ticker, reducing=reducing):
+            logger.warning("Kalshi place_order blocked by live policy: %s", ticker)
+            return None
+
         book_side, yes_price = _legacy_side_action_to_v2(side, action, price_dollars)
         tif = _normalize_kalshi_tif(time_in_force)
         body = {
@@ -430,6 +745,85 @@ class KalshiClient:
             resp.status_code, resp.text[:300], ticker,
         )
         return None
+
+    def get_fills(self, limit: int = 200, max_pages: int = 5,
+                  min_ts: int | None = None,
+                  raise_on_error: bool = False) -> list[dict]:
+        """Fetch this account's executed trade fills from /portfolio/fills.
+
+        Fills are the authoritative record of contracts traded (VIP volume),
+        distinct from settlements which only cover resolved positions. Each
+        fill includes ticker, side, action, count, yes_price/no_price (cents),
+        is_taker, and created_time.
+
+        Args:
+            limit: Page size per request.
+            max_pages: Maximum pages to walk (cursor pagination).
+            min_ts: Optional Unix seconds lower bound; passed as ``min_ts``.
+            raise_on_error: When True, a failed page fetch raises
+                ``KalshiPortfolioQueryError`` instead of returning whatever
+                fills were accumulated so far. A partial/empty list on HTTP
+                failure is indistinguishable from "confirmed no more fills"
+                to a caller that cannot see this method's internals —
+                callers that must never mistake "unknown" for "zero" (e.g.
+                the MM pilot's fill poll, which drives inventory/hedge
+                accounting) set this True. Default False preserves the
+                original silent partial-return behavior for existing
+                callers (e.g. kalshi_vip.py).
+
+        Returns:
+            A list of fill records, newest first.
+
+        Raises:
+            KalshiPortfolioQueryError: Only when ``raise_on_error`` is True
+                and a page fetch fails.
+        """
+        fills: list[dict] = []
+        cursor = None
+        for _ in range(max_pages):
+            params: dict = {"limit": limit}
+            if cursor:
+                params["cursor"] = cursor
+            if min_ts is not None:
+                params["min_ts"] = min_ts
+            resp = self._request("GET", "/portfolio/fills", params=params)
+            if not resp or resp.status_code != 200:
+                status = resp.status_code if resp is not None else "no response"
+                logger.warning("Kalshi get_fills failed: %s", status)
+                if raise_on_error:
+                    raise KalshiPortfolioQueryError(
+                        f"get_fills page fetch failed ({status}) after "
+                        f"{len(fills)} fill(s) already accumulated this "
+                        f"call — result would be ambiguous (partial vs. "
+                        f"complete)")
+                break
+            data = resp.json()
+            page = data.get("fills", [])
+            fills.extend(page)
+            cursor = data.get("cursor")
+            if not cursor or not page:
+                break
+        else:
+            # Codex round-3 finding: exhausted max_pages while every page
+            # fetch succeeded and the cursor was STILL non-empty — more
+            # fills genuinely exist beyond max_pages*limit for this
+            # min_ts window. Silently returning a partial list here is
+            # exactly the "unknown looks like zero/some" ambiguity
+            # raise_on_error exists to close for the HTTP-failure case;
+            # hitting our own page bound must be treated identically.
+            if cursor:
+                logger.warning(
+                    "Kalshi get_fills exhausted max_pages=%d while more "
+                    "fills were still available (cursor non-empty) — %d "
+                    "fill(s) accumulated is a PARTIAL result", max_pages,
+                    len(fills))
+                if raise_on_error:
+                    raise KalshiPortfolioQueryError(
+                        f"get_fills exhausted max_pages={max_pages} "
+                        f"while the cursor still had more data — "
+                        f"{len(fills)} fill(s) accumulated is an "
+                        f"incomplete result")
+        return fills
 
     def get_order_status(self, order_id: str) -> dict | None:
         """Get the status of a specific order.
@@ -697,3 +1091,48 @@ def _audit_orderbook_sort_order(ticker: str, side: str, entries: list) -> None:
         _orderbook_sort_audit_logged = True
     except (KeyError, ValueError, TypeError, IndexError) as e:
         logger.debug("Orderbook sort audit skipped (parse error): %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Environment-driven construction + self-heal support
+# ---------------------------------------------------------------------------
+
+def kalshi_creds_configured() -> bool:
+    """True when the env carries enough material to attempt Kalshi auth."""
+    return bool(
+        os.getenv("KALSHI_API_KEY_ID")
+        and (os.getenv("KALSHI_PRIVATE_KEY_PATH") or os.getenv("KALSHI_PRIVATE_KEY_BASE64"))
+    )
+
+
+def build_client_from_env(attempts: int = 1, retry_wait: float = 0.0) -> "KalshiClient | None":
+    """Construct and authenticate a KalshiClient from env credentials.
+
+    Auth verification pings /exchange/status, which fails during Kalshi's
+    daily maintenance window even with valid keys — so callers that boot at
+    an unlucky time can pass attempts/retry_wait to ride it out, and the
+    continuous loop re-invokes this to heal a degraded start.
+
+    Returns None when creds are absent or every attempt fails.
+    """
+    if not kalshi_creds_configured():
+        return None
+    api_key_id = os.getenv("KALSHI_API_KEY_ID")
+    key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
+    key_b64 = os.getenv("KALSHI_PRIVATE_KEY_BASE64")
+    for attempt in range(1, max(1, attempts) + 1):
+        client = KalshiClient()
+        if key_b64:
+            ok = client.login_with_api_key(api_key_id, private_key_base64=key_b64)
+        else:
+            ok = client.login_with_api_key(api_key_id, private_key_path=os.path.expanduser(key_path))
+        if ok:
+            return client
+        if attempt < max(1, attempts):
+            logger.warning(
+                "Kalshi auth failed (attempt %d/%d) — venue may be in its "
+                "maintenance window; retrying in %.0fs",
+                attempt, attempts, retry_wait,
+            )
+            time.sleep(retry_wait)
+    return None

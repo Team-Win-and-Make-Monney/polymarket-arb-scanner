@@ -62,6 +62,42 @@ class TestMatchEventsByTitle:
         assert _match_events_by_title([], {}, {}) == []
         assert _match_events_by_title([{"title": "test"}], {}, {}) == []
 
+    def test_matcher_preserves_entity_overlap_gate(self):
+        from scans.multi_cross import _match_events_by_title
+
+        pm_events = [{"title": "Who will win the Michigan governor election in 2026?", "markets": []}]
+        kalshi_events = {
+            "MI-GOV": [{"ticker": "MI-GOV-DEM"}],
+            "GOLD": [{"ticker": "GOLD-PRICE"}],
+            "WEATHER": [{"ticker": "WEATHER-NYC"}],
+        }
+        kalshi_titles = {
+            "MI-GOV": "Who will win the Michigan governor election in 2026?",
+            "GOLD": "Price of gold above 3000 in 2026?",
+            "WEATHER": "New York City snowfall in December?",
+        }
+
+        matches = _match_events_by_title(pm_events, kalshi_events, kalshi_titles)
+
+        assert [match[1] for match in matches] == ["MI-GOV"]
+
+    def test_tied_scores_preserve_first_kalshi_event(self):
+        from scans.multi_cross import _match_events_by_title
+
+        pm_events = [{"title": "Michigan governor election in 2026", "markets": []}]
+        kalshi_events = {
+            "FIRST": [{"ticker": "FIRST"}],
+            "SECOND": [{"ticker": "SECOND"}],
+        }
+        kalshi_titles = {
+            "FIRST": "Michigan governor election in 2026",
+            "SECOND": "Michigan governor election in 2026",
+        }
+
+        matches = _match_events_by_title(pm_events, kalshi_events, kalshi_titles)
+
+        assert [match[1] for match in matches] == ["FIRST"]
+
 
 # ---------------------------------------------------------------------------
 # Outcome matching tests
@@ -263,7 +299,8 @@ class TestMultiCrossExecutor:
                  "side": "yes", "_token_id": "tok_c"},
             ],
         }
-        legs = executor._build_legs(opp, 5.0)
+        with patch("executor.ENABLED_EXECUTION_PLATFORMS", frozenset({"polymarket"})):
+            legs = executor._build_legs(opp, 5.0)
         assert len(legs) == 3
         for leg in legs:
             assert leg["platform"] == "polymarket"
@@ -302,7 +339,11 @@ class TestMultiCrossExecutor:
                  "side": "yes", "_token_id": "tok_c"},
             ],
         }
-        legs = executor._build_legs(opp, 5.0)
+        with patch(
+            "executor.ENABLED_EXECUTION_PLATFORMS",
+            frozenset({"polymarket", "kalshi"}),
+        ):
+            legs = executor._build_legs(opp, 5.0)
         assert len(legs) == 3
         platforms = [leg["platform"] for leg in legs]
         assert "polymarket" in platforms
@@ -355,3 +396,44 @@ class TestMultiCrossExecutor:
         }):
             result = executor._revalidate(opp)
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# Kalshi fallback fetch (audit #77): when kalshi_data is not pre-fetched the
+# scan must fall back to scans.kalshi._fetch_kalshi_data (which returns the
+# expected (events, by_event, titles) 3-tuple). The old call to
+# scans.helpers._parallel_fetch_kalshi(kalshi_client) raised TypeError —
+# missing its required `tickers` arg — and returned a dict, not a 3-tuple.
+# ---------------------------------------------------------------------------
+
+class TestKalshiFallbackFetch:
+    def test_falls_back_to_fetch_kalshi_data(self):
+        from scans.multi_cross import scan_multi_cross
+
+        fake_event = {"title": "Test Election", "id": "ev-1", "markets": [{}, {}]}
+        with patch("scans.multi_cross.get_negrisk_events", return_value=[fake_event]), \
+             patch("scans.kalshi._fetch_kalshi_data",
+                   return_value=([], {}, {})) as mock_fetch:
+            result = scan_multi_cross(
+                [fake_event], kalshi_client=MagicMock(), kalshi_data=None,
+            )
+        mock_fetch.assert_called_once()
+        assert result == []
+
+    def test_fallback_result_unpacks_into_three_parts(self):
+        """The fallback fetch must feed events/by_event/titles downstream."""
+        from scans.multi_cross import scan_multi_cross
+
+        fake_event = {"title": "Test Election", "id": "ev-1", "markets": [{}, {}]}
+        kalshi_events = [{"event_ticker": "EV-1", "mutually_exclusive": True}]
+        kalshi_by_event = {"EV-1": [{"title": "A"}, {"title": "B"}]}
+        kalshi_titles = {"EV-1": "Totally Different Title"}
+
+        with patch("scans.multi_cross.get_negrisk_events", return_value=[fake_event]), \
+             patch("scans.kalshi._fetch_kalshi_data",
+                   return_value=(kalshi_events, kalshi_by_event, kalshi_titles)):
+            # No titles match, so no opportunities — but no TypeError either.
+            result = scan_multi_cross(
+                [fake_event], kalshi_client=MagicMock(), kalshi_data=None,
+            )
+        assert result == []

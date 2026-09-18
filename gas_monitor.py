@@ -1,31 +1,23 @@
 """Real-time gas price monitor for dynamic fee-aware arbitrage thresholds."""
 
 import logging
+import math
 import threading
 import time
 
 import requests
 
+from url_guard import assert_public_url
+
 logger = logging.getLogger(__name__)
 
 
 class GasMonitor:
-    """Fetches real-time gas prices for Polygon, tracks platform fee state.
+    """Fetches real-time gas prices for Polygon for gas-aware thresholds.
 
     When enabled, replaces static POLYGON_GAS_ESTIMATE with real-time data
     and computes dynamic execution thresholds based on actual costs.
     """
-
-    # Platform-specific fee estimates (per-trade, in dollars)
-    # These approximate the additional platform costs beyond gas.
-    PLATFORM_FEES = {
-        "polymarket": 0.0,       # Gas only (handled separately)
-        "kalshi": 0.02,          # ~$0.02 taker fee per contract
-        "betfair": 0.05,         # 5% of typical profit (~$1 spread)
-        "smarkets": 0.02,        # 2% commission
-        "sxbet": 0.0,            # 0% commission on API trades
-        "matchbook": 0.0,        # 0% commission
-    }
 
     # Number of Polygon transactions required per platform leg
     # Polymarket trades settle on-chain; others are off-chain.
@@ -67,6 +59,12 @@ class GasMonitor:
                 "POLYGON_RPC_URL", "https://polygon-rpc.com"
             )
 
+        # SSRF guard: the RPC endpoint is read from env and POSTed JSON-RPC; an
+        # injected internal URL would let gas calls reach the internal network.
+        self.polygon_rpc_url = assert_public_url(
+            self.polygon_rpc_url, env_name="POLYGON_RPC_URL"
+        )
+
         self.cache_ttl = cache_ttl
         self.safety_margin = safety_margin
         self.fallback_gas_cost = fallback_gas_cost
@@ -86,6 +84,8 @@ class GasMonitor:
         # Default fallbacks
         self._default_gas_gwei = 30.0
         self._default_matic_price = 0.50
+        self._gas_source_valid = False
+        self._matic_source_valid = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -144,7 +144,8 @@ class GasMonitor:
     ) -> float:
         """Calculate dynamic minimum profit threshold for a platform pair.
 
-        Accounts for gas costs on each leg plus platform-specific fees,
+        Accounts for Polygon gas costs on each on-chain leg (platform
+        trading fees are already netted out of scan net_profit by fees.py),
         multiplied by the safety margin.
 
         Args:
@@ -161,12 +162,11 @@ class GasMonitor:
         txns_b = self.PLATFORM_GAS_TXNS.get(platform_b.lower(), 0)
         total_gas = gas_cost_per_tx * (txns_a + txns_b)
 
-        # Add platform-specific fee estimates
-        fee_a = self.PLATFORM_FEES.get(platform_a.lower(), 0.0)
-        fee_b = self.PLATFORM_FEES.get(platform_b.lower(), 0.0)
-
-        raw_cost = total_gas + fee_a + fee_b
-        return raw_cost * self.safety_margin
+        # Gas only: platform trading fees are already netted out of every
+        # scan's net_profit by fees.py — re-adding flat estimates here
+        # double-charged fees and skipped fee-netted opportunities (a $0.04
+        # KalshiMulti profit lost to a phantom $0.048 "gas" threshold).
+        return total_gas * self.safety_margin
 
     def should_execute(self, opp: dict) -> bool:
         """Check if an opportunity's profit exceeds the dynamic threshold.
@@ -183,9 +183,21 @@ class GasMonitor:
         if not self.enabled:
             return True
 
-        net_profit = opp.get("net_profit", 0)
+        try:
+            net_profit = float(opp.get("net_profit", 0))
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(net_profit):
+            return False
         platform_a, platform_b = self._infer_platforms(opp)
+        gas_txns = self.PLATFORM_GAS_TXNS.get(platform_a, 0) + self.PLATFORM_GAS_TXNS.get(platform_b, 0)
+        if gas_txns == 0:
+            return True
         threshold = self.get_effective_threshold(platform_a, platform_b)
+
+        if not self._gas_source_valid or not self._matic_source_valid:
+            logger.warning("Gas-aware execution blocked: live gas or token-price input unavailable")
+            return False
 
         if net_profit < threshold:
             logger.debug(
@@ -229,9 +241,13 @@ class GasMonitor:
             # Result is hex string in Wei
             gas_wei = int(data["result"], 16)
             gas_gwei = gas_wei / 1e9
+            if not math.isfinite(gas_gwei) or gas_gwei <= 0:
+                raise ValueError("non-positive or non-finite gas price")
+            self._gas_source_valid = True
             logger.debug("Polygon gas price: %.2f Gwei", gas_gwei)
             return gas_gwei
         except Exception as exc:
+            self._gas_source_valid = False
             logger.warning(
                 "Failed to fetch Polygon gas price: %s. Using default %.1f Gwei",
                 exc,
@@ -256,31 +272,64 @@ class GasMonitor:
         price = self._do_fetch_matic_price()
 
         with self._matic_lock:
-            self._matic_price = price
+            if price is not None:
+                self._matic_source_valid = True
+                self._matic_price = price
+                self._matic_price_ts = time.time()
+                return price
+            if self._matic_price is not None:
+                self._matic_source_valid = False
+                # Fetch failed: keep the last-good price rather than
+                # poisoning the cache with the default; bump ts so a flaky
+                # CoinGecko is not hammered every call.
+                self._matic_price_ts = time.time()
+                logger.warning(
+                    "MATIC price fetch failed — reusing last-good $%.4f",
+                    self._matic_price)
+                return self._matic_price
+            logger.warning(
+                "MATIC price unavailable and no last-good value — using default $%.2f",
+                self._default_matic_price)
+            self._matic_price = self._default_matic_price
             self._matic_price_ts = time.time()
+            self._matic_source_valid = False
+            return self._default_matic_price
 
-        return price
+    def _do_fetch_matic_price(self) -> float | None:
+        """Raw HTTP call to CoinGecko for the Polygon gas-token price.
 
-    def _do_fetch_matic_price(self) -> float:
-        """Raw HTTP call to CoinGecko for MATIC price."""
+        Polygon's gas token migrated MATIC→POL (Sept 2024). CoinGecko serves
+        the live token as polygon-ecosystem-token; the legacy matic-network
+        id intermittently returns an empty dict, which produced the
+        KeyError-'usd' failures seen in prod. Query both, prefer POL.
+
+        Returns None on failure so the caller can keep the last-good price
+        instead of poisoning the cache with the default.
+        """
         try:
             resp = requests.get(
                 "https://api.coingecko.com/api/v3/simple/price",
-                params={"ids": "matic-network", "vs_currencies": "usd"},
+                params={
+                    "ids": "polygon-ecosystem-token,matic-network",
+                    "vs_currencies": "usd",
+                },
                 timeout=5,
             )
             resp.raise_for_status()
             data = resp.json()
-            price = float(data["matic-network"]["usd"])
-            logger.debug("MATIC price: $%.4f", price)
-            return price
+            for coin_id in ("polygon-ecosystem-token", "matic-network"):
+                usd = (data.get(coin_id) or {}).get("usd")
+                if usd is not None:
+                    price = float(usd)
+                    if not math.isfinite(price) or price <= 0:
+                        raise ValueError("non-positive or non-finite Polygon token price")
+                    logger.debug("Polygon gas-token price: $%.4f (%s)", price, coin_id)
+                    return price
+            logger.warning("CoinGecko returned no usd price for POL/MATIC: %s", data)
+            return None
         except Exception as exc:
-            logger.warning(
-                "Failed to fetch MATIC price: %s. Using default $%.2f",
-                exc,
-                self._default_matic_price,
-            )
-            return self._default_matic_price
+            logger.warning("Failed to fetch MATIC price: %s", exc)
+            return None
 
     def _infer_platforms(self, opp: dict) -> tuple[str, str]:
         """Extract or infer platform pair from an opportunity dict.

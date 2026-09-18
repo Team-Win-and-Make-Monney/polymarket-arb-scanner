@@ -3,9 +3,10 @@
 > **Owner:** Jonathon Tamm · **Review cadence:** monthly, and after any deploy incident.
 
 ## Deploy (Railway)
-- Railway auto-deploys on **push to `master`** via GitHub integration (Docker, `python:3.12-slim`). Entrypoint: `python scanner.py --continuous`.
+- **Current state:** the observed Railway worker is dry-run. The project is paused for broad expansion, but the worker still consumes resources until an operator stops it.
+- Railway auto-deploys on **push to `master`** via GitHub integration (Docker, `python:3.12-slim`). Entrypoint: `python scanner.py --continuous --mode kalshi`.
 - **A push to `master` restarts the live worker even for docs-only changes.** Batch changes and merge in a controlled window; avoid merging while opportunities are mid-execution.
-- Required production env vars:
+- Required dry-run production env vars:
   - `DASHBOARD_HOST=0.0.0.0` (Railway edge healthcheck must reach the container)
   - `DASHBOARD_PASS=<strong secret>` (required whenever host is non-loopback — `validate_config()` enforces)
   - Feature flags as desired: `MM_ENABLED`, `SNAPSHOT_ENABLED`, `DYNAMIC_FEE_ENABLED`, `EVENT_MONITOR_ENABLED` (all default false)
@@ -13,6 +14,10 @@
 - Health check: `GET /healthz` on 8080. The Dockerfile healthcheck reads Railway's `PORT` before falling back to 8080 (PR #19).
 - Persistent state: `DATA_DIR` holds `trades.db` + `snapshots.db`.
 - IBKR needs a reachable IB Gateway socket — not viable from Railway without a persistent gateway host.
+
+## Live Kalshi D0 gate
+
+Generic `--exec-mode full-auto` is not an approved runbook. The only verified live path is `scripts/launch-kalshi-d0-live.sh`. Before invoking it, verify the account and credentials, current jurisdiction/product eligibility, limits, physical emergency stop, and one operator message containing all five envelope fields: `venue`, `pair`, `max_notional_usd`, `max_daily_loss_usd`, and `kill_switch`. Obtain separate action-time approval immediately before launch.
 
 ## Post-deploy checklist (run before trusting live trading)
 1. `/healthz` returns 200.
@@ -23,7 +28,7 @@
 6. `validate_config()` passed (startup log) and execution flags match intent.
 
 ## Safe feature-flag enablement
-Enable one flag at a time, with `DRY_RUN=true` first, watch a full cycle, then promote. Never flip a flag and `DRY_RUN=false` in the same deploy.
+Enable one research flag at a time with `DRY_RUN=true` and watch a full cycle. Feature flags and credentials do not authorize `DRY_RUN=false`.
 
 ## Observability acceptance contract
 Per failure mode: current signal, alert, owner. **Gaps are marked** — they feed `ROADMAP.md`, not silently omitted.
@@ -47,7 +52,7 @@ Per failure mode: current signal, alert, owner. **Gaps are marked** — they fee
 Metrics are exposed Prometheus-style (`metrics.py:MetricsCollector`).
 
 ## Rollback runbook (bad deploy)
-1. **Stop the bleeding:** set `DRY_RUN=true` in Railway env and redeploy — halts live order placement immediately.
+1. **Stop the bleeding:** use the physical/operator kill switch first, then set `DRY_RUN=true` in Railway and redeploy.
 2. **Pause/cancel pending orders:** check dashboard / `trades.db`; cancel open orders on the affected platform(s) via their console or client.
 3. **Revert code:** `git revert <bad-commit>` (or redeploy the prior known-good commit) to `master`.
 4. **Reconcile positions:** restart triggers `recovery.py:reconcile_orphaned_positions()`; verify open positions in `trades.db` match each platform's actual positions.

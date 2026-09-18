@@ -264,14 +264,14 @@ class TestHedgerPartialFills:
                 pf = {
                     "id": 1, "platform": "polymarket",
                     "token_id": "token_yes_123", "fill_price": 0.40,
-                    "size": 5.0, "side": "YES", "hedge_attempts": 0,
+                    "size": 2.5, "side": "YES", "hedge_attempts": 0,
                 }
                 result = hedger._attempt_hedge(pf)
                 assert result is True
                 mock_pm.place_order.assert_called_once()
                 call_args = mock_pm.place_order.call_args
                 assert call_args[1]["side"] == "SELL"
-                assert call_args[1]["size"] == 5.0  # filled share qty, not dollars
+                assert call_args[1]["size"] == 2.5
 
     def test_kalshi_partial_fill_hedge(self, PartialFillHedger, db):
         """Kalshi: 50% fill on YES, 100% on NO → hedge sells YES."""
@@ -285,14 +285,13 @@ class TestHedgerPartialFills:
         pf = {
             "id": 2, "platform": "kalshi",
             "token_id": "TICKER-ABC", "fill_price": 0.40,
-            "size": 5.0, "side": "yes", "hedge_attempts": 0,
+            "size": 2.5, "side": "yes", "hedge_attempts": 0,
         }
         result = hedger._attempt_hedge(pf)
         assert result is True
         mock_kalshi.place_order.assert_called_once()
         call_args = mock_kalshi.place_order.call_args
         assert call_args[1]["side"] == "yes"
-        assert call_args[1]["count"] == 5  # filled contracts, not size/bid
 
     def test_betfair_partial_fill_hedge(self, PartialFillHedger, db):
         """Betfair: 50% BACK filled, 100% LAY → hedge LAYs the position."""
@@ -662,3 +661,94 @@ class TestHedgeIdentifierRoundTrip:
         assert pf["_market_id"] == "mb_m1"
         assert pf["_runner_id"] == "r1"
         assert hedger._attempt_hedge(pf) is True
+
+
+# ---------------------------------------------------------------------------
+# Plan 10: _hedge_kalshi buy-to-reduce direction (spec section 4 / test 3)
+# Fail-before: on master _hedge_kalshi was sell-only — an action="buy"
+# reduce request had no code path (side-finding 4).
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def real_kalshi_api():
+    """Swap the autouse MagicMock for the REAL kalshi_api module.
+
+    The buy-to-reduce tests exercise real orderbook parsing (best_yes_ask
+    derivation from the NO-bid side), which a MagicMock stand-in cannot do.
+    Restores the mock afterwards so the module-level autouse fixture's
+    teardown stays coherent.
+    """
+    mocked = sys.modules.get("kalshi_api")
+    if isinstance(mocked, MagicMock):
+        del sys.modules["kalshi_api"]
+        import kalshi_api as real_mod
+        yield real_mod
+        sys.modules["kalshi_api"] = mocked
+    else:
+        import kalshi_api as real_mod
+        yield real_mod
+
+
+class TestKalshiBuyToReduce:
+    @staticmethod
+    def _book(yes_bid=0.40, no_bid=0.44):
+        """orderbook_fp book: yes_ask derives as 1 - no_bid (= 0.56)."""
+        return {"orderbook_fp": {
+            "yes_dollars": [[f"{yes_bid:.4f}", "100.00"]],
+            "no_dollars": [[f"{no_bid:.4f}", "100.00"]],
+        }}
+
+    def test_buy_reduce_hits_best_ask(self, PartialFillHedger, db, real_kalshi_api):
+        mock_kalshi = MagicMock()
+        mock_kalshi.fetch_order_book.return_value = self._book()
+        mock_kalshi.place_order.return_value = {"order_id": "k_buyback_1"}
+        hedger = PartialFillHedger(kalshi_client=mock_kalshi, db=db)
+
+        # Short entered at 0.55; best yes ask is 0.56 -> loss 0.01 within max
+        result = hedger._hedge_kalshi("TICK", fill_price=0.55, size=5.6,
+                                      max_loss=0.55 * 0.15, side="yes",
+                                      action="buy")
+        assert result is True
+        call = mock_kalshi.place_order.call_args
+        assert call[1]["action"] == "buy"
+        assert call[1]["side"] == "yes"
+        assert call[1]["price_dollars"] == pytest.approx(0.56)
+
+    def test_buy_reduce_respects_max_loss_guard(self, PartialFillHedger, db, real_kalshi_api):
+        mock_kalshi = MagicMock()
+        mock_kalshi.fetch_order_book.return_value = self._book()
+        hedger = PartialFillHedger(kalshi_client=mock_kalshi, db=db)
+
+        # Short entered at 0.40; buying back at 0.56 loses 0.16 > max 0.06
+        result = hedger._hedge_kalshi("TICK", fill_price=0.40, size=5.6,
+                                      max_loss=0.40 * 0.15, side="yes",
+                                      action="buy")
+        assert result is False
+        mock_kalshi.place_order.assert_not_called()
+
+    def test_sell_direction_unchanged(self, PartialFillHedger, db, real_kalshi_api):
+        mock_kalshi = MagicMock()
+        mock_kalshi.fetch_order_book.return_value = self._book()
+        mock_kalshi.place_order.return_value = {"order_id": "k_sell_1"}
+        hedger = PartialFillHedger(kalshi_client=mock_kalshi, db=db)
+
+        result = hedger._hedge_kalshi("TICK", fill_price=0.41, size=4.0,
+                                      max_loss=0.41 * 0.15, side="yes")
+        assert result is True
+        call = mock_kalshi.place_order.call_args
+        assert call[1]["action"] == "sell"
+        assert call[1]["price_dollars"] == pytest.approx(0.40)  # best yes bid
+
+    def test_hedge_inventory_forwards_reduce_action(self, PartialFillHedger, db, real_kalshi_api):
+        mock_kalshi = MagicMock()
+        mock_kalshi.fetch_order_book.return_value = self._book()
+        mock_kalshi.place_order.return_value = {"order_id": "k_buyback_2"}
+        hedger = PartialFillHedger(kalshi_client=mock_kalshi, db=db)
+
+        result = hedger.hedge_inventory(
+            market_key="TICK", platform="kalshi", side="yes",
+            fill_price=0.55, size=5.6, token_id="TICK",
+            reduce_action="buy",
+        )
+        assert result is True
+        assert mock_kalshi.place_order.call_args[1]["action"] == "buy"

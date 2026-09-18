@@ -350,6 +350,12 @@ class TestNetProfitCrossPlatform:
         worst_fees = max(case1, case2)
         assert ev_fees <= worst_fees
 
+    def test_ev_fees_weight_each_case_by_its_probability(self):
+        """Side-A win fees must be weighted by P(A), not P(not A)."""
+        from fees import _select_fees
+
+        assert _select_fees(0.03, 0.01, 0.80) == pytest.approx(0.026)
+
 
 # ---------------------------------------------------------------------------
 # betfair_commission

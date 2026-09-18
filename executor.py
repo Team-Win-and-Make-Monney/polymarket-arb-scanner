@@ -25,6 +25,28 @@ class _RevalidationAPIError(Exception):
     """Raised when revalidation fails due to an API/network error, not price movement."""
     pass
 
+
+def _cached_probability(entry: dict | None, *keys: str) -> float | None:
+    """Return the first scalar 0..1 probability from a cache entry.
+
+    WebSocket payloads retain raw string fields and, for Kalshi snapshots,
+    raw price ladders. Revalidation must consume normalized executable asks,
+    never concatenate a raw string with a float or treat a ladder as a price.
+    """
+    if not entry:
+        return None
+    for key in keys:
+        value = entry.get(key)
+        if value is None or isinstance(value, (dict, list, tuple)):
+            continue
+        try:
+            probability = float(value)
+        except (TypeError, ValueError):
+            continue
+        if 0.0 <= probability <= 1.0:
+            return probability
+    return None
+
 # Conditional metrics import — never breaks if metrics.py is missing
 try:
     from config import METRICS_ENABLED as _METRICS_ENABLED
@@ -62,6 +84,7 @@ from fees import (
     net_profit_gemini_binary,
     net_profit_ibkr_binary,
     net_profit_multi_cross,
+    net_profit_logical_arb,
     find_lowest_fee_path,
 )
 
@@ -345,6 +368,31 @@ class ArbitrageExecutor:
                 return False
             self.max_trade_size = min(self.max_trade_size, CANARY_MAX_TRADE_SIZE)
 
+        # 0e. Plan 10 / MM pilot single-choke-point guard. The legacy
+        # KalshiRewards path (this method's opp_type == "KalshiRewards"
+        # branch below, and _build_legs -> _execute_single_leg's kalshi arm)
+        # calls kalshi_client.place_order directly and is pre-existing on
+        # master — it does NOT run through KalshiMMPilot.authorize_order's
+        # kill switch, caps, or gates. That is fine when nothing else is
+        # quoting Kalshi, but once the MM pilot owns Kalshi quoting
+        # (MM_KALSHI_PILOT_ENABLED), two independent systems placing orders
+        # on the same venue at once is exactly the failure mode the pilot's
+        # single-choke-point design exists to prevent. Fail closed: disable
+        # this path entirely while the pilot is enabled, regardless of
+        # DRY_RUN/REWARDS_ENABLED. When the flag is false, behavior here is
+        # unchanged from master.
+        if opp_type == "KalshiRewards":
+            from config import MM_KALSHI_PILOT_ENABLED
+            if MM_KALSHI_PILOT_ENABLED:
+                logger.warning(
+                    "[MM_PILOT] Legacy KalshiRewards execution path disabled "
+                    "while MM_KALSHI_PILOT_ENABLED=true — %s skipped (the "
+                    "pilot owns Kalshi quoting; see "
+                    "docs/plans/10-mm-pilot-prep.md)", market,
+                )
+                self._log_skipped(opportunity, "mm_pilot_owns_kalshi")
+                return False
+
         prefix = "[DRY RUN] " if self.dry_run else ("[CANARY] " if CANARY_MODE else "")
 
         logger.info(f"{prefix}--- Evaluating: {market} ({opp_type}) ---")
@@ -579,10 +627,8 @@ class ArbitrageExecutor:
         Returns True if the opportunity is still profitable (>= threshold of original).
         Returns False only when prices have genuinely degraded below threshold.
 
-        API/network failures are treated leniently: if the original ROI was >= 2%,
-        the opportunity is accepted despite the failed re-fetch (the CLOB prices
-        from scan time are still recent enough to act on). This prevents transient
-        API errors from causing 100% rejection rates.
+        API/network failures fail closed because an unverified price cannot
+        authorize a consequential order.
 
         Emits a structured REVAL| calibration log line for every decision (per D-01).
         """
@@ -763,7 +809,7 @@ class ArbitrageExecutor:
                     reason = "Market expired"
                 else:
                     consensus = opportunity.get("_consensus_prob", 0.0)
-                    if consensus < TIME_DECAY_MIN_CONSENSUS:
+                    if max(consensus, 1.0 - consensus) < TIME_DECAY_MIN_CONSENSUS:
                         logger.info("Time decay: consensus dropped below threshold: %.2f", consensus)
                         passed = False
                         reason = f"Consensus {consensus:.2f} dropped below {TIME_DECAY_MIN_CONSENSUS}"
@@ -780,24 +826,10 @@ class ArbitrageExecutor:
             # Unknown type — proceed cautiously (passed=True from init)
 
         except _RevalidationAPIError as e:
-            # API/network failure — not a price degradation.
-            # Accept if original ROI was strong enough (prices were CLOB-verified at scan).
-            if scan_roi >= 0.02:
-                logger.info(
-                    "Revalidation API error for %s (ROI=%.1f%%), proceeding with scan prices: %s",
-                    opp_type, scan_roi * 100, e,
-                )
-                passed = True
-                reval_profit = original_profit
-                reason = "api_error_accepted"
-            else:
-                logger.info(
-                    "Revalidation API error for %s (ROI=%.1f%% < 2%%), rejecting: %s",
-                    opp_type, scan_roi * 100, e,
-                )
-                passed = False
-                reval_profit = 0.0
-                reason = "api_error_rejected"
+            logger.info("Revalidation API error for %s; rejecting: %s", opp_type, e)
+            passed = False
+            reval_profit = 0.0
+            reason = "api_error_rejected"
         except Exception as e:
             logger.warning("Revalidation unexpected error: %s", e)
             passed = False
@@ -905,8 +937,8 @@ class ArbitrageExecutor:
             return False, 0.0, "feed_stale"
 
         if cached_yes and cached_no:
-            yes_ask = cached_yes.get("price")
-            no_ask = cached_no.get("price")
+            yes_ask = _cached_probability(cached_yes, "best_ask", "ask", "price")
+            no_ask = _cached_probability(cached_no, "best_ask", "ask", "price")
 
         if yes_ask is None or no_ask is None:
             yes_book = fetch_order_book(token_ids[0])
@@ -958,8 +990,9 @@ class ArbitrageExecutor:
                 logger.info("Skipping revalidation: polymarket token %s stale for >30s", tid)
                 return False, 0.0, "feed_stale"
 
-            if cached and cached.get("price") is not None:
-                yes_asks.append(cached["price"])
+            cached_ask = _cached_probability(cached, "best_ask", "ask", "price")
+            if cached_ask is not None:
+                yes_asks.append(cached_ask)
             else:
                 book = fetch_order_book(tid)
                 if not book:
@@ -1006,8 +1039,9 @@ class ArbitrageExecutor:
                 logger.info("Skipping revalidation: polymarket token %s stale for >30s", tid)
                 return False, 0.0, "feed_stale"
 
-            if cached and cached.get("price") is not None:
-                no_asks.append(cached["price"])
+            cached_ask = _cached_probability(cached, "best_ask", "ask", "price")
+            if cached_ask is not None:
+                no_asks.append(cached_ask)
             else:
                 book = fetch_order_book(tid)
                 if not book:
@@ -1071,11 +1105,12 @@ class ArbitrageExecutor:
                     logger.info("Skipping revalidation: polymarket token %s stale for >30s", tid)
                     return False, 0.0, "feed_stale"
 
-                if cached and cached.get("price") is not None:
+                cached_ask = _cached_probability(cached, "best_ask", "ask", "price")
+                if cached_ask is not None:
                     if i == 0:
-                        pm_yes = cached["price"]
+                        pm_yes = cached_ask
                     else:
-                        pm_no = cached["price"]
+                        pm_no = cached_ask
             if pm_yes is None or pm_no is None:
                 yes_book = fetch_order_book(token_ids[0])
                 no_book = fetch_order_book(token_ids[1])
@@ -1097,8 +1132,8 @@ class ArbitrageExecutor:
                 return False, 0.0, "feed_stale"
 
             if cached_k:
-                k_yes = cached_k.get("yes_price")
-                k_no = cached_k.get("no_price")
+                k_yes = _cached_probability(cached_k, "yes_ask", "yes_price", "yes")
+                k_no = _cached_probability(cached_k, "no_ask", "no_price", "no")
             if k_yes is None or k_no is None:
                 book = self.kalshi_client.fetch_order_book(kalshi_ticker)
                 if not book:
@@ -1349,10 +1384,13 @@ class ArbitrageExecutor:
                 return False, 0.0, "feed_stale"
 
             if cached:
-                fresh_price = cached.get("yes_ask") or cached.get("yes", price)
-                prices.append(fresh_price)
+                if platform == "polymarket":
+                    fresh_price = _cached_probability(cached, "best_ask", "ask", "price")
+                else:
+                    fresh_price = _cached_probability(cached, "yes_ask", "yes_price", "yes")
+                prices.append(fresh_price if fresh_price is not None else float(price))
             else:
-                prices.append(price)
+                prices.append(float(price))
             platforms.append(platform)
 
         result = net_profit_multi_cross(prices, platforms)
@@ -1379,24 +1417,24 @@ class ArbitrageExecutor:
             (passed, reval_profit, reason)
         """
         token_ids = opp.get("_token_ids", [])
-        if not token_ids or len(token_ids) < 1:
+        if_token_ids = opp.get("_if_token_ids", [])
+        if len(token_ids) < 2 or len(if_token_ids) < 2:
             raise _RevalidationAPIError("logical_arb missing token IDs")
 
         # Fetch live prices for the underpriced outcome (then_yes)
         try:
             then_yes_token = token_ids[0]
             then_yes_book = fetch_order_book(then_yes_token)
-            if not then_yes_book:
-                # API unavailable — proceed with scan prices (generous on Layer 4)
-                logger.debug("CLOB unavailable for logical_arb revalidation, proceeding with scan prices")
-                return True, original_profit, "clob_unavailable"
+            if_no_book = fetch_order_book(if_token_ids[1])
+            if not then_yes_book or not if_no_book:
+                raise _RevalidationAPIError("logical_arb CLOB unavailable")
 
-            then_yes_asks = then_yes_book.get("asks", [])
-            if not then_yes_asks:
-                logger.debug("No asks in CLOB for logical_arb, proceeding")
-                return True, original_profit, "no_asks"
-
-            fresh_then_price = float(then_yes_asks[0].get("price", opp.get("_then_price", 0)))
+            then_yes_data = get_best_bid_ask(then_yes_book)
+            if_no_data = get_best_bid_ask(if_no_book)
+            fresh_then_price = then_yes_data.get("ask")
+            fresh_if_no_price = if_no_data.get("ask")
+            if fresh_then_price is None or fresh_if_no_price is None:
+                raise _RevalidationAPIError("logical_arb executable asks unavailable")
             original_then_price = opp.get("_then_price", fresh_then_price)
 
             # Check for >10% price movement (Layer 4 threshold)
@@ -1408,16 +1446,21 @@ class ArbitrageExecutor:
                 )
                 return False, 0.0, "price_moved_too_much"
 
-            # Update opportunity with fresh prices
+            reval_profit = net_profit_logical_arb(1.0 - fresh_if_no_price, fresh_then_price)
+            threshold = self._get_revalidation_threshold(original_profit, opp)
+            if reval_profit < threshold:
+                return False, reval_profit, "profit_below_floor"
+
             opp["_then_price"] = fresh_then_price
-            opp["net_profit"] = original_profit  # Profit calc doesn't change if just refetching
+            opp["_if_no_price"] = fresh_if_no_price
+            opp["net_profit"] = reval_profit
 
         except Exception as e:
-            logger.debug("Logical arb revalidation CLOB fetch failed: %s", e)
-            # Graceful degradation: accept if original ROI was good (handled by caller)
-            return True, original_profit, "clob_error_accepted"
+            if isinstance(e, _RevalidationAPIError):
+                raise
+            raise _RevalidationAPIError(f"logical_arb CLOB fetch failed: {e}") from e
 
-        return True, original_profit, "passed"
+        return True, reval_profit, "passed"
 
     def _revalidate_whale_copy(
         self, opp: dict, original_profit: float,
@@ -1485,8 +1528,9 @@ class ArbitrageExecutor:
                     logger.info("Skipping price refetch: polymarket %s stale for >30s", tid)
                     return None
 
-                if cached and cached.get("price") is not None:
-                    return cached["price"]
+                cached_ask = _cached_probability(cached, "best_ask", "ask", "price")
+                if cached_ask is not None:
+                    return cached_ask
                 book = fetch_order_book(tid)
                 if book:
                     data = get_best_bid_ask(book)
@@ -1501,8 +1545,11 @@ class ArbitrageExecutor:
                     logger.info("Skipping price refetch: kalshi %s stale for >30s", ticker)
                     return None
 
-                if cached and cached.get(f"{side}_price") is not None:
-                    return cached[f"{side}_price"]
+                cached_ask = _cached_probability(
+                    cached, f"{side}_ask", f"{side}_price", side,
+                )
+                if cached_ask is not None:
+                    return cached_ask
                 book = self.kalshi_client.fetch_order_book(ticker)
                 if book:
                     from kalshi_api import parse_orderbook, best_yes_ask, best_no_ask, _audit_raw_orderbook
@@ -2215,28 +2262,24 @@ class ArbitrageExecutor:
             # Example: Bitcoin >$100k (if_yes) implies Bitcoin >$90k (then_yes).
             # If P(>$90k) < P(>$100k), buy >$90k and sell >$100k for arbitrage.
             token_ids = opportunity.get("_token_ids", [])
-            if not token_ids:
+            if_token_ids = opportunity.get("_if_token_ids", [])
+            if len(token_ids) < 2 or len(if_token_ids) < 2:
                 logger.warning("LogicalArb opp missing token IDs: %s", opportunity)
                 return []
 
-            # We need two token IDs: one for then_yes (underpriced), one for if_yes (hedge)
-            # token_ids[0] is typically the then_yes YES token
-            then_yes_token = token_ids[0] if len(token_ids) > 0 else ""
+            then_yes_token = token_ids[0]
+            if_no_token = if_token_ids[1]
 
-            # For the if_yes hedge, we need its token ID. In a two-outcome market,
-            # the NO token is the hedge. We may need to fetch if_market's token IDs separately.
-            # For now, we'll assume if_yes_token is provided or we have index [1]
-            if_yes_token = token_ids[1] if len(token_ids) > 1 else ""
-
-            if not then_yes_token or not if_yes_token:
+            if not then_yes_token or not if_no_token:
                 logger.warning("LogicalArb opp missing required token IDs for both outcomes")
                 return []
 
             legs = [
                 {"platform": "polymarket", "side": "BUY", "token": "yes",
                  "price": opportunity.get("_then_price", 0), "_token_id": then_yes_token},
-                {"platform": "polymarket", "side": "SELL", "token": "yes",
-                 "price": opportunity.get("_if_price", 0), "_token_id": if_yes_token},
+                {"platform": "polymarket", "side": "BUY", "token": "no",
+                 "price": opportunity.get("_if_no_price", 1.0 - opportunity.get("_if_price", 0)),
+                 "_token_id": if_no_token},
             ]
 
         elif opp_type == "WhaleCopy":
@@ -2608,11 +2651,38 @@ class ArbitrageExecutor:
                 price=leg.get("price", 0),
                 size=size,
                 status="dry_run",
+                outcome=leg.get("outcome") or leg.get("token"),
             )
 
         logger.info(f"[DRY RUN] Logged opportunity #{opp_id} with {len(legs)} legs.")
         self._write_decision(opportunity, "execute", "dry_run")
         return True
+
+    def _record_failed_leg(self, trade_id: int, leg: dict,
+                           unknown_state: bool = False) -> None:
+        """Record a failed leg, preserving reconciliation state for unconfirmed cancels.
+
+        A leg whose GTC cancel was unconfirmed may still have a live order at
+        the venue. Recording it as 'failed' would hide it from recovery.py
+        (which only scans 'pending' trades with order IDs), so persist it as
+        'pending' with its order_id instead.
+
+        unknown_state: pass True from exception handlers. An exception raised
+        after _execute_single_leg assigned leg['_order_id'] leaves the venue-
+        side state unknown (the order may be live), so such legs are also
+        preserved as 'pending' rather than dropped to 'failed' (fail closed).
+        """
+        if leg.get("_cancel_unconfirmed") or (unknown_state and leg.get("_order_id")):
+            self.db.set_trade_order_id(trade_id, leg.get("_order_id"))
+            self.db.update_trade_status(trade_id, "pending")
+            reason = ("cancel unconfirmed" if leg.get("_cancel_unconfirmed")
+                      else "exception after order placement — venue state unknown")
+            logger.error(
+                f"Trade #{trade_id} left 'pending' with order_id={leg.get('_order_id')!r} "
+                f"— {reason}, awaiting recovery reconciliation"
+            )
+        else:
+            self.db.update_trade_status(trade_id, "failed")
 
     def _execute_legs(self, opportunity: dict, legs: list[dict], size: float) -> bool:
         """Execute trade legs concurrently on both platforms."""
@@ -2645,6 +2715,7 @@ class ArbitrageExecutor:
                 price=leg.get("price", 0),
                 size=size,
                 status="pending",
+                outcome=leg.get("outcome") or leg.get("token"),
             )
             leg["_trade_id"] = trade_id
 
@@ -2688,9 +2759,13 @@ class ArbitrageExecutor:
                         if success:
                             logger.info(f"Leg {idx+1} FILLED: {leg['platform']} order={order_id}")
                         else:
+                            trade_id = leg["_trade_id"]
+                            self._record_failed_leg(trade_id, leg)
+                            results[idx] = False
                             logger.error(f"Leg {idx+1} FAILED: {leg['platform']}")
                     except Exception as e:
-                        self._finalize_leg_trade(leg, False, leg.get("_order_id"), None)
+                        trade_id = leg["_trade_id"]
+                        self._record_failed_leg(trade_id, leg, unknown_state=True)
                         results[idx] = False
                         logger.error(f"Leg {idx+1} ERROR: {e}")
         else:
@@ -2703,6 +2778,9 @@ class ArbitrageExecutor:
                     if success:
                         logger.info(f"Leg {i+1} FILLED: {leg['platform']} order={order_id}")
                     else:
+                        trade_id = leg["_trade_id"]
+                        self._record_failed_leg(trade_id, leg)
+                        results[i] = False
                         logger.error(f"Leg {i+1} FAILED: {leg['platform']}")
                         # Abort remaining legs — no point continuing
                         for j in range(i + 1, len(legs)):
@@ -2710,7 +2788,8 @@ class ArbitrageExecutor:
                         logger.warning("Aborting remaining legs after leg %d failure.", i + 1)
                         break
                 except Exception as e:
-                    self._finalize_leg_trade(leg, False, leg.get("_order_id"), None)
+                    trade_id = leg["_trade_id"]
+                    self._record_failed_leg(trade_id, leg, unknown_state=True)
                     results[i] = False
                     logger.error(f"Leg {i+1} ERROR: {e}")
                     for j in range(i + 1, len(legs)):
@@ -2871,6 +2950,7 @@ class ArbitrageExecutor:
                 price=leg.get("price", 0),
                 size=size,
                 status="pending",
+                outcome=leg.get("outcome") or leg.get("token"),
             )
             leg["_trade_id"] = trade_id
 
@@ -2894,10 +2974,14 @@ class ArbitrageExecutor:
                             idx + 1, leg["platform"], order_id,
                         )
                     else:
+                        trade_id = leg["_trade_id"]
+                        self._record_failed_leg(trade_id, leg)
+                        results[idx] = False
                         logger.error(
                             "Concurrent leg %d FAILED: %s", idx + 1, leg["platform"])
                 except Exception as e:
-                    self._finalize_leg_trade(leg, False, leg.get("_order_id"), None)
+                    trade_id = leg["_trade_id"]
+                    self._record_failed_leg(trade_id, leg, unknown_state=True)
                     results[idx] = False
                     logger.error("Concurrent leg %d ERROR: %s", idx + 1, e)
 
@@ -2960,8 +3044,11 @@ class ArbitrageExecutor:
 
         Must happen before fill polling so crash recovery can reconcile.
         """
+        if not order_id:
+            return
+        leg["_order_id"] = order_id
         trade_id = leg.get("_trade_id")
-        if not trade_id or not order_id:
+        if not trade_id:
             return
         try:
             self.db.update_trade_status(
@@ -2970,7 +3057,6 @@ class ArbitrageExecutor:
                 order_id=order_id,
                 client_order_id=leg.get("_idempotency_key"),
             )
-            leg["_order_id"] = order_id
         except Exception as e:
             logger.warning(
                 "Failed to persist order_id=%s for trade #%s: %s",
@@ -3076,13 +3162,37 @@ class ArbitrageExecutor:
                             "cancelling — no taker fallback per D-05",
                             order_id, GTC_ORDER_TIMEOUT,
                         )
+                        cancel_confirmed = False
                         try:
-                            self.pm_trader.cancel_order(order_id)
+                            cancel_confirmed = bool(self.pm_trader.cancel_order(order_id))
                         except Exception as cancel_err:
                             logger.warning(
-                                "Failed to cancel Polymarket GTC order %s: %s",
-                                order_id, cancel_err,
+                                f"Failed to cancel Polymarket GTC order {order_id}: {cancel_err}"
                             )
+                        if not cancel_confirmed:
+                            # Cancel unconfirmed: the order may still be live and fill
+                            # later (untracked exposure). Mark the leg so recovery/
+                            # reconciliation can find it via the preserved _order_id.
+                            leg["_cancel_unconfirmed"] = True
+                            logger.error(
+                                f"Polymarket GTC order {order_id} cancel UNCONFIRMED for market "
+                                f"{opportunity.get('market', opportunity.get('type', '?'))} — "
+                                f"order may still be live; leg flagged for reconciliation"
+                            )
+                            if _alert_manager:
+                                try:
+                                    _alert_manager.alert(
+                                        "cancel_unconfirmed",
+                                        "CRITICAL",
+                                        f"Polymarket GTC cancel unconfirmed for order {order_id}",
+                                        details={
+                                            "order_id": order_id,
+                                            "market": opportunity.get("market"),
+                                            "platform": "polymarket",
+                                        },
+                                    )
+                                except Exception:
+                                    logger.exception("cancel_unconfirmed alert failed")
                     else:
                         logger.warning(
                             "Polymarket FOK order %s not filled (cancel/expire/timeout)",
@@ -3113,6 +3223,11 @@ class ArbitrageExecutor:
             # Determine time-in-force based on config and leg position
             use_gtc = _use_gtc_for_leg(leg.get("_leg_index", 0))
             tif = "good_till_canceled" if use_gtc else "fill_or_kill"
+
+            from kalshi_policy import live_kalshi_submit_allowed
+            if not live_kalshi_submit_allowed(ticker):
+                logger.warning("Kalshi order blocked by live policy: %s", ticker)
+                return False, None, None
 
             resp = self.kalshi_client.place_order(
                 ticker=ticker,

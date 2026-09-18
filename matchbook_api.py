@@ -281,6 +281,24 @@ class MatchbookClient:
         if not self.authenticated:
             return None
 
+        # DRY_RUN guard (audit S12): honor the flag at the client boundary so a
+        # direct place_order() call can never hit the live venue when DRY_RUN=true,
+        # independent of the executor's own guard.
+        from config import DRY_RUN
+        if DRY_RUN:
+            logger.info(
+                "Matchbook place_order DRY_RUN — not placed (%s runner=%s odds=%.3f stake=%.2f)",
+                side, runner_id, odds, stake,
+            )
+            # Mirror the live success shape (id/status) so callers that read
+            # resp["id"] don't get an empty order id; "DRY_RUN" is unmistakable.
+            return {"id": "DRY_RUN", "status": "dry_run", "dry_run": True,
+                    "market-id": market_id, "runner-id": runner_id,
+                    "side": side, "odds": odds, "stake": stake}
+
+        if _circuit.is_open():
+            logger.warning("Matchbook place_order skipped: circuit open")
+            return None
         _rate_limit()
         try:
             resp = self.session.post(
@@ -294,12 +312,15 @@ class MatchbookClient:
                 timeout=30,
             )
             if resp.status_code in (200, 201):
+                _circuit.record_success()
                 return resp.json()
             logger.error("Matchbook place_order: %s %s",
                          resp.status_code, resp.text[:200])
+            _circuit.record_failure()
             return None
         except requests.RequestException as exc:
             logger.error("Matchbook place_order failed: %s", exc)
+            _circuit.record_failure()
             return None
 
     def get_balance(self) -> float | None:
@@ -350,15 +371,29 @@ class MatchbookClient:
         """
         if not self.authenticated:
             return False
+        from config import DRY_RUN
+        if DRY_RUN:
+            logger.info("Matchbook cancel_order DRY_RUN — not cancelling offer %s", offer_id)
+            return True
+        if _circuit.is_open():
+            logger.warning("Matchbook cancel_order skipped: circuit open")
+            return False
         _rate_limit()
         try:
             resp = self.session.delete(
                 f"{MATCHBOOK_API_URL}/offers/{offer_id}",
                 timeout=30,
             )
-            return resp.status_code in (200, 204)
+            if resp.status_code in (200, 204):
+                _circuit.record_success()
+                return True
+            logger.warning("Matchbook cancel_order: %s %s",
+                           resp.status_code, resp.text[:200])
+            _circuit.record_failure()
+            return False
         except requests.RequestException as exc:
             logger.warning("Matchbook cancel_order failed: %s", exc)
+            _circuit.record_failure()
             return False
 
     def fetch_all_markets(self) -> list[dict]:

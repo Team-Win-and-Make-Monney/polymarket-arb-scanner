@@ -74,15 +74,33 @@ def _read_cached_price(cache: dict, key: tuple[str, str], max_age: float) -> dic
     return entry
 
 
+def _as_probability(value) -> float | None:
+    """Normalize a scalar WS value to a 0..1 probability."""
+    if value is None or isinstance(value, (dict, list, tuple)):
+        return None
+    try:
+        probability = float(value)
+    except (TypeError, ValueError):
+        return None
+    return probability if 0.0 <= probability <= 1.0 else None
+
+
 def _kalshi_price(entry: dict, side: str) -> float | None:
     """Extract a side price from a Kalshi WS cache entry.
 
     The WS handler stores Kalshi prices under multiple possible field
     names depending on the feed shape. Probe the common ones in order.
     """
-    if side == "yes":
-        return entry.get("yes") or entry.get("yes_price") or entry.get("price")
-    return entry.get("no") or entry.get("no_price")
+    keys = (
+        ("yes_ask", "yes_price", "yes", "price")
+        if side == "yes"
+        else ("no_ask", "no_price", "no")
+    )
+    for key in keys:
+        probability = _as_probability(entry.get(key))
+        if probability is not None:
+            return probability
+    return None
 
 
 def _poly_ask_for_token(cache: dict, token_id: str, max_age: float) -> float | None:
@@ -94,7 +112,11 @@ def _poly_ask_for_token(cache: dict, token_id: str, max_age: float) -> float | N
     entry = _read_cached_price(cache, ("polymarket", token_id), max_age)
     if not entry:
         return None
-    return entry.get("best_ask") or entry.get("ask") or entry.get("price")
+    for key in ("best_ask", "ask", "price"):
+        probability = _as_probability(entry.get(key))
+        if probability is not None:
+            return probability
+    return None
 
 
 class CrossPairIndex:

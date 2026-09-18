@@ -1,0 +1,59 @@
+name: EDGAR Corporate-Action Watcher
+
+on:
+  schedule:
+    # Weekdays at 14:00 / 18:00 / 21:00 UTC (~10am / 2pm / 5pm ET) — covers the
+    # SEC filing day; filings disseminate through the afternoon.
+    - cron: '0 14,18,21 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      always_alert:
+        description: 'Send a Telegram heartbeat even with no new filings'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # The watcher only needs requests (+ stdlib); skip arbgrid's heavy stack.
+      - name: Install dependencies
+        run: pip install 'requests==2.31.0' 'defusedxml==0.7.1'
+
+      # Persist alerted accessions between runs so we only ticket NEW filings.
+      - name: Restore EDGAR state cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/edgar_state.json
+          key: edgar-state-${{ github.run_id }}
+          restore-keys: |
+            edgar-state-
+
+      - name: Run EDGAR watcher (detection only)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+          ALWAYS_ALERT: ${{ github.event.inputs.always_alert }}
+        run: |
+          FLAGS="--state-file /tmp/edgar_state.json"
+          if [[ "$ALWAYS_ALERT" == "true" ]]; then
+            FLAGS="$FLAGS --always-alert"
+          fi
+          python scripts/run_edgar_scan.py $FLAGS

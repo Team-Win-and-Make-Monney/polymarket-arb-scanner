@@ -552,7 +552,7 @@ executor.execute(opportunity)
 | `MATCHBOOK_USERNAME` + `MATCHBOOK_PASSWORD` | Matchbook | Trading |
 | `GEMINI_API_KEY` + `GEMINI_API_SECRET` | Gemini | Trading |
 | `IBKR_HOST` + `IBKR_PORT` + `IBKR_CLIENT_ID` | IBKR | Trading |
-| `METACULUS_API_KEY` | Metaculus | Optional (public API) |
+| `METACULUS_API_KEY` | Metaculus | Required with approved API access and `METACULUS_COMMERCIAL_USE_APPROVED=true` |
 
 ### Execution Controls (tune trading behavior)
 

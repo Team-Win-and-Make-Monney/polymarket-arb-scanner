@@ -2,6 +2,7 @@
 
 import pytest
 from unittest.mock import MagicMock, patch
+from typing import ClassVar
 import sys
 import os
 
@@ -338,3 +339,87 @@ class TestScanKalshiMulti:
             result = scan_kalshi_multi(client, 0.01, kalshi_data=kalshi_data)
 
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# scan_kalshi_multi — exhaustiveness gate (2026-07-21 false-positive post-mortem)
+# ---------------------------------------------------------------------------
+
+
+class TestScanKalshiMultiExhaustiveness:
+    """mutually_exclusive=True means at most one outcome pays — NOT that the
+    listed outcomes cover the space. KXTRUMPPHOTO-26JUL26 (buckets exactly
+    4/5/6/7 days, no '3 or fewer' tail) priced at 0.86 was reported as an
+    8% riskless arb; if the value lands 0-3 every leg loses. A scalar strike
+    ladder is only exhaustive when it has open-ended tail buckets."""
+
+    CLOSE: ClassVar[dict[str, str]] = {"close_time": "2030-01-01T00:00:00Z", "expiration_time": "2030-01-01T00:00:00Z"}
+
+    def _scan(self, markets, prices):
+        from scans.kalshi import scan_kalshi_multi
+        client = MagicMock()
+        client.get_market_price.side_effect = prices
+        client.get_order_book_depth.return_value = {"yes_ask_size": 50}
+        kalshi_data = (
+            [{"event_ticker": "EV1", "title": "Ladder Event", "mutually_exclusive": True}],
+            {"EV1": markets},
+            {"EV1": "Ladder Event"},
+        )
+        with patch("scans.kalshi._within_resolution_window", return_value=True), \
+             patch("scans.kalshi.filter_dust", side_effect=lambda x: x):
+            return scan_kalshi_multi(client, 0.01, kalshi_data=kalshi_data)
+
+    def test_exact_bucket_ladder_without_tails_is_rejected(self):
+        # The live KXTRUMPPHOTO shape: exact-value buckets, no open tails,
+        # asks sum 0.86 — looks like an 8%+ arb but the set is not exhaustive.
+        markets = [
+            {"ticker": f"K-{s}", "title": str(s), "floor_strike": s, "cap_strike": s, **self.CLOSE}
+            for s in (4, 5, 6, 7)
+        ]
+        prices = [(0.23, 0.78), (0.37, 0.64), (0.25, 0.76), (0.01, 0.99)]
+        assert self._scan(markets, prices) == []
+
+    def test_ladder_with_open_tails_is_kept(self):
+        # Bottom tail (<=3), interior exact buckets, top tail (>=6): exhaustive.
+        markets = [
+            {"ticker": "K-LOW", "title": "3 or fewer", "floor_strike": None, "cap_strike": 3, **self.CLOSE},
+            {"ticker": "K-4", "title": "4", "floor_strike": 4, "cap_strike": 4, **self.CLOSE},
+            {"ticker": "K-5", "title": "5", "floor_strike": 5, "cap_strike": 5, **self.CLOSE},
+            {"ticker": "K-HIGH", "title": "6 or more", "floor_strike": 6, "cap_strike": None, **self.CLOSE},
+        ]
+        prices = [(0.18, 0.83), (0.28, 0.73), (0.26, 0.75), (0.18, 0.83)]  # asks sum 0.90
+        result = self._scan(markets, prices)
+        assert len(result) == 1
+        assert result[0]["type"] == "KalshiMulti(4)"
+
+    def test_ladder_with_interior_gap_is_rejected(self):
+        # Tails present but bucket 4 missing (<=3, 5, >=6): a 4 loses every leg.
+        markets = [
+            {"ticker": "K-LOW", "title": "3 or fewer", "floor_strike": None, "cap_strike": 3, **self.CLOSE},
+            {"ticker": "K-5", "title": "5", "floor_strike": 5, "cap_strike": 5, **self.CLOSE},
+            {"ticker": "K-HIGH", "title": "6 or more", "floor_strike": 6, "cap_strike": None, **self.CLOSE},
+        ]
+        prices = [(0.28, 0.73), (0.30, 0.71), (0.28, 0.73)]  # asks sum 0.86
+        assert self._scan(markets, prices) == []
+
+    def test_ladder_with_between_buckets_is_kept(self):
+        # <=3, between 4-5, >=6: contiguous coverage with a range bucket.
+        markets = [
+            {"ticker": "K-LOW", "title": "3 or fewer", "floor_strike": None, "cap_strike": 3, **self.CLOSE},
+            {"ticker": "K-MID", "title": "4 to 5", "floor_strike": 4, "cap_strike": 5, **self.CLOSE},
+            {"ticker": "K-HIGH", "title": "6 or more", "floor_strike": 6, "cap_strike": None, **self.CLOSE},
+        ]
+        prices = [(0.28, 0.73), (0.32, 0.69), (0.28, 0.73)]  # asks sum 0.88
+        result = self._scan(markets, prices)
+        assert len(result) == 1
+
+    def test_categorical_event_without_strikes_unchanged(self):
+        # No strike fields at all -> no structural signal; existing behavior kept.
+        markets = [
+            {"ticker": "K-A", "title": "A", **self.CLOSE},
+            {"ticker": "K-B", "title": "B", **self.CLOSE},
+            {"ticker": "K-C", "title": "C", **self.CLOSE},
+        ]
+        prices = [(0.35, 0.65), (0.30, 0.70), (0.25, 0.75)]  # asks sum 0.90
+        result = self._scan(markets, prices)
+        assert len(result) == 1

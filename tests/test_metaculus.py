@@ -1,386 +1,283 @@
-"""Tests for Metaculus API client."""
+"""Tests for the current, read-only Metaculus Posts API client."""
 
-import sys
 import os
-from unittest.mock import patch, MagicMock, PropertyMock
+import sys
+from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from metaculus_api import MetaculusClient, _rate_limit, MIN_REQUEST_INTERVAL
+from metaculus_api import (  # noqa: E402
+    MIN_REQUEST_INTERVAL,
+    METACULUS_API_URL,
+    MetaculusClient,
+    _community_probability,
+    _normalize_post,
+    _rate_limit,
+)
 
+
+def _binary_post(post_id: int = 10, question_id: int = 20, probability: float = 0.63) -> dict:
+    return {
+        "id": post_id,
+        "title": "Will the test event happen?",
+        "nr_forecasters": 44,
+        "question": {
+            "id": question_id,
+            "title": "Will the test event happen?",
+            "type": "binary",
+            "aggregations": {
+                "recency_weighted": {
+                    "latest": {"centers": [probability], "forecaster_count": 42}
+                }
+            },
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Authentication and requests
+# ---------------------------------------------------------------------------
 
 class TestMetaculusLogin:
-    def test_login_succeeds_with_api_key(self):
-        """Login with an explicit API key sets auth header and returns True."""
+    def test_uses_current_posts_endpoint_and_token(self):
         client = MetaculusClient()
+        response = MagicMock(status_code=200)
 
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {"results": []}
-
-        with patch.object(client.session, "get", return_value=mock_resp):
+        with patch.object(client.session, "get", return_value=response) as request:
             with patch("metaculus_api._rate_limit"):
-                result = client.login(api_key="test-key-123")
+                result = client.login("test-token")
 
         assert result is True
         assert client.authenticated is True
-        assert client.session.headers["Authorization"] == "Token test-key-123"
+        assert client.base_url == METACULUS_API_URL
+        assert client.session.headers["Authorization"] == "Token test-token"
+        assert request.call_args.args[0] == f"{METACULUS_API_URL}/posts/"
+        assert request.call_args.kwargs["params"]["with_cp"] == "true"
 
-    def test_login_succeeds_without_api_key(self):
-        """Login without a key still works (public API)."""
+    def test_rejects_missing_token_without_network_call(self):
         client = MetaculusClient()
 
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {"results": []}
-
-        with patch.object(client.session, "get", return_value=mock_resp):
-            with patch("metaculus_api._rate_limit"):
-                with patch.dict(os.environ, {}, clear=False):
-                    # Ensure no env var is set
-                    os.environ.pop("METACULUS_API_KEY", None)
-                    result = client.login()
-
-        assert result is True
-        assert client.authenticated is True
-        assert "Authorization" not in client.session.headers
-
-    def test_login_falls_back_to_env_var(self):
-        """Login reads METACULUS_API_KEY from env if no arg provided."""
-        client = MetaculusClient()
-
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {"results": []}
-
-        with patch.object(client.session, "get", return_value=mock_resp):
-            with patch("metaculus_api._rate_limit"):
-                with patch.dict(os.environ, {"METACULUS_API_KEY": "env-key-456"}):
-                    result = client.login()
-
-        assert result is True
-        assert client.session.headers["Authorization"] == "Token env-key-456"
-
-    def test_login_fails_on_http_error(self):
-        """Login returns False when verification request fails."""
-        client = MetaculusClient()
-
-        mock_resp = MagicMock()
-        mock_resp.status_code = 403
-
-        with patch.object(client.session, "get", return_value=mock_resp):
-            with patch("metaculus_api._rate_limit"):
-                result = client.login(api_key="bad-key")
+        with patch.dict(os.environ, {}, clear=True):
+            with patch.object(client.session, "get") as request:
+                result = client.login()
 
         assert result is False
         assert client.authenticated is False
+        request.assert_not_called()
 
-    def test_login_fails_on_request_exception(self):
-        """Login returns False on network error."""
+    def test_falls_back_to_environment_token(self):
+        client = MetaculusClient()
+        response = MagicMock(status_code=200)
+
+        with patch.dict(os.environ, {"METACULUS_API_KEY": "env-token"}):
+            with patch.object(client.session, "get", return_value=response):
+                with patch("metaculus_api._rate_limit"):
+                    assert client.login() is True
+
+        assert client.session.headers["Authorization"] == "Token env-token"
+
+    @pytest.mark.parametrize("status_code", [401, 403, 500])
+    def test_rejects_http_error(self, status_code):
+        client = MetaculusClient()
+        response = MagicMock(status_code=status_code)
+
+        with patch.object(client.session, "get", return_value=response):
+            with patch("metaculus_api._rate_limit"):
+                assert client.login("bad-token") is False
+
+        assert client.authenticated is False
+
+    def test_rejects_request_exception(self):
         client = MetaculusClient()
 
-        import requests
-        with patch.object(client.session, "get",
-                          side_effect=requests.RequestException("timeout")):
+        with patch.object(client.session, "get", side_effect=requests.RequestException("timeout")):
             with patch("metaculus_api._rate_limit"):
-                result = client.login(api_key="test-key")
-
-        assert result is False
-        assert client.authenticated is False
+                assert client.login("token") is False
 
 
 class TestMetaculusRequest:
-    def test_request_returns_json_on_success(self):
-        """_request returns parsed JSON on 200 response."""
+    def test_blocks_request_before_login(self):
         client = MetaculusClient()
 
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {"results": [{"id": 1}]}
+        with patch.object(client.session, "request") as request:
+            assert client._request("GET", "/posts/") is None
 
-        with patch.object(client.session, "request", return_value=mock_resp):
+        request.assert_not_called()
+
+    def test_returns_json_after_login(self):
+        client = MetaculusClient()
+        client.authenticated = True
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"results": [_binary_post()]}
+
+        with patch.object(client.session, "request", return_value=response):
+            with patch("metaculus_api._rate_limit") as limiter:
+                result = client._request("GET", "/posts/")
+
+        assert result == {"results": [_binary_post()]}
+        limiter.assert_called_once()
+
+    def test_returns_none_on_http_error(self):
+        client = MetaculusClient()
+        client.authenticated = True
+        response = MagicMock(status_code=500, text="server error")
+
+        with patch.object(client.session, "request", return_value=response):
             with patch("metaculus_api._rate_limit"):
-                result = client._request("GET", "/questions/")
+                assert client._request("GET", "/posts/") is None
 
-        assert result == {"results": [{"id": 1}]}
-
-    def test_request_returns_none_on_error_status(self):
-        """_request returns None on non-200 status."""
+    def test_returns_none_on_request_exception(self):
         client = MetaculusClient()
+        client.authenticated = True
 
-        mock_resp = MagicMock()
-        mock_resp.status_code = 500
-        mock_resp.text = "Internal Server Error"
-
-        with patch.object(client.session, "request", return_value=mock_resp):
+        with patch.object(client.session, "request", side_effect=requests.RequestException("down")):
             with patch("metaculus_api._rate_limit"):
-                result = client._request("GET", "/questions/1/")
+                assert client._request("GET", "/posts/") is None
 
-        assert result is None
 
-    def test_request_returns_none_on_exception(self):
-        """_request returns None on network exception."""
-        client = MetaculusClient()
+# ---------------------------------------------------------------------------
+# Response normalization and lookup
+# ---------------------------------------------------------------------------
 
-        import requests
-        with patch.object(client.session, "request",
-                          side_effect=requests.RequestException("connection")):
-            with patch("metaculus_api._rate_limit"):
-                result = client._request("GET", "/questions/")
+class TestPostNormalization:
+    def test_normalizes_binary_question_for_existing_consumers(self):
+        question = _normalize_post(_binary_post())
 
-        assert result is None
+        assert question["id"] == 20
+        assert question["_post_id"] == 10
+        assert question["number_of_forecasters"] == 44
+        assert question["community_prediction"]["full"]["q2"] == pytest.approx(0.63)
 
-    def test_request_calls_rate_limit(self):
-        """_request invokes _rate_limit before each call."""
-        client = MetaculusClient()
+    def test_uses_aggregation_forecaster_count_as_fallback(self):
+        post = _binary_post()
+        post.pop("nr_forecasters")
 
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {}
+        question = _normalize_post(post)
 
-        with patch.object(client.session, "request", return_value=mock_resp):
-            with patch("metaculus_api._rate_limit") as mock_rl:
-                client._request("GET", "/questions/")
+        assert question["number_of_forecasters"] == 42
 
-        mock_rl.assert_called_once()
+    def test_skips_non_binary_and_group_posts(self):
+        post = _binary_post()
+        post["question"]["type"] = "numeric"
+
+        assert _normalize_post(post) is None
+        assert _normalize_post({"id": 1, "group_of_questions": []}) is None
+
+    def test_missing_community_prediction_is_allowed(self):
+        post = _binary_post()
+        post["question"]["aggregations"] = None
+
+        question = _normalize_post(post)
+
+        assert "community_prediction" not in question
+        assert _community_probability(post["question"]) is None
 
 
 class TestFetchActiveQuestions:
-    def test_returns_parsed_questions(self):
-        """fetch_active_questions returns list of question dicts."""
-        client = MetaculusClient()
-        questions = [
-            {"id": 100, "title": "Will X happen?"},
-            {"id": 101, "title": "Will Y happen?"},
-        ]
-
-        with patch.object(client, "_request",
-                          return_value={"results": questions}):
-            result = client.fetch_active_questions(limit=50)
-
-        assert len(result) == 2
-        assert result[0]["id"] == 100
-        assert result[1]["title"] == "Will Y happen?"
-
-    def test_passes_correct_params(self):
-        """fetch_active_questions sends status, limit, offset, type params."""
+    def test_uses_documented_post_filters_and_tracks_id_mapping(self):
         client = MetaculusClient()
 
-        with patch.object(client, "_request",
-                          return_value={"results": []}) as mock_req:
-            client.fetch_active_questions(limit=100, offset=50)
+        with patch.object(client, "_request", return_value={"results": [_binary_post()]}) as request:
+            result = client.fetch_active_questions(limit=50, offset=5, category="politics")
 
-        mock_req.assert_called_once_with("GET", "/questions/", params={
-            "status": "open",
-            "limit": 100,
-            "offset": 50,
-            "type": "forecast",
-        })
+        assert result[0]["id"] == 20
+        assert client._post_ids[20] == 10
+        request.assert_called_once_with(
+            "GET",
+            "/posts/",
+            params={
+                "statuses": ["open"],
+                "forecast_type": ["binary"],
+                "with_cp": "true",
+                "limit": 50,
+                "offset": 5,
+                "categories": ["politics"],
+            },
+        )
 
-    def test_passes_category_as_search(self):
-        """fetch_active_questions adds search param when category provided."""
+    def test_skips_unsupported_posts_and_handles_failure(self):
         client = MetaculusClient()
+        numeric = _binary_post()
+        numeric["question"]["type"] = "numeric"
 
-        with patch.object(client, "_request",
-                          return_value={"results": []}) as mock_req:
-            client.fetch_active_questions(category="politics")
-
-        mock_req.assert_called_once_with("GET", "/questions/", params={
-            "status": "open",
-            "limit": 200,
-            "offset": 0,
-            "type": "forecast",
-            "search": "politics",
-        })
-
-    def test_returns_empty_list_on_failure(self):
-        """fetch_active_questions returns [] when API returns None."""
-        client = MetaculusClient()
-
+        with patch.object(client, "_request", return_value={"results": [numeric]}):
+            assert client.fetch_active_questions() == []
         with patch.object(client, "_request", return_value=None):
-            result = client.fetch_active_questions()
+            assert client.fetch_active_questions() == []
 
-        assert result == []
 
-    def test_returns_empty_list_when_no_results_key(self):
-        """fetch_active_questions returns [] when response has no results."""
+class TestQuestionLookup:
+    def test_details_returns_none_when_feed_cannot_resolve_post(self):
         client = MetaculusClient()
 
-        with patch.object(client, "_request", return_value={}):
-            result = client.fetch_active_questions()
+        with patch.object(client, "fetch_active_questions", return_value=[]):
+            with patch.object(client, "_request") as request:
+                assert client.get_question_details(20) is None
 
-        assert result == []
+        request.assert_not_called()
 
+    def test_details_resolves_uncached_question_through_posts_feed(self):
+        client = MetaculusClient()
+        normalized = _normalize_post(_binary_post(post_id=10, question_id=20))
 
-class TestGetQuestionPrediction:
-    def test_extracts_median_probability(self):
-        """get_question_prediction returns q2 (median) from community prediction."""
+        with patch.object(client, "fetch_active_questions", return_value=[normalized]):
+            with patch.object(client, "_request", return_value=_binary_post()) as request:
+                result = client.get_question_details(20)
+
+        assert result["id"] == 20
+        request.assert_called_once_with("GET", "/posts/10/")
+
+    def test_details_uses_known_post_id(self):
+        client = MetaculusClient()
+        client._post_ids[20] = 10
+
+        with patch.object(client, "_request", return_value=_binary_post()) as request:
+            result = client.get_question_details(20)
+
+        assert result["id"] == 20
+        request.assert_called_once_with("GET", "/posts/10/")
+
+    def test_prediction_reads_normalized_community_value(self):
         client = MetaculusClient()
 
-        question_data = {
-            "id": 42,
-            "title": "Will X happen?",
-            "community_prediction": {
-                "full": {
-                    "q1": 0.25,
-                    "q2": 0.65,
-                    "q3": 0.85,
-                }
-            }
-        }
+        with patch.object(client, "get_question_details", return_value=_normalize_post(_binary_post())):
+            assert client.get_question_prediction(20) == pytest.approx(0.63)
 
-        with patch.object(client, "_request", return_value=question_data):
-            result = client.get_question_prediction(42)
-
-        assert result == pytest.approx(0.65)
-
-    def test_returns_none_when_no_prediction(self):
-        """get_question_prediction returns None when community_prediction missing."""
+    def test_prediction_returns_none_when_access_tier_omits_cp(self):
         client = MetaculusClient()
+        question = _normalize_post(_binary_post())
+        question.pop("community_prediction")
 
-        with patch.object(client, "_request",
-                          return_value={"id": 42, "title": "Test"}):
-            result = client.get_question_prediction(42)
+        with patch.object(client, "get_question_details", return_value=question):
+            assert client.get_question_prediction(20) is None
 
-        assert result is None
-
-    def test_returns_none_when_prediction_incomplete(self):
-        """get_question_prediction returns None when nested keys missing."""
+    def test_search_ranks_locally_without_undocumented_api_param(self):
         client = MetaculusClient()
+        first = _normalize_post(_binary_post(post_id=1, question_id=1))
+        second = dict(first, id=2, title="Will inflation fall below two percent?")
 
-        with patch.object(client, "_request",
-                          return_value={"id": 42,
-                                        "community_prediction": {"full": {}}}):
-            result = client.get_question_prediction(42)
+        with patch.object(client, "fetch_active_questions", return_value=[second, first]) as fetch:
+            result = client.search_questions("Will the test event happen?", limit=1)
 
-        assert result is None
-
-    def test_returns_none_on_api_failure(self):
-        """get_question_prediction returns None when API call fails."""
-        client = MetaculusClient()
-
-        with patch.object(client, "_request", return_value=None):
-            result = client.get_question_prediction(999)
-
-        assert result is None
-
-    def test_returns_none_when_prediction_is_none(self):
-        """get_question_prediction handles None values in prediction chain."""
-        client = MetaculusClient()
-
-        with patch.object(client, "_request",
-                          return_value={"id": 42,
-                                        "community_prediction": None}):
-            result = client.get_question_prediction(42)
-
-        assert result is None
+        assert result == [first]
+        fetch.assert_called_once_with(limit=200)
 
 
-class TestSearchQuestions:
-    def test_passes_search_params(self):
-        """search_questions sends search, status, limit, type params."""
-        client = MetaculusClient()
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
 
-        with patch.object(client, "_request",
-                          return_value={"results": []}) as mock_req:
-            client.search_questions("election 2026", limit=25)
-
-        mock_req.assert_called_once_with("GET", "/questions/", params={
-            "search": "election 2026",
-            "status": "open",
-            "limit": 25,
-            "type": "forecast",
-        })
-
-    def test_returns_matching_questions(self):
-        """search_questions returns list of matched question dicts."""
-        client = MetaculusClient()
-        questions = [{"id": 10, "title": "Election question"}]
-
-        with patch.object(client, "_request",
-                          return_value={"results": questions}):
-            result = client.search_questions("election")
-
-        assert len(result) == 1
-        assert result[0]["id"] == 10
-
-    def test_returns_empty_list_on_failure(self):
-        """search_questions returns [] when API fails."""
-        client = MetaculusClient()
-
-        with patch.object(client, "_request", return_value=None):
-            result = client.search_questions("nonexistent")
-
-        assert result == []
-
-
-class TestGetQuestionDetails:
-    def test_returns_full_question_dict(self):
-        """get_question_details returns the full question response."""
-        client = MetaculusClient()
-        question = {
-            "id": 42,
-            "title": "Will X happen?",
-            "url": "https://www.metaculus.com/questions/42/",
-            "resolution_criteria": "Resolves YES if...",
-            "created_time": "2025-01-01T00:00:00Z",
-            "close_time": "2026-12-31T23:59:59Z",
-            "community_prediction": {"full": {"q1": 0.2, "q2": 0.5, "q3": 0.8}},
-            "possibilities": {"type": "binary"},
-        }
-
-        with patch.object(client, "_request", return_value=question):
-            result = client.get_question_details(42)
-
-        assert result["id"] == 42
-        assert result["title"] == "Will X happen?"
-        assert result["possibilities"]["type"] == "binary"
-
-    def test_returns_none_on_failure(self):
-        """get_question_details returns None when API fails."""
-        client = MetaculusClient()
-
-        with patch.object(client, "_request", return_value=None):
-            result = client.get_question_details(999)
-
-        assert result is None
-
-
-class TestRateLimiting:
-    def test_min_request_interval_is_one_second(self):
-        """Rate limit interval is 1.0 second for Metaculus."""
+class TestRateLimit:
+    def test_interval_is_one_second(self):
         assert MIN_REQUEST_INTERVAL == 1.0
 
-    def test_rate_limit_function_exists(self):
-        """_rate_limit is a callable function."""
-        assert callable(_rate_limit)
-
-    def test_rate_limit_sleeps_when_called_rapidly(self):
-        """_rate_limit sleeps to enforce minimum interval."""
-        import metaculus_api
-
-        # Reset the global timestamp so next call thinks one was just made
-        original = metaculus_api._last_request_time
-        metaculus_api._last_request_time = 0
-
-        try:
-            with patch("metaculus_api.time.sleep") as mock_sleep:
-                with patch("metaculus_api.time.time", side_effect=[100.0, 100.0]):
-                    # _last_request_time is 0, time.time() returns 100.0
-                    # elapsed = 100.0, which is >= 1.0, so no sleep needed
+    def test_rate_limit_sleeps_for_remaining_interval(self):
+        with patch("metaculus_api.time.time", side_effect=[100.5, 101.0]):
+            with patch("metaculus_api.time.sleep") as sleep:
+                with patch("metaculus_api._last_request_time", 100.0):
                     _rate_limit()
-                    mock_sleep.assert_not_called()
 
-            # Now simulate a rapid second call
-            metaculus_api._last_request_time = 100.0
-            with patch("metaculus_api.time.sleep") as mock_sleep:
-                with patch("metaculus_api.time.time", side_effect=[100.3, 100.3]):
-                    # elapsed = 0.3, need to sleep 0.7
-                    _rate_limit()
-                    mock_sleep.assert_called_once()
-                    sleep_duration = mock_sleep.call_args[0][0]
-                    assert sleep_duration == pytest.approx(0.7, abs=0.05)
-        finally:
-            metaculus_api._last_request_time = original
+        sleep.assert_called_once_with(pytest.approx(0.5))

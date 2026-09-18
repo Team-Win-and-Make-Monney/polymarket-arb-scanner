@@ -11,16 +11,18 @@ import types
 import pytest
 from unittest.mock import MagicMock, patch
 
-# Mock tenacity before importing polymarket_api — the module uses decorators
-# at import time, so we need a mock that passes through the decorated function.
-if "tenacity" not in sys.modules:
-    _tenacity_mock = types.ModuleType("tenacity")
-    # retry() must be a decorator factory that returns the original function unchanged
-    _tenacity_mock.retry = lambda **kwargs: (lambda fn: fn)
-    _tenacity_mock.stop_after_attempt = lambda *a, **kw: None
-    _tenacity_mock.wait_exponential = lambda *a, **kw: None
-    _tenacity_mock.retry_if_exception_type = lambda *a, **kw: None
-    sys.modules["tenacity"] = _tenacity_mock
+# Mock tenacity before importing polymarket_api only if not already installed
+try:
+    import tenacity
+except ImportError:
+    if "tenacity" not in sys.modules:
+        _tenacity_mock = types.ModuleType("tenacity")
+        # retry() must be a decorator factory that returns the original function unchanged
+        _tenacity_mock.retry = lambda **kwargs: (lambda fn: fn)
+        _tenacity_mock.stop_after_attempt = lambda *a, **kw: None
+        _tenacity_mock.wait_exponential = lambda *a, **kw: None
+        _tenacity_mock.retry_if_exception_type = lambda *a, **kw: None
+        sys.modules["tenacity"] = _tenacity_mock
 
 # Mock py_clob_client_v2 since CI may not have the SDK installed
 for mod in [
@@ -49,7 +51,7 @@ if not hasattr(_clob_types, "OrderType") or isinstance(getattr(_clob_types, "Ord
     _clob_types.BalanceAllowanceParams = MagicMock
 
 import polymarket_api
-from polymarket_api import _rate_limit, _rate_lock, PolymarketTrader
+from polymarket_api import _rate_limit, _rate_lock, get_best_bid_ask as _real_get_best_bid_ask, PolymarketTrader
 from config import PM_RATE_LIMIT as MIN_REQUEST_INTERVAL
 
 
@@ -300,6 +302,7 @@ class TestPolymarketTraderPlaceOrder:
         }
         trader = PolymarketTrader.__new__(PolymarketTrader)
         trader.client = mock_client
+        trader.execution_enabled = True
 
         resp = trader.place_order(
             token_id="tok",
@@ -315,7 +318,9 @@ class TestPolymarketTraderPlaceOrder:
         ot = kwargs.kwargs.get("order_type") if kwargs.kwargs else None
         if ot is None and len(kwargs.args) >= 3:
             ot = kwargs.args[2]
-        assert ot == "FOK"
+        # Compare against the module's own map — the concrete OrderType binding
+        # depends on whether the real SDK or the stub was imported first.
+        assert ot == polymarket_api._ORDER_TYPE_MAP["FOK"]
 
     def test_place_order_accepts_signature_compatible_kwargs(self):
         """place_order must accept the kwargs executor passes (no TypeError)."""
@@ -323,6 +328,7 @@ class TestPolymarketTraderPlaceOrder:
         mock_client.create_and_post_order.return_value = {"success": True, "orderID": "x"}
         trader = PolymarketTrader.__new__(PolymarketTrader)
         trader.client = mock_client
+        trader.execution_enabled = True
         # This is the exact call shape from executor._execute_single_leg
         resp = trader.place_order(
             token_id="tok",
@@ -333,3 +339,241 @@ class TestPolymarketTraderPlaceOrder:
             order_type="GTC",
         )
         assert resp is not None
+
+    def test_place_order_unknown_order_type_returns_none(self):
+        """Unknown order types must be rejected without hitting the venue."""
+        mock_client = MagicMock()
+        trader = PolymarketTrader.__new__(PolymarketTrader)
+        trader.client = mock_client
+        trader.execution_enabled = True
+        resp = trader.place_order(
+            token_id="tok", side="BUY", price=0.45, size=5.0, order_type="IOC",
+        )
+        assert resp is None
+        assert not mock_client.create_and_post_order.called
+
+    def test_place_order_gtd_requires_expiration(self):
+        """GTD without a non-zero expiration must raise ValueError."""
+        trader = PolymarketTrader.__new__(PolymarketTrader)
+        trader.client = MagicMock()
+        trader.execution_enabled = True
+        with pytest.raises(ValueError):
+            trader.place_order(
+                token_id="tok", side="BUY", price=0.45, size=5.0, order_type="GTD",
+            )
+        with pytest.raises(ValueError):
+            trader.place_order(
+                token_id="tok", side="BUY", price=0.45, size=5.0,
+                order_type="GTD", expiration=0,
+            )
+        assert not trader.client.create_and_post_order.called
+
+    def test_place_order_gtd_forwards_expiration(self):
+        """A valid GTD order forwards the GTD mapping and the expiration."""
+        mock_client = MagicMock()
+        mock_client.create_and_post_order.return_value = {"success": True, "orderID": "x"}
+        trader = PolymarketTrader.__new__(PolymarketTrader)
+        trader.client = mock_client
+        trader.execution_enabled = True
+        captured = {}
+
+        class _CapturingOrderArgs:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        with patch.object(polymarket_api, "OrderArgs", _CapturingOrderArgs):
+            resp = trader.place_order(
+                token_id="tok", side="BUY", price=0.45, size=5.0,
+                order_type="GTD", expiration=1893456000,
+            )
+        assert resp is not None
+        assert captured["expiration"] == 1893456000
+        call = mock_client.create_and_post_order.call_args
+        assert call.kwargs["order_type"] == polymarket_api._ORDER_TYPE_MAP["GTD"]
+        assert isinstance(call.args[0], _CapturingOrderArgs)
+
+    def test_place_order_is_blocked_without_explicit_code_gate(self):
+        mock_client = MagicMock()
+        trader = PolymarketTrader.__new__(PolymarketTrader)
+        trader.client = mock_client
+
+        assert trader.place_order(
+            token_id="tok", side="BUY", price=0.45, size=5.0,
+        ) is None
+        mock_client.create_and_post_order.assert_not_called()
+
+
+class TestPolymarketTraderCancelOrder:
+    """Fail-closed cancel confirmation."""
+
+    def _trader(self, resp):
+        trader = PolymarketTrader.__new__(PolymarketTrader)
+        trader.client = MagicMock()
+        trader.client.cancel_order.return_value = resp
+        return trader
+
+    def test_cancel_non_dict_response_is_false(self):
+        assert self._trader("OK").cancel_order("oid-1") is False
+
+    def test_cancel_none_response_is_false(self):
+        assert self._trader(None).cancel_order("oid-1") is False
+
+    def test_cancel_empty_canceled_list_is_false(self):
+        assert self._trader({"canceled": []}).cancel_order("oid-1") is False
+
+    def test_cancel_list_without_our_id_is_false(self):
+        assert self._trader({"canceled": ["other-id"]}).cancel_order("oid-1") is False
+
+    def test_cancel_list_with_our_id_is_true(self):
+        assert self._trader({"canceled": ["oid-1"]}).cancel_order("oid-1") is True
+
+    def test_cancel_british_spelling_with_our_id_is_true(self):
+        assert self._trader({"cancelled": ["oid-1"]}).cancel_order("oid-1") is True
+
+    def test_cancel_exception_is_false(self):
+        trader = PolymarketTrader.__new__(PolymarketTrader)
+        trader.client = MagicMock()
+        trader.client.cancel_order.side_effect = RuntimeError("boom")
+        assert trader.cancel_order("oid-1") is False
+
+
+class TestPolymarketTraderGetBalance:
+    """Fail-closed balance validation."""
+
+    def _trader(self, resp):
+        trader = PolymarketTrader.__new__(PolymarketTrader)
+        trader.client = MagicMock()
+        trader.client.get_balance_allowance.return_value = resp
+        return trader
+
+    def test_valid_balance(self):
+        assert self._trader({"balance": "12500000"}).get_balance() == 12.5
+
+    def test_non_dict_response_is_none(self):
+        assert self._trader("12500000").get_balance() is None
+
+    def test_missing_balance_key_is_none(self):
+        assert self._trader({"allowance": "1"}).get_balance() is None
+
+    def test_malformed_balance_is_none(self):
+        assert self._trader({"balance": "not-a-number"}).get_balance() is None
+        assert self._trader({"balance": None}).get_balance() is None
+
+    def test_nan_inf_negative_balance_is_none(self):
+        assert self._trader({"balance": "nan"}).get_balance() is None
+        assert self._trader({"balance": "inf"}).get_balance() is None
+        assert self._trader({"balance": "-1"}).get_balance() is None
+
+
+class TestClobProxyInjection:
+    """POLYMARKET_PROXY_URL must fail closed if the SDK internal disappears."""
+
+    def test_missing_sdk_internal_raises(self):
+        helpers_mod = polymarket_api._clob_http
+        had_attr = hasattr(helpers_mod, "_http_client")
+        saved = getattr(helpers_mod, "_http_client", None)
+        try:
+            if had_attr:
+                delattr(helpers_mod, "_http_client")
+            with pytest.raises(RuntimeError):
+                polymarket_api._install_clob_proxy("http://proxy.local:8080")
+        finally:
+            if had_attr:
+                helpers_mod._http_client = saved
+
+    def test_install_sets_httpx_client(self):
+        helpers_mod = polymarket_api._clob_http
+        had_attr = hasattr(helpers_mod, "_http_client")
+        saved = getattr(helpers_mod, "_http_client", None)
+        helpers_mod._http_client = object()
+        try:
+            with patch.object(polymarket_api.httpx, "Client") as mock_client_cls:
+                polymarket_api._install_clob_proxy("http://proxy.local:8080")
+                mock_client_cls.assert_called_once_with(
+                    http2=True, proxy="http://proxy.local:8080")
+                assert helpers_mod._http_client is mock_client_cls.return_value
+        finally:
+            if had_attr:
+                helpers_mod._http_client = saved
+            else:
+                del helpers_mod._http_client
+
+    def test_trader_init_installs_proxy_before_client_when_env_set(self):
+        """The write path must be proxied before the CLOB client exists."""
+        calls = []
+        with patch.dict(os.environ, {"POLYMARKET_PROXY_URL": "http://proxy.local:8080"}), \
+             patch.object(polymarket_api, "_install_clob_proxy",
+                          side_effect=lambda url: calls.append(("proxy", url))), \
+             patch.object(polymarket_api, "ClobClient",
+                          side_effect=lambda **kw: calls.append(("client",)) or MagicMock()):
+            PolymarketTrader(private_key="0xkey", execution_enabled=True)
+        assert calls[0] == ("proxy", "http://proxy.local:8080")
+        assert ("client",) in calls
+
+    def test_trader_init_fails_closed_when_sdk_internal_missing(self):
+        """Missing SDK internal aborts trader construction, not module import."""
+        helpers_mod = polymarket_api._clob_http
+        had_attr = hasattr(helpers_mod, "_http_client")
+        saved = getattr(helpers_mod, "_http_client", None)
+        try:
+            if had_attr:
+                delattr(helpers_mod, "_http_client")
+            with patch.dict(os.environ, {"POLYMARKET_PROXY_URL": "http://proxy.local:8080"}), \
+                 patch.object(polymarket_api, "ClobClient") as mock_cls:
+                with pytest.raises(RuntimeError):
+                    PolymarketTrader(private_key="0xkey", execution_enabled=True)
+                assert not mock_cls.called
+        finally:
+            if had_attr:
+                helpers_mod._http_client = saved
+
+    def test_trader_init_skips_proxy_when_env_unset(self):
+        env_without = {k: v for k, v in os.environ.items() if k != "POLYMARKET_PROXY_URL"}
+        with patch.dict(os.environ, env_without, clear=True), \
+             patch.object(polymarket_api, "_install_clob_proxy") as mock_install, \
+             patch.object(polymarket_api, "ClobClient", return_value=MagicMock()):
+            PolymarketTrader(private_key="0xkey", execution_enabled=True)
+        assert not mock_install.called
+
+
+class TestPolymarketTraderGetOrders:
+    """get_orders must pass through the V2 get_open_orders result."""
+
+    def _trader(self, resp):
+        trader = PolymarketTrader.__new__(PolymarketTrader)
+        trader.client = MagicMock()
+        trader.client.get_open_orders.return_value = resp
+        return trader
+
+    def test_list_response_passthrough(self):
+        orders = [{"id": "a"}, {"id": "b"}]
+        assert self._trader(orders).get_orders() == orders
+
+    def test_dict_response_unwraps_orders_key(self):
+        assert self._trader({"orders": [{"id": "a"}]}).get_orders() == [{"id": "a"}]
+
+    def test_none_response_is_empty_list(self):
+        assert self._trader(None).get_orders() == []
+
+    def test_exception_is_empty_list(self):
+        trader = PolymarketTrader.__new__(PolymarketTrader)
+        trader.client = MagicMock()
+        trader.client.get_open_orders.side_effect = RuntimeError("boom")
+        assert trader.get_orders() == []
+
+
+class TestBestBidAskValidation:
+    @pytest.mark.parametrize("bad_price", [-0.01, 0.0, 1.0, 1.01, float("nan"), float("inf")])
+    def test_invalid_top_level_is_not_executable(self, bad_price):
+        result = _real_get_best_bid_ask({
+            "bids": [{"price": bad_price, "size": 10}],
+            "asks": [{"price": bad_price, "size": 10}],
+        })
+        assert result == {"bid": None, "bid_size": None, "ask": None, "ask_size": None}
+
+    def test_valid_top_levels_are_preserved(self):
+        result = _real_get_best_bid_ask({
+            "bids": [{"price": "0.49", "size": "12"}],
+            "asks": [{"price": "0.51", "size": "8"}],
+        })
+        assert result == {"bid": 0.49, "bid_size": 12.0, "ask": 0.51, "ask_size": 8.0}

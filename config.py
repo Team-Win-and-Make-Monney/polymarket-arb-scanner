@@ -1,12 +1,16 @@
 """Centralized configuration — all constants backed by environment variables."""
 
 import logging
+import math
 import os
 import sys
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
-load_dotenv(os.path.expanduser("~/.claude/.env"))
+# Project-local .env only. Never merge personal/global env files (e.g.
+# ~/.claude/.env) into the bot environment — that leaks unrelated personal
+# credentials into the trading process.
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +32,16 @@ def _env_float(name: str, default: str) -> float:
         raise ConfigError(
             f"Environment variable {name}={raw!r} is not a valid float"
         )
+
+
+def _env_non_negative_float(name: str, default: str) -> float:
+    """Read a finite non-negative float, raising ConfigError otherwise."""
+    value = _env_float(name, default)
+    if not math.isfinite(value) or value < 0:
+        raise ConfigError(
+            f"Environment variable {name}={value!r} must be finite and >= 0"
+        )
+    return value
 
 
 def _env_int(name: str, default: str) -> int:
@@ -89,6 +103,7 @@ FUZZY_MATCH_THRESHOLD = _env_int("FUZZY_MATCH_THRESHOLD", "72")
 WS_SUBSCRIPTION_LIMIT = _env_int("WS_SUBSCRIPTION_LIMIT", "2000")
 WS_TRIGGER_ENABLED = _env_bool("WS_TRIGGER_ENABLED", "true")
 WS_TRIGGER_THRESHOLD = _env_float("WS_TRIGGER_THRESHOLD", "0.03")
+WS_TRIGGER_DEDUPE_SECONDS = _env_non_negative_float("WS_TRIGGER_DEDUPE_SECONDS", "5.0")
 PARALLEL_WORKERS = _env_int("PARALLEL_WORKERS", "4")
 RESCAN_INTERVAL = _env_int("RESCAN_INTERVAL", "30")
 MAX_RESOLUTION_DAYS = _env_int("MAX_RESOLUTION_DAYS", "7")
@@ -156,13 +171,43 @@ _VALID_PLATFORMS = frozenset([
     "polymarket", "kalshi", "betfair", "smarkets",
     "sxbet", "matchbook", "gemini", "ibkr",
 ])
-_raw_enabled = os.getenv("ENABLED_EXECUTION_PLATFORMS", "polymarket,kalshi")
+_raw_enabled = os.getenv("ENABLED_EXECUTION_PLATFORMS", "kalshi")
 if _raw_enabled.strip().lower() in ("all", "all platforms", "*"):
     ENABLED_EXECUTION_PLATFORMS: frozenset[str] = _VALID_PLATFORMS
 else:
     ENABLED_EXECUTION_PLATFORMS: frozenset[str] = frozenset(
         p.strip().lower() for p in _raw_enabled.split(",") if p.strip()
     )
+
+# Scan-venue pin (SCAN_VENUES preferred; PAPER_SCAN_VENUES is the legacy name).
+# When set to kalshi / kalshi-only, skip Polymarket fetches even if --mode all.
+# International Polymarket is forbidden to execute from this book.
+_PAPER_SCAN_VENUES = (
+    os.getenv("SCAN_VENUES") or os.getenv("PAPER_SCAN_VENUES") or ""
+).strip().lower()
+_POLYMARKET_SCAN_SKIP_MODES = frozenset({
+    "kalshi", "betfair", "smarkets", "sxbet", "matchbook",
+    "gemini", "ibkr", "triangular", "mm-pilot", "rewards",
+})
+
+
+def polymarket_scan_enabled(mode: str) -> bool:
+    """Whether this run should fetch or scan Polymarket markets."""
+    if _PAPER_SCAN_VENUES in {"kalshi", "kalshi-only"}:
+        return False
+    return mode not in _POLYMARKET_SCAN_SKIP_MODES
+
+
+def polymarket_reward_fetch_enabled(mode: str) -> bool:
+    """Whether this run should hit the Polymarket rewards endpoint.
+
+    ``rewards`` is in the market-scan skip set (it does not fetch the CLOB
+    universe), but it still needs the dedicated reward feed unless the run is
+    pinned to Kalshi-only.
+    """
+    if _PAPER_SCAN_VENUES in {"kalshi", "kalshi-only"}:
+        return False
+    return mode in ("all", "rewards")
 
 # Platform minimum order sizes (USD). Orders below these are rejected
 # client-side to prevent API rejections and costly partial-fill hedging.
@@ -361,6 +406,11 @@ POLYMARKET_FUNDER_ADDRESS = os.getenv("POLYMARKET_FUNDER_ADDRESS")
 POLYMARKET_SIGNATURE_TYPE = _env_int("POLYMARKET_SIGNATURE_TYPE", "0")
 KALSHI_API_KEY_ID = os.getenv("KALSHI_API_KEY_ID")
 KALSHI_PRIVATE_KEY_PATH = os.getenv("KALSHI_PRIVATE_KEY_PATH")
+# Self-heal: a boot during Kalshi's daily maintenance window must not
+# permanently degrade the run (2026-07-23 incident — 31h Polymarket-only).
+KALSHI_AUTH_BOOT_ATTEMPTS = _env_int("KALSHI_AUTH_BOOT_ATTEMPTS", "3")
+KALSHI_AUTH_BOOT_RETRY_WAIT = _env_float("KALSHI_AUTH_BOOT_RETRY_WAIT", "20")
+KALSHI_REAUTH_INTERVAL = _env_float("KALSHI_REAUTH_INTERVAL", "120")
 BETFAIR_USERNAME = os.getenv("BETFAIR_USERNAME")
 BETFAIR_PASSWORD = os.getenv("BETFAIR_PASSWORD")
 BETFAIR_APP_KEY = os.getenv("BETFAIR_APP_KEY") or os.getenv("BETFAIR_API_KEY")
@@ -391,14 +441,20 @@ SMARKETS_RATE_LIMIT = _env_float("SMARKETS_RATE_LIMIT", "0.2")  # 5/s
 SXBET_RATE_LIMIT = _env_float("SXBET_RATE_LIMIT", "0.2")        # 5/s
 MATCHBOOK_RATE_LIMIT = _env_float("MATCHBOOK_RATE_LIMIT", "0.2")  # 5/s
 
-# IBKR ForecastEx (via IB Gateway / TWS socket)
-IBKR_HOST = os.getenv("IBKR_HOST", "127.0.0.1")
+# IBKR ForecastEx (via IB Gateway / TWS socket).  Host is intentionally
+# opt-in: a cloud deployment must not probe its own localhost on every boot.
+IBKR_HOST = os.getenv("IBKR_HOST")
 IBKR_PORT = _env_int("IBKR_PORT", "4001")
 IBKR_CLIENT_ID = _env_int("IBKR_CLIENT_ID", "1")
 IBKR_ORDER_RATE_LIMIT = _env_float("IBKR_ORDER_RATE_LIMIT", "5.0")
 
-# Metaculus (read-only signal source, works without API key)
+# Metaculus (read-only signal source).  The current API requires a token, and
+# any commercial use requires a separate written agreement.  Both gates must
+# be satisfied explicitly before the client is initialized.
 METACULUS_API_KEY = os.getenv("METACULUS_API_KEY")
+METACULUS_COMMERCIAL_USE_APPROVED = _env_bool(
+    "METACULUS_COMMERCIAL_USE_APPROVED", "false"
+)
 METACULUS_CACHE_TTL = _env_float("METACULUS_CACHE_TTL", "300")
 
 # ---------------------------------------------------------------------------
@@ -431,6 +487,21 @@ MM_MAX_INVENTORY = _env_float("MM_MAX_INVENTORY", "500.0")  # $500 per market ca
 MM_MAX_TOTAL_EXPOSURE = _env_float("MM_MAX_TOTAL_EXPOSURE", "500.0")
 MM_REFRESH_INTERVAL = _env_float("MM_REFRESH_INTERVAL", "10.0")
 
+# Kalshi Liquidity Incentive Program (LIP) market making — the MM lead
+# strategy per docs/plans/02-kalshi-lip-mm-scope.md. Retail LIP ends
+# 2027-01-01 (help centre, verified 2026-08-17); pools come from
+# GET /incentive_programs.
+LIP_MIN_POOL = _env_float("LIP_MIN_POOL", "10.0")  # ignore pools under $10/period
+LIP_MAX_MARKETS = _env_int("LIP_MAX_MARKETS", "5")
+LIP_SELECT_INTERVAL = _env_float("LIP_SELECT_INTERVAL", "3600.0")  # re-rank hourly
+LIP_EXCLUDED_CATEGORIES = tuple(
+    c.strip() for c in os.getenv("LIP_EXCLUDED_CATEGORIES", "Sports").split(",") if c.strip()
+)
+LIP_PRICE_BAND_LOW = _env_float("LIP_PRICE_BAND_LOW", "0.10")
+LIP_PRICE_BAND_HIGH = _env_float("LIP_PRICE_BAND_HIGH", "0.90")
+LIP_MIN_HOURS_REMAINING = _env_float("LIP_MIN_HOURS_REMAINING", "24.0")
+LIP_DEPTH_PROBE_LIMIT = _env_int("LIP_DEPTH_PROBE_LIMIT", "25")  # max book fetches per selection pass
+
 # Liquidity rewards (Polymarket + Kalshi)
 REWARDS_ENABLED = _env_bool("REWARDS_ENABLED", "false")
 REWARDS_MAX_EXPOSURE = _env_float("REWARDS_MAX_EXPOSURE", "200.0")
@@ -438,6 +509,14 @@ REWARDS_MIN_SIZE = _env_float("REWARDS_MIN_SIZE", "5.0")
 REWARDS_MAX_SPREAD = _env_float("REWARDS_MAX_SPREAD", "0.05")
 REWARDS_POLL_INTERVAL = _env_int("REWARDS_POLL_INTERVAL", "60")
 REWARDS_MIN_RESTING_TIME = _env_int("REWARDS_MIN_RESTING_TIME", "300")
+REWARDS_MAX_MARKETS = _env_int("REWARDS_MAX_MARKETS", "100")
+
+# Kalshi Liquidity Incentive Program (LIP) — snapshot scoring of resting orders.
+KALSHI_LIP_ENABLED = _env_bool("KALSHI_LIP_ENABLED", "false")
+# Kalshi Volume Incentive Program (VIP) — passive volume-rebate tracking.
+KALSHI_VIP_TRACK_ENABLED = _env_bool("KALSHI_VIP_TRACK_ENABLED", "false")
+# VIP fills polling interval (seconds); tracking-only, never an execution path.
+KALSHI_VIP_POLL_INTERVAL = _env_int("KALSHI_VIP_POLL_INTERVAL", "1800")
 
 # Kalshi multi-outcome execution gating (kill-switch + depth check)
 # Set to false to disable KalshiMulti scanning/execution entirely.
@@ -453,6 +532,11 @@ KALSHI_MULTI_MIN_DEPTH = _env_int("KALSHI_MULTI_MIN_DEPTH", "10")
 # YES asks sum to just under/over 1.0. A sum well below this means missing,
 # closed, or stale legs — not a real arb.
 KALSHI_MULTI_MIN_SUM = _env_float("KALSHI_MULTI_MIN_SUM", "0.85")
+# Same implausible-sum defense for Gemini categorical events: point-spread
+# events list alternative lines that are neither exclusive nor exhaustive,
+# so summing their prices fakes riskless 90%+ ROI (2026-07-24 paper-window
+# false-positive class — sibling of the Kalshi strike-ladder gate, PR #100).
+GEMINI_MULTI_MIN_SUM = _env_float("GEMINI_MULTI_MIN_SUM", "0.85")
 
 # Multi-outcome cross-platform execution gating (kill-switch + depth check)
 # MultiCross places N legs concurrently across Polymarket + Kalshi. Same
@@ -621,6 +705,53 @@ LEAD_LAG_PLATFORMS = os.getenv("LEAD_LAG_PLATFORMS", "polymarket,kalshi")
 MM_TOXIC_FLOW_ENABLED = _env_bool("MM_TOXIC_FLOW_ENABLED", "false")
 MM_TOXIC_FLOW_THRESHOLD = _env_float("MM_TOXIC_FLOW_THRESHOLD", "0.60")
 MM_TOXIC_FLOW_PAUSE_SECONDS = _env_float("MM_TOXIC_FLOW_PAUSE_SECONDS", "60.0")
+
+# ---------------------------------------------------------------------------
+# Kalshi reward-MM pilot (plan 10 — docs/plans/10-mm-pilot-prep.md).
+# Independently gated from the legacy Polymarket MM_ENABLED path. Venue is
+# Kalshi ONLY: every pilot order is hard-checked platform == "kalshi" at the
+# authorize_order choke point in mm_pilot.py, on top of the
+# ENABLED_EXECUTION_PLATFORMS allowlist. All defaults are the conservative
+# tranche-1 pilot values from the spec ($2-3K bankroll, <=$300 gross/market).
+# ---------------------------------------------------------------------------
+MM_KALSHI_PILOT_ENABLED = _env_bool("MM_KALSHI_PILOT_ENABLED", "false")
+LIVE_ENVELOPE: dict | None = None
+
+# Fill detection (spec section 3) — REST polling of /portfolio/fills.
+MM_FILL_POLL_SECONDS = _env_float("MM_FILL_POLL_SECONDS", "2.0")
+
+# Auto-hedge (spec section 4).
+MM_INVENTORY_TARGET_USD = _env_float("MM_INVENTORY_TARGET_USD", "0.0")
+MM_HEDGE_DEADBAND_USD = _env_float("MM_HEDGE_DEADBAND_USD", "5.0")
+MM_HEDGE_MAX_LATENCY_SECONDS = _env_float("MM_HEDGE_MAX_LATENCY_SECONDS", "10.0")
+MM_HALT_WINDOW_SECONDS = _env_float("MM_HALT_WINDOW_SECONDS", "3600.0")
+
+# Inventory caps — hard, enforced in the order path (spec section 5).
+# Both USD and contract units are enforced; the most restrictive wins.
+# The legacy MM_MAX_INVENTORY / MM_MAX_TOTAL_EXPOSURE stay untouched for the
+# old path; the pilot reads only these MM_MAX_* keys.
+MM_MAX_INVENTORY_USD = _env_float("MM_MAX_INVENTORY_USD", "100.0")
+MM_MAX_INVENTORY_CONTRACTS = _env_int("MM_MAX_INVENTORY_CONTRACTS", "250")
+MM_MAX_TOTAL_INVENTORY_USD = _env_float("MM_MAX_TOTAL_INVENTORY_USD", "250.0")
+MM_MAX_GROSS_PER_MARKET_USD = _env_float("MM_MAX_GROSS_PER_MARKET_USD", "300.0")
+MM_QUOTE_SIZE_USD = _env_float("MM_QUOTE_SIZE_USD", "10.0")
+MM_PILOT_BANKROLL_USD = _env_float("MM_PILOT_BANKROLL_USD", "2000.0")
+
+# Pre-quote gate thresholds (spec section 6).
+MM_BOOK_MAX_STALE_SECONDS = _env_float("MM_BOOK_MAX_STALE_SECONDS", "30.0")
+MM_VOL_PULL_MULTIPLIER = _env_float("MM_VOL_PULL_MULTIPLIER", "2.5")
+MM_MAX_BOOK_DEPTH_FRACTION = _env_float("MM_MAX_BOOK_DEPTH_FRACTION", "0.25")
+
+# Kill switch / control plane (spec section 7). Fail closed: a cache older
+# than MM_CONTROLS_MAX_STALE_SECONDS means unknown operator intent = off.
+MM_CONTROLS_POLL_SECONDS = _env_float("MM_CONTROLS_POLL_SECONDS", "60.0")
+MM_CONTROLS_MAX_STALE_SECONDS = _env_float("MM_CONTROLS_MAX_STALE_SECONDS", "300.0")
+
+# Canary phase (spec section 8). Live trading always begins in canary mode.
+MM_CANARY_FILLS = _env_int("MM_CANARY_FILLS", "10")
+MM_CANARY_QUOTE_SIZE_USD = _env_float("MM_CANARY_QUOTE_SIZE_USD", "2.0")
+MM_CANARY_MAX_LOSS_USD = _env_float("MM_CANARY_MAX_LOSS_USD", "10.0")
+MM_CANARY_MIN_HOURS = _env_float("MM_CANARY_MIN_HOURS", "24.0")
 
 # Layer 4 — Informed Trading (New)
 # #39: Social Sentiment Signals — Twitter/Reddit sentiment vs price
@@ -822,6 +953,31 @@ MARKET_TITLE_MAX_LEN = _env_int("MARKET_TITLE_MAX_LEN", "60")
 # Resolution sniping — how close to settlement a market must be (in hours)
 # before _is_near_resolution() flags it as a candidate. Default 48h.
 RESOLUTION_SNIPE_WINDOW_HOURS = _env_float("RESOLUTION_SNIPE_WINDOW_HOURS", "48")
+
+# Mirror paper opportunities to Supabase (supabase_sync.OpportunitySync).
+OPP_SYNC_ENABLED = _env_bool("OPP_SYNC_ENABLED", "false")
+
+# Paper-trading window tracker (paper_record.py). PAPER_WINDOW_START is an ISO
+# UTC timestamp (e.g. "2026-07-21T20:30:00Z"); empty disables the tracker.
+# Validated here at import so a malformed timestamp fails loudly instead of
+# silently disabling the tracker mid-deploy.
+PAPER_WINDOW_START = os.getenv("PAPER_WINDOW_START", "")
+PAPER_WINDOW_START_TS = 0.0
+if PAPER_WINDOW_START:
+    try:
+        from datetime import datetime as _pw_dt, timezone as _pw_tz
+        _pw_parsed = _pw_dt.fromisoformat(PAPER_WINDOW_START.replace("Z", "+00:00"))
+        if _pw_parsed.tzinfo is None:
+            # A naive timestamp would be read as deploy-host local time,
+            # making the window deployment-dependent; the config contract is
+            # UTC, so pin it explicitly.
+            _pw_parsed = _pw_parsed.replace(tzinfo=_pw_tz.utc)
+        PAPER_WINDOW_START_TS = _pw_parsed.timestamp()
+    except ValueError as _pw_exc:
+        raise ConfigError(
+            f"PAPER_WINDOW_START is not a valid ISO timestamp: {PAPER_WINDOW_START!r}"
+        ) from _pw_exc
+PAPER_WINDOW_DAYS = max(1, _env_int("PAPER_WINDOW_DAYS", "7"))
 
 # Dashboard query limits
 DASHBOARD_RECENT_TRADES_LIMIT = _env_int("DASHBOARD_RECENT_TRADES_LIMIT", "100")
@@ -1084,6 +1240,7 @@ def validate_config() -> list[str]:
     Returns:
         List of non-fatal warning messages (logged but not raised).
     """
+    global LIVE_ENVELOPE, MM_MAX_GROSS_PER_MARKET_USD, MM_MAX_INVENTORY_USD, MM_CANARY_MAX_LOSS_USD
     warnings: list[str] = []
 
     # --- Enum checks ---
@@ -1130,10 +1287,51 @@ def validate_config() -> list[str]:
         "ALERT_LOSS_STREAK_THRESHOLD": ALERT_LOSS_STREAK_THRESHOLD,
         "STALE_PRICE_THRESHOLD": STALE_PRICE_THRESHOLD,
         "BACKTEST_RECOMMENDATIONS_MAX_AGE_HOURS": BACKTEST_RECOMMENDATIONS_MAX_AGE_HOURS,
+        "KALSHI_VIP_POLL_INTERVAL": KALSHI_VIP_POLL_INTERVAL,
+        "KALSHI_AUTH_BOOT_ATTEMPTS": KALSHI_AUTH_BOOT_ATTEMPTS,
+        "KALSHI_REAUTH_INTERVAL": KALSHI_REAUTH_INTERVAL,
+        "LIP_MAX_MARKETS": LIP_MAX_MARKETS,
+        "LIP_SELECT_INTERVAL": LIP_SELECT_INTERVAL,
+        "LIP_DEPTH_PROBE_LIMIT": LIP_DEPTH_PROBE_LIMIT,
+        # Plan 10 — Kalshi MM pilot keys
+        "MM_FILL_POLL_SECONDS": MM_FILL_POLL_SECONDS,
+        "MM_HEDGE_MAX_LATENCY_SECONDS": MM_HEDGE_MAX_LATENCY_SECONDS,
+        "MM_HALT_WINDOW_SECONDS": MM_HALT_WINDOW_SECONDS,
+        "MM_MAX_INVENTORY_USD": MM_MAX_INVENTORY_USD,
+        "MM_MAX_INVENTORY_CONTRACTS": MM_MAX_INVENTORY_CONTRACTS,
+        "MM_MAX_TOTAL_INVENTORY_USD": MM_MAX_TOTAL_INVENTORY_USD,
+        "MM_MAX_GROSS_PER_MARKET_USD": MM_MAX_GROSS_PER_MARKET_USD,
+        "MM_QUOTE_SIZE_USD": MM_QUOTE_SIZE_USD,
+        "MM_PILOT_BANKROLL_USD": MM_PILOT_BANKROLL_USD,
+        "MM_BOOK_MAX_STALE_SECONDS": MM_BOOK_MAX_STALE_SECONDS,
+        "MM_VOL_PULL_MULTIPLIER": MM_VOL_PULL_MULTIPLIER,
+        "MM_MAX_BOOK_DEPTH_FRACTION": MM_MAX_BOOK_DEPTH_FRACTION,
+        "MM_CONTROLS_POLL_SECONDS": MM_CONTROLS_POLL_SECONDS,
+        "MM_CONTROLS_MAX_STALE_SECONDS": MM_CONTROLS_MAX_STALE_SECONDS,
+        "MM_CANARY_FILLS": MM_CANARY_FILLS,
+        "MM_CANARY_QUOTE_SIZE_USD": MM_CANARY_QUOTE_SIZE_USD,
+        "MM_CANARY_MAX_LOSS_USD": MM_CANARY_MAX_LOSS_USD,
+        "MM_CANARY_MIN_HOURS": MM_CANARY_MIN_HOURS,
     }
     for name, val in _positive.items():
         if val <= 0:
             raise ConfigError(f"{name}={val} must be > 0")
+
+    # Plan 10 non-negative keys (zero is a valid value for these)
+    if MM_INVENTORY_TARGET_USD < 0:
+        raise ConfigError(
+            f"MM_INVENTORY_TARGET_USD={MM_INVENTORY_TARGET_USD} must be >= 0")
+    if MM_HEDGE_DEADBAND_USD < 0:
+        raise ConfigError(
+            f"MM_HEDGE_DEADBAND_USD={MM_HEDGE_DEADBAND_USD} must be >= 0")
+    if not (0 < LIP_PRICE_BAND_LOW < LIP_PRICE_BAND_HIGH < 1):
+        raise ConfigError(
+            f"LIP_PRICE_BAND_HIGH ({LIP_PRICE_BAND_HIGH}) must be > "
+            f"LIP_PRICE_BAND_LOW ({LIP_PRICE_BAND_LOW}), with both in (0, 1)")
+    if not (0 < MM_MAX_BOOK_DEPTH_FRACTION <= 1):
+        raise ConfigError(
+            f"MM_MAX_BOOK_DEPTH_FRACTION={MM_MAX_BOOK_DEPTH_FRACTION} "
+            f"must be in (0, 1]")
 
     # --- Non-negative checks ---
     _non_negative = {
@@ -1143,9 +1341,12 @@ def validate_config() -> list[str]:
         "DEFAULT_MIN_PROFIT": DEFAULT_MIN_PROFIT,
         "PM_RATE_LIMIT": PM_RATE_LIMIT,
         "KALSHI_RATE_LIMIT": KALSHI_RATE_LIMIT,
+        "KALSHI_AUTH_BOOT_RETRY_WAIT": KALSHI_AUTH_BOOT_RETRY_WAIT,
         "POLYGON_GAS_ESTIMATE": POLYGON_GAS_ESTIMATE,
         "WEBHOOK_MIN_PROFIT": WEBHOOK_MIN_PROFIT,
         "ALERT_BALANCE_LOW_THRESHOLD": ALERT_BALANCE_LOW_THRESHOLD,
+        "LIP_MIN_POOL": LIP_MIN_POOL,
+        "LIP_MIN_HOURS_REMAINING": LIP_MIN_HOURS_REMAINING,
     }
     for name, val in _non_negative.items():
         if val < 0:
@@ -1217,7 +1418,6 @@ def validate_config() -> list[str]:
             f"STALE_PRICE_MOVE_PCT={STALE_PRICE_MOVE_PCT} "
             f"must be in (0, 1)"
         )
-
     # --- Relationship checks ---
     if BASE_TRADE_SIZE > MAX_TRADE_SIZE:
         raise ConfigError(
@@ -1258,6 +1458,13 @@ def validate_config() -> list[str]:
             f"ENABLED_EXECUTION_PLATFORMS contains unknown platforms: "
             f"{', '.join(sorted(unknown))}. "
             f"Valid: {', '.join(sorted(_VALID_PLATFORMS))}"
+        )
+
+    if "polymarket" in ENABLED_EXECUTION_PLATFORMS and not DRY_RUN:
+        raise ConfigError(
+            "Polymarket is public-data/shadow-only and cannot be included in "
+            "ENABLED_EXECUTION_PLATFORMS when DRY_RUN=false. Remove polymarket "
+            "from the execution whitelist."
         )
 
     # SX Bet quarantine — place_order() sends unsigned JSON and is rejected by
@@ -1355,6 +1562,64 @@ def validate_config() -> list[str]:
         raise ConfigError(
             f"CANARY_MAX_TRADES={CANARY_MAX_TRADES} exceeds hard cap 3"
         )
+
+    # --- Live envelope: DRY_RUN=false requires an operator five-item file ---
+    if not DRY_RUN:
+        from live_envelope import EnvelopeError, require_live_envelope
+        try:
+            envelope = require_live_envelope()
+        except EnvelopeError as exc:
+            raise ConfigError(str(exc)) from exc
+        if envelope["venue"] != "kalshi-d0":
+            raise ConfigError(
+                "This scanner live path is Kalshi D0 only; envelope venue is "
+                f"{envelope['venue']!r}. Use the matching launcher for other venues."
+            )
+        LIVE_ENVELOPE = envelope
+        MM_MAX_GROSS_PER_MARKET_USD = min(
+            MM_MAX_GROSS_PER_MARKET_USD, envelope["max_notional_usd"]
+        )
+        MM_MAX_INVENTORY_USD = min(MM_MAX_INVENTORY_USD, envelope["max_notional_usd"])
+        MM_CANARY_MAX_LOSS_USD = min(
+            MM_CANARY_MAX_LOSS_USD, envelope["max_daily_loss_usd"]
+        )
+
+    # --- Kalshi MM pilot invariants (plan 10, spec sections 4-6) ---
+    if MM_KALSHI_PILOT_ENABLED:
+        # Forced preconditions: hedging and both hot-path gates are NOT
+        # optional for the pilot. Refuse a live (non-dry-run) start outright.
+        if not DRY_RUN:
+            missing = [
+                name for name, enabled in (
+                    ("MM_AUTO_HEDGE_ENABLED", MM_AUTO_HEDGE_ENABLED),
+                    ("MM_TOXIC_FLOW_ENABLED", MM_TOXIC_FLOW_ENABLED),
+                    ("MM_VOLATILITY_ADJUSTED_ENABLED", MM_VOLATILITY_ADJUSTED_ENABLED),
+                ) if not enabled
+            ]
+            if missing:
+                raise ConfigError(
+                    "MM_KALSHI_PILOT_ENABLED=true with DRY_RUN=false requires "
+                    f"{', '.join(missing)} — the pilot refuses to start live "
+                    "without auto-hedge and the toxic-flow/volatility gates."
+                )
+        if "kalshi" not in ENABLED_EXECUTION_PLATFORMS:
+            raise ConfigError(
+                "MM_KALSHI_PILOT_ENABLED=true but 'kalshi' is not in "
+                "ENABLED_EXECUTION_PLATFORMS — the pilot is Kalshi-only."
+            )
+        if not (MM_MAX_INVENTORY_USD <= MM_MAX_GROSS_PER_MARKET_USD <= 300.0):
+            warnings.append(
+                f"MM pilot cap sanity: expected MM_MAX_INVENTORY_USD "
+                f"({MM_MAX_INVENTORY_USD}) <= MM_MAX_GROSS_PER_MARKET_USD "
+                f"({MM_MAX_GROSS_PER_MARKET_USD}) <= 300 (pre-registered "
+                f"per-market ceiling)"
+            )
+        if MM_MAX_TOTAL_INVENTORY_USD > 0.15 * MM_PILOT_BANKROLL_USD:
+            warnings.append(
+                f"MM pilot cap sanity: MM_MAX_TOTAL_INVENTORY_USD "
+                f"({MM_MAX_TOTAL_INVENTORY_USD}) > 15% of pilot bankroll "
+                f"(${MM_PILOT_BANKROLL_USD})"
+            )
 
     # --- Startup summary for Phase 8 strategies ---
     strategy_status = []

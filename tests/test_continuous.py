@@ -37,7 +37,17 @@ sys.modules["dashboard"] = mock_dashboard
 sys.modules["display"] = MagicMock()
 sys.modules["recovery"] = MagicMock()
 
-from continuous import OpportunityIndex, _recalc_profit, _get_market_lock, _calc_realized_pnl, _StageTimer, _format_stage_timings
+from continuous import (
+    OpportunityIndex,
+    _StageTimer,
+    _calc_realized_pnl,
+    _format_stage_timings,
+    _get_market_lock,
+    _is_execution_eligible,
+    _recalc_profit,
+    _ws_opportunity_probability,
+    _ws_tracking_probability,
+)
 from db import TradeDB
 
 # Restore original modules so other test files are not affected
@@ -182,6 +192,21 @@ class TestOpportunityIndexRebuild:
         idx.rebuild(opps)
         assert idx.lookup("polymarket", "") == []
         assert idx.lookup("kalshi", "") == []
+
+    def test_monitoring_only_opp_cannot_reach_ws_index(self):
+        idx = OpportunityIndex()
+        idx.rebuild([{
+            "_token_ids": ["reward-token"],
+            "net_profit": 10.0,
+            "_execution_eligible": False,
+        }])
+        assert idx.lookup("polymarket", "reward-token") == []
+        assert idx.get_subscription_tokens() == ([], [])
+
+    def test_execution_eligibility_defaults_true_and_honors_false(self):
+        assert _is_execution_eligible({}) is True
+        assert _is_execution_eligible({"_execution_eligible": True}) is True
+        assert _is_execution_eligible({"_execution_eligible": False}) is False
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +425,22 @@ class TestRecalcProfit:
         # gross = 1.0 - 0.82 = 0.18, should be positive
         assert result > 0
 
+    def test_recalc_binary_uses_normalized_string_asks(self):
+        opp = {
+            "type": "Binary",
+            "_token_ids": ["tok_yes", "tok_no"],
+        }
+        cache = {
+            ("polymarket", "tok_yes"): {"best_ask": "0.40", "price": "0.39"},
+            ("polymarket", "tok_no"): {"best_ask": "0.42", "price": "0.41"},
+        }
+
+        with patch("continuous.net_profit_binary_internal", return_value={"net_profit": 0.18}) as profit:
+            result = _recalc_profit(opp, "polymarket", "tok_yes", 0.40, cache)
+
+        assert result == pytest.approx(0.18)
+        profit.assert_called_once_with(0.40, 0.42)
+
     def test_recalc_binary_missing_other_token(self):
         """Should return None when other token not in cache."""
         opp = {
@@ -439,6 +480,41 @@ class TestRecalcProfit:
         opp = {"type": "Binary", "_token_ids": []}
         result = _recalc_profit(opp, "polymarket", "tok", 0.5, {})
         assert result is None
+
+
+class TestWSTrackingProbability:
+    def test_kalshi_prefers_normalized_ask_over_raw_ladder(self):
+        entry = {
+            "yes": [[40, 10]],
+            "no": [[60, 10]],
+            "yes_ask": "0.41",
+            "no_ask": "0.61",
+        }
+
+        assert _ws_tracking_probability("kalshi", entry) == pytest.approx(0.41)
+
+    def test_kalshi_raw_ladder_and_cent_delta_are_not_probabilities(self):
+        entry = {"yes": [[40, 10]], "no": [[60, 10]], "price": 45}
+
+        assert _ws_tracking_probability("kalshi", entry) is None
+
+    def test_opportunity_selects_kalshi_no_side_from_metadata(self):
+        opp = {
+            "type": "FeePromo",
+            "_platform_a": "polymarket",
+            "_platform_b": "kalshi",
+            "_side_a": "yes",
+            "_side_b": "no",
+        }
+        entry = {"yes_ask": "0.41", "no_ask": "0.62"}
+
+        assert _ws_opportunity_probability(opp, "kalshi", entry) == pytest.approx(0.62)
+
+    def test_opportunity_infers_kalshi_no_side_from_cross_type(self):
+        opp = {"type": "Cross(PM_YES + K_NO)"}
+        entry = {"yes_ask": "0.41", "no_ask": "0.62"}
+
+        assert _ws_opportunity_probability(opp, "kalshi", entry) == pytest.approx(0.62)
 
 
 # ---------------------------------------------------------------------------
@@ -495,7 +571,11 @@ class TestCalcRealizedPnl:
         trade_db.close()
 
     def test_uses_fill_prices_when_available(self, db):
-        """Should use actual fill prices instead of expected P&L."""
+        """Should use actual fill prices instead of expected P&L.
+
+        Polymarket ``size`` is SHARES (PolymarketTrader.place_order passes it
+        through as the share count), so cost = fill * size and contracts =
+        size. Arb payout = min contracts across legs (guaranteed winner)."""
         opp_id = db.log_opportunity("Binary", "M", "", 0.85, 0.15, 0.176, 50, "traded")
         db.log_trade(opp_id, "polymarket", "BUY", 0.40, 5.0, "filled", fill_price=0.41)
         db.log_trade(opp_id, "polymarket", "BUY", 0.45, 5.0, "filled", fill_price=0.46)
@@ -503,10 +583,8 @@ class TestCalcRealizedPnl:
 
         pos = db.get_open_positions()[0]
         realized = _calc_realized_pnl(db, pos)
-        # 1.0 - (0.41*5 + 0.46*5) = 1.0 - 4.35 = -3.35
-        # For $1 unit: 1.0 - (0.41 + 0.46) = 0.13
-        expected = 1.0 - (0.41 * 5.0 + 0.46 * 5.0)
-        assert realized == pytest.approx(expected)
+        # cost = 0.41*5 + 0.46*5 = 4.35; payout = min(5, 5) = 5; P&L = +0.65
+        assert realized == pytest.approx(5.0 - 4.35)
 
     def test_falls_back_to_expected_when_no_trades(self, db):
         """Should fall back to expected_pnl when no trades exist."""
@@ -524,23 +602,104 @@ class TestCalcRealizedPnl:
         pos_id = db.create_position(opp_id, "m1", "polymarket", 0.15)
         pos = db.get_open_positions()[0]
         realized = _calc_realized_pnl(db, pos)
-        # No fill prices, uses order prices: 1.0 - (0.40*5 + 0.45*5)
-        expected = 1.0 - (0.40 * 5.0 + 0.45 * 5.0)
-        assert realized == pytest.approx(expected)
+        # PM shares at order prices: cost = 0.40*5 + 0.45*5 = 4.25;
+        # payout = min(5, 5) = 5; P&L = +0.75
+        assert realized == pytest.approx(5.0 - 4.25)
+
+    def test_explicit_zero_fill_fails_closed(self, db):
+        """A recorded zero fill is invalid, not a request to reuse limit price."""
+        opp_id = db.log_opportunity("Imbalance", "M", "", 0.50, 0.10, 0.20, 50, "traded")
+        db.log_trade(
+            opp_id, "polymarket", "BUY", 0.50, 10.0, "filled",
+            fill_price=0.0, outcome="yes",
+        )
+        db.create_position(opp_id, "m1", "polymarket", 0.10)
+        pos = db.get_open_positions()[0]
+
+        realized = _calc_realized_pnl(db, pos, winning_side="yes")
+
+        assert realized == pytest.approx(-10.0)
+
+    @pytest.mark.parametrize(
+        "trade",
+        [
+            {"platform": "kalshi", "side": "yes", "price": float("nan"),
+             "fill_price": None, "size": 10.0, "status": "filled"},
+            {"platform": "kalshi", "side": "yes", "price": 0.5,
+             "fill_price": float("inf"), "size": 10.0, "status": "filled"},
+            {"platform": "kalshi", "side": "yes", "price": 0.5,
+             "fill_price": 0.5, "size": float("nan"), "status": "filled"},
+            {"platform": "kalshi", "side": "yes", "price": True,
+             "fill_price": 0.5, "size": 10.0, "status": "filled"},
+        ],
+    )
+    def test_non_finite_or_boolean_money_never_returns_expected_profit(self, trade):
+        """Malformed filled rows must produce a non-positive fail-closed result."""
+        db = MagicMock()
+        db.get_trades_for_opportunity.return_value = [trade]
+        pos = {"opportunity_id": 1, "expected_pnl": 0.25}
+
+        assert _calc_realized_pnl(db, pos, winning_side="yes") <= 0
+
+    def test_zero_size_never_returns_expected_profit(self, db):
+        opp_id = db.log_opportunity("Imbalance", "M", "", 0.50, 0.10, 0.20, 50, "traded")
+        db.log_trade(opp_id, "polymarket", "BUY", 0.50, 0.0, "filled", outcome="yes")
+        db.create_position(opp_id, "m1", "polymarket", 0.10)
+        pos = db.get_open_positions()[0]
+
+        assert _calc_realized_pnl(db, pos, winning_side="yes") <= 0
+
+    def test_non_filled_rows_are_excluded(self, db):
+        """Pending and failed requests cannot add settlement cost or payout."""
+        opp_id = db.log_opportunity("Imbalance", "M", "", 0.40, 0.10, 0.25, 50, "traded")
+        db.log_trade(
+            opp_id, "polymarket", "BUY", 0.40, 5.0, "filled",
+            fill_price=0.40, outcome="no",
+        )
+        db.log_trade(opp_id, "polymarket", "BUY", 0.90, 50.0, "pending", outcome="yes")
+        db.log_trade(opp_id, "polymarket", "BUY", 0.90, 50.0, "failed", outcome="yes")
+        db.create_position(opp_id, "m1", "polymarket", 0.10)
+        pos = db.get_open_positions()[0]
+
+        realized = _calc_realized_pnl(db, pos, winning_side="no")
+
+        assert realized == pytest.approx(3.0)
+
+    def test_expected_fallback_when_no_filled_rows_remain(self, db):
+        opp_id = db.log_opportunity("Binary", "M", "", 0.85, 0.15, 0.176, 50, "traded")
+        db.log_trade(opp_id, "polymarket", "BUY", 0.40, 5.0, "pending")
+        db.log_trade(opp_id, "polymarket", "BUY", 0.45, 5.0, "failed")
+        db.create_position(opp_id, "m1", "polymarket", 0.15)
+        pos = db.get_open_positions()[0]
+
+        assert _calc_realized_pnl(db, pos) == pytest.approx(0.15)
+
+    def test_polymarket_buy_no_settles_from_persisted_outcome(self, db):
+        """BUY is execution direction; the separate NO outcome drives payout."""
+        opp_id = db.log_opportunity("Imbalance", "M", "", 0.40, 0.10, 0.25, 50, "traded")
+        db.log_trade(
+            opp_id, "polymarket", "BUY", 0.40, 10.0, "filled",
+            fill_price=0.40, outcome="no",
+        )
+        db.create_position(opp_id, "m1", "polymarket", 0.10)
+        pos = db.get_open_positions()[0]
+
+        realized = _calc_realized_pnl(db, pos, winning_side="no")
+
+        assert realized == pytest.approx(6.0)
 
     def test_directional_winning_yes_bet(self, db):
-        """Directional bet on YES that resolved YES: payout = contracts * $1.
+        """Directional PM bet on YES that resolved YES: payout = shares * $1.
 
-        $10 of size at fill 0.40 → 25 contracts. Payout = $25, cost = fill*size
-        = $4 (matching the existing accounting convention used by the arb
-        fallback). Net = +$21."""
+        Polymarket size = SHARES: 10 shares at fill 0.40 → cost $4.00,
+        payout $10.00, net +$6.00."""
         opp_id = db.log_opportunity("Imbalance", "M", "", 0.40, 0.10, 0.25, 50, "traded")
         db.log_trade(opp_id, "polymarket", "yes", 0.40, 10.0, "filled", fill_price=0.40)
         db.create_position(opp_id, "m1", "polymarket", 0.10)
         pos = db.get_open_positions()[0]
         realized = _calc_realized_pnl(db, pos, winning_side="yes")
-        # contracts = 10/0.40 = 25; payout = 25; cost = 0.40*10 = 4; net = +21
-        assert realized == pytest.approx(21.0)
+        # contracts = 10 shares; payout = 10; cost = 0.40*10 = 4; net = +6
+        assert realized == pytest.approx(6.0)
 
     def test_directional_losing_yes_bet(self, db):
         """Directional bet on YES that resolved NO: payout = $0, realized = -cost.
@@ -553,9 +712,8 @@ class TestCalcRealizedPnl:
         db.create_position(opp_id, "m1", "polymarket", 0.10)
         pos = db.get_open_positions()[0]
         realized = _calc_realized_pnl(db, pos, winning_side="no")
-        # YES leg lost; payout = 0; realized = -(0.40 * 10) = -4
+        # PM YES leg lost; payout = 0; realized = -(0.40 * 10 shares) = -4
         assert realized == pytest.approx(-4.0)
-        # The buggy formula returned 1.0 - 4.0 = -3.0 — overstating P&L by $1.
 
     def test_directional_handles_buy_alias_for_yes(self, db):
         """Trade.side='BUY' should match winning_side='yes'."""
@@ -564,20 +722,273 @@ class TestCalcRealizedPnl:
         db.create_position(opp_id, "m1", "polymarket", 0.10)
         pos = db.get_open_positions()[0]
         realized = _calc_realized_pnl(db, pos, winning_side="yes")
-        # contracts = 5/0.50 = 10; payout = 10; cost = 0.50*5 = 2.5; net = +7.5
-        assert realized == pytest.approx(7.5)
+        # PM: contracts = 5 shares; payout = 5; cost = 0.50*5 = 2.5; net = +2.5
+        assert realized == pytest.approx(2.5)
 
-    def test_arbitrage_default_unchanged(self, db):
-        """Without winning_side, arb opps should still get the legacy 1.0-cost
-        payout — that formula is correct when one side guaranteed pays $1."""
+    def test_arbitrage_default_uses_min_contracts_payout(self, db):
+        """Without winning_side, arb payout = min contracts across legs * $1
+        — whichever leg wins pays $1/contract, and the min contract count is
+        the amount guaranteed hedged across both legs."""
         opp_id = db.log_opportunity("Binary", "M", "", 0.85, 0.15, 0.176, 50, "traded")
         db.log_trade(opp_id, "polymarket", "BUY", 0.40, 0.5, "filled", fill_price=0.41)
         db.log_trade(opp_id, "polymarket", "BUY", 0.45, 0.5, "filled", fill_price=0.46)
         db.create_position(opp_id, "m1", "polymarket", 0.15)
         pos = db.get_open_positions()[0]
         realized = _calc_realized_pnl(db, pos)
-        expected = 1.0 - (0.41 * 0.5 + 0.46 * 0.5)
+        # PM shares: cost = 0.41*0.5 + 0.46*0.5 = 0.435; payout = min(0.5, 0.5)
+        assert realized == pytest.approx(0.5 - 0.435)
+
+    def test_regression_kalshi_dollar_size_derives_integer_contracts(self, db):
+        """Regression (audit #77 round 2): Kalshi ``size`` is the requested
+        DOLLAR amount; the executor places max(1, int(size/price)) contracts.
+
+        Two-leg $50/$50 Kalshi arb at 0.48/0.49:
+        - leg 1: int(50/0.48) = 104 contracts, cost = 104*0.48 = 49.92
+        - leg 2: int(50/0.49) = 102 contracts, cost = 102*0.49 = 49.98
+        - payout = min(104, 102) = 102; P&L = 102 - 99.90 = +2.10
+        The pre-audit formula reported 1.0 - (0.48*50 + 0.49*50) = -47.50 on
+        this profitable arb — corrupting realized P&L and the daily-loss
+        halt input.
+        """
+        opp_id = db.log_opportunity("KalshiBinary", "M", "", 0.97, 0.02, 0.02, 50, "traded")
+        db.log_trade(opp_id, "kalshi", "yes", 0.48, 50.0, "filled", fill_price=0.48)
+        db.log_trade(opp_id, "kalshi", "no", 0.49, 50.0, "filled", fill_price=0.49)
+        db.create_position(opp_id, "m1", "kalshi", 0.02)
+        pos = db.get_open_positions()[0]
+        realized = _calc_realized_pnl(db, pos)
+        expected = 102.0 - (104 * 0.48 + 102 * 0.49)  # +2.10
         assert realized == pytest.approx(expected)
+        assert realized > 0  # profitable arb must not report a huge loss
+
+    def test_regression_mixed_venue_arb_uses_per_venue_semantics(self, db):
+        """PM leg in SHARES + Kalshi leg in DOLLARS within one opportunity.
+
+        PM: 10 shares at 0.45 → cost 4.50, contracts 10.
+        Kalshi: $5 at 0.50 → int(5/0.50) = 10 contracts, cost 5.00.
+        payout = min(10, 10) = 10; P&L = 10 - 9.50 = +0.50.
+        """
+        opp_id = db.log_opportunity("Cross", "M", "", 0.95, 0.05, 0.05, 50, "traded")
+        db.log_trade(opp_id, "polymarket", "BUY", 0.45, 10.0, "filled", fill_price=0.45)
+        db.log_trade(opp_id, "kalshi", "no", 0.50, 5.0, "filled", fill_price=0.50)
+        db.create_position(opp_id, "m1", "polymarket", 0.05)
+        pos = db.get_open_positions()[0]
+        realized = _calc_realized_pnl(db, pos)
+        assert realized == pytest.approx(0.50)
+
+
+class TestLegContractsAndCostVenueSemantics:
+    """Round-3 audit findings: stake-sized venues and fail-closed handling.
+
+    Betfair/Matchbook place round(size, 2) as a STAKE at decimal odds
+    1/price (executor.py) — a third semantics distinct from PM shares and
+    the dollar->integer-contracts venues. Unknown venues and malformed
+    money data must fail CLOSED (zero payout, full cost lost) because this
+    feeds the daily-loss halt — it may over-trigger, never under-trigger.
+    """
+
+    @pytest.fixture
+    def db(self):
+        trade_db = TradeDB(":memory:")
+        yield trade_db
+        trade_db.close()
+
+    # ---------------------------------------------------------------------------
+    # Stake-sized venues (Betfair / Matchbook)
+
+    def test_betfair_winning_back_bet_pays_stake_over_price(self, db):
+        """$10 stake backed at 0.30: win returns 10/0.30 = 33.333, net
+        +23.333. The dollar-contract path would truncate to 33 contracts
+        (cost 9.90, net +23.10) — Betfair does not truncate stakes."""
+        opp_id = db.log_opportunity("BetfairArb", "M", "", 0.30, 0.10, 0.33, 50, "traded")
+        db.log_trade(opp_id, "betfair", "back", 0.30, 10.0, "filled", fill_price=0.30)
+        db.create_position(opp_id, "m1", "betfair", 0.10)
+        pos = db.get_open_positions()[0]
+        realized = _calc_realized_pnl(db, pos, winning_side="yes")
+        assert realized == pytest.approx(10.0 / 0.30 - 10.0)  # +23.333...
+
+    def test_matchbook_losing_bet_forfeits_rounded_stake(self, db):
+        """Matchbook places stake=round(size, 2): size 10.456 -> $10.46
+        staked and lost. The dollar-contract path reported -$10.00
+        (int(10.456/0.50) = 20 contracts x 0.50)."""
+        opp_id = db.log_opportunity("MatchbookArb", "M", "", 0.50, 0.10, 0.20, 50, "traded")
+        db.log_trade(opp_id, "matchbook", "back", 0.50, 10.456, "filled", fill_price=0.50)
+        db.create_position(opp_id, "m1", "matchbook", 0.10)
+        pos = db.get_open_positions()[0]
+        realized = _calc_realized_pnl(db, pos, winning_side="no")
+        assert realized == pytest.approx(-10.46)
+
+    # ---------------------------------------------------------------------------
+    # Fail-closed: unknown venue
+
+    def test_unknown_venue_fails_closed_with_error_log(self, db, caplog):
+        """An unrecognized platform must NOT silently take the
+        dollar->contracts path (which would report +$10 profit here) —
+        worst case is assumed: zero payout, full $10 cost lost."""
+        opp_id = db.log_opportunity("Binary", "M", "", 0.50, 0.10, 0.20, 50, "traded")
+        db.log_trade(opp_id, "robinhood", "yes", 0.50, 10.0, "filled", fill_price=0.50)
+        db.create_position(opp_id, "m1", "robinhood", 0.10)
+        pos = db.get_open_positions()[0]
+        with caplog.at_level("ERROR", logger="continuous"):
+            realized = _calc_realized_pnl(db, pos)
+        assert realized == pytest.approx(-10.0)
+        assert any("unknown venue" in r.message for r in caplog.records)
+
+    def test_empty_platform_fails_closed(self, db, caplog):
+        """Missing platform is as unverifiable as an unknown one."""
+        opp_id = db.log_opportunity("Binary", "M", "", 0.50, 0.10, 0.20, 50, "traded")
+        db.log_trade(opp_id, "", "yes", 0.50, 10.0, "filled", fill_price=0.50)
+        db.create_position(opp_id, "m1", "polymarket", 0.10)
+        pos = db.get_open_positions()[0]
+        with caplog.at_level("ERROR", logger="continuous"):
+            realized = _calc_realized_pnl(db, pos)
+        assert realized == pytest.approx(-10.0)
+        assert any("P&L fail-closed" in r.message for r in caplog.records)
+
+    # ---------------------------------------------------------------------------
+    # Fail-closed: malformed money data
+
+    def test_zero_price_fails_closed_not_one_phantom_contract(self, db, caplog):
+        """price=0 on a dollar-contract venue previously produced a silent
+        1-contract-at-cost-0 guess (and fell through to the expected_pnl
+        fallback). Fail closed instead: error log + full $10 size lost."""
+        opp_id = db.log_opportunity("KalshiBinary", "M", "", 0.50, 0.10, 0.20, 50, "traded")
+        db.log_trade(opp_id, "kalshi", "yes", 0.0, 10.0, "filled")
+        db.create_position(opp_id, "m1", "kalshi", 0.10)
+        pos = db.get_open_positions()[0]
+        with caplog.at_level("ERROR", logger="continuous"):
+            realized = _calc_realized_pnl(db, pos, winning_side="yes")
+        assert realized == pytest.approx(-10.0)
+        assert any("P&L fail-closed" in r.message for r in caplog.records)
+
+    def test_stake_venue_zero_fill_fails_closed(self, db, caplog):
+        """Betfair leg with no usable price: the stake is treated as lost."""
+        opp_id = db.log_opportunity("BetfairArb", "M", "", 0.50, 0.10, 0.20, 50, "traded")
+        db.log_trade(opp_id, "betfair", "back", 0.0, 8.0, "filled")
+        db.create_position(opp_id, "m1", "betfair", 0.10)
+        pos = db.get_open_positions()[0]
+        with caplog.at_level("ERROR", logger="continuous"):
+            realized = _calc_realized_pnl(db, pos, winning_side="yes")
+        assert realized == pytest.approx(-8.0)
+        assert any("P&L fail-closed" in r.message for r in caplog.records)
+
+    def test_malformed_leg_poisons_arb_payout_conservatively(self, db, caplog):
+        """A worst-cased leg contributes zero contracts, so the arb min-
+        contracts payout collapses to 0 and the whole position reads as
+        cost lost — the halt over-triggers rather than under-triggers."""
+        opp_id = db.log_opportunity("Cross", "M", "", 0.95, 0.05, 0.05, 50, "traded")
+        db.log_trade(opp_id, "polymarket", "BUY", 0.45, 10.0, "filled", fill_price=0.45)
+        db.log_trade(opp_id, "unknown-venue", "no", 0.50, 5.0, "filled", fill_price=0.50)
+        db.create_position(opp_id, "m1", "polymarket", 0.05)
+        pos = db.get_open_positions()[0]
+        with caplog.at_level("ERROR", logger="continuous"):
+            realized = _calc_realized_pnl(db, pos)
+        # PM leg cost 4.50 + worst-cased leg cost 5.00; payout min(10, 0)=0
+        assert realized == pytest.approx(-9.50)
+
+
+class TestRealizedPnlFailClosedData:
+    """Round-4 review findings: invalid money data and trade-status handling.
+
+    `fill_price or price` masked an explicit zero fill, type-only checks
+    accepted NaN/inf/bool, zero-size legs collapsed to (0, 0) and fell
+    through to the (typically positive) expected_pnl fallback, and every
+    trade row — filled, failed, or pending — entered the P&L sums.
+    """
+
+    @pytest.fixture
+    def db(self):
+        trade_db = TradeDB(":memory:")
+        yield trade_db
+        trade_db.close()
+
+    def test_explicit_zero_fill_is_not_masked_by_order_price(self, db, caplog):
+        """A recorded fill_price of 0.0 is invalid money data, not a missing
+        fill — it must NOT silently fall back to the order price. PM worst
+        case: shares cost at most $1/share, so 10 shares read as -$10."""
+        opp_id = db.log_opportunity("Binary", "M", "", 0.50, 0.10, 0.20, 50, "traded")
+        db.log_trade(opp_id, "polymarket", "BUY", 0.40, 10.0, "filled", fill_price=0.0)
+        db.create_position(opp_id, "m1", "polymarket", 0.10)
+        pos = db.get_open_positions()[0]
+        with caplog.at_level("ERROR", logger="continuous"):
+            realized = _calc_realized_pnl(db, pos, winning_side="yes")
+        assert realized == pytest.approx(-10.0)
+        assert any("P&L fail-closed" in r.message for r in caplog.records)
+
+    def test_nan_fill_fails_closed(self, caplog):
+        """NaN passes isinstance((int, float)) — it must still be rejected."""
+        db = MagicMock()
+        db.get_trades_for_opportunity.return_value = [{
+            "id": 1,
+            "platform": "polymarket",
+            "side": "BUY",
+            "price": 0.40,
+            "fill_price": float("nan"),
+            "size": 10.0,
+            "status": "filled",
+        }]
+        pos = {"opportunity_id": 1, "expected_pnl": 0.10}
+        with caplog.at_level("ERROR", logger="continuous"):
+            realized = _calc_realized_pnl(db, pos, winning_side="yes")
+        assert realized == pytest.approx(-10.0)
+
+    def test_zero_size_leg_never_reaches_expected_pnl_fallback(self, db, caplog):
+        """Regression: a zero-size leg produced (0, 0), total cost 0, and the
+        function returned the POSITIVE expected_pnl for a garbage position.
+        An unpriceable leg must fail closed to -(known cost) instead."""
+        opp_id = db.log_opportunity("Binary", "M", "", 0.50, 5.0, 0.20, 50, "traded")
+        db.log_trade(opp_id, "polymarket", "BUY", 0.40, 0.0, "filled", fill_price=0.40)
+        db.create_position(opp_id, "m1", "polymarket", expected_pnl=5.0)
+        pos = db.get_open_positions()[0]
+        with caplog.at_level("ERROR", logger="continuous"):
+            realized = _calc_realized_pnl(db, pos)
+        assert realized <= 0.0  # never the +5.0 expected_pnl fallback
+        assert any("fail-closed" in r.message for r in caplog.records)
+
+    def test_failed_legs_are_excluded_from_pnl(self, db):
+        """Failed legs never reached the venue: no cost, no payout. Before
+        the fix they were priced like fills, corrupting realized P&L."""
+        opp_id = db.log_opportunity("Binary", "M", "", 0.85, 0.15, 0.176, 50, "traded")
+        db.log_trade(opp_id, "polymarket", "BUY", 0.40, 5.0, "filled", fill_price=0.41)
+        db.log_trade(opp_id, "polymarket", "BUY", 0.45, 5.0, "failed")
+        db.create_position(opp_id, "m1", "polymarket", 0.15)
+        pos = db.get_open_positions()[0]
+        realized = _calc_realized_pnl(db, pos, winning_side="yes")
+        # Only the filled YES leg: payout 5 - cost 2.05 = +2.95
+        assert realized == pytest.approx(5.0 - 0.41 * 5)
+
+    def test_pending_leg_is_excluded_from_realized_pnl(self, db):
+        """Pending rows are not confirmed executions and cannot affect P&L."""
+        opp_id = db.log_opportunity("Binary", "M", "", 0.85, 0.15, 0.176, 50, "traded")
+        db.log_trade(opp_id, "polymarket", "BUY", 0.40, 5.0, "filled", fill_price=0.41)
+        db.log_trade(opp_id, "polymarket", "BUY", 0.45, 5.0, "pending")
+        db.create_position(opp_id, "m1", "polymarket", 0.15)
+        pos = db.get_open_positions()[0]
+        realized = _calc_realized_pnl(db, pos)
+        # Only the confirmed filled leg enters realized P&L.
+        assert realized == pytest.approx(5.0 - 0.41 * 5)
+
+    def test_all_legs_failed_preserves_expected_pnl_fallback(self, db):
+        """No executed rows preserves the legacy expected-P&L fallback."""
+        opp_id = db.log_opportunity("Binary", "M", "", 0.85, 5.0, 0.176, 50, "traded")
+        db.log_trade(opp_id, "polymarket", "BUY", 0.40, 5.0, "failed")
+        db.create_position(opp_id, "m1", "polymarket", expected_pnl=5.0)
+        pos = db.get_open_positions()[0]
+        assert _calc_realized_pnl(db, pos) == pytest.approx(5.0)
+
+    def test_polymarket_buy_no_settles_by_stored_outcome(self, db):
+        """Regression: PM BUY_NO legs are logged side="BUY", which aliases to
+        winning_side="yes" — a NO bet that WON was scored as a loss (and a
+        NO bet that lost was scored as a win). The traded outcome column
+        must drive settlement when present."""
+        opp_id = db.log_opportunity("Imbalance", "M", "", 0.40, 0.10, 0.25, 50, "traded")
+        db.log_trade(opp_id, "polymarket", "BUY", 0.40, 10.0, "filled",
+                     fill_price=0.40, outcome="no")
+        db.create_position(opp_id, "m1", "polymarket", 0.10)
+        pos = db.get_open_positions()[0]
+        # Market resolved NO: the NO leg WON. payout 10 - cost 4 = +6
+        assert _calc_realized_pnl(db, pos, winning_side="no") == pytest.approx(6.0)
+        # Market resolved YES: the NO leg LOST. payout 0 - cost 4 = -4
+        assert _calc_realized_pnl(db, pos, winning_side="yes") == pytest.approx(-4.0)
 
 
 # ---------------------------------------------------------------------------
@@ -803,3 +1214,200 @@ class TestBankrollRefresh:
         assert error_caught is True
         # In production the except block logs and continues — update_bankroll never called
         executor.position_sizer.update_bankroll.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Codex round-2 finding #3: SIGINT/SIGTERM must signal the MM pilot to stop
+# IMMEDIATELY (set _mm_pilot_stop directly from the signal handler), not
+# only via the end-of-cycle cleanup path further down run_continuous, which
+# only runs after the CURRENT scan cycle finishes. A long synchronous scan
+# cycle, or a hard kill before cleanup completes, could otherwise leave live
+# GTC orders resting on Kalshi with nothing cancelling them.
+#
+# run_continuous is a large synchronous orchestrator that registers signal
+# handlers early and then drives an asyncio event loop end-to-end — too
+# complex and stateful to run to completion in a unit test (no test in this
+# file does). This captures the REAL closure Python registers via
+# signal.signal (not a reimplementation of its logic): signal.signal is
+# monkeypatched to record its arguments, and the very next call
+# run_continuous makes (constructing OpportunityIndex) is monkeypatched to
+# raise a sentinel exception, so the function returns immediately after
+# registering the handler and before the untestable async orchestration
+# starts. The captured handler function's closure cells are then inspected
+# directly (co_freevars / __closure__) to reach the REAL _mm_pilot_stop
+# threading.Event object it holds, and the handler is invoked exactly as
+# the OS would, observing its actual effect on that real object.
+#
+# Fail-before: the handler only called shutdown_event.set() — the captured
+# handler's _mm_pilot_stop stayed unset after being invoked.
+# ---------------------------------------------------------------------------
+
+class _StopEarly(Exception):
+    """Sentinel used to abort run_continuous right after it registers
+    signal handlers, before the async orchestration loop starts."""
+
+
+class TestSignalHandlerStopsMMPilotImmediately:
+    def _run_until_signal_registered(self, monkeypatch):
+        import continuous
+        import signal as signal_module
+
+        captured: dict = {}
+        monkeypatch.setattr(
+            continuous.signal, "signal",
+            lambda sig, handler: captured.__setitem__(sig, handler))
+        monkeypatch.setattr(
+            continuous, "OpportunityIndex",
+            lambda: (_ for _ in ()).throw(_StopEarly()))
+
+        args = MagicMock()
+        args.interval = None
+        with pytest.raises(_StopEarly):
+            continuous.run_continuous(
+                args=args, min_profit=0.01, kalshi_client=None,
+                kalshi_api_key_id=None, kalshi_private_key_path=None,
+                executor=MagicMock(), db=MagicMock(), price_cache={},
+            )
+        assert signal_module.SIGTERM in captured, (
+            "SIGTERM handler was never registered before the sentinel fired")
+        return captured[signal_module.SIGTERM]
+
+    @staticmethod
+    def _closure_var(func, name):
+        freevars = func.__code__.co_freevars
+        cells = dict(zip(freevars, func.__closure__ or ()))
+        assert name in cells, (
+            f"{name!r} is not a free variable of the captured handler "
+            f"(found: {sorted(cells)}) — signature of _signal_handler "
+            f"may have changed"
+        )
+        return cells[name].cell_contents
+
+    def test_sigterm_sets_mm_pilot_stop_immediately(self, monkeypatch):
+        handler = self._run_until_signal_registered(monkeypatch)
+        mm_pilot_stop = self._closure_var(handler, "_mm_pilot_stop")
+        shutdown_event = self._closure_var(handler, "shutdown_event")
+        assert isinstance(mm_pilot_stop, threading.Event)
+        assert mm_pilot_stop.is_set() is False  # not yet — signal hasn't fired
+
+        import signal as signal_module
+        handler(signal_module.SIGTERM, None)
+
+        assert mm_pilot_stop.is_set() is True, (
+            "signal handler must set _mm_pilot_stop directly, not only "
+            "shutdown_event — otherwise the MM pilot only notices a "
+            "shutdown once the current scan cycle's end-of-loop cleanup "
+            "runs, which can take arbitrarily long"
+        )
+        assert shutdown_event.is_set() is True  # pre-existing behavior kept
+
+    def test_mm_pilot_stop_is_idempotent_across_repeated_signals(
+            self, monkeypatch):
+        """SIGINT then SIGTERM (or a repeated SIGTERM) must not raise —
+        threading.Event.set() is idempotent, matching shutdown_event's
+        existing behavior."""
+        handler = self._run_until_signal_registered(monkeypatch)
+        import signal as signal_module
+        handler(signal_module.SIGINT, None)
+        handler(signal_module.SIGTERM, None)
+        mm_pilot_stop = self._closure_var(handler, "_mm_pilot_stop")
+        assert mm_pilot_stop.is_set() is True
+
+    def test_signal_handler_does_not_log_reentrantly(self, monkeypatch):
+        """Logging from an OS signal handler can re-enter a buffered stream."""
+        import continuous
+        import signal as signal_module
+
+        info = MagicMock()
+        monkeypatch.setattr(continuous.logger, "info", info)
+        handler = self._run_until_signal_registered(monkeypatch)
+
+        handler(signal_module.SIGTERM, None)
+
+        info.assert_not_called()
+
+
+class TestAsyncioSignalWakeup:
+    def test_wakes_selector_without_replacing_signal_handler(self):
+        import continuous
+        loop = MagicMock()
+        event = MagicMock()
+
+        assert continuous._wake_asyncio_selector(loop, event) is True
+        loop.call_soon_threadsafe.assert_called_once_with(event.set)
+        loop.add_signal_handler.assert_not_called()
+
+    def test_closed_loop_preserves_direct_fallback(self):
+        import continuous
+        loop = MagicMock()
+        loop.call_soon_threadsafe.side_effect = RuntimeError
+
+        assert continuous._wake_asyncio_selector(loop, MagicMock()) is False
+
+    def test_missing_loop_preserves_direct_fallback(self):
+        import continuous
+        assert continuous._wake_asyncio_selector(None, MagicMock()) is False
+
+
+# ---------------------------------------------------------------------------
+# CodeRabbit finding (adjacent to Codex round-2 #3, fixed opportunistically
+# while already in this exact shutdown-safety code): the MM pilot
+# startup-failure exception handler must mirror the end-of-run cleanup
+# path's force-stop symmetry — a thread that started enough to place live
+# orders but doesn't unwind within the join timeout must still have those
+# orders cancelled directly via _mm_pilot.stop(), not silently dropped when
+# _mm_pilot/_mm_pilot_thread are cleared to None.
+#
+# A full behavioral test here would need to drive run_continuous past
+# OpportunityIndex() into the MM-pilot try block, start a real thread, and
+# force it to outlive a 15s join timeout — too slow and heavyweight for a
+# unit test. This checks the fix structurally instead (same technique
+# tests/test_mm_pilot_gates.py::TestNoBypass already uses for a similarly
+# hard-to-exercise invariant): the startup-failure except block must
+# contain the same is_alive() + _mm_pilot.stop() pattern the cleanup path
+# uses, not just an unconditional join.
+# ---------------------------------------------------------------------------
+
+class TestStartupFailureMirrorsCleanupForceStop:
+    @staticmethod
+    def _exception_handler_source():
+        import re
+        src_path = os.path.join(os.path.dirname(__file__), "..", "continuous.py")
+        with open(src_path, encoding="utf-8") as fh:
+            source = fh.read()
+        marker = 'logger.exception("MM pilot failed to start: %s", exc)'
+        start = source.index(marker)
+        # The except block ends at the next top-level (8-space-indented)
+        # statement after this point, i.e. `_mm_pilot = None` immediately
+        # followed by `_mm_pilot_thread = None` and a blank line.
+        end = source.index("\n\n", start)
+        return source[start:end]
+
+    def test_startup_failure_checks_is_alive_before_clearing_state(self):
+        block = self._exception_handler_source()
+        assert "_mm_pilot_thread.join(timeout=15)" in block
+        assert "_mm_pilot_thread.is_alive()" in block, (
+            "startup-failure handler must check is_alive() after the join "
+            "timeout, mirroring the end-of-run cleanup path, instead of "
+            "silently clearing _mm_pilot/_mm_pilot_thread regardless of "
+            "whether the thread actually stopped"
+        )
+        assert "_mm_pilot.stop()" in block, (
+            "a thread still alive after the join timeout must have its "
+            "resting orders force-cancelled directly"
+        )
+        # is_alive() must be checked strictly before the state is cleared.
+        assert block.index("is_alive()") < block.index("_mm_pilot = None")
+        assert "if thread_stopped:" in block
+        assert "retaining references" in block
+
+
+class TestMMPilotModeIsolation:
+    def test_pilot_startup_requires_dedicated_mode(self):
+        """The feature flag alone must never start the order-producing loop."""
+        import inspect
+        import continuous
+
+        source = inspect.getsource(continuous.run_continuous)
+        assert "config.MM_KALSHI_PILOT_ENABLED" in source
+        assert 'getattr(args, "mode", None) == "mm-pilot"' in source

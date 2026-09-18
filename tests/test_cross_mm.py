@@ -185,6 +185,29 @@ class TestCrossPlatformMaker:
                    side="bid", price=0.45, size=5.0)
         hedger.hedge_inventory.assert_not_called()
 
+    def test_live_fill_uses_stored_trader_and_retains_failed_cancel(self):
+        CrossPlatformMaker, _ = self._import()
+        mm = CrossPlatformMaker(dry_run=False)
+        mm.add_pair(market_key="m1", platform_a="polymarket",
+                    platform_b="kalshi", mid_a=0.45, mid_b=0.55)
+        trader = MagicMock()
+        trader.cancel_order.return_value = False
+        mm._traders["kalshi"] = trader
+        mm.quote_manager._active_orders["live_sibling"] = {
+            "platform": "kalshi", "market_key": "m1", "side": "ask",
+            "price": 0.55, "size": 5.0, "status": "resting",
+            "placed_at": 1.0,
+        }
+
+        mm.on_fill(order_id="filled_elsewhere", market_key="m1",
+                   platform="polymarket", side="bid", price=0.45, size=5.0)
+        assert mm.quote_manager.get_active_orders("m1")[0]["order_id"] == "live_sibling"
+
+        trader.cancel_order.return_value = True
+        mm.on_fill(order_id="filled_elsewhere", market_key="m1",
+                   platform="polymarket", side="bid", price=0.45, size=5.0)
+        assert mm.quote_manager.get_active_orders("m1") == []
+
     def test_generate_opportunities(self):
         CrossPlatformMaker, _ = self._import()
         mm = CrossPlatformMaker(quote_size=5.0, max_inventory=100.0)

@@ -295,7 +295,9 @@ def _refine_bracket_with_clob(
         total_cost = sum(prices)
         overround = total_cost - 1.0
 
-        if overround < 0:
+        # overround < 0 means total ask cost < $1 -> guaranteed profit; KEEP those.
+        # Drop overround >= 0 (no edge after re-pricing on the ask side).
+        if overround >= 0:
             continue
 
         from fees import net_profit_bracket

@@ -278,6 +278,28 @@ class TestMarketMaker:
         assert mgr.cancel_quote(oid)
         assert len(mgr.get_active_orders("mkt1")) == 0
 
+    def test_quote_manager_retains_order_when_exchange_cancel_fails(self):
+        from market_maker import QuoteManager
+        mgr = QuoteManager()
+        oid = "live_order_1"
+        mgr._active_orders[oid] = {
+            "platform": "polymarket", "market_key": "mkt1", "side": "bid",
+            "price": 0.48, "size": 5.0, "status": "resting",
+            "placed_at": time.time(),
+        }
+        trader = MagicMock()
+        trader.cancel_order.side_effect = RuntimeError("venue unavailable")
+
+        assert mgr.cancel_all() == 0
+        assert [order["order_id"] for order in mgr.get_active_orders()] == [oid]
+        assert mgr.cancel_all(trader=trader) == 0
+        assert [order["order_id"] for order in mgr.get_active_orders()] == [oid]
+
+        trader.cancel_order.side_effect = None
+        trader.cancel_order.return_value = True
+        assert mgr.cancel_all(trader=trader) == 1
+        assert mgr.get_active_orders() == []
+
     def test_market_maker_add_and_generate(self):
         from market_maker import MarketMaker
         mm = MarketMaker(min_spread=0.04, quote_size=5.0, dry_run=True)
@@ -402,7 +424,8 @@ class TestExecutorNewTypes:
             "_trade_price": 0.45,
             "_token_ids": ["tok_yes", "tok_no"],
         }
-        legs = self.executor._build_legs(opp, 5.0)
+        with patch("executor.ENABLED_EXECUTION_PLATFORMS", frozenset({"polymarket"})):
+            legs = self.executor._build_legs(opp, 5.0)
         assert len(legs) == 1
         assert legs[0]["platform"] == "polymarket"
 
@@ -426,7 +449,8 @@ class TestExecutorNewTypes:
             "_trade_price": 0.30,
             "_token_ids": ["tok_yes", "tok_no"],
         }
-        legs = self.executor._build_legs(opp, 5.0)
+        with patch("executor.ENABLED_EXECUTION_PLATFORMS", frozenset({"polymarket"})):
+            legs = self.executor._build_legs(opp, 5.0)
         assert len(legs) == 1
         assert legs[0]["token"] == "no"
 
@@ -438,7 +462,8 @@ class TestExecutorNewTypes:
             "_ask_price": 0.52,
             "_market_key": "test_mkt",
         }
-        legs = self.executor._build_legs(opp, 5.0)
+        with patch("executor.ENABLED_EXECUTION_PLATFORMS", frozenset({"polymarket"})):
+            legs = self.executor._build_legs(opp, 5.0)
         assert len(legs) == 2
         assert legs[0]["_mm_side"] == "bid"
         assert legs[1]["_mm_side"] == "ask"

@@ -362,11 +362,15 @@ def _refine_correlated_with_depth(
         fetch_clob = _fetch_clob_for_market
 
     # Pre-fetch every unique (market_key, market_dict) leg in parallel.
+    # Key by the LONG/SHORT leg keys (falling back to a/b when absent) so the
+    # key always matches the market dict it maps to. Stage 1 may assign
+    # market B as the long leg, in which case keying `_long_market` under
+    # `_market_key_a` swapped the two books at lookup time.
     fetch_tasks: dict[str, dict] = {}
     for opp in opportunities:
         for key, market_field in (
-            (opp.get("_market_key_a"), opp.get("_long_market")),
-            (opp.get("_market_key_b"), opp.get("_short_market")),
+            (opp.get("_long_leg") or opp.get("_market_key_a"), opp.get("_long_market")),
+            (opp.get("_short_leg") or opp.get("_market_key_b"), opp.get("_short_market")),
         ):
             if key and market_field is not None and key not in fetch_tasks:
                 fetch_tasks[key] = market_field

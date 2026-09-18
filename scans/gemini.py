@@ -151,6 +151,7 @@ def scan_gemini_multi(gemini_client: GeminiClient, min_profit: float) -> list[di
 
     # Stage 1: gather candidates that pass the profit gate on mid prices.
     candidates: list[dict] = []
+    implausible_skipped = 0
     for event in categorical_events:
         contracts = event.get("contracts", [])
         if len(contracts) < 3:
@@ -167,6 +168,15 @@ def scan_gemini_multi(gemini_client: GeminiClient, min_profit: float) -> list[di
             prices.append(float(price))
             symbols.append(c.get("instrumentSymbol", ""))
         if not valid or not prices:
+            continue
+
+        total_mid = sum(prices)
+        if total_mid < config.GEMINI_MULTI_MIN_SUM:
+            # Outcome sets summing far below $1 are not exhaustive MECE sets
+            # (e.g. point-spread events listing alternative lines) — buying
+            # them all does NOT guarantee a $1 payout. Same defense as the
+            # Kalshi strike-ladder gate.
+            implausible_skipped += 1
             continue
 
         result = net_profit_gemini_multi(prices, fee_rate=config.GEMINI_TAKER_RATE)
@@ -225,6 +235,10 @@ def scan_gemini_multi(gemini_client: GeminiClient, min_profit: float) -> list[di
             "_clob_depth": min_depth,
         })
 
+    if implausible_skipped:
+        logger.info(
+            "Skipped %d Gemini events with outcome sums < %.2f (non-exhaustive sets).",
+            implausible_skipped, config.GEMINI_MULTI_MIN_SUM)
     logger.info("Found %d Gemini multi-outcome opportunities.", len(opportunities))
     opportunities = filter_dust(opportunities)
     return opportunities

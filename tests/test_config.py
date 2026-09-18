@@ -10,10 +10,12 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import (
     setup_logging, LOG_LEVEL, DASHBOARD_PORT, WEBHOOK_URL,
-    _env_float, _env_int, _env_bool, ConfigError, validate_config,
+    _env_float, _env_non_negative_float, _env_int, _env_bool,
+    ConfigError, validate_config,
 )
 
 
@@ -110,6 +112,20 @@ class TestEnvFloat:
         monkeypatch.setenv("TEST_FLOAT", "")
         with pytest.raises(ConfigError, match="TEST_FLOAT.*not a valid float"):
             _env_float("TEST_FLOAT", "0")
+
+
+class TestEnvNonNegativeFloat:
+    def test_accepts_zero_and_positive_values(self, monkeypatch):
+        monkeypatch.setenv("TEST_NON_NEGATIVE_FLOAT", "0")
+        assert _env_non_negative_float("TEST_NON_NEGATIVE_FLOAT", "5") == 0.0
+        monkeypatch.setenv("TEST_NON_NEGATIVE_FLOAT", "5.5")
+        assert _env_non_negative_float("TEST_NON_NEGATIVE_FLOAT", "5") == 5.5
+
+    @pytest.mark.parametrize("raw", ["-0.01", "nan", "inf", "-inf"])
+    def test_rejects_negative_and_non_finite_values(self, monkeypatch, raw):
+        monkeypatch.setenv("TEST_NON_NEGATIVE_FLOAT", raw)
+        with pytest.raises(ConfigError, match="must be finite and >= 0"):
+            _env_non_negative_float("TEST_NON_NEGATIVE_FLOAT", "5")
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +236,48 @@ class TestValidateConfig:
     def test_negative_min_liquidity(self, monkeypatch):
         monkeypatch.setenv("MIN_LIQUIDITY", "-1")
         with pytest.raises(ValueError, match="MIN_LIQUIDITY.*must be >= 0"):
+            _reload_config()
+
+    @pytest.mark.parametrize("name,value", [
+        ("LIP_MIN_POOL", "-0.01"),
+        ("LIP_MAX_MARKETS", "0"),
+        ("LIP_SELECT_INTERVAL", "0"),
+        ("LIP_PRICE_BAND_LOW", "-0.01"),
+        ("LIP_PRICE_BAND_HIGH", "1.01"),
+        ("LIP_MIN_HOURS_REMAINING", "-1"),
+        ("LIP_DEPTH_PROBE_LIMIT", "0"),
+    ])
+    def test_invalid_lip_config_fails_fast(self, monkeypatch, name, value):
+        monkeypatch.setenv(name, value)
+        with pytest.raises(ValueError, match=name):
+            _reload_config()
+
+    def test_reversed_lip_price_band_fails_fast(self, monkeypatch):
+        monkeypatch.setenv("LIP_PRICE_BAND_LOW", "0.80")
+        monkeypatch.setenv("LIP_PRICE_BAND_HIGH", "0.20")
+        with pytest.raises(ValueError, match=r"LIP_PRICE_BAND_HIGH.*LIP_PRICE_BAND_LOW"):
+            _reload_config()
+
+    @pytest.mark.parametrize(("name", "value"), [
+        ("LIP_PRICE_BAND_LOW", "0"),
+        ("LIP_PRICE_BAND_HIGH", "1"),
+    ])
+    def test_lip_price_band_requires_open_interval(self, monkeypatch,
+                                                   name, value):
+        monkeypatch.setenv(name, value)
+        with pytest.raises(
+            ValueError,
+            match=r"LIP_PRICE_BAND_HIGH.*LIP_PRICE_BAND_LOW",
+        ):
+            _reload_config()
+
+    def test_equal_lip_price_band_fails_fast(self, monkeypatch):
+        monkeypatch.setenv("LIP_PRICE_BAND_LOW", "0.50")
+        monkeypatch.setenv("LIP_PRICE_BAND_HIGH", "0.50")
+        with pytest.raises(
+            ValueError,
+            match=r"LIP_PRICE_BAND_HIGH.*LIP_PRICE_BAND_LOW",
+        ):
             _reload_config()
 
     def test_sizing_aggressiveness_above_one(self, monkeypatch):
@@ -337,6 +395,18 @@ class TestValidateConfigWarnings:
 
 class TestPlatformWhitelistConfig:
 
+    def test_default_whitelist_is_kalshi_only(self, monkeypatch):
+        monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **kw: None)
+        monkeypatch.delenv("ENABLED_EXECUTION_PLATFORMS", raising=False)
+        cfg = _reload_config()
+        assert cfg.ENABLED_EXECUTION_PLATFORMS == frozenset({"kalshi"})
+
+    def test_live_polymarket_is_blocked(self, monkeypatch):
+        monkeypatch.setenv("ENABLED_EXECUTION_PLATFORMS", "polymarket,kalshi")
+        monkeypatch.setenv("DRY_RUN", "false")
+        with pytest.raises(ValueError, match="public-data/shadow-only"):
+            _reload_config()
+
     def test_valid_platforms_accepted(self, monkeypatch):
         monkeypatch.setenv("ENABLED_EXECUTION_PLATFORMS", "polymarket,kalshi,sxbet")
         cfg = _reload_config()
@@ -383,6 +453,19 @@ class TestPlatformWhitelistConfig:
             assert PLATFORM_MIN_ORDER_SIZE[plat] >= 0
 
 
+class TestPolymarketRewardFetch:
+    def test_rewards_mode_fetches_unless_kalshi_only(self):
+        from config import polymarket_reward_fetch_enabled, polymarket_scan_enabled
+        assert polymarket_reward_fetch_enabled("rewards") is True
+        assert polymarket_scan_enabled("rewards") is False
+
+    def test_kalshi_only_skips_polymarket_reward_fetch(self, monkeypatch):
+        monkeypatch.setenv("SCAN_VENUES", "kalshi")
+        cfg = _reload_config()
+        assert cfg.polymarket_reward_fetch_enabled("rewards") is False
+        assert cfg.polymarket_reward_fetch_enabled("all") is False
+
+
 # ---------------------------------------------------------------------------
 # validate_config — Phase 1 quick-win guards (PR #18)
 # ---------------------------------------------------------------------------
@@ -391,7 +474,7 @@ class TestSXBetQuarantine:
     """SX Bet `place_order()` sends unsigned JSON. Live trading must be blocked."""
 
     def test_live_trading_with_sxbet_raises(self, monkeypatch):
-        monkeypatch.setenv("ENABLED_EXECUTION_PLATFORMS", "polymarket,sxbet")
+        monkeypatch.setenv("ENABLED_EXECUTION_PLATFORMS", "kalshi,sxbet")
         monkeypatch.setenv("DRY_RUN", "false")
         with pytest.raises(ValueError, match="SX Bet"):
             _reload_config()
@@ -402,11 +485,17 @@ class TestSXBetQuarantine:
         cfg = _reload_config()  # must not raise
         assert "sxbet" in cfg.ENABLED_EXECUTION_PLATFORMS
 
-    def test_live_trading_without_sxbet_ok(self, monkeypatch):
-        monkeypatch.setenv("ENABLED_EXECUTION_PLATFORMS", "polymarket,kalshi")
+    def test_live_trading_without_sxbet_ok(self, monkeypatch, tmp_path):
+        from live_envelope_fixtures import write_test_envelope
+        monkeypatch.setenv("LIVE_ENVELOPE_PATH", str(write_test_envelope(tmp_path)))
+        monkeypatch.setenv("ENABLED_EXECUTION_PLATFORMS", "kalshi")
         monkeypatch.setenv("DRY_RUN", "false")
-        cfg = _reload_config()  # must not raise
-        assert "sxbet" not in cfg.ENABLED_EXECUTION_PLATFORMS
+        try:
+            cfg = _reload_config()  # must not raise
+            assert cfg.ENABLED_EXECUTION_PLATFORMS == frozenset({"kalshi"})
+        finally:
+            monkeypatch.setenv("DRY_RUN", "true")
+            _reload_config()
 
 
 class TestDashboardHostGuard:
@@ -543,3 +632,39 @@ class TestWhaleCopyConfig:
     def test_polygonscan_api_key_optional(self):
         from config import POLYGONSCAN_API_KEY
         assert isinstance(POLYGONSCAN_API_KEY, str)
+
+
+# ---------------------------------------------------------------------------
+# Env hygiene — no personal/global env files merged into the bot environment
+# ---------------------------------------------------------------------------
+
+class TestEnvFileHygiene:
+    """The bot must only load the project-local .env.
+
+    Loading ~/.claude/.env (or any file outside the repo) merges personal
+    credentials into the trading process environment. Regression guard for
+    the audit finding that config.py and cli.py both did exactly that.
+    """
+
+    def _module_source(self, name: str) -> str:
+        root = Path(__file__).resolve().parent.parent
+        return (root / name).read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize("module_file", ["config.py", "cli.py"])
+    def test_no_personal_env_file_loaded(self, module_file):
+        source = self._module_source(module_file)
+        assert "load_dotenv(os.path.expanduser" not in source, (
+            f"{module_file} loads a dotenv file outside the project directory "
+            "— personal env files must never be merged into the bot environment"
+        )
+        assert "find_dotenv" not in source, (
+            f"{module_file} must not search parent directories for dotenv files"
+        )
+
+    @pytest.mark.parametrize("module_file", ["config.py", "cli.py"])
+    def test_project_local_dotenv_still_loaded(self, module_file):
+        source = self._module_source(module_file)
+        assert 'Path(__file__).resolve().parent / ".env"' in source, (
+            f"{module_file} must load only the .env adjacent to the module"
+        )
+        assert "load_dotenv(dotenv_path=" in source

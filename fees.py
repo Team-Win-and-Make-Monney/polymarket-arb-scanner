@@ -31,7 +31,7 @@ def _select_fees(case_a_fees: float, case_b_fees: float, price_a: float) -> floa
     if FEE_MODEL == "expected_value":
         # Use price as proxy for probability of that side winning
         prob_a = max(0.0, min(1.0, price_a))
-        return prob_a * case_b_fees + (1.0 - prob_a) * case_a_fees
+        return prob_a * case_a_fees + (1.0 - prob_a) * case_b_fees
     return max(case_a_fees, case_b_fees)
 
 

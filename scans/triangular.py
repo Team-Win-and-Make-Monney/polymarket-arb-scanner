@@ -321,6 +321,14 @@ def scan_triangular(
             "confidence": min_confidence,
             "_platform_a": best_yes_platform,
             "_platform_b": best_no_platform,
+            # Refinement metadata (_refine_triangular_with_clob): platform A
+            # holds the YES leg at best_yes, platform B the NO leg at best_no.
+            # Without these, refinement fell back to other_price=0 and always
+            # treated the Polymarket leg as the YES side.
+            "_side_a": "yes",
+            "_price_a": best_yes,
+            "_side_b": "no",
+            "_price_b": best_no,
             "_platforms_checked": platforms_list,
             "_clob_depth": 0,
         }
@@ -398,17 +406,25 @@ def _refine_triangular_with_clob(opportunities: list[dict], min_profit: float) -
 
         token_ids = o.get("_token_ids", [])
         if not token_ids or len(token_ids) < 2:
-            refined.append(o)
+            logger.debug("Dropping triangular opportunity: Polymarket token IDs unavailable")
             continue
 
         clob = clob_cache.get(tuple(token_ids[:2]))
         if not clob or clob.get("yes_ask") is None or clob.get("no_ask") is None:
-            o["_clob_refined"] = False
-            refined.append(o)
+            logger.debug("Dropping triangular opportunity: executable Polymarket asks unavailable")
             continue
 
         # Determine which side Polymarket is on and use real ask price
-        if pa == "polymarket":
+        if pa == "polymarket" and pb == "polymarket":
+            # Both legs are Polymarket: refine BOTH from the live book.
+            # Platform A carries the YES leg, platform B the NO leg —
+            # leaving _price_b at its stale Stage-1 NO midpoint would let a
+            # false arb survive and execute at an unverified NO price.
+            pm_ask = clob["yes_ask"]
+            other_price = clob["no_ask"]
+            other_platform = pb
+            result = net_profit_triangular(pm_ask, other_price, pa, pb)
+        elif pa == "polymarket":
             pm_side = o.get("_side_a", "yes") if "_side_a" in o else "yes"
             pm_ask = clob["yes_ask"] if pm_side == "yes" else clob["no_ask"]
             other_price = o.get("_price_b", 0)
@@ -430,11 +446,24 @@ def _refine_triangular_with_clob(opportunities: list[dict], min_profit: float) -
             )
 
         if result["net_profit"] >= min_profit:
+            o["gross_spread"] = f"{result['gross_spread']:.4f}"
             o["net_profit"] = result["net_profit"]
             o["fees"] = f"${result['fees']:.4f}"
             total_cost = pm_ask + other_price
             if total_cost > 0:
                 o["net_roi"] = f"{result['net_profit'] / total_cost * 100:.2f}%"
+            # Persist the LIVE executable prices — execution parses the
+            # prices string (and _price_a/_price_b), so leaving the stale
+            # Stage-1 mid prices in place would defeat the refinement.
+            # Platform A carries the YES leg, platform B the NO leg.
+            if pa == "polymarket":
+                yes_price, no_price = pm_ask, other_price
+            else:
+                yes_price, no_price = other_price, pm_ask
+            o["prices"] = f"{pa}_Y={yes_price:.3f} {pb}_N={no_price:.3f}"
+            o["total_cost"] = f"${total_cost:.4f}"
+            o["_price_a"] = yes_price
+            o["_price_b"] = no_price
             o["_clob_depth"] = min(
                 clob.get("yes_ask_size") or 0,
                 clob.get("no_ask_size") or 0,

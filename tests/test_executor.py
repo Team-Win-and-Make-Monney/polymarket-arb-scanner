@@ -396,6 +396,7 @@ class TestDryRunLog:
         trades = db.get_trades_for_opportunity(opps[0]["id"])
         assert len(trades) == 2
         assert all(t["status"] == "dry_run" for t in trades)
+        assert [t["outcome"] for t in trades] == ["yes", "no"]
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +504,51 @@ class TestCheckWsCache:
 # ---------------------------------------------------------------------------
 
 class TestCrossRevalidationStrategy:
+    def test_uses_normalized_ws_asks_and_coerces_strings(self, executor):
+        """Production WS payloads contain string prices and raw Kalshi ladders."""
+        from unittest.mock import call, patch as mpatch
+
+        opp = {
+            "type": "Cross(PM_NO + K_YES)",
+            "net_profit": 0.10,
+            "prices": "PM_N=0.690 K_Y=0.410",
+            "total_cost": "$1.1000",
+            "_token_ids": ["tok_yes", "tok_no"],
+            "_kalshi_ticker": "TICKER-XYZ",
+        }
+        now = time.time()
+        price_cache = {
+            ("polymarket", "tok_yes"): {
+                "best_ask": "0.310", "price": "0.300", "_ts": now,
+            },
+            ("polymarket", "tok_no"): {
+                "best_ask": "0.690", "price": "0.680", "_ts": now,
+            },
+            ("kalshi", "TICKER-XYZ"): {
+                "yes": [[40, 10]],
+                "no": [[60, 10]],
+                "yes_ask": "0.410",
+                "no_ask": "0.360",
+                "_ts": now,
+            },
+        }
+
+        with mpatch(
+            "executor.net_profit_cross_platform",
+            side_effect=[{"net_profit": 0.05}, {"net_profit": 0.11}],
+        ) as profit:
+            passed, reval_profit, reason = executor._revalidate_cross(
+                opp, 0.10, price_cache,
+            )
+
+        assert passed is True
+        assert reval_profit == pytest.approx(0.11)
+        assert reason == "passed"
+        assert profit.call_args_list == [
+            call(0.31, 0.36, "yes", "no"),
+            call(0.69, 0.41, "no", "yes"),
+        ]
+
     def test_strategy1_remains_best(self, executor):
         """When strategy 1 (PM_YES + K_NO) stays best, prices should contain PM_Y= and K_N=."""
         from unittest.mock import patch as mpatch
@@ -1291,7 +1337,9 @@ class TestBuildLegsTriangularCross:
             "_platform_b": "kalshi",
             "_kalshi_ticker": "TICKER-TRI",
         }
-        legs = executor._build_legs(opp, 5.0)
+        p1, p2 = self._patch_all_platforms()
+        with p1, p2:
+            legs = executor._build_legs(opp, 5.0)
         assert len(legs) == 2
         assert legs[0]["platform"] == "polymarket"
         assert legs[0]["price"] == pytest.approx(0.350)
@@ -1463,7 +1511,7 @@ class TestRevalidateTriangular:
             assert result is False
 
     def test_revalidate_triangular_missing_platforms_high_roi(self, executor):
-        """TriangularCross with missing platform info but high ROI: API error accepted."""
+        """TriangularCross with missing platform info fails closed at any ROI."""
         opp = {
             "type": "TriangularCross",
             "net_profit": 0.10,
@@ -1473,7 +1521,7 @@ class TestRevalidateTriangular:
             "_platform_b": "",
         }
         result = executor._revalidate(opp, None)
-        assert result is True  # ROI ~14% >= 2%, so API error is accepted
+        assert result is False
 
     def test_revalidate_triangular_missing_platforms_low_roi(self, executor):
         """TriangularCross with missing platform info and low ROI: rejected."""
@@ -1496,6 +1544,25 @@ class TestRevalidateTriangular:
         }
         result = executor._revalidate(opp, None)
         assert result is True
+
+
+class TestRevalidateLogicalArb:
+    def test_invalid_executable_ask_fails_closed(self, executor):
+        opp = {
+            "type": "LogicalArb",
+            "net_profit": 0.10,
+            "total_cost": "$0.7000",
+            "_then_price": 0.40,
+            "_token_ids": ["then-yes", "then-no"],
+            "_if_token_ids": ["if-yes", "if-no"],
+        }
+        books = [
+            {"asks": [{"price": "nan", "size": "100"}]},
+            {"asks": [{"price": "0.35", "size": "100"}]},
+        ]
+
+        with patch("executor.fetch_order_book", side_effect=books):
+            assert executor._revalidate(opp, None) is False
 
 
 # ---------------------------------------------------------------------------
@@ -1532,8 +1599,8 @@ class TestRevalidateNegRisk:
         result = executor._revalidate(opp, None)
         assert result is False
 
-    def test_api_error_accepted_when_high_roi(self, executor):
-        """NegRisk: API error accepted when ROI >= 2% (proceeds with scan prices)."""
+    def test_api_error_rejected_when_high_roi(self, executor):
+        """NegRisk: API errors fail closed even when scan ROI is high."""
         from unittest.mock import patch as mpatch
         opp = {
             "type": "NegRiskInternal",
@@ -1543,7 +1610,7 @@ class TestRevalidateNegRisk:
         }
         with mpatch("executor.fetch_order_book", return_value=None):
             result = executor._revalidate(opp, None)
-            assert result is True  # ROI ~11% >= 2%, API error accepted
+            assert result is False
 
     def test_api_error_rejected_when_low_roi(self, executor):
         """NegRisk: API error rejected when ROI < 2%."""
@@ -1613,8 +1680,8 @@ class TestRevalidateKalshiMulti:
         }
         mock_book = {
             "orderbook": {
-                "yes": [["45", "100"]],
-                "no": [],
+                "yes": [],
+                "no": [["55", "100"]],
             }
         }
         executor.kalshi_client.fetch_order_book.return_value = mock_book
@@ -1646,8 +1713,8 @@ class TestRevalidateKalshiMulti:
         result = ex._revalidate(opp, None)
         assert result is False
 
-    def test_api_error_accepted_when_high_roi(self, executor):
-        """KalshiMulti: API error accepted when ROI >= 2%."""
+    def test_api_error_rejected_when_high_roi(self, executor):
+        """KalshiMulti: API errors fail closed even when scan ROI is high."""
         opp = {
             "type": "KalshiMultiOutcome",
             "net_profit": 0.10,
@@ -1656,7 +1723,7 @@ class TestRevalidateKalshiMulti:
         }
         executor.kalshi_client.fetch_order_book.return_value = None
         result = executor._revalidate(opp, None)
-        assert result is True  # ROI 12.5% >= 2%, API error accepted
+        assert result is False
 
     def test_api_error_rejected_when_low_roi(self, executor):
         """KalshiMulti: API error rejected when ROI < 2%."""
@@ -2168,6 +2235,16 @@ class TestMinOrderSize:
                     leg, 3.0, opp)
         assert success is True
 
+    def test_kalshi_sports_ticker_does_not_place(self, executor):
+        leg = {"platform": "kalshi", "side": "yes", "action": "buy",
+               "price": 0.50, "_ticker": "KXNFLGAME-26AUG18"}
+        opp = {"type": "KalshiBinary"}
+        with patch("executor.ENABLED_EXECUTION_PLATFORMS",
+                   frozenset(["polymarket", "kalshi"])):
+            success, _, _ = executor._execute_single_leg(leg, 3.0, opp)
+        assert success is False
+        executor.kalshi_client.place_order.assert_not_called()
+
     def test_cross_all_rejects_when_per_leg_size_below_minimum(self, executor):
         """Cross-all with per-leg size below platform min returns empty."""
         opp = {
@@ -2461,6 +2538,188 @@ class TestMakerRouting:
             f"Expected exactly 1 order attempt (maker only), got {call_count}"
         )
 
+    def test_unconfirmed_cancel_flags_leg_for_reconciliation(self, executor, caplog):
+        """cancel_order returning False must flag the leg (_cancel_unconfirmed),
+        log an ERROR, and preserve the order ID for recovery/reconciliation."""
+        import logging as _logging
+        from unittest.mock import patch as mpatch
+        leg = {
+            "platform": "polymarket",
+            "side": "BUY",
+            "token": "yes",
+            "price": 0.45,
+            "_token_id": "tok_yes",
+        }
+        opp = {"type": "Binary", "_layer": 1, "market": "Test Market?"}
+        executor.pm_trader.place_order.return_value = {
+            "success": True, "orderID": "order_unconfirmed_1"
+        }
+        executor.pm_trader.cancel_order = MagicMock(return_value=False)
+        with mpatch("executor.ORDER_TIME_IN_FORCE", "gtc"), \
+             mpatch("executor.GTC_ORDER_TIMEOUT", 0.01), \
+             mpatch("executor.ENABLED_EXECUTION_PLATFORMS",
+                    frozenset(["polymarket", "kalshi"])), \
+             mpatch.object(executor, "_confirm_fill_pm", return_value=None), \
+             caplog.at_level(_logging.ERROR, logger="executor"):
+            executor.dry_run = False
+            success, order_id, fill_price = executor._execute_single_leg(leg, 5.0, opp)
+        assert success is False
+        # Order ID preserved on both the return value and the leg
+        assert order_id == "order_unconfirmed_1"
+        assert leg["_order_id"] == "order_unconfirmed_1"
+        # Leg carries the unconfirmed-cancel marker
+        assert leg.get("_cancel_unconfirmed") is True
+        # An ERROR mentioning the order ID was logged
+        assert any(
+            r.levelno == _logging.ERROR and "order_unconfirmed_1" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_confirmed_cancel_does_not_flag_leg(self, executor):
+        """cancel_order returning True must NOT set _cancel_unconfirmed."""
+        from unittest.mock import patch as mpatch
+        leg = {
+            "platform": "polymarket",
+            "side": "BUY",
+            "token": "yes",
+            "price": 0.45,
+            "_token_id": "tok_yes",
+        }
+        opp = {"type": "Binary", "_layer": 1}
+        executor.pm_trader.place_order.return_value = {
+            "success": True, "orderID": "order_confirmed_1"
+        }
+        executor.pm_trader.cancel_order = MagicMock(return_value=True)
+        with mpatch("executor.ORDER_TIME_IN_FORCE", "gtc"), \
+             mpatch("executor.GTC_ORDER_TIMEOUT", 0.01), \
+             mpatch("executor.ENABLED_EXECUTION_PLATFORMS",
+                    frozenset(["polymarket", "kalshi"])), \
+             mpatch.object(executor, "_confirm_fill_pm", return_value=None):
+            executor.dry_run = False
+            success, order_id, fill_price = executor._execute_single_leg(leg, 5.0, opp)
+        assert success is False
+        assert "_cancel_unconfirmed" not in leg
+
+    def test_cancel_raising_flags_leg_and_preserves_order_id(self, executor):
+        """cancel_order RAISING must still flag the leg and preserve the order ID."""
+        from unittest.mock import patch as mpatch
+        leg = {
+            "platform": "polymarket",
+            "side": "BUY",
+            "token": "yes",
+            "price": 0.45,
+            "_token_id": "tok_yes",
+        }
+        opp = {"type": "Binary", "_layer": 1, "market": "Test Market?"}
+        executor.pm_trader.place_order.return_value = {
+            "success": True, "orderID": "order_raise_1"
+        }
+        executor.pm_trader.cancel_order = MagicMock(side_effect=RuntimeError("venue down"))
+        with mpatch("executor.ORDER_TIME_IN_FORCE", "gtc"), \
+             mpatch("executor.GTC_ORDER_TIMEOUT", 0.01), \
+             mpatch("executor.ENABLED_EXECUTION_PLATFORMS",
+                    frozenset(["polymarket", "kalshi"])), \
+             mpatch.object(executor, "_confirm_fill_pm", return_value=None):
+            executor.dry_run = False
+            success, order_id, fill_price = executor._execute_single_leg(leg, 5.0, opp)
+        assert success is False
+        assert order_id == "order_raise_1"
+        assert leg["_order_id"] == "order_raise_1"
+        assert leg.get("_cancel_unconfirmed") is True
+
+    def test_unconfirmed_cancel_fires_alert_when_manager_present(self, executor):
+        """An unconfirmed cancel must route through alerting when available."""
+        from unittest.mock import patch as mpatch
+        leg = {
+            "platform": "polymarket",
+            "side": "BUY",
+            "token": "yes",
+            "price": 0.45,
+            "_token_id": "tok_yes",
+        }
+        opp = {"type": "Binary", "_layer": 1, "market": "Alert Market?"}
+        executor.pm_trader.place_order.return_value = {
+            "success": True, "orderID": "order_alert_1"
+        }
+        executor.pm_trader.cancel_order = MagicMock(return_value=False)
+        mock_alert_manager = MagicMock()
+        with mpatch("executor.ORDER_TIME_IN_FORCE", "gtc"), \
+             mpatch("executor.GTC_ORDER_TIMEOUT", 0.01), \
+             mpatch("executor.ENABLED_EXECUTION_PLATFORMS",
+                    frozenset(["polymarket", "kalshi"])), \
+             mpatch("executor._alert_manager", mock_alert_manager), \
+             mpatch.object(executor, "_confirm_fill_pm", return_value=None):
+            executor.dry_run = False
+            executor._execute_single_leg(leg, 5.0, opp)
+        assert mock_alert_manager.alert.called
+        args = mock_alert_manager.alert.call_args
+        assert args.args[0] == "cancel_unconfirmed"
+        # Must be a supported AlertManager severity ("error" under-routes to
+        # WARNING); an untracked-exposure event is high-severity.
+        assert args.args[1] == "CRITICAL"
+        assert args.kwargs["details"]["order_id"] == "order_alert_1"
+
+
+class TestRecordFailedLeg:
+    """Unconfirmed cancels must survive restart via a pending DB row + order_id."""
+
+    def _make_trade(self, db):
+        opp_id = db.log_opportunity(
+            "Binary", "M?", "Y=0.4 N=0.5", 0.9, 0.1, 0.11, 100.0, "detect")
+        return db.log_trade(opp_id, "polymarket", "BUY", 0.45, 5.0, "pending")
+
+    def test_unconfirmed_cancel_row_is_pending_with_order_id(self, executor, db):
+        trade_id = self._make_trade(db)
+        leg = {
+            "platform": "polymarket",
+            "_trade_id": trade_id,
+            "_order_id": "order_live_1",
+            "_cancel_unconfirmed": True,
+        }
+        executor._record_failed_leg(trade_id, leg)
+        row = [t for t in db.get_pending_trades() if t["id"] == trade_id]
+        assert len(row) == 1, "unconfirmed-cancel trade must stay visible to recovery"
+        assert row[0]["status"] == "pending"
+        assert row[0]["order_id"] == "order_live_1"
+
+    def test_confirmed_cancel_row_is_failed(self, executor, db):
+        trade_id = self._make_trade(db)
+        leg = {
+            "platform": "polymarket",
+            "_trade_id": trade_id,
+            "_order_id": "order_dead_1",
+        }
+        executor._record_failed_leg(trade_id, leg)
+        assert all(t["id"] != trade_id for t in db.get_pending_trades())
+        rows = db.conn.execute(
+            "SELECT status FROM trades WHERE id = ?", (trade_id,)).fetchall()
+        assert rows[0][0] == "failed"
+
+    def test_exception_after_placement_row_is_pending_with_order_id(self, executor, db):
+        """unknown_state=True + an assigned order_id: the venue-side state is
+        unknown (order may be live) — must stay visible to recovery."""
+        trade_id = self._make_trade(db)
+        leg = {
+            "platform": "polymarket",
+            "_trade_id": trade_id,
+            "_order_id": "order_maybe_live_1",
+        }
+        executor._record_failed_leg(trade_id, leg, unknown_state=True)
+        row = [t for t in db.get_pending_trades() if t["id"] == trade_id]
+        assert len(row) == 1, "exception-path trade with an order_id must stay pending"
+        assert row[0]["status"] == "pending"
+        assert row[0]["order_id"] == "order_maybe_live_1"
+
+    def test_exception_before_placement_row_is_failed(self, executor, db):
+        """unknown_state=True without an order_id: nothing was placed — failed."""
+        trade_id = self._make_trade(db)
+        leg = {"platform": "polymarket", "_trade_id": trade_id}
+        executor._record_failed_leg(trade_id, leg, unknown_state=True)
+        assert all(t["id"] != trade_id for t in db.get_pending_trades())
+        rows = db.conn.execute(
+            "SELECT status FROM trades WHERE id = ?", (trade_id,)).fetchall()
+        assert rows[0][0] == "failed"
+
 
 # ---------------------------------------------------------------------------
 # _derive_position_platform: position.platform must reflect the legs' actual
@@ -2514,3 +2773,73 @@ class TestDerivePositionPlatform:
     def test_empty_legs_returns_unknown(self):
         from executor import _derive_position_platform
         assert _derive_position_platform([]) == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Finding #1: the legacy KalshiRewards execution path (opp_type ==
+# "KalshiRewards" -> _build_legs -> _execute_single_leg's kalshi arm,
+# calling kalshi_client.place_order directly) must be disabled while the MM
+# pilot owns Kalshi quoting (MM_KALSHI_PILOT_ENABLED) — two independent
+# systems placing orders on the same venue at once defeats the pilot's
+# single-choke-point safety design. When the flag is false, this path is
+# unchanged from master.
+# Fail-before: opp_type == "KalshiRewards" ran straight through execute()'s
+# full pipeline into kalshi_client.place_order with no awareness of the
+# pilot at all, regardless of MM_KALSHI_PILOT_ENABLED.
+# ---------------------------------------------------------------------------
+
+class TestMmPilotBlocksLegacyKalshiRewards:
+    def _opportunity(self):
+        return {
+            "type": "KalshiRewards",
+            "market": "KXTEST-26DEC31",
+            "market_ticker": "KXTEST-26DEC31",
+            "optimal_bid": 0.45,
+            "optimal_ask": 0.55,
+            "size": 5.0,
+        }
+
+    def test_blocked_when_pilot_enabled(self, executor, db, monkeypatch):
+        import config
+        monkeypatch.setattr(config, "MM_KALSHI_PILOT_ENABLED", True)
+        result = executor.execute(self._opportunity())
+        assert result is False
+        executor.kalshi_client.place_order.assert_not_called()
+        opps = db.get_recent_opportunities()
+        assert opps[-1]["action"] == "skipped:mm_pilot_owns_kalshi"
+
+    def test_unaffected_when_pilot_disabled(self, executor, db, monkeypatch):
+        import config
+        monkeypatch.setattr(config, "MM_KALSHI_PILOT_ENABLED", False)
+        # Needed only because this test now runs deep enough into the
+        # pipeline (risk_manager.check's Kalshi balance comparison) to
+        # touch it — unrelated to the guard under test.
+        executor.kalshi_client.get_balance.return_value = 100.0
+        executor.execute(self._opportunity())
+        opps = db.get_recent_opportunities()
+        # Whatever happens to this opportunity downstream (revalidation,
+        # risk gate, leg building) is out of scope here — the only thing
+        # under test is that the NEW guard did not fire when disabled.
+        assert opps[-1]["action"] != "skipped:mm_pilot_owns_kalshi"
+
+    def test_other_opp_types_unaffected_by_the_flag(self, executor, db,
+                                                     monkeypatch):
+        """The guard is scoped to opp_type == "KalshiRewards" only — it must
+        not touch any other strategy's execution path."""
+        import config
+        monkeypatch.setattr(config, "MM_KALSHI_PILOT_ENABLED", True)
+        executor.pm_trader.get_balance.return_value = 100.0
+        opp = {
+            "type": "Binary",
+            "market": "Test Market",
+            "prices": "Y=0.400 N=0.450",
+            "total_cost": "$0.8500",
+            "net_profit": 0.138,
+            "net_roi": "16.2%",
+            "_clob_depth": 100.0,
+            "_token_ids": ["tok_yes", "tok_no"],
+        }
+        result = executor.execute(opp)
+        assert result is True
+        opps = db.get_recent_opportunities()
+        assert opps[-1]["action"] != "skipped:mm_pilot_owns_kalshi"

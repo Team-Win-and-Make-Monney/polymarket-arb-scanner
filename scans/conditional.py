@@ -289,20 +289,37 @@ def _refine_conditional_with_clob(
         condition_clob = clob_results.get(condition_key)
         uncond_clob = clob_results.get(uncond_key)
 
-        if cond_clob:
-            p_x_given_y = cond_clob.get("yes_ask", opp["_p_x_given_y"])
-        else:
-            p_x_given_y = opp["_p_x_given_y"]
+        # Leg pricing depends on direction (see fees.net_profit_conditional):
+        # - BUY_CONDITIONAL: buy P(X|Y) and P(Y) at the ask, SELL P(X) at the bid.
+        # - BUY_UNCONDITIONAL: buy P(X) at the ask, SELL P(X|Y) and P(Y) at the bid.
+        # Sell legs realise the bid, not the ask — pricing every leg from
+        # yes_ask overstated sell proceeds and inflated net_profit.
+        # A SELL leg with no live bid is unexecutable — there is nothing to
+        # sell into — so the opp is dropped rather than falling back to the
+        # stale Stage-1 price. Buy legs keep the Stage-1 fallback.
+        buy_conditional = opp["_direction"] == "BUY_CONDITIONAL"
 
-        if condition_clob:
-            p_y = condition_clob.get("yes_ask", opp["_p_y"])
-        else:
-            p_y = opp["_p_y"]
+        def _leg_price(clob: dict | None, is_buy: bool, fallback: float) -> float | None:
+            if is_buy:
+                if not clob:
+                    return fallback
+                val = clob.get("yes_ask")
+                return val if val is not None else fallback
+            # Sell leg: a live bid is required; None means "drop the opp".
+            if not clob:
+                return None
+            return clob.get("yes_bid")
 
-        if uncond_clob:
-            p_x = uncond_clob.get("yes_ask", opp["_p_x"])
-        else:
-            p_x = opp["_p_x"]
+        p_x_given_y = _leg_price(cond_clob, buy_conditional, opp["_p_x_given_y"])
+        p_y = _leg_price(condition_clob, buy_conditional, opp["_p_y"])
+        p_x = _leg_price(uncond_clob, not buy_conditional, opp["_p_x"])
+
+        if p_x_given_y is None or p_y is None or p_x is None:
+            logger.debug(
+                "Conditional dropped: sell leg has no live bid (%s)",
+                opp.get("market", "?")[:50],
+            )
+            continue
 
         from fees import net_profit_conditional
         result = net_profit_conditional(
@@ -320,11 +337,25 @@ def _refine_conditional_with_clob(
             opp["_p_y"] = p_y
             opp["_p_x"] = p_x
 
+            # Depth per leg matches the side actually traded: ask size for
+            # buy legs, bid size for sell legs. Every leg contributes — a
+            # missing book or missing traded-side size is ZERO executable
+            # depth, not a skipped leg (fail-closed).
             depths = []
-            for clob in [cond_clob, condition_clob, uncond_clob]:
-                if clob:
-                    depths.append(clob.get("yes_ask_size", 0))
-            opp["_clob_depth"] = min(depths) if depths else 0
+            for clob, is_buy in [
+                (cond_clob, buy_conditional),
+                (condition_clob, buy_conditional),
+                (uncond_clob, not buy_conditional),
+            ]:
+                price_key = "yes_ask" if is_buy else "yes_bid"
+                size_key = "yes_ask_size" if is_buy else "yes_bid_size"
+                depth = (
+                    ((clob or {}).get(size_key) or 0)
+                    if clob and clob.get(price_key) is not None
+                    else 0
+                )
+                depths.append(depth)
+            opp["_clob_depth"] = min(depths)
 
             refined.append(opp)
 

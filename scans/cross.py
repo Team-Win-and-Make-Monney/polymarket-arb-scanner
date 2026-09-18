@@ -86,39 +86,47 @@ def _refine_cross_with_clob(opportunities: list[dict], markets_by_key: dict, min
                 except Exception as e:
                     logger.debug("CLOB fetch failed for %s: %s", mk, e)
 
+    # FAIL-CLOSED (audit #77 round 2): opps whose CLOB verification cannot be
+    # completed (missing market / book / ask+bid / Kalshi prices) are DROPPED,
+    # not passed through with stale mid-price profits.
     refined = []
     for opp in opportunities:
         market_key = opp.get("_market_key")
         market = markets_by_key.get(market_key) if market_key else None
         if not market:
-            refined.append(opp)
+            logger.debug("Cross dropped (fail-closed): no market for key %s", market_key)
             continue
 
         clob = clob_results.get(market_key)
         if not clob:
-            opp["_clob_refined"] = False
-            refined.append(opp)
+            logger.debug("Cross dropped (fail-closed): no CLOB book for %s", market_key)
             continue
 
-        # Use ask price, fall back to bid + 0.01 if ask is missing
-        pm_yes = clob["yes_ask"]
-        pm_no = clob["no_ask"]
+        # Use ask price, fall back to bid + 0.01 if ask is missing. A
+        # malformed book (missing keys entirely) must drop the opportunity,
+        # not raise — .get() so absent fields behave like empty sides.
+        pm_yes = clob.get("yes_ask")
+        pm_no = clob.get("no_ask")
+        pm_yes_depth = clob.get("yes_ask_size")
+        pm_no_depth = clob.get("no_ask_size")
         partial = False
         if pm_yes is None and clob.get("yes_bid") is not None:
             pm_yes = clob["yes_bid"] + 0.01
+            pm_yes_depth = clob.get("yes_bid_size")
             partial = True
         if pm_no is None and clob.get("no_bid") is not None:
             pm_no = clob["no_bid"] + 0.01
+            pm_no_depth = clob.get("no_bid_size")
             partial = True
-        if pm_yes is None or pm_no is None:
-            opp["_clob_refined"] = False
-            refined.append(opp)
+        if (pm_yes is None or pm_no is None
+                or pm_yes_depth is None or pm_no_depth is None):
+            logger.debug("Cross dropped (fail-closed): empty book sides for %s", market_key)
             continue
         k_yes = opp.get("_kalshi_yes")
         k_no = opp.get("_kalshi_no")
 
         if k_yes is None or k_no is None:
-            refined.append(opp)
+            logger.debug("Cross dropped (fail-closed): missing Kalshi prices for %s", market_key)
             continue
 
         result1 = net_profit_cross_platform(pm_yes, k_no, "yes", "no")
@@ -138,10 +146,7 @@ def _refine_cross_with_clob(opportunities: list[dict], markets_by_key: dict, min
             opp["fees"] = f"${best['fees']:.4f}"
             opp["net_profit"] = best["net_profit"]
             opp["net_roi"] = f"{best['net_profit'] / total_cost * 100:.2f}%"
-            opp["_clob_depth"] = min(
-                clob["yes_ask_size"] or 0,
-                clob["no_ask_size"] or 0,
-            )
+            opp["_clob_depth"] = min(pm_yes_depth or 0, pm_no_depth or 0)
             if partial:
                 opp["_partial_clob"] = True
             try:
@@ -633,14 +638,21 @@ def _refine_cross_all_with_clob(opportunities: list[dict], min_profit: float,
             except Exception as e:
                 logger.debug("CLOB fetch failed for cross-all key %s: %s", key, e)
 
-    refined_out = []
+    # FAIL-CLOSED: every PM opp must complete CLOB verification to survive.
+    # Both confirmed-unprofitable opps AND opps whose verification cannot be
+    # completed (missing token IDs / CLOB book / fee function / unparseable
+    # prices) are dropped in place — a stale mid-price net_profit must never
+    # reach execution.
+    dropped_ids: set[int] = set()
     for o in pm_opps:
         token_ids = o.get("_token_ids", [])
         if not token_ids or len(token_ids) < 2:
+            dropped_ids.add(id(o))
             continue
 
         clob = clob_cache.get(tuple(token_ids[:2]))
-        if not clob or clob["yes_ask"] is None or clob["no_ask"] is None:
+        if not clob or clob.get("yes_ask") is None or clob.get("no_ask") is None:
+            dropped_ids.add(id(o))
             continue
 
         pa = o.get("_platform_a", "")
@@ -648,41 +660,88 @@ def _refine_cross_all_with_clob(opportunities: list[dict], min_profit: float,
         fee_key = (pa, pb) if (pa, pb) in _CROSS_FEE_FUNCS else (pb, pa)
         ff = _CROSS_FEE_FUNCS.get(fee_key)
         if not ff:
+            dropped_ids.add(id(o))
             continue
 
-        pm_yes = clob["yes_ask"]
-        pm_no = clob["no_ask"]
-
-        # Parse the other platform's price from the prices string
-        # Format: "PM_Y=0.45 K_N=0.50" or similar — skip Polymarket entries
+        # Parse BOTH legs (side + price) from the prices string. Format is
+        # "{platform}_Y={price} {platform}_N={price}" — exactly one YES leg
+        # and one NO leg. Only the combination matching the opportunity's
+        # original structure is re-evaluated; treating the other platform's
+        # YES price as a NO price (or vice versa) prices an impossible trade.
+        pm_side = None
         other_price = None
+        other_side = None
         for part in o.get("prices", "").split():
             if "=" not in part:
                 continue
             label, _, val_str = part.partition("=")
-            if not val_str or label.lower().startswith("pm_") or label.lower().startswith("polymarket"):
+            lab = label.lower()
+            if lab.endswith("_y"):
+                side = "yes"
+            elif lab.endswith("_n"):
+                side = "no"
+            else:
                 continue
             try:
                 candidate = float(val_str)
-                if 0.0 < candidate < 1.0:
-                    other_price = candidate
-                    break
             except ValueError:
                 logger.debug("Could not parse price from prices part %r", part)
+                continue
+            if not (0.0 < candidate < 1.0):
+                continue
+            if lab.startswith("pm_") or lab.startswith("polymarket"):
+                pm_side = side
+            else:
+                other_price = candidate
+                other_side = side
 
-        if other_price is None:
+        if pm_side is None or other_price is None or other_side == pm_side:
+            dropped_ids.add(id(o))
             continue
 
-        # Determine which side Polymarket is on
-        if pa == "polymarket":
-            r1 = ff(pm_yes, other_price, "yes", "no")
-            r2 = ff(pm_no, other_price, "no", "yes")
-        else:
-            r1 = ff(other_price, pm_yes, "yes", "no")
-            r2 = ff(other_price, pm_no, "no", "yes")
+        # Reprice the PM leg from the live book on ITS side only.
+        pm_price = clob.get("yes_ask") if pm_side == "yes" else clob.get("no_ask")
+        pm_depth_raw = (
+            clob.get("yes_ask_size") if pm_side == "yes"
+            else clob.get("no_ask_size")
+        )
+        if pm_price is None or pm_depth_raw is None:
+            dropped_ids.add(id(o))
+            continue
+        pm_depth = pm_depth_raw or 0
 
-        best_r = r1 if r1["net_profit"] > r2["net_profit"] else r2
+        # Argument order mirrors Stage 1: (price_a, price_b, side_a, side_b).
+        if pa == "polymarket":
+            best_r = ff(pm_price, other_price, pm_side, other_side)
+        else:
+            best_r = ff(other_price, pm_price, other_side, pm_side)
+
         if best_r["net_profit"] >= min_profit:
+            total_cost = pm_price + other_price
+            pm_tag = "Y" if pm_side == "yes" else "N"
+            other_tag = "Y" if other_side == "yes" else "N"
+            # Persist the LIVE executable prices — the executor parses the
+            # prices string at execution time, so leaving the stale mid-price
+            # string in place would defeat the refinement.
+            if pa == "polymarket":
+                o["prices"] = (f"{pa}_{pm_tag}={pm_price:.3f} "
+                               f"{pb}_{other_tag}={other_price:.3f}")
+            else:
+                o["prices"] = (f"{pa}_{other_tag}={other_price:.3f} "
+                               f"{pb}_{pm_tag}={pm_price:.3f}")
+            o["total_cost"] = f"${total_cost:.4f}"
             o["net_profit"] = best_r["net_profit"]
             o["fees"] = f"${best_r['fees']:.4f}"
-            o["_clob_depth"] = min(clob["yes_ask_size"] or 0, clob["no_ask_size"] or 0)
+            if total_cost > 0:
+                o["net_roi"] = f"{best_r['net_profit'] / total_cost * 100:.2f}%"
+            o["_clob_depth"] = pm_depth
+            o["_clob_refined"] = True
+        else:
+            # Confirmed unprofitable at live CLOB prices.
+            dropped_ids.add(id(o))
+
+    if dropped_ids:
+        opportunities[:] = [o for o in opportunities if id(o) not in dropped_ids]
+        logger.info(
+            "Dropped %d cross-all candidates at CLOB verification.", len(dropped_ids)
+        )

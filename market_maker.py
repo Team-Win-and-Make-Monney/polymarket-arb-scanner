@@ -251,16 +251,47 @@ class QuoteManager:
                      platform, side, market_key, price, size)
         return None
 
+    @staticmethod
+    def _cancel_on_exchange(order_id: str, trader) -> bool:
+        """Best-effort live cancel (plan 10 side-finding 1).
+
+        Before this, "cancelling" only cleared the local dict — a live
+        resting order would survive process death. Dry-run order IDs
+        (``dry_`` prefix) never reach the exchange.
+
+        Args:
+            order_id: Venue order identifier, or a ``dry_`` synthetic ID.
+            trader: Venue client whose ``cancel_order`` must explicitly
+                confirm a live cancellation.
+
+        Returns:
+            True for a synthetic dry-run cancellation or an explicitly
+            confirmed live cancellation; False otherwise.
+        """
+        if order_id.startswith("dry_"):
+            return True
+        if trader is None:
+            return False
+        try:
+            result = trader.cancel_order(order_id)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            logger.warning("Live cancel failed for %s: %s", order_id, exc)
+            return False
+        return result is True
+
     def cancel_quote(self, order_id: str, trader=None) -> bool:
         """Cancel a resting order.
 
         Args:
             order_id: Order ID to cancel.
-            trader: Platform-specific trader/client instance.
+            trader: Platform-specific trader/client instance. When provided,
+                the cancel is also sent to the exchange (live orders only).
 
         Returns:
             True if cancelled or already gone.
         """
+        if not self._cancel_on_exchange(order_id, trader):
+            return False
         with self._lock:
             if order_id in self._active_orders:
                 self._active_orders[order_id]["status"] = "cancelled"
@@ -271,6 +302,9 @@ class QuoteManager:
     def cancel_all(self, market_key: str = "", trader=None) -> int:
         """Cancel all active orders, optionally filtered by market.
 
+        When ``trader`` is provided, live orders are also cancelled on the
+        exchange (plan 10 side-finding 1).
+
         Returns number of orders cancelled.
         """
         with self._lock:
@@ -278,10 +312,14 @@ class QuoteManager:
                 oid for oid, info in self._active_orders.items()
                 if not market_key or info["market_key"] == market_key
             ]
-            for oid in to_cancel:
-                self._active_orders[oid]["status"] = "cancelled"
-                del self._active_orders[oid]
-            return len(to_cancel)
+        cancelled = []
+        for oid in to_cancel:
+            if self._cancel_on_exchange(oid, trader):
+                cancelled.append(oid)
+        with self._lock:
+            for oid in cancelled:
+                self._active_orders.pop(oid, None)
+        return len(cancelled)
 
     def get_active_orders(self, market_key: str = "") -> list[dict]:
         """Get all active orders, optionally filtered by market."""
@@ -561,10 +599,16 @@ class MarketMaker:
 
         return opportunities
 
-    def stop(self) -> None:
-        """Stop market making — cancel all outstanding quotes."""
+    def stop(self, trader=None) -> None:
+        """Stop market making — cancel all outstanding quotes.
+
+        Args:
+            trader: Optional platform client; when provided, live resting
+                orders are cancelled on the exchange too, not just in the
+                local dict (plan 10 side-finding 1).
+        """
         self._running = False
-        cancelled = self.quote_manager.cancel_all()
+        cancelled = self.quote_manager.cancel_all(trader=trader)
         logger.info("MM stopped: cancelled %d outstanding quotes", cancelled)
 
     def get_status(self) -> dict:
@@ -624,7 +668,18 @@ class CrossPlatformMaker:
         self.auto_hedge_enabled = auto_hedge_enabled
         self.dry_run = dry_run
         self._pairs: dict[str, dict] = {}
+        self._traders: dict[str, object] = {}
         self._lock = threading.Lock()
+
+    def _cancel_market_orders(self, market_key: str) -> bool:
+        """Cancel tracked legs without forgetting unconfirmed live orders."""
+        all_cancelled = True
+        for order in self.quote_manager.get_active_orders(market_key):
+            trader = (None if self.dry_run
+                      else self._traders.get(order["platform"]))
+            if not self.quote_manager.cancel_quote(order["order_id"], trader):
+                all_cancelled = False
+        return all_cancelled
 
     def add_pair(
         self,
@@ -650,7 +705,10 @@ class CrossPlatformMaker:
 
     def remove_pair(self, market_key: str) -> None:
         """Stop quoting a paired market; cancel any open legs."""
-        self.quote_manager.cancel_all(market_key)
+        if not self._cancel_market_orders(market_key):
+            logger.warning("CrossPlatformMM retained pair %s because one or "
+                           "more live cancels were unconfirmed", market_key)
+            return
         with self._lock:
             self._pairs.pop(market_key, None)
 
@@ -676,6 +734,8 @@ class CrossPlatformMaker:
                 Pass ``None`` (default) for dry-run.
         """
         traders = traders or {}
+        if not self.dry_run:
+            self._traders.update(traders)
         with self._lock:
             pairs = dict(self._pairs)
         if market_key:
@@ -691,7 +751,10 @@ class CrossPlatformMaker:
             quotes_b = self.quote_engine.calculate_quotes(
                 pair["mid_b"], inv_b, self.max_inventory)
 
-            self.quote_manager.cancel_all(mk)
+            if not self._cancel_market_orders(mk):
+                logger.warning("CrossPlatformMM skipped refresh for %s because "
+                               "a prior live order remains unconfirmed", mk)
+                continue
 
             trader_a = traders.get(pair["platform_a"]) if not self.dry_run else None
             trader_b = traders.get(pair["platform_b"]) if not self.dry_run else None
@@ -745,10 +808,12 @@ class CrossPlatformMaker:
 
         self.quote_manager.record_fill(order_id, size, price)
 
-        # Cancel the sibling leg so we don't accidentally double-fill
-        for other in self.quote_manager.get_active_orders(market_key):
-            if other["order_id"] != order_id:
-                self.quote_manager.cancel_quote(other["order_id"])
+        # Cancel every residual leg (including a partially-filled source
+        # order) so we do not accidentally double-fill. Missing traders or
+        # failed venue cancels retain local truth for retry/escalation.
+        if not self._cancel_market_orders(market_key):
+            logger.error("CrossPlatformMM fill left one or more unconfirmed "
+                         "live orders for %s", market_key)
 
         logger.info(
             "CrossPlatformMM fill: %s %s %s @ %.4f ($%.2f) | inv_a=%.2f inv_b=%.2f",
@@ -1033,7 +1098,7 @@ class KalshiRewardTracker:
         avg_spread = sum(o["spread"] for o in orders) / len(orders) if orders else 0
 
         # Estimate: reward ∝ resting_time * (1 - spread_tightness)
-        estimated_daily = (total_resting / 86400) * (1 - avg_spread * 100) * 0.50
+        estimated_daily = (total_resting / 86400) * (1 - avg_spread) * 0.50
         return max(0.0, estimated_daily)
 
 
@@ -1109,6 +1174,21 @@ class VolatilityTracker:
             mean_return = sum(returns) / len(returns)
             variance = sum((r - mean_return) ** 2 for r in returns) / len(returns)
             return variance ** 0.5
+
+    def has_min_samples(self, market_key: str) -> bool:
+        """True once enough price samples exist for a trustworthy reading.
+
+        ``get_volatility`` returns 0.0 (interpreted by callers as "calm")
+        both when a market is genuinely calm AND when there simply isn't
+        enough data yet (fewer than ``min_samples`` observations) — those
+        are not the same thing. A safety gate that treats "unknown" as
+        "calmest possible" during warm-up would let a fast-moving market
+        quote at the base spread before there is any data to judge it by.
+        Callers that must fail closed on "unknown" (e.g. the MM pilot's G8
+        volatility ceiling) check this before trusting the multiplier.
+        """
+        with self._lock:
+            return len(self._prices.get(market_key, [])) >= self.min_samples
 
     def get_spread_multiplier(
         self,

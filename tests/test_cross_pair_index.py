@@ -260,6 +260,27 @@ class TestEvaluate:
         assert opp["_source"] == "ws_cross_pair"
         assert opp["_layer"] == 1
 
+    def test_accepts_normalized_string_asks_and_ignores_raw_ladders(self):
+        idx = CrossPairIndex()
+        now = time.time()
+        cache = {
+            ("polymarket", "TY1"): {"_ts": now, "best_ask": "0.30", "price": "0.29"},
+            ("polymarket", "TN1"): {"_ts": now, "best_ask": "0.80", "price": "0.79"},
+            ("kalshi", "KSH1"): {
+                "_ts": now,
+                "yes": [[20, 5]],
+                "no": [[70, 5]],
+                "yes_ask": "0.31",
+                "no_ask": "0.30",
+            },
+        }
+
+        opp = idx.evaluate(_make_pair(), cache, min_profit=0.01)
+
+        assert opp is not None
+        assert opp["type"] == "Cross(PM_YES + K_NO)"
+        assert opp["prices"] == "PM_Y=0.300 K_N=0.300"
+
     def test_no_arb_when_prices_too_close_to_one(self):
         idx = CrossPairIndex()
         cache = {}

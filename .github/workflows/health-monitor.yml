@@ -1,0 +1,83 @@
+name: health-monitor
+
+# External uptime monitor for the Railway deployment — detection independent
+# of the process itself (Reliability Gate, defense layer 2). Pages Slack when
+# /status is unreachable or the Kalshi client has dropped out of the
+# authenticated set. Feed-level degradation alerts come from inside the bot
+# (FeedHealthTracker); this catches the cases where the bot itself can't tell us.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe /status
+        id: probe
+        env:
+          DASHBOARD_USER: ${{ secrets.DASHBOARD_USER }}
+          DASHBOARD_PASS: ${{ secrets.DASHBOARD_PASS }}
+        run: |
+          set +e
+          code=$(curl -s -o status.json -w "%{http_code}" --max-time 30 \
+            -u "${DASHBOARD_USER}:${DASHBOARD_PASS}" \
+            "https://arb-scanner-production.up.railway.app/status")
+          echo "http_code=${code}" >> "$GITHUB_OUTPUT"
+
+          problem=""
+          if [ "$code" != "200" ]; then
+            problem="/status returned HTTP ${code:-000} (bot down, dashboard dead, or auth broken)"
+          elif ! jq -e 'type == "object"' status.json >/dev/null 2>&1; then
+            # Fail closed: /status serves state.to_dict() as JSON — a 200
+            # with a non-object body violates the endpoint contract.
+            problem="/status returned 200 but the body is not a JSON object"
+          else
+            # kalshi is the enabled execution platform: it must be in the
+            # authenticated client set. platform_health may be absent on
+            # builds predating the detection layer — treat absent as OK.
+            # NOTE: jq's // would collapse false/null to the default, so
+            # membership is tested explicitly with has().
+            kalshi=$(jq -r 'if (.platform_health.clients? | type) == "object" and (.platform_health.clients | has("kalshi")) then (.platform_health.clients.kalshi | tostring) else "absent" end' status.json 2>/dev/null)
+            if [ "$kalshi" = "false" ] || [ "$kalshi" = "null" ]; then
+              problem="Kalshi client is NOT authenticated (self-heal not recovering?)"
+            fi
+            unhealthy=$(jq -r '[.platform_health.feeds // {} | to_entries[] | select(.value.healthy == false) | .key] | join(", ")' status.json 2>/dev/null)
+            if [ -n "$unhealthy" ] && [ "$unhealthy" != "" ]; then
+              # Feed outages already alert from inside the bot; include as
+              # context only when we are alerting anyway, or if >1 feed is
+              # dark (bot-side alerting itself may be broken).
+              feeds_dark=$(jq -r '[.platform_health.feeds // {} | to_entries[] | select(.value.healthy == false)] | length' status.json 2>/dev/null)
+              if [ "${feeds_dark:-0}" -gt 1 ]; then
+                problem="${problem:+$problem; }multiple WS feeds dark: ${unhealthy}"
+              fi
+            fi
+          fi
+          echo "problem=${problem}" >> "$GITHUB_OUTPUT"
+
+      - name: Alert Slack on failure
+        if: steps.probe.outputs.problem != ''
+        env:
+          WEBHOOK: ${{ secrets.MONITOR_SLACK_WEBHOOK }}
+          PROBLEM: ${{ steps.probe.outputs.problem }}
+        run: |
+          if [ -z "$WEBHOOK" ]; then
+            echo "::warning::MONITOR_SLACK_WEBHOOK secret is not set — no Slack alert sent"
+            exit 0
+          fi
+          payload=$(jq -n --arg text ":rotating_light: arbgrid external monitor: ${PROBLEM} — https://arb-scanner-production.up.railway.app/status" '{text: $text}')
+          if ! curl -sf --max-time 15 -X POST -H "Content-Type: application/json" \
+            -d "$payload" "$WEBHOOK" > /dev/null; then
+            echo "::warning::Slack alert delivery FAILED — health problem was: ${PROBLEM}"
+          fi
+
+      - name: Fail job on problem (visible in Actions history)
+        if: steps.probe.outputs.problem != ''
+        run: |
+          echo "::error::${{ steps.probe.outputs.problem }}"
+          exit 1

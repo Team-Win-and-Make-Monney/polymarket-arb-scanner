@@ -249,3 +249,60 @@ class TestEdgeCases:
             raise RuntimeError("CLOB down")
         out = _refine([opp], fetch_clob=boom, min_liquidity=10)
         assert out == []
+
+
+# ---------------------------------------------------------------------------
+# Long/short vs a/b orientation (audit #77)
+# ---------------------------------------------------------------------------
+
+
+class TestSwappedLegOrientation:
+    """Stage 1 assigns market B as the long leg when B is underpriced.
+
+    The pre-fetch used to key ``_long_market`` under ``_market_key_a`` and
+    ``_short_market`` under ``_market_key_b`` unconditionally, so when B was
+    the long leg the two books were swapped at lookup time. Fetch tasks must
+    be keyed by the long/short mapping, not a/b.
+    """
+
+    def _make_swapped_opp(self):
+        """Opp where market B is the LONG leg (B was underpriced)."""
+        return {
+            "type": "Correlated",
+            "_layer": 4,
+            "market": "A vs B",
+            "_long_leg": "mkt-b",
+            "_long_leg_name": "B",
+            "_long_price": 0.40,
+            "_short_leg": "mkt-a",
+            "_short_leg_name": "A",
+            "_short_price": 0.55,
+            "spread": abs(0.55 - 0.40) / 0.55,
+            "_token_ids_a": ["tok_a_yes", "tok_a_no"],
+            "_token_ids_b": ["tok_b_yes", "tok_b_no"],
+            "_market_key_a": "mkt-a",
+            "_market_key_b": "mkt-b",
+            "_pair_source": "manual",
+            "_long_market": {"id": "mkt-b", "clobTokenIds": '["tok_b_yes","tok_b_no"]'},
+            "_short_market": {"id": "mkt-a", "clobTokenIds": '["tok_a_yes","tok_a_no"]'},
+        }
+
+    def test_books_not_swapped_when_b_is_long(self):
+        opp = self._make_swapped_opp()
+        # Long (B) book: ask available, bid missing. Short (A) book: bid
+        # available, ask missing. If the books get swapped, the long leg has
+        # no ask and the short leg no bid -> the opp is wrongly dropped.
+        fetch = _fake_fetch({
+            "mkt-b": _book(ask=0.41, bid=None, ask_size=300.0),
+            "mkt-a": _book(ask=None, bid=0.54, bid_size=250.0),
+        })
+        out = _refine(
+            [opp], fetch_clob=fetch,
+            min_liquidity=10, max_spread_collapse=0.50,
+        )
+        assert len(out) == 1
+        r = out[0]
+        assert r["_long_ask"] == 0.41   # from market B's book (the long leg)
+        assert r["_short_bid"] == 0.54  # from market A's book (the short leg)
+        assert r["_long_depth"] == 300.0
+        assert r["_short_depth"] == 250.0

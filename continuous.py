@@ -1,25 +1,27 @@
 """Continuous mode: periodic re-scans with WebSocket feeds, settlement, and dashboard updates."""
 
-from sentry_init import init_sentry
+from sentry_init import init_sentry, capture_scan_heartbeat
 init_sentry()
 
 import asyncio
 import json
 import logging
+import math
 import os
 import signal
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from polymarket_api import fetch_all_markets, fetch_events
-from ws_feeds import FeedManager
+from polymarket_api import fetch_all_markets, fetch_events, fetch_reward_markets
+from ws_feeds import FeedManager, get_feed_health_tracker
 from db import TradeDB
 from display import display_results
 from dashboard import state as dashboard_state
 from recovery import reconcile_orphaned_positions
 from scripts.analytics import get_strategy_metrics
 from credential_health import CredentialHealthChecker
+from kalshi_api import build_client_from_env, kalshi_creds_configured
 from fees import (
     net_profit_binary_internal,
     net_profit_negrisk_internal,
@@ -35,6 +37,7 @@ from config import (
     WS_SUBSCRIPTION_LIMIT as CONFIG_WS_SUBSCRIPTION_LIMIT,
     WS_TRIGGER_ENABLED as CONFIG_WS_TRIGGER_ENABLED,
     WS_TRIGGER_THRESHOLD as CONFIG_WS_TRIGGER_THRESHOLD,
+    WS_TRIGGER_DEDUPE_SECONDS as CONFIG_WS_TRIGGER_DEDUPE_SECONDS,
     HEDGE_ENABLED as CONFIG_HEDGE_ENABLED,
     SNAPSHOT_ENABLED as CONFIG_SNAPSHOT_ENABLED,
     SNAPSHOT_INTERVAL as CONFIG_SNAPSHOT_INTERVAL,
@@ -43,6 +46,15 @@ from config import (
     WS_STALE_FEED_SECONDS as CONFIG_WS_STALE_FEED_SECONDS,
     REWARDS_ENABLED as CONFIG_REWARDS_ENABLED,
     REWARDS_POLL_INTERVAL as CONFIG_REWARDS_POLL_INTERVAL,
+    KALSHI_LIP_ENABLED as CONFIG_KALSHI_LIP_ENABLED,
+    KALSHI_VIP_TRACK_ENABLED as CONFIG_KALSHI_VIP_TRACK_ENABLED,
+    KALSHI_VIP_POLL_INTERVAL as CONFIG_KALSHI_VIP_POLL_INTERVAL,
+    IMBALANCE_ENABLED as CONFIG_IMBALANCE_ENABLED,
+    NEWS_SNIPE_ENABLED as CONFIG_NEWS_SNIPE_ENABLED,
+    CORRELATED_ENABLED as CONFIG_CORRELATED_ENABLED,
+    TIME_DECAY_ENABLED as CONFIG_TIME_DECAY_ENABLED,
+    polymarket_scan_enabled,
+    polymarket_reward_fetch_enabled,
 )
 
 # Conditional metrics import — never breaks if metrics.py is missing
@@ -66,8 +78,7 @@ from scans import (
     scan_betfair_backlay,
     scan_smarkets_backall,
     scan_smarkets_backlay,
-    scan_sxbet_backall,
-    scan_sxbet_backlay,
+    scan_sxbet,
     scan_matchbook_backall,
     scan_matchbook_backlay,
     scan_gemini_binary,
@@ -96,6 +107,117 @@ from scans.time_decay import scan_time_decay
 logger = logging.getLogger(__name__)
 
 
+def _wake_asyncio_selector(loop, event) -> bool:
+    """Wake a running asyncio selector without replacing OS signal handlers."""
+    if loop is None:
+        return False
+    try:
+        loop.call_soon_threadsafe(event.set)
+    except RuntimeError:
+        # The loop may already be closed during repeated shutdown signals.
+        return False
+    return True
+
+
+def _is_execution_eligible(opp: dict) -> bool:
+    """Return whether an opportunity may enter any execution path."""
+    return opp.get("_execution_eligible", True) is not False
+
+
+def _cache_probability(entry: dict | None, *keys: str) -> float | None:
+    """Return the first scalar 0..1 probability from a WS cache entry."""
+    if not entry:
+        return None
+    for key in keys:
+        value = entry.get(key)
+        if value is None or isinstance(value, (dict, list, tuple)):
+            continue
+        try:
+            probability = float(value)
+        except (TypeError, ValueError):
+            continue
+        if 0.0 <= probability <= 1.0:
+            return probability
+    return None
+
+
+def _ws_tracking_probability(platform: str, entry: dict | None) -> float | None:
+    """Extract one executable scalar probability for WS-driven trackers."""
+    if platform == "polymarket":
+        return _cache_probability(entry, "best_ask", "ask", "price")
+    if platform == "kalshi":
+        return _cache_probability(
+            entry,
+            "yes_ask", "yes_price", "yes",
+            "no_ask", "no_price", "no",
+            "price",
+        )
+    return _cache_probability(entry, "price", "yes_price", "yes")
+
+
+def _ws_opportunity_probability(opp: dict, platform: str, entry: dict | None) -> float | None:
+    """Extract the executable WS price for the opportunity's platform side."""
+    if platform != "kalshi":
+        return _ws_tracking_probability(platform, entry)
+
+    side = None
+    if opp.get("_platform_a") == "kalshi":
+        side = opp.get("_side_a")
+    elif opp.get("_platform_b") == "kalshi":
+        side = opp.get("_side_b")
+
+    if side is None:
+        opp_type = opp.get("type", "").upper()
+        if "K_NO" in opp_type:
+            side = "no"
+        elif "K_YES" in opp_type:
+            side = "yes"
+
+    if side == "no":
+        return _cache_probability(entry, "no_ask", "no_price", "no")
+    return _cache_probability(entry, "yes_ask", "yes_price", "yes", "price")
+
+
+class _WSTriggerDeduper:
+    """Thread-safe short cooldown for identical WS-triggered opportunities."""
+
+    def __init__(self, cooldown_seconds: float):
+        self.cooldown_seconds = max(0.0, float(cooldown_seconds))
+        self._last_queued: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _key(opp: dict) -> str:
+        market_key = (
+            opp.get("_market_key")
+            or opp.get("_kalshi_ticker")
+            or opp.get("market", "?")
+        )
+        return f"{opp.get('_source', '')}:{opp.get('type', '')}:{market_key}"
+
+    def admit(self, opp: dict, now: float | None = None) -> bool:
+        """Claim a cooldown slot, returning False for a recent duplicate."""
+        now = time.monotonic() if now is None else now
+        key = self._key(opp)
+        with self._lock:
+            if now - self._last_queued.get(key, float("-inf")) < self.cooldown_seconds:
+                return False
+            self._last_queued[key] = now
+            if len(self._last_queued) > 10_000:
+                cutoff = now - max(self.cooldown_seconds * 2, 60.0)
+                self._last_queued = {
+                    existing_key: queued_at
+                    for existing_key, queued_at in self._last_queued.items()
+                    if queued_at >= cutoff
+                }
+            return True
+
+    def forget(self, opp: dict) -> None:
+        """Release a claim when queue insertion fails."""
+        with self._lock:
+            self._last_queued.pop(self._key(opp), None)
+
+
 class OpportunityIndex:
     """Maps (platform, ticker/token) to opportunities for fast lookup on WS updates."""
 
@@ -107,6 +229,8 @@ class OpportunityIndex:
         """Rebuild the index from a list of opportunities."""
         new_index: dict[tuple[str, str], list[dict]] = {}
         for opp in opportunities:
+            if not _is_execution_eligible(opp):
+                continue
             keys = self._extract_keys(opp)
             for key in keys:
                 new_index.setdefault(key, []).append(opp)
@@ -231,6 +355,130 @@ def _leg_won(trade_side: str, winning_side: str) -> bool:
     return aliases is not None and ts in aliases
 
 
+# Venue sizing semantics, verified against executor._execute_single_leg:
+# - SHARES: Polymarket passes `size` straight to PolymarketTrader.place_order,
+#   whose `size` parameter is the number of shares.
+# - DOLLAR->CONTRACTS: Kalshi (count=max(1,int(size/price))), Smarkets,
+#   SX Bet, Gemini, IBKR (quantity=max(1,int(size/price))) convert the
+#   requested dollar size to an integer contract count at the order price.
+# - STAKE: Betfair (limitOrder size=round(size,2) at decimal odds 1/price)
+#   and Matchbook (stake=round(size,2) at decimal odds 1/price) place the
+#   dollar STAKE directly; a winning back bet returns stake/price
+#   (= stake/price one-dollar contracts), a losing one forfeits the stake.
+_SHARE_SIZED_VENUES = frozenset({"polymarket"})
+_DOLLAR_CONTRACT_VENUES = frozenset({"kalshi", "smarkets", "sxbet", "gemini", "ibkr"})
+_STAKE_SIZED_VENUES = frozenset({"betfair", "matchbook"})
+
+
+def _money_valid(value) -> bool:
+    """Return whether a value is valid positive money data.
+
+    bool is an int subclass, and NaN/inf pass isinstance checks — all three
+    must be rejected before a value can price a P&L leg.
+
+    Args:
+        value: Candidate numeric value.
+
+    Returns:
+        True only for finite, positive, non-boolean numbers.
+    """
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value > 0)
+
+
+def _leg_contracts_and_cost(trade: dict) -> tuple[float, float] | None:
+    """Return (contracts, dollar_cost) for one trade leg, venue-aware.
+
+    FAIL-CLOSED: this feeds realized P&L and therefore the daily-loss halt.
+    An unknown/missing venue or malformed money data (missing, zero,
+    negative, NaN or infinite price/fill/size) must never silently produce
+    an optimistic number:
+
+    - When the recorded size is valid but the prices are not, we take the
+      WORST CASE — zero payout, the venue-consistent worst dollar cost lost
+      (shares are capped at $1/share on Polymarket, stake venues lose the
+      rounded stake, dollar venues lose the dollar size) — so the halt can
+      only over-trigger, never under-trigger.
+    - When the size itself is invalid the leg cannot be priced at all;
+      return ``None`` so the caller can refuse to produce a realized number
+      from garbage instead of falling back to expected profit.
+
+    Args:
+        trade: Persisted trade row. Polymarket records shares, Betfair and
+            Matchbook record stake, and the remaining supported venues record
+            a requested dollar amount converted to integer contracts.
+
+    Returns:
+        ``(contracts, dollar_cost)`` when the leg can be conservatively priced,
+        otherwise ``None`` when even a safe dollar cost cannot be derived.
+    """
+    platform = (trade.get("platform") or "").lower()
+    price = trade.get("price")
+    fill = trade.get("fill_price")
+    if fill is None:  # explicit None check — a recorded zero fill is NOT a
+        fill = price  # missing fill, it is invalid money data (rejected below)
+    size = trade.get("size")
+
+    def _log_fail(reason: str, worst_cost: float | None) -> None:
+        logger.error(
+            "P&L fail-closed: %s (trade id=%s platform=%r price=%r fill=%r "
+            "size=%r) — %s.",
+            reason, trade.get("id"), trade.get("platform"), price,
+            trade.get("fill_price"), size,
+            ("leg unpriceable, refusing realized P&L from garbage data"
+             if worst_cost is None
+             else f"assuming worst case: ${worst_cost:.2f} lost, zero payout"),
+        )
+
+    def _worst_case(reason: str) -> tuple[float, float] | None:
+        # Conservative direction: zero payout, full cost lost, in the USD
+        # unit the venue actually recorded (`size` is SHARES on Polymarket,
+        # a dollar STAKE on Betfair/Matchbook, dollars elsewhere).
+        if not _money_valid(size):
+            _log_fail(reason, None)
+            return None
+        safe_fill = fill if _money_valid(fill) else None
+        if platform in _SHARE_SIZED_VENUES:
+            # Shares cost at most $1/share; use the fill when it's usable.
+            worst_cost = (safe_fill * size) if safe_fill is not None else float(size)
+        elif platform in _STAKE_SIZED_VENUES:
+            worst_cost = round(size, 2)  # mirrors round(size, 2) at placement
+        elif platform in _DOLLAR_CONTRACT_VENUES:
+            worst_cost = float(size)
+        else:
+            # Unknown venue: sizing semantics unknown, take the largest
+            # plausible interpretation (dollar size vs shares * fill).
+            worst_cost = max(float(size), (safe_fill or 0.0) * size)
+        _log_fail(reason, worst_cost)
+        return 0.0, worst_cost
+
+    if not _money_valid(size):
+        _log_fail("missing or invalid trade size", None)
+        return None
+
+    if platform in _SHARE_SIZED_VENUES:
+        if not _money_valid(fill):
+            return _worst_case("missing or invalid fill/order price")
+        return float(size), fill * size
+
+    if platform in _DOLLAR_CONTRACT_VENUES:
+        if not _money_valid(price) or not _money_valid(fill):
+            return _worst_case("missing or invalid fill/order price")
+        # Mirror the executor's dollars -> integer-contracts conversion.
+        contracts = float(max(1, int(size / price)))
+        return contracts, contracts * fill
+
+    if platform in _STAKE_SIZED_VENUES:
+        stake = round(size, 2)  # mirrors round(size, 2) at placement
+        if not _money_valid(fill):
+            return _worst_case("missing or invalid fill/order price")
+        # Back bet: stake at decimal odds 1/fill returns stake/fill if it
+        # wins — equivalent to stake/fill one-dollar contracts.
+        return stake / fill, stake
+
+    return _worst_case(f"unknown venue {platform!r}")
+
+
 def _calc_realized_pnl(db: TradeDB, pos: dict, winning_side: str | None = None) -> float:
     """Calculate realized P&L from actual fill prices in the trades table.
 
@@ -245,32 +493,88 @@ def _calc_realized_pnl(db: TradeDB, pos: dict, winning_side: str | None = None) 
 
     Returns:
         Realized P&L in USD. Falls back to expected_pnl when no trade data is
-        available. When winning_side is None, assumes an arbitrage payout of
-        $1 (correct for Binary/NegRisk/Cross/etc. where one side guaranteed
-        wins, INCORRECT for losing directional bets).
+        available. When winning_side is None, assumes an arbitrage payout:
+        the winning leg pays $1/contract, so guaranteed payout is the minimum
+        contract count across legs (correct for Binary/NegRisk/Cross/etc.
+        where one side guaranteed wins, INCORRECT for losing directional
+        bets — pass winning_side for those).
+
+    Note:
+        Contract counts and dollar costs are derived per venue by
+        ``_leg_contracts_and_cost`` — Polymarket logs ``size`` in SHARES,
+        Betfair and Matchbook log a dollar STAKE, and the remaining supported
+        venues log a requested DOLLAR size converted to contracts via
+        ``max(1, int(size / price))``.
     """
     trades = db.get_trades_for_opportunity(pos["opportunity_id"])
     if not trades:
         return pos.get("expected_pnl", 0)
-    total_fill_cost = sum(
-        (t.get("fill_price") or t["price"]) * t["size"] for t in trades
-    )
-    if total_fill_cost <= 0:
+
+    # Realized P&L is based only on confirmed venue fills. Pending, aborted,
+    # failed, cancelled, dry-run, and orphaned rows are not executed legs and
+    # must not affect settlement. If no confirmed fills remain, preserve the
+    # expected-P&L fallback for legacy/incomplete records.
+    trades = [t for t in trades if (t.get("status") or "").lower() == "filled"]
+    if not trades:
         return pos.get("expected_pnl", 0)
 
-    if winning_side is None:
-        # Arbitrage assumption: exactly one side pays $1 total payout.
-        return 1.0 - total_fill_cost
-
-    # Per-leg payout based on resolved outcome.
-    total_payout = 0.0
+    legs: list[tuple[tuple[float, float], dict]] = []
+    invalid = False
     for t in trades:
-        if not _leg_won(t.get("side", ""), winning_side):
+        # Prefer an explicitly persisted executed size when a venue supports
+        # partial fills; otherwise the confirmed row's requested size is the
+        # executor's current full-fill representation.
+        trade = dict(t)
+        if _money_valid(t.get("executed_size")):
+            trade["size"] = t["executed_size"]
+        priced = _leg_contracts_and_cost(trade)
+        if priced is None:
+            invalid = True
             continue
-        fill = t.get("fill_price") or t["price"]
-        if fill > 0:
-            contracts = t["size"] / fill
-            total_payout += contracts  # $1 per winning contract
+        legs.append((priced, trade))
+
+    total_fill_cost = sum(cost for (_, cost), _t in legs)
+
+    if invalid:
+        # Garbage money data on at least one live leg: refuse to synthesize
+        # a payout, and NEVER fall back to (typically positive) expected
+        # profit — report the known cost as lost so the halt over-triggers.
+        logger.error(
+            "Realized P&L fail-closed for opportunity %s: unpriceable trade "
+            "leg(s); reporting -$%.2f (known cost, zero payout).",
+            pos.get("opportunity_id"), total_fill_cost,
+        )
+        expected = pos.get("expected_pnl", 0)
+        expected_loss = (
+            abs(float(expected))
+            if isinstance(expected, (int, float))
+            and not isinstance(expected, bool)
+            and math.isfinite(expected)
+            else 0.0
+        )
+        return -max(total_fill_cost, expected_loss)
+
+    if winning_side is None:
+        # Arbitrage assumption: exactly one leg settles at $1 per contract.
+        # Guaranteed payout = min contracts across legs (whichever leg wins,
+        # at least that many contracts pay out).
+        contracts_per_leg = [contracts for (contracts, _), _t in legs]
+        return min(contracts_per_leg) - total_fill_cost
+
+    # Per-leg payout based on resolved outcome. The traded outcome
+    # (yes/no/...) is persisted separately from the execution side because
+    # Polymarket BUY_NO legs are logged with side="BUY"; fall back to side
+    # for legacy rows and venues whose side IS the outcome.
+    total_payout = 0.0
+    for (contracts, _cost), t in legs:
+        trade_side = (
+            t.get("outcome")
+            if (t.get("platform") or "").lower() == "polymarket"
+            else t.get("side")
+        )
+        if not _leg_won(trade_side or t.get("side") or "", winning_side):
+            continue
+        total_payout += contracts  # $1 per winning contract
     return total_payout - total_fill_cost
 
 
@@ -459,8 +763,9 @@ def _recalc_profit(opp: dict, platform: str, ticker: str, new_price: float, pric
                     prices.append(new_price)
                 else:
                     cached = price_cache.get((platform, tid))
-                    if cached and cached.get("price") is not None:
-                        prices.append(cached["price"])
+                    cached_ask = _cache_probability(cached, "best_ask", "ask", "price")
+                    if cached_ask is not None:
+                        prices.append(cached_ask)
                     else:
                         return None
             result = net_profit_binary_internal(prices[0], prices[1])
@@ -475,8 +780,9 @@ def _recalc_profit(opp: dict, platform: str, ticker: str, new_price: float, pric
                     prices.append(new_price)
                 else:
                     cached = price_cache.get((platform, tid))
-                    if cached and cached.get("price") is not None:
-                        prices.append(cached["price"])
+                    cached_ask = _cache_probability(cached, "best_ask", "ask", "price")
+                    if cached_ask is not None:
+                        prices.append(cached_ask)
                     else:
                         return None
             result = net_profit_negrisk_internal(prices)
@@ -486,8 +792,12 @@ def _recalc_profit(opp: dict, platform: str, ticker: str, new_price: float, pric
             cached = price_cache.get(("kalshi", k_ticker))
             if not cached:
                 return None
-            k_yes = cached.get("yes_price", opp.get("_kalshi_yes"))
-            k_no = cached.get("no_price", opp.get("_kalshi_no"))
+            k_yes = _cache_probability(cached, "yes_ask", "yes_price", "yes")
+            k_no = _cache_probability(cached, "no_ask", "no_price", "no")
+            if k_yes is None:
+                k_yes = _cache_probability(opp, "_kalshi_yes")
+            if k_no is None:
+                k_no = _cache_probability(opp, "_kalshi_no")
             if k_yes is None or k_no is None:
                 return None
             result = net_profit_kalshi_binary(k_yes, k_no)
@@ -504,6 +814,8 @@ def _recalc_profit(opp: dict, platform: str, ticker: str, new_price: float, pric
             side_b = opp.get("_side_b", "no")
             if price_a is None or price_b is None or not pa or not pb:
                 return None
+            price_a = float(price_a)
+            price_b = float(price_b)
 
             # Determine which side the WS update applies to
             if platform == pa:
@@ -915,6 +1227,35 @@ def _scan_jev_crypto_continuous(
     )
 
 
+def heal_kalshi_client(executor, platform_clients, hedger, notifier):
+    """Attempt one Kalshi re-auth from env creds and rewire dependents.
+
+    Called from the continuous loop when the run started degraded (boot-time
+    auth failure, e.g. during Kalshi's daily maintenance window). On success
+    the executor, credential-health platform map, and hedger all receive the
+    fresh client so execution paths heal along with scanning.
+
+    Returns the authenticated client, or None if re-auth failed.
+    """
+    healed = build_client_from_env()
+    if healed is None:
+        logger.warning("Kalshi re-auth attempt failed — will retry on cooldown.")
+        return None
+    executor.kalshi_client = healed
+    platform_clients["kalshi"] = healed
+    if hedger is not None:
+        hedger.kalshi_client = healed
+    logger.warning("Kalshi authentication RESTORED — resuming Kalshi scans.")
+    if notifier:
+        try:
+            notifier.notify_text(
+                "arbgrid: Kalshi authentication restored — Kalshi and "
+                "cross-platform scanning resumed.")
+        except Exception as e:
+            logger.warning("Notifier failed on Kalshi-restore alert: %s", e)
+    return healed
+
+
 def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                    kalshi_private_key_path, executor, db, price_cache,
                    extra_clients=None, notifier=None, pm_trader=None,
@@ -951,10 +1292,37 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
     rescan_interval = getattr(args, 'interval', None) or CONFIG_RESCAN_INTERVAL
 
     shutdown_event = asyncio.Event()
+    _signal_loop = None
+
+    # Plan 10 / Codex round-2 finding #3: declared here (not later, where
+    # the MM pilot setup block used to create them) so the signal handler
+    # below can reference _mm_pilot_stop unconditionally and safely —
+    # these three names always exist in this scope regardless of whether
+    # MM_KALSHI_PILOT_ENABLED ever turns them into a running pilot.
+    _mm_pilot = None
+    _mm_pilot_thread = None
+    _mm_pilot_stop = threading.Event()
 
     def _signal_handler(sig, frame):
-        logger.info("Shutting down gracefully...")
+        # Signal handlers must only perform async-signal-safe state changes.
+        # Logging can re-enter a handler while its buffered stream is flushing,
+        # raising RuntimeError during the very shutdown path that must stay safe.
         shutdown_event.set()
+        # Signal the MM pilot to stop IMMEDIATELY, not only via the
+        # end-of-cycle cleanup path (further down this function, which
+        # only runs after the CURRENT scan cycle finishes). A long
+        # synchronous scan cycle, or a hard kill before cleanup completes,
+        # could otherwise leave live GTC orders resting on Kalshi with
+        # nothing cancelling them for however long that cycle takes. The
+        # pilot's own run_loop polls this event every ~0.5s and cancels
+        # all resting orders via stop() as soon as it notices — idempotent
+        # and safe to set here even when the pilot was never enabled.
+        _mm_pilot_stop.set()
+        # Keep the direct ``signal.signal`` path above so the pilot stop flag
+        # is asserted even while the event loop is inside synchronous work.
+        # Then wake asyncio's selector through its self-pipe so the outer loop
+        # enters cleanup immediately instead of sleeping until its timeout.
+        _wake_asyncio_selector(_signal_loop, shutdown_event)
 
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
@@ -962,6 +1330,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
     opp_index = OpportunityIndex()
     ws_trigger_enabled = CONFIG_WS_TRIGGER_ENABLED
     ws_trigger_threshold = CONFIG_WS_TRIGGER_THRESHOLD
+    ws_trigger_deduper = _WSTriggerDeduper(CONFIG_WS_TRIGGER_DEDUPE_SECONDS)
     ws_sub_limit = CONFIG_WS_SUBSCRIPTION_LIMIT
     _price_cache_lock = threading.Lock()
     _execution_semaphore = threading.Semaphore(CONFIG_MAX_CONCURRENT_WS_EXECUTIONS)
@@ -975,6 +1344,43 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
     cross_pair_index = CrossPairIndex()
     cross_pair_ws_enabled = os.getenv("CROSS_PAIR_WS_ENABLED", "true").lower() == "true"
     _cross_pair_min_profit_factor = float(os.getenv("CROSS_PAIR_WS_MIN_PROFIT_FACTOR", "1.0"))
+
+    # Cross-cycle Polymarket->Kalshi match cache for the convergence scan —
+    # titles are static, so fuzzy matching only runs for unseen markets and on
+    # a periodic full refresh instead of every cycle.
+    from scans.convergence_inputs import ConvergenceMatchCache
+    _convergence_match_cache = ConvergenceMatchCache(
+        refresh_interval=float(os.getenv("CONVERGENCE_REMATCH_INTERVAL", "1800")))
+
+    # Mirror paper opportunities to the shared Supabase ledger (durable,
+    # queryable off-box). Resumes from the remote high-water mark; a Supabase
+    # outage falls back to the local max so no historical backfill storms.
+    _opp_sync = None
+    _opp_sync_hwm = 0
+    _opp_sync_inflight = False
+    try:
+        from config import OPP_SYNC_ENABLED
+        if OPP_SYNC_ENABLED:
+            from supabase_sync import OpportunitySync, build_client_from_env
+            _opp_sync = OpportunitySync(build_client_from_env(), db=db)
+            from config import PAPER_WINDOW_START_TS as _pw_ts
+            _opp_sync_hwm = _opp_sync.get_remote_high_water_mark(window_start_ts=_pw_ts)
+            logger.info("Opportunity Supabase sync active (resuming after id %d)", _opp_sync_hwm)
+    except Exception as exc:
+        logger.warning("Opportunity Supabase sync init failed: %s", exc)
+
+    # Paper-trading window tracker: daily digest + one-time completion alert.
+    _paper_tracker = None
+    try:
+        from config import PAPER_WINDOW_START, PAPER_WINDOW_START_TS, PAPER_WINDOW_DAYS
+        if PAPER_WINDOW_START_TS and notifier:
+            from paper_record import PaperRecordTracker
+            _paper_tracker = PaperRecordTracker(
+                db, notifier, window_start=PAPER_WINDOW_START_TS, window_days=PAPER_WINDOW_DAYS)
+            logger.info("Paper-record tracker active: window %s + %d days",
+                        PAPER_WINDOW_START, PAPER_WINDOW_DAYS)
+    except Exception as exc:
+        logger.warning("Paper-record tracker init failed: %s", exc)
 
     # Initialize PriceTracker for stale price detection (Layer 2)
     _price_tracker = None
@@ -1006,34 +1412,166 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
     except Exception as exc:
         logger.debug("MarketMaker not available: %s", exc)
 
+    # Plan 10: Kalshi reward-MM pilot safety layer (docs/plans/10-mm-pilot-prep.md).
+    # Independently gated from the legacy MM_ENABLED path above. The pilot
+    # runs its own thread so the 2s fill poll / 10s quote refresh cadences
+    # are not tied to the scan interval. Fails closed at every gate.
+    # _mm_pilot / _mm_pilot_thread / _mm_pilot_stop are declared earlier in
+    # this function (with the signal handler) — not re-declared here.
+    if (config.MM_KALSHI_PILOT_ENABLED
+            and getattr(args, "mode", None) == "mm-pilot"):
+        try:
+            from mm_pilot import (
+                ControlsPoller,
+                KalshiMMPilot,
+                build_controls_client_from_env,
+            )
+            try:
+                from alerting import alert_manager as _pilot_alerts
+            except ImportError as exc:
+                logger.debug("MM pilot: alerting unavailable (%s) — "
+                             "halts will log but not page.", exc)
+                _pilot_alerts = None
+            _controls_client = None
+            try:
+                _controls_client = build_controls_client_from_env()
+            except Exception as exc:
+                logger.warning(
+                    "MM pilot: Supabase controls client unavailable (%s) — "
+                    "the kill-switch cache stays stale and the pilot fails "
+                    "closed (no quotes).", exc)
+            _mm_pilot = KalshiMMPilot(
+                kalshi_client=kalshi_client,
+                db=db,
+                alert_manager=_pilot_alerts,
+                controls=ControlsPoller(supabase_client=_controls_client),
+            )
+            # Market selection is PR #43's select_lip_markets — not this
+            # plan's job. Without it the pilot never receives a selection
+            # snapshot and gate G4 fails closed (no quotes are placed).
+            _mm_pilot_selection = None
+            try:
+                from scans.lip_select import select_lip_markets
+
+                def _mm_pilot_selection():
+                    markets = select_lip_markets(kalshi_client) or []
+                    return [
+                        m.get("ticker", "") if isinstance(m, dict) else str(m)
+                        for m in markets
+                    ]
+            except ImportError:
+                logger.warning(
+                    "MM pilot: scans.lip_select not available (PR #43 not "
+                    "landed) — no market selection; G4 fails closed.")
+            _mm_pilot_thread = threading.Thread(
+                target=_mm_pilot.run_loop,
+                args=(_mm_pilot_stop, _mm_pilot_selection),
+                name="mm-pilot",
+                daemon=True,
+            )
+            _mm_pilot_thread.start()
+            logger.info("Kalshi MM pilot started (dry_run=%s).",
+                        _mm_pilot.dry_run)
+        except Exception as exc:
+            logger.exception("MM pilot failed to start: %s", exc)
+            # If the failure landed after the thread started, signal it now
+            # so it cancels any resting orders and exits (fail closed).
+            _mm_pilot_stop.set()
+            thread_stopped = True
+            if _mm_pilot_thread is not None:
+                # Thread.start() itself can fail; only join a thread that
+                # actually started.
+                if _mm_pilot_thread.ident is not None:
+                    _mm_pilot_thread.join(timeout=15)
+                # Mirror the end-of-run cleanup path's force-stop symmetry
+                # (CodeRabbit round-2): a thread that started enough to
+                # place live orders but didn't unwind within the join
+                # timeout must still have those orders cancelled directly,
+                # and the stuck thread logged rather than silently dropped
+                # by clearing _mm_pilot/_mm_pilot_thread below.
+                if _mm_pilot_thread.is_alive() and _mm_pilot is not None:
+                    logger.warning(
+                        "MM pilot startup-failure thread did not stop in "
+                        "15s; forcing order cancel directly.")
+                    _mm_pilot.stop()
+                    _mm_pilot_thread.join(timeout=15)
+                thread_stopped = not _mm_pilot_thread.is_alive()
+            if thread_stopped:
+                _mm_pilot = None
+                _mm_pilot_thread = None
+            else:
+                logger.critical(
+                    "MM pilot startup-failure thread is still alive after "
+                    "stop/join; retaining references and keeping the stop "
+                    "signal asserted (fail closed).")
+
     # Initialize reward trackers for liquidity rewards (Layer 3)
     _reward_tracker = None
     _kalshi_reward_tracker = None
+    _kalshi_vip_tracker = None
     try:
         if CONFIG_REWARDS_ENABLED:
             from market_maker import RewardTracker, KalshiRewardTracker
             _reward_tracker = RewardTracker()
             _kalshi_reward_tracker = KalshiRewardTracker(db)
             logger.info("Reward trackers enabled in continuous mode.")
+        if CONFIG_KALSHI_VIP_TRACK_ENABLED and kalshi_client is not None:
+            from kalshi_vip import KalshiVipTracker
+            _kalshi_vip_tracker = KalshiVipTracker(kalshi_client)
+            logger.info("Kalshi VIP volume tracking enabled (tracking-only).")
+        if CONFIG_KALSHI_LIP_ENABLED:
+            logger.info("Kalshi LIP scoring enabled; resting-order scores accrue per period.")
     except Exception as exc:
         logger.debug("Reward trackers not available: %s", exc)
 
+    # Feed health tracking: WS messages feed the tracker; outage/recovery
+    # transitions alert via the notifier (the 07-23 incident ran 31h silent).
+    _feed_health = get_feed_health_tracker()
+
+    def _on_feed_health_change(platform: str, is_healthy: bool):
+        if is_healthy:
+            msg = "arbgrid: %s feed RECOVERED — full detection resumed." % platform
+        else:
+            msg = ("arbgrid: %s feed DEGRADED — no WS messages for >%.0fs; "
+                   "detection running blind on this venue." % (
+                       platform, config.API_OUTAGE_STALE_THRESHOLD))
+        logger.warning(msg)
+        if notifier:
+            # notify_text is a synchronous webhook POST — deliver off-thread
+            # so a slow Slack endpoint can't stall WS message processing or
+            # the event loop that invoked the health callback.
+            def _send(m=msg):
+                try:
+                    notifier.notify_text(m)
+                except Exception as e:
+                    logger.warning("Feed-health alert failed to send: %s", e)
+            threading.Thread(target=_send, name="feed-health-alert", daemon=True).start()
+
+    _feed_health.register_health_callback(_on_feed_health_change)
+
     def on_price_update(platform, ticker, data):
         data["_ts"] = time.time()
+        _feed_health.record_message(platform)
         with _price_cache_lock:
             price_cache[(platform, ticker)] = data
 
+        tracking_price = _ws_tracking_probability(platform, data)
+
         # Feed PriceTracker for stale price detection
-        if _price_tracker:
-            price_val = data.get("price") or data.get("yes") or data.get("yes_price")
-            if price_val is not None:
-                _price_tracker.update(platform, ticker, float(price_val))
+        if _price_tracker and tracking_price is not None:
+            _price_tracker.update(platform, ticker, tracking_price)
 
         # Update MarketMaker mid-price for registered markets
-        if _market_maker:
-            price_val = data.get("price") or data.get("yes") or data.get("yes_price")
-            if price_val is not None:
-                _market_maker.update_price(ticker, float(price_val))
+        if _market_maker and tracking_price is not None:
+            _market_maker.update_price(ticker, tracking_price)
+
+        # Plan 10: feed the Kalshi MM pilot's book freshness + VolatilityTracker
+        # with orderbook_delta ticks for subscribed pilot tickers.
+        if _mm_pilot and platform == "kalshi" and tracking_price is not None:
+            try:
+                _mm_pilot.on_ws_price(ticker, tracking_price)
+            except Exception as exc:
+                logger.debug("MM pilot WS feed failed: %s", exc)
 
         # Sprint 3: Feed VolatilityTracker + LeadLagMM with per-tick prices
         _feed_sprint3_trackers(platform, ticker, data)
@@ -1058,6 +1596,10 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                     continue
                 if _metrics:
                     _metrics.inc("cross_pair_eval_hits")
+                if not ws_trigger_deduper.admit(opp):
+                    if _metrics:
+                        _metrics.inc("cross_pair_trigger_duplicates")
+                    continue
                 market_name = opp.get("market", "?")
                 logger.info(
                     "WS Cross trigger: %s profit=$%.4f (%s)",
@@ -1074,6 +1616,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                     if _metrics:
                         _metrics.inc("cross_pair_triggers")
                 except Exception as exc:
+                    ws_trigger_deduper.forget(opp)
                     logger.debug("Cross priority push failed, skipping: %s", exc)
 
         # Event-driven execution: check if this update affects a tracked opportunity
@@ -1083,10 +1626,12 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
         if not affected:
             return
         for opp in affected:
+            if not _is_execution_eligible(opp):
+                continue
             # Recalculate profit using fresh WS price instead of stale value
             with _price_cache_lock:
                 cached = price_cache.get((platform, ticker), {})
-            new_price = cached.get("price")
+            new_price = _ws_opportunity_probability(opp, platform, cached)
             if new_price is None:
                 continue
             recalculated_profit = _recalc_profit(opp, platform, ticker, new_price, price_cache)
@@ -1097,6 +1642,8 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                 # Time-sensitive opps (stale, resolution) get higher priority (lower value = dequeues first)
                 opp_copy = dict(opp)
                 opp_copy["net_profit"] = profit
+                if not ws_trigger_deduper.admit(opp_copy):
+                    continue
                 priority = -_execution_priority(opp_copy)
                 seq = _seq_counter
                 _seq_counter += 1
@@ -1106,6 +1653,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                         _priority_queue.put((priority, seq, opp_copy)), loop
                     )
                 except Exception as exc:
+                    ws_trigger_deduper.forget(opp_copy)
                     # Fallback: execute directly if queue push fails
                     logger.debug("Priority queue push failed, executing directly: %s", exc)
                     if not _execution_semaphore.acquire(blocking=False):
@@ -1239,6 +1787,15 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
     # Remove None clients
     platform_clients = {k: v for k, v in platform_clients.items() if v is not None}
 
+    # Kalshi self-heal state: last re-auth attempt timestamp (cooldown-gated
+    # in the scan loop; see heal_kalshi_client). The alias is needed because
+    # `platform_clients` is shadowed by a triangular-scan local inside the loop.
+    _kalshi_reauth_last = 0.0
+    _health_platform_clients = platform_clients
+    # Latest measured credential-health results (platform -> bool), filled by
+    # _monitor_credential_health; consumed by the /status health publisher.
+    _cred_health_state: dict = {}
+
     health_checker = None
     if _alert_manager and platform_clients:
         from config import CREDENTIAL_HEALTH_CHECK_INTERVAL
@@ -1272,6 +1829,9 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                     continue
 
                 _priority_val, _seq, opp = item
+                if not _is_execution_eligible(opp):
+                    _priority_queue.task_done()
+                    continue
                 market_name = opp.get("market", "?")
                 profit = opp.get("net_profit", 0)
 
@@ -1328,6 +1888,35 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                 logger.warning("Feed staleness check failed: %s", e)
                 await asyncio.sleep(5)  # Retry after 5 seconds
 
+    async def _monitor_feed_health():
+        """Background task: evaluate feed outages every 30s.
+
+        check_outages() fires the registered degradation/recovery alerts and
+        its result is published to /status as per-platform health so the
+        external monitor can page on a degraded venue, not just a dead pod.
+        """
+        while not shutdown_event.is_set():
+            try:
+                outages = _feed_health.check_outages()
+                dashboard_state.platform_health = {
+                    "feeds": {
+                        p: {
+                            "healthy": not info["in_outage"],
+                            "last_message_ago_s": round(info["last_message_ago"], 1),
+                        }
+                        for p, info in outages.items()
+                    },
+                    # Measured credential health from the 30-min checker;
+                    # "unknown" until a platform's first check completes.
+                    "clients": {
+                        name: _cred_health_state.get(name, "unknown")
+                        for name in _health_platform_clients
+                    },
+                }
+            except Exception as e:
+                logger.warning("Feed health check failed: %s", e)
+            await asyncio.sleep(30)
+
     async def _monitor_credential_health():
         """Background task: check API credential health every 30 minutes.
 
@@ -1339,15 +1928,24 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                 if health_checker:
                     results = await health_checker.check_all_platforms()
                     logger.info("Credential health check complete: %s", results)
+                    if isinstance(results, dict):
+                        _cred_health_state.update(results)
                 await asyncio.sleep(1800)  # 30 minutes
             except Exception as e:
                 logger.warning("Credential health check failed: %s", e)
                 await asyncio.sleep(1800)  # Retry after 30 minutes
 
     async def _continuous_loop():
+        # Capture the running loop for the direct OS signal handler.  Its
+        # call_soon_threadsafe wakeup preserves immediate pilot cancellation
+        # while also interrupting a selector wait on macOS.
+        nonlocal _signal_loop, kalshi_client, _kalshi_reauth_last
+        _signal_loop = asyncio.get_running_loop()
+
         ws_task = None
         priority_consumer_task = None
         stale_monitor_task = None
+        feed_health_task = None
         health_monitor_task = None
         scan_count = 0
 
@@ -1357,6 +1955,10 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
 
         # Start feed staleness monitor as a background task
         stale_monitor_task = asyncio.create_task(_monitor_feed_staleness())
+
+        # Start feed health monitor (outage alerts + /status platform health)
+        feed_health_task = asyncio.create_task(_monitor_feed_health())
+        logger.info("Feed health monitor started.")
 
         # Start credential health monitor as a background task
         if health_checker:
@@ -1372,6 +1974,20 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
 
             _scan_start = time.time()
             _stage_timings: dict[str, float] = {}
+            _stage_display_start: float | None = None
+
+            # Self-heal a degraded Kalshi start (e.g. boot during the venue's
+            # daily maintenance window): re-auth on a cooldown until it works.
+            if (kalshi_client is None and kalshi_creds_configured()
+                    and _scan_start - _kalshi_reauth_last >= config.KALSHI_REAUTH_INTERVAL):
+                _kalshi_reauth_last = _scan_start
+                # Synchronous login can block up to ~30s on a dead venue —
+                # run it off the event loop so WS execution keeps moving.
+                healed = await asyncio.get_running_loop().run_in_executor(
+                    None, heal_kalshi_client,
+                    executor, _health_platform_clients, hedger, notifier)
+                if healed is not None:
+                    kalshi_client = healed
 
             # Daily reset for metrics and alert state
             nonlocal _last_daily_reset_date
@@ -1383,6 +1999,8 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                 if _alert_manager:
                     _alert_manager.reset_daily()
                 _last_daily_reset_date = _today
+                if _paper_tracker:
+                    _paper_tracker.on_day_boundary(time.time())
 
             try:
                 from concurrent.futures import ThreadPoolExecutor
@@ -1390,16 +2008,19 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                 # Stage 1: Fetch data from all platforms in parallel
                 poly_markets = []
                 poly_events = None
+                poly_reward_markets = []
                 kalshi_data = None
 
                 with _StageTimer("fetch", _stage_timings):
                     fetch_futures = {}
-                    with ThreadPoolExecutor(max_workers=3) as pool:
-                        if args.mode not in ("kalshi", "betfair", "smarkets", "sxbet", "matchbook", "gemini", "ibkr", "triangular"):
+                    with ThreadPoolExecutor(max_workers=4) as pool:
+                        if polymarket_scan_enabled(args.mode):
                             fetch_futures["poly_markets"] = pool.submit(fetch_all_markets)
-                        if args.mode in ("all", "negrisk", "multi-cross"):
+                        if polymarket_scan_enabled(args.mode) and args.mode in ("all", "negrisk", "multi-cross"):
                             fetch_futures["poly_events"] = pool.submit(fetch_events)
-                        if args.mode in ("all", "kalshi", "cross", "spread", "multi-cross") and kalshi_client:
+                        if polymarket_reward_fetch_enabled(args.mode) and CONFIG_REWARDS_ENABLED:
+                            fetch_futures["poly_reward_markets"] = pool.submit(fetch_reward_markets)
+                        if args.mode in ("all", "kalshi", "cross", "spread", "multi-cross", "rewards") and kalshi_client:
                             fetch_futures["kalshi_data"] = pool.submit(_fetch_kalshi_data, kalshi_client)
 
                         for key, future in fetch_futures.items():
@@ -1409,6 +2030,8 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                                     poly_markets = result or []
                                 elif key == "poly_events":
                                     poly_events = result
+                                elif key == "poly_reward_markets":
+                                    poly_reward_markets = result or []
                                 elif key == "kalshi_data":
                                     kalshi_data = result
                             except Exception as e:
@@ -1532,9 +2155,8 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                 if args.mode in ("all", "sxbet"):
                     sxbet = extra_clients.get("sxbet")
                     if sxbet:
-                        sx_backall = scan_sxbet_backall(sxbet, min_profit)
+                        sx_backall, sx_backlay = scan_sxbet(sxbet, min_profit)
                         all_opportunities.extend(sx_backall)
-                        sx_backlay = scan_sxbet_backlay(sxbet, min_profit)
                         all_opportunities.extend(sx_backlay)
 
                 if args.mode in ("all", "matchbook"):
@@ -1657,6 +2279,12 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                                     t = mkt.get("ticker", "")
                                     if t:
                                         observability_market_keys.append(t)
+                        # Plan 10: pilot tickers get toxic-flow observability
+                        # even when they don't surface in the scan data.
+                        if _mm_pilot:
+                            for _pt in _mm_pilot.pilot_tickers():
+                                if _pt not in observability_market_keys:
+                                    observability_market_keys.append(_pt)
                         if args.mode in ("all", "toxic-flow"):
                             tox_opps = scan_toxic_flow_pause(observability_market_keys)
                             all_opportunities.extend(tox_opps)
@@ -1683,9 +2311,11 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                 # Layer 3: Liquidity Rewards
                 if args.mode in ("all", "rewards") and CONFIG_REWARDS_ENABLED:
                     try:
-                        if poly_markets and _reward_tracker:
+                        pm_reward_opps = []
+                        k_reward_opps = []
+                        if poly_reward_markets and _reward_tracker:
                             pm_reward_opps = scan_polymarket_rewards(
-                                markets=poly_markets,
+                                markets=poly_reward_markets,
                                 reward_tracker=_reward_tracker,
                                 price_cache=price_cache,
                             )
@@ -1695,16 +2325,33 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                             k_reward_opps = scan_kalshi_rewards(
                                 kalshi_client=kalshi_client,
                                 reward_tracker=_kalshi_reward_tracker,
+                                kalshi_data=kalshi_data,
                             )
                             all_opportunities.extend(k_reward_opps)
 
                         logger.debug(
                             "Rewards scan complete: %d Polymarket + %d Kalshi opps",
-                            len(pm_reward_opps) if poly_markets and _reward_tracker else 0,
-                            len(k_reward_opps) if kalshi_client and _kalshi_reward_tracker else 0,
+                            len(pm_reward_opps),
+                            len(k_reward_opps),
                         )
                     except Exception as exc:
                         logger.debug("Rewards scanning error: %s", exc)
+
+                # Kalshi VIP: passive volume-rebate tracking (no execution path).
+                if _kalshi_vip_tracker is not None:
+                    try:
+                        # Monotonic clock: immune to wall-clock jumps over a long run.
+                        now_ts = time.monotonic()
+                        if now_ts - _kalshi_vip_tracker.last_poll_ts >= CONFIG_KALSHI_VIP_POLL_INTERVAL:
+                            _kalshi_vip_tracker.last_poll_ts = now_ts
+                            vip_summary = _kalshi_vip_tracker.summarize_since()
+                            logger.info(
+                                "Kalshi VIP: %d eligible contracts, est. cap $%.4f",
+                                vip_summary["eligible_contracts"],
+                                vip_summary["reward_cap_usd"],
+                            )
+                    except Exception as exc:
+                        logger.debug("Kalshi VIP tracking error: %s", exc)
 
                 # Layer 4: informed-trading scans (flag-gated; disabled by
                 # default). Each helper gates on its own config flag + mode and
@@ -1862,51 +2509,16 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                         from scans.convergence import scan_convergence
                         from config import CONVERGENCE_MIN_DIVERGENCE, CONVERGENCE_MIN_PLATFORMS
                         from matcher import match_cross_platform
-                        # Build platform_prices_map from current data
-                        _conv_prices: dict[str, dict] = {}
-                        if poly_markets:
-                            for mkt in poly_markets:
-                                cid = mkt.get("condition_id", "")
-                                title = mkt.get("question") or mkt.get("title", "")
-                                tokens = mkt.get("tokens", [])
-                                yp = None
-                                for t in tokens:
-                                    if t.get("outcome", "").lower() == "yes":
-                                        yp = t.get("price")
-                                if cid and yp:
-                                    _conv_prices.setdefault(cid, {})["polymarket"] = {
-                                        "yes": float(yp), "no": 1.0 - float(yp),
-                                    }
-                                    _conv_prices[cid]["_title"] = title
-                        if kalshi_data and kalshi_data[0] and poly_markets:
-                            kflat = []
-                            for evt in kalshi_data[0]:
-                                for mkt in evt.get("markets", [evt]):
-                                    kflat.append(mkt)
-                            matches = match_cross_platform(
-                                poly_markets, kflat, "polymarket", "kalshi",
-                                threshold=72, min_confidence=args.min_confidence,
-                            )
-                            for m in matches:
-                                pm_mkt = m.get("market_a", {})
-                                k_mkt = m.get("market_b", {})
-                                cid = pm_mkt.get("condition_id", "")
-                                ya = k_mkt.get("yes_ask") or k_mkt.get("yes_price")
-                                if cid and ya:
-                                    pv = float(ya)
-                                    if pv > 1:
-                                        pv /= 100.0
-                                    _conv_prices.setdefault(cid, {})["kalshi"] = {
-                                        "yes": pv, "no": 1.0 - pv,
-                                    }
-                        _conv_matched = []
-                        for mk, data in _conv_prices.items():
-                            title = data.pop("_title", mk)
-                            pp = {k: v for k, v in data.items() if isinstance(v, dict)}
-                            if len(pp) >= 2:
-                                _conv_matched.append({
-                                    "market_key": mk, "title": title, "platform_prices": pp,
-                                })
+                        from scans.convergence_inputs import build_convergence_matched
+                        _conv_matched = build_convergence_matched(
+                            poly_markets or [],
+                            kalshi_data[0] if kalshi_data and kalshi_data[0] else [],
+                            _convergence_match_cache,
+                            matcher_fn=match_cross_platform,
+                            min_confidence=args.min_confidence,
+                            min_platforms=CONVERGENCE_MIN_PLATFORMS,
+                            now=time.time(),
+                        )
                         conv_opps = scan_convergence(
                             _conv_matched, min_divergence=CONVERGENCE_MIN_DIVERGENCE,
                             min_platforms=CONVERGENCE_MIN_PLATFORMS, min_profit=min_profit,
@@ -1940,6 +2552,25 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                     _price_tracker.cleanup(max_age_seconds=300)
 
                 # Platform fund rebalancing check (every 5 scans)
+                nonlocal _opp_sync_inflight
+                if _opp_sync and scan_count % 5 == 0 and not _opp_sync_inflight:
+                    # Offload the Supabase HTTP call — inline it would stall the
+                    # event loop (WS handling, priority execution) during a slow
+                    # or unreachable remote. Same pattern as the nightly backtest.
+                    _opp_sync_inflight = True
+                    async def _run_opp_sync():
+                        nonlocal _opp_sync_hwm, _opp_sync_inflight
+                        try:
+                            hwm = _opp_sync_hwm
+                            loop = asyncio.get_event_loop()
+                            _opp_sync_hwm = await loop.run_in_executor(
+                                None, lambda: _opp_sync.sync_opportunities(after_id=hwm))
+                        except Exception as exc:
+                            logger.warning("Opportunity Supabase sync failed (will retry): %s", exc)
+                        finally:
+                            _opp_sync_inflight = False
+                    asyncio.ensure_future(_run_opp_sync())
+
                 if scan_count % 5 == 0 and notifier:
                     try:
                         _check_platform_balance(
@@ -2054,19 +2685,22 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
 
                 # Execute opportunities sequentially (balance must be rechecked between trades)
                 if all_opportunities:
+                    execution_opportunities = [
+                        opp for opp in all_opportunities if _is_execution_eligible(opp)
+                    ]
                     # Apply execution budget cap (selectivity control).
                     # Opportunities are already sorted by _execution_priority
                     # (weight * capital_efficiency_score), so slicing [:N]
                     # keeps the top N highest-priority candidates per cycle.
                     budget = getattr(config, "EXECUTION_BUDGET_PER_SCAN", 0)
                     exec_queue = (
-                        all_opportunities[:budget]
-                        if budget > 0 else all_opportunities
+                        execution_opportunities[:budget]
+                        if budget > 0 else execution_opportunities
                     )
-                    if budget > 0 and len(all_opportunities) > budget:
+                    if budget > 0 and len(execution_opportunities) > budget:
                         logger.info(
                             "Execution budget: top %d of %d opportunities selected",
-                            budget, len(all_opportunities),
+                            budget, len(execution_opportunities),
                         )
                     logger.info("--- Execution Pass ---")
                     executed = 0
@@ -2271,7 +2905,9 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                         pass
 
                 # Rebuild opportunity index for WS-triggered execution
-                opp_index.rebuild(all_opportunities)
+                opp_index.rebuild([
+                    opp for opp in all_opportunities if _is_execution_eligible(opp)
+                ])
 
                 # Subscribe to WebSocket feeds for discovered markets.
                 # We subscribe to opportunity tokens AND also to broader
@@ -2314,6 +2950,13 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                         if len(kalshi_sub_tickers) >= ws_sub_limit:
                             break
 
+                # Plan 10: pilot tickers ride the Kalshi WS subscription set
+                # so the pilot's book freshness gate (G6) sees live ticks.
+                if _mm_pilot:
+                    for _pt in _mm_pilot.pilot_tickers():
+                        if _pt and _pt not in kalshi_sub_tickers:
+                            kalshi_sub_tickers.append(_pt)
+
                 if scan_count == 1 and not ws_task:
                     feed_manager.subscribe_polymarket(poly_sub_ids)
                     if kalshi_client:
@@ -2328,10 +2971,20 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                         poly_token_ids=poly_sub_ids,
                         kalshi_tickers=kalshi_sub_tickers,
                     )
+                    # If Kalshi healed after a degraded boot, its WS task was
+                    # never spawned by run() — start it now (idempotent).
+                    if kalshi_client is not None:
+                        feed_manager.start_kalshi_feed_late()
+
+                # Sentry Crons heartbeat: emitted as the LAST step of the try
+                # block so a failure anywhere in the cycle reports "error",
+                # never both. A missed check-in pages (loop hang / death).
+                capture_scan_heartbeat("ok")
 
             except Exception as e:
                 import traceback
                 logger.error("Scan failed: %s\n%s", e, traceback.format_exc())
+                capture_scan_heartbeat("error")
                 if _metrics:
                     _metrics.inc("scans_total", {"status": "failed"})
 
@@ -2340,7 +2993,8 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
             # the scan cycle (target: total <2 min for arb-quality reaction time).
             try:
                 _scan_total = time.time() - _scan_start
-                _stage_timings.setdefault("display_exec", time.time() - _stage_display_start)
+                if _stage_display_start is not None:
+                    _stage_timings.setdefault("display_exec", time.time() - _stage_display_start)
                 logger.info(
                     "Scan #%d stage timings — %s",
                     scan_count,
@@ -2358,6 +3012,27 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                 pass
 
         # Cleanup
+        # Plan 10: stop the MM pilot first — run_loop's exit path cancels
+        # every resting pilot order before the process dies (SIGTERM rule,
+        # spec section 7). Gate on the THREAD, not just _mm_pilot, so a
+        # late startup failure that reset _mm_pilot still signals the
+        # thread it left running.
+        if _mm_pilot or _mm_pilot_thread is not None:
+            logger.info("Stopping Kalshi MM pilot...")
+            _mm_pilot_stop.set()
+            if _mm_pilot_thread is not None:
+                _mm_pilot_thread.join(timeout=15)
+                if _mm_pilot_thread.is_alive() and _mm_pilot:
+                    logger.warning("MM pilot thread did not stop in 15s; "
+                                   "forcing order cancel directly.")
+                    _mm_pilot.stop()
+                    _mm_pilot_thread.join(timeout=15)
+                    if _mm_pilot_thread.is_alive():
+                        logger.critical(
+                            "MM pilot thread remains alive after forced "
+                            "stop; cancellation retries exhausted or venue "
+                            "call still blocked.")
+
         logger.info("Stopping WebSocket feeds...")
         feed_manager.stop()
         if ws_task:
@@ -2376,6 +3051,12 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
             stale_monitor_task.cancel()
             try:
                 await stale_monitor_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if feed_health_task:
+            feed_health_task.cancel()
+            try:
+                await feed_health_task
             except (asyncio.CancelledError, Exception):
                 pass
         if health_monitor_task:

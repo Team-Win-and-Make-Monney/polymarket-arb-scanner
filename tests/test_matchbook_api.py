@@ -36,6 +36,34 @@ def _no_rate_limit():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _dry_run_off():
+    """Default DRY_RUN off so live-path tests (circuit, post) exercise the
+    network branch; the DRY_RUN tests re-patch it to True."""
+    with patch("config.DRY_RUN", False):
+        yield
+
+
+# ---------------------------------------------------------------------------
+# TestMatchbookDryRun (audit S12)
+# ---------------------------------------------------------------------------
+
+class TestMatchbookDryRun:
+    """DRY_RUN must be honored at the client boundary — no live network call."""
+
+    def test_place_order_dry_run_does_not_post(self, client):
+        with patch("config.DRY_RUN", True):
+            result = client.place_order("mkt1", "run1", "back", 2.0, 10.0)
+        assert result is not None and result["dry_run"] is True
+        assert result["id"] == "DRY_RUN"          # caller reads resp["id"] for the order id
+        client.session.post.assert_not_called()
+
+    def test_cancel_order_dry_run_does_not_delete(self, client):
+        with patch("config.DRY_RUN", True):
+            assert client.cancel_order("offer-1") is True
+        client.session.delete.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # TestMatchbookLogin
 # ---------------------------------------------------------------------------
@@ -323,3 +351,27 @@ class TestMatchbookRequest:
             status_code=404, text="Not Found"
         )
         assert client._request("GET", "/missing") is None
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker on order methods (audit C-3/B42)
+# ---------------------------------------------------------------------------
+
+class TestMatchbookCircuitBreaker:
+    def test_place_order_skips_when_circuit_open(self, client, monkeypatch):
+        monkeypatch.setattr(matchbook_api._circuit, "is_open", lambda: True)
+        assert client.place_order("mkt", "run", "back", 2.0, 5.0) is None
+        client.session.post.assert_not_called()
+
+    def test_cancel_order_skips_when_circuit_open(self, client, monkeypatch):
+        monkeypatch.setattr(matchbook_api._circuit, "is_open", lambda: True)
+        assert client.cancel_order("offer-1") is False
+        client.session.delete.assert_not_called()
+
+    def test_place_order_records_failure_on_non_2xx(self, client, monkeypatch):
+        monkeypatch.setattr(matchbook_api._circuit, "is_open", lambda: False)
+        recorded = []
+        monkeypatch.setattr(matchbook_api._circuit, "record_failure", lambda: recorded.append(1))
+        client.session.post.return_value = MagicMock(status_code=500, text="err")
+        client.place_order("mkt", "run", "back", 2.0, 5.0)
+        assert recorded  # non-2xx records a circuit failure

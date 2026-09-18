@@ -9,7 +9,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-latest
 
     steps:
       - name: Checkout
@@ -26,21 +26,15 @@ jobs:
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
 
-      - name: Run tests
+      - name: Lint (critical rules only)
         run: |
-          set +e
-          pytest tests/ -v --tb=short 2>&1 | tee test-output.txt
-          set -e
+          pip install ruff
+          # E9/F63/F7/F82: syntax errors, undefined names, misused comparisons —
+          # correctness-only gate; full style adoption tracked separately.
+          ruff check . --select E9,F63,F7,F82
 
-          SUMMARY=$(tail -5 test-output.txt | grep -oP '\d+ (failed|error)' || echo "")
-          FAILED=$(echo "$SUMMARY" | grep -oP '(\d+) failed' | grep -oP '\d+' || echo "0")
-          ERRORS=$(echo "$SUMMARY" | grep -oP '(\d+) error' | grep -oP '\d+' || echo "0")
-          TOTAL_BAD=$((FAILED + ERRORS))
-
-          echo "Test results: $FAILED failed, $ERRORS errors ($TOTAL_BAD total non-passing)"
-
-          if [ "$TOTAL_BAD" -gt 0 ]; then
-            echo "::error::Test failures detected ($TOTAL_BAD failures/errors)"
-            exit 1
-          fi
-          echo "All tests passed."
+      - name: Run tests
+        # Gate on pytest's exit code directly. The previous grep-based summary
+        # parsing returned green when pytest crashed before printing a summary
+        # (import error, OOM) — exactly the failure a merge gate must catch.
+        run: pytest tests/ -v --tb=short

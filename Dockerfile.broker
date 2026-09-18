@@ -1,0 +1,17 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY *.py ./
+COPY broker/ ./broker/
+
+RUN useradd --create-home --uid 10001 broker && \
+    mkdir -p /authority /data && \
+    chown -R broker:broker /authority /data
+
+USER broker
+
+ENTRYPOINT ["python", "-m", "broker.worker"]

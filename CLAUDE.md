@@ -74,6 +74,17 @@ Each first-class strategy has a feature flag defaulting to `false`. The four fla
 | `CROSS_MM_ENABLED` | #11 cross-platform MM | `scans/cross_mm.py`, `market_maker.CrossPlatformMaker` |
 | `AUTO_REBALANCE_ENABLED` | #18 auto-rebalance | `treasury.py`, `gemini_api.withdraw_usdc`, `db.transfers` table, `POST /api/rebalance/execute` |
 
+**Plan 10 (Kalshi reward-MM pilot):** `MM_KALSHI_PILOT_ENABLED` (default `false`) gates
+`mm_pilot.KalshiMMPilot` — the safety layer for live Kalshi LIP/VIP quoting
+(spec: `docs/plans/10-mm-pilot-prep.md`). Independent of the legacy `MM_ENABLED`
+Polymarket path. Kalshi ONLY (hard-checked at the `authorize_order` choke point).
+A live (non-dry-run) start refuses to boot unless `MM_AUTO_HEDGE_ENABLED`,
+`MM_TOXIC_FLOW_ENABLED`, and `MM_VOLATILITY_ADJUSTED_ENABLED` are all true
+(`validate_config` raises), and the Supabase `bot_controls.mm_pilot_enabled` kill
+switch (migration 0004, seeded false) must be fresh AND true or the pilot pulls all
+quotes. Rollout: D0 dry-run soak → D1 live canary (`MM_CANARY_*`) → D2 pilot sizing;
+D1/D2 activation is an operator decision.
+
 Remaining gaps and the build sequence to close them are documented in the v2 framework's Remediation Roadmap section.
 
 
@@ -197,7 +208,7 @@ Each `*_api.py` wraps a platform's REST API with auth, retries (`tenacity`), and
 - **Matchbook**: Username/password session auth (0% commission on predictions)
 - **Gemini Predictions**: HMAC-SHA384 signed headers (API key + secret), 1.75% maker / 7% taker fees (`GEMINI_MAKER_RATE` / `GEMINI_TAKER_RATE`), full buy+sell. Fee formula per the CFTC 40.6 filing effective 2026-03-09: `roundup(rate × C × P × (1 − P))` — *not* the legacy `min(P, 1−P) × rate`. The old single `GEMINI_FEE_RATE=0.05` constant is superseded (slated for removal).
 - **IBKR ForecastEx**: TWS API via `ib_insync` (IB Gateway socket), BUY-only (no sell), LMT-only, $0.00 commission, 5s order rate limit
-- **Metaculus**: Public REST API (optional API key), read-only signal source
+- **Metaculus**: Authenticated `/api/posts` REST API, read-only signal source; requires an API token, access tier, and written commercial-use permission
 
 ### Supporting Modules
 
@@ -265,6 +276,27 @@ External SDKs are mocked via `sys.modules` stubs before importing the module und
 
 Run a specific test: `pytest tests/test_fees.py::TestPolymarketFee::test_zero_when_sell_equals_buy -v`
 
+## Agent Delivery Workflow
+
+### Isolate and scope the work
+- Refresh `origin/master`, then inspect `git status`, `git worktree list`, and open PRs before editing. Work from a dedicated task branch and isolated worktree based on the current `origin/master`; never edit, clean, stash, or reset the dirty canonical checkout.
+- Use one branch per objective. If another branch, worktree, or PR overlaps the same files or subsystem, coordinate or serialize the work instead of racing it.
+- Keep one PR to one purpose. Before commit and again before the PR, inspect `git status`, `git diff --stat`, and the complete diff. Exclude unrelated code, formatting, generated artifacts, dependencies, and secrets.
+
+### Verify, review, and hand off
+- For every change, run `git diff --check`. For `.coderabbit.yaml`, also run `ruby -e 'require "yaml"; YAML.parse_file(".coderabbit.yaml")'`.
+- For Python or CI behavior changes, use Python 3.12 and run the same correctness gates as `.github/workflows/test.yml`: `ruff check . --select E9,F63,F7,F82` and `pytest tests/ -v --tb=short`. Add the narrowest relevant regression test first when practical; do not weaken, skip, or relabel checks to obtain green status.
+- Write an imperative, outcome-specific PR title. The PR body must explain why, what changed, exact verification and results, deployment or trading risk, and deferred work. State every unrun check.
+- CodeRabbit reviews every non-draft PR incrementally. Address actionable findings with narrow fixes, push, and wait for CodeRabbit and `test` again. Do not resolve a thread without fixing it or recording why it is non-actionable.
+- Before handoff, fetch `origin/master`, confirm the branch is current, inspect the final diff, and rerun affected verification after any branch update or conflict resolution. Required `test` and `CodeRabbit` checks, conversation resolution, and a mergeable state are mandatory; never bypass protection or force-push.
+
+### Depot, merge, and production boundaries
+- Depot supplies the managed runner only for `.github/workflows/test.yml`. Keep scheduled monitoring, market scans, digests, communications, and any deployment workflow off Depot unless a separate, explicit infrastructure task authorizes the change. Depot account settings, runner groups, cache or network policy, and usage caps are external account changes, not part of repository implementation.
+- Never exercise a write-capable trading path during validation. Do not run with `DRY_RUN=false`, `--exec-mode full-auto`, a live launcher, order submission, fund movement, or production credentials. Tests must use mocks or read-only/dry-run paths.
+- Stop at a review-ready PR for changes involving live order placement, risk or loss limits, funds, credentials or secrets, permissions or authentication, account or provider configuration, migrations, production infrastructure or configuration, scheduled external communications, or other destructive or hard-to-reverse effects. Obtain explicit action-time confirmation for the exact effect.
+- Low-risk changes may use GitHub-native auto-merge only when the final diff is limited to `docs/**`, `tests/**`, and Markdown files other than `AGENTS.md` or `CLAUDE.md`; the branch is current with `master`; required `test` and `CodeRabbit` checks pass on the latest commit; every actionable review finding is resolved; and GitHub reports the PR mergeable. Changes to `AGENTS.md`, `CLAUDE.md`, `.coderabbit.yaml`, or any other delivery or review control require explicit action-time approval. Immediately before arming auto-merge, use read-only operating evidence to verify the Railway worker is dry-run and no opportunity is mid-execution; if that quiescent state cannot be verified, stop at the PR. Do not change trading state to manufacture a merge window. The ordinary Railway restart triggered by a qualifying merge is authorized as part of this repository's autonomous lane; runtime, dependency, workflow, launcher, broker, trading, risk, Docker, and Railway changes remain outside it. Do not create a workflow that bypasses GitHub branch protection or polls around a missing required check.
+- After an autonomous or explicitly authorized merge, verify the remote result with `gh pr view <PR> --json state,mergedAt,mergeCommit,statusCheckRollup`, fetch `origin/master`, confirm the merge commit is an ancestor, inspect the latest `Tests` run on `master`, and read back `https://arb-scanner-production.up.railway.app/healthz`. A merged commit or green PR checks alone do not prove a healthy deployment. If the deployment or health check fails, stop further autonomous delivery, report the failure, and follow only a repository-documented rollback path; never exercise a live trading path as a deployment test.
+
 ## CI / CD
 
 - `.github/workflows/test.yml` runs `pytest` on every PR to `master` (Python 3.12, installs both `requirements.txt` and `requirements-dev.txt`).
@@ -279,11 +311,11 @@ Run a specific test: `pytest tests/test_fees.py::TestPolymarketFee::test_zero_wh
 ## Environment Variables
 
 All env vars are defined in `config.py` with defaults. Key groups:
-- Platform credentials: `POLYMARKET_PRIVATE_KEY`, `KALSHI_API_KEY_ID`/`KALSHI_PRIVATE_KEY_PATH` (or `_BASE64`), `BETFAIR_*`, `SMARKETS_API_KEY`, `SXBET_API_KEY`, `MATCHBOOK_USERNAME`/`MATCHBOOK_PASSWORD`, `GEMINI_API_KEY`/`GEMINI_API_SECRET`, `IBKR_HOST`/`IBKR_PORT`/`IBKR_CLIENT_ID` (IB Gateway), `METACULUS_API_KEY` (optional)
+- Platform credentials: `POLYMARKET_PRIVATE_KEY`, `KALSHI_API_KEY_ID`/`KALSHI_PRIVATE_KEY_PATH` (or `_BASE64`), `BETFAIR_*`, `SMARKETS_API_KEY`, `SXBET_API_KEY`, `MATCHBOOK_USERNAME`/`MATCHBOOK_PASSWORD`, `GEMINI_API_KEY`/`GEMINI_API_SECRET`, explicit `IBKR_HOST`/`IBKR_PORT`/`IBKR_CLIENT_ID` (IB Gateway), and `METACULUS_API_KEY` plus `METACULUS_COMMERCIAL_USE_APPROVED=true` after written commercial API permission
 - Execution: `DRY_RUN` (default: true), `EXECUTION_MODE`, `MAX_TRADE_SIZE`
 - Risk: `DAILY_LOSS_LIMIT`, `MAX_OPEN_POSITIONS`, `MIN_LIQUIDITY`, `MIN_NET_ROI`
 - Dynamic fees: `DYNAMIC_FEE_ENABLED`, `POLYGON_RPC_URL`, `GAS_PRICE_CACHE_TTL`
-- Event monitor: `EVENT_MONITOR_ENABLED`, `EVENT_DIVERGENCE_THRESHOLD`
+- Event monitor: `EVENT_MONITOR_ENABLED`, `EVENT_DIVERGENCE_THRESHOLD`, `METACULUS_COMMERCIAL_USE_APPROVED`
 - Tuning: `RESCAN_INTERVAL`, `WS_TRIGGER_THRESHOLD`, `WS_SUBSCRIPTION_LIMIT`, `FUZZY_MATCH_THRESHOLD`, `RESOLUTION_SNIPE_WINDOW_HOURS` (default `48`)
 - Infra: `WEBHOOK_URL`, `DASHBOARD_PORT`, `DASHBOARD_HOST` (default `127.0.0.1`; production must set `0.0.0.0` + `DASHBOARD_PASS`), `DASHBOARD_PASS`, `DATA_DIR`, `LOG_LEVEL`, `LOG_FILE`
 - Proxies: `POLYMARKET_PROXY_URL`, `KALSHI_PROXY_URL`
@@ -296,7 +328,7 @@ The following env vars should be set in Railway for production deployment (Railw
 - `MM_ENABLED=true` — Enable market making engine
 - `SNAPSHOT_ENABLED=true` — Enable price snapshot recording for backtesting
 - `DYNAMIC_FEE_ENABLED=true` — Enable real-time Polygon gas monitoring
-- `EVENT_MONITOR_ENABLED=true` — Enable Metaculus/Manifold signal aggregation
+- `EVENT_MONITOR_ENABLED=true` — Enable signal aggregation; Metaculus also requires its API key and explicit commercial-use approval flag
 
 **Market Making Tuning:**
 - `MM_MIN_SPREAD=0.02` — 2% minimum spread width

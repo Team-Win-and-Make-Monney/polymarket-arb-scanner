@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -37,7 +38,39 @@ _rate_lock = threading.Lock()
 # Proxy support — Gamma REST (requests) + authenticated CLOB writes (httpx in py-clob-client-v2)
 _session = requests.Session()
 _proxy_url = os.getenv("POLYMARKET_PROXY_URL")
+
+
+def _install_clob_proxy(proxy_url: str) -> None:
+    """Route py-clob-client-v2's httpx transport through proxy_url.
+
+    py-clob-client-v2 uses a module-level httpx client that otherwise bypasses
+    POLYMARKET_PROXY_URL (critical for US/MI geoblock on CLOB writes). This is an
+    undocumented internal; fail closed if the SDK layout changes rather than
+    silently sending unproxied signed requests.
+    """
+    if not hasattr(_clob_http, "_http_client"):
+        raise RuntimeError(
+            "py-clob-client-v2 no longer exposes http_helpers.helpers._http_client; "
+            "POLYMARKET_PROXY_URL cannot be enforced — refusing to start with an "
+            "unproxied CLOB write path")
+    # Atomic replacement: construct the new client first; only after successful
+    # construction close the old transport (guarded) and swap, so a construction
+    # failure never leaves the SDK without a working proxied client.
+    new_client = httpx.Client(http2=True, proxy=proxy_url)
+    previous = _clob_http._http_client
+    if previous is not None:
+        try:
+            previous.close()
+        except Exception:
+            logger.debug("Failed to close previous CLOB httpx client", exc_info=True)
+    _clob_http._http_client = new_client
+
+
 if _proxy_url:
+    # Gamma REST proxying only — never raises. The fail-closed CLOB write-path
+    # injection (_install_clob_proxy) runs in PolymarketTrader.__init__ so a
+    # missing SDK internal aborts only when the authenticated write path is
+    # actually constructed, not any dry-run/read-only import of this module.
     _session.proxies = {"http": _proxy_url, "https": _proxy_url}
     # py-clob-client-v2 uses a module-level httpx client that otherwise bypasses
     # POLYMARKET_PROXY_URL (critical for US/MI geoblock on CLOB writes).
@@ -93,66 +126,189 @@ def _get_with_retry(url: str, params: dict = None, timeout: int = 30) -> request
         raise
 
 
-def fetch_all_markets(limit: int = 500, max_pages: int = 20) -> list[dict]:
-    """Fetch all active markets from the Gamma API with pagination."""
-    all_markets = []
-    offset = 0
+def _fetch_gamma_keyset(resource: str, order: str, limit: int, max_pages: int) -> list[dict]:
+    """Fetch a volume-ranked, bounded Gamma universe with opaque cursors.
+
+    Args:
+        resource: Gamma collection name (``markets`` or ``events``).
+        order: API field used for descending economic ranking.
+        limit: Requested page size; Gamma may apply a lower server cap.
+        max_pages: Maximum number of cursor pages to fetch.
+
+    Returns:
+        Unique response rows in keyset order.
+    """
+    rows_by_id: dict[str, dict] = {}
+    cursor = None
 
     for _ in range(max_pages):
         params = {
             "limit": limit,
-            "offset": offset,
             "active": "true",
             "closed": "false",
+            "order": order,
+            "ascending": "false",
         }
+        if cursor:
+            params["after_cursor"] = cursor
         try:
-            resp = _get_with_retry(f"{GAMMA_BASE}/markets", params=params)
-            markets = resp.json()
-        except (requests.RequestException, json.JSONDecodeError, _RateLimitError) as e:
-            logger.warning("Polymarket markets request failed at offset %s: %s", offset, e)
+            resp = _get_with_retry(f"{GAMMA_BASE}/{resource}/keyset", params=params)
+            payload = resp.json()
+        except (requests.RequestException, json.JSONDecodeError, _RateLimitError) as exc:
+            logger.warning("Polymarket %s keyset request failed: %s", resource, exc)
             break
 
-        if not markets:
+        if not isinstance(payload, dict):
+            logger.warning("Polymarket %s keyset returned non-object payload", resource)
             break
-
-        all_markets.extend(markets)
-        offset += limit
-
-        if len(markets) < limit:
+        page = payload.get(resource)
+        if not isinstance(page, list):
+            logger.warning("Polymarket %s keyset payload missing %s list", resource, resource)
             break
+        for row in page:
+            if isinstance(row, dict):
+                row_id = row.get("id")
+                key = str(row_id if row_id is not None else row.get("conditionId") or "")
+                if key:
+                    rows_by_id[key] = row
 
-    return all_markets
+        cursor = payload.get("next_cursor")
+        if not page or not cursor:
+            break
+    else:
+        logger.info(
+            "Polymarket %s universe bounded at %d pages (%d unique rows, order=%s desc)",
+            resource, max_pages, len(rows_by_id), order,
+        )
+
+    return list(rows_by_id.values())
+
+
+def fetch_all_markets(limit: int = 500, max_pages: int = 20) -> list[dict]:
+    """Fetch the top active markets by numeric lifetime volume.
+
+    Gamma rejects deep offset pagination and the active universe exceeds
+    25,000 rows. The scanner intentionally bounds each cycle to ``max_pages``
+    economically relevant markets using the official keyset cursor.
+
+    Args:
+        limit: Requested Gamma page size.
+        max_pages: Maximum cursor pages per scan cycle.
+
+    Returns:
+        Active market dicts ranked by descending numeric lifetime volume.
+    """
+    return _fetch_gamma_keyset("markets", "volumeNum", limit, max_pages)
 
 
 def fetch_events(limit: int = 500, max_pages: int = 20) -> list[dict]:
-    """Fetch events from the Gamma API (for grouping multi-outcome markets)."""
-    all_events = []
-    offset = 0
+    """Fetch the top active events by numeric lifetime volume.
+
+    Args:
+        limit: Requested Gamma page size.
+        max_pages: Maximum cursor pages per scan cycle.
+
+    Returns:
+        Active event dicts ranked by descending lifetime volume.
+    """
+    return _fetch_gamma_keyset("events", "volume", limit, max_pages)
+
+
+def _normalize_sampling_market(market: dict) -> dict | None:
+    """Convert a CLOB sampling-market row to the scanner's Gamma shape.
+
+    Args:
+        market: Raw row from the CLOB ``/sampling-markets`` endpoint.
+
+    Returns:
+        Normalized market dict, or ``None`` when reward metadata is unusable.
+    """
+    condition_id = market.get("condition_id")
+    rewards = market.get("rewards")
+    tokens = market.get("tokens")
+    if not condition_id or not isinstance(rewards, dict) or not isinstance(tokens, list):
+        return None
+    try:
+        min_size = float(rewards["min_size"])
+        max_spread = float(rewards["max_spread"]) / 100.0
+        daily_rate = sum(
+            float(rate.get("rewards_daily_rate") or 0)
+            for rate in (rewards.get("rates") or [])
+            if isinstance(rate, dict)
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    if min_size <= 0 or max_spread <= 0 or daily_rate <= 0:
+        return None
+
+    outcome_order = {"yes": 0, "no": 1}
+    normalized_tokens = sorted(
+        (token for token in tokens if isinstance(token, dict) and token.get("token_id")),
+        key=lambda token: outcome_order.get(str(token.get("outcome", "")).lower(), 2),
+    )
+    if len(normalized_tokens) < 2:
+        return None
+    tags = market.get("tags") or []
+    category = str(tags[0]).lower() if isinstance(tags, list) and tags else ""
+    return {
+        "conditionId": condition_id,
+        "question": market.get("question") or condition_id,
+        "category": category,
+        "active": bool(market.get("active", True)),
+        "closed": bool(market.get("closed", False)),
+        "acceptingOrders": bool(market.get("accepting_orders", True)),
+        "outcomePrices": [token.get("price") for token in normalized_tokens[:2]],
+        "clobTokenIds": json.dumps([token["token_id"] for token in normalized_tokens[:2]]),
+        "incentives": {
+            "min_incentive_size": min_size,
+            "max_incentive_spread": max_spread,
+            "pool_size_usdc": daily_rate,
+            "reward_daily_rate_usdc": daily_rate,
+        },
+        "_sampling_market": True,
+    }
+
+
+def fetch_reward_markets(max_pages: int = 20) -> list[dict]:
+    """Fetch and normalize the complete current CLOB reward-market feed.
+
+    Args:
+        max_pages: Safety cap for 1,000-row CLOB cursor pages.
+
+    Returns:
+        Unique normalized reward-market dicts keyed by condition ID.
+    """
+    markets_by_condition: dict[str, dict] = {}
+    cursor = None
 
     for _ in range(max_pages):
-        params = {
-            "limit": limit,
-            "offset": offset,
-            "active": "true",
-            "closed": "false",
-        }
+        params = {"next_cursor": cursor} if cursor else None
         try:
-            resp = _get_with_retry(f"{GAMMA_BASE}/events", params=params)
-            events = resp.json()
-        except (requests.RequestException, json.JSONDecodeError, _RateLimitError) as e:
-            logger.warning("Polymarket events request failed at offset %s: %s", offset, e)
+            resp = _get_with_retry(f"{CLOB_BASE}/sampling-markets", params=params)
+            payload = resp.json()
+        except (requests.RequestException, json.JSONDecodeError, _RateLimitError) as exc:
+            logger.warning("Polymarket sampling-markets request failed: %s", exc)
             break
-
-        if not events:
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            logger.warning("Polymarket sampling-markets returned an invalid payload")
             break
-
-        all_events.extend(events)
-        offset += limit
-
-        if len(events) < limit:
+        for raw_market in payload["data"]:
+            if not isinstance(raw_market, dict):
+                continue
+            market = _normalize_sampling_market(raw_market)
+            if market:
+                markets_by_condition[market["conditionId"]] = market
+        cursor = payload.get("next_cursor")
+        if not payload["data"] or not cursor or cursor == "LTE=":
             break
+    else:
+        logger.warning(
+            "Polymarket sampling-markets hit max_pages=%d (%d unique markets)",
+            max_pages, len(markets_by_condition),
+        )
 
-    return all_events
+    logger.info("Fetched %d current Polymarket reward markets.", len(markets_by_condition))
+    return list(markets_by_condition.values())
 
 
 def fetch_order_book(token_id: str) -> dict | None:
@@ -175,12 +331,26 @@ def get_best_bid_ask(order_book: dict) -> dict:
     asks = order_book.get("asks", [])
     if bids:
         best_bid = bids[0]  # Highest bid first
-        result["bid"] = float(best_bid.get("price", 0))
-        result["bid_size"] = float(best_bid.get("size", 0))
+        try:
+            price = float(best_bid.get("price"))
+            size = float(best_bid.get("size"))
+        except (TypeError, ValueError):
+            price = size = None
+        if price is not None and size is not None and math.isfinite(price) and math.isfinite(size):
+            if 0.0 < price < 1.0 and size > 0.0:
+                result["bid"] = price
+                result["bid_size"] = size
     if asks:
         best_ask = asks[0]  # Lowest ask first
-        result["ask"] = float(best_ask.get("price", 0))
-        result["ask_size"] = float(best_ask.get("size", 0))
+        try:
+            price = float(best_ask.get("price"))
+            size = float(best_ask.get("size"))
+        except (TypeError, ValueError):
+            price = size = None
+        if price is not None and size is not None and math.isfinite(price) and math.isfinite(size):
+            if 0.0 < price < 1.0 and size > 0.0:
+                result["ask"] = price
+                result["ask_size"] = size
     return result
 
 
@@ -288,7 +458,8 @@ class PolymarketTrader:
     """CLOB trading client for Polymarket using py-clob-client-v2."""
 
     def __init__(self, private_key: str, chain_id: int = 137,
-                 funder: str | None = None, signature_type: int = 0):
+                 funder: str | None = None, signature_type: int = 0,
+                 execution_enabled: bool = False):
         """Initialise the CLOB trading client.
 
         Args:
@@ -297,9 +468,32 @@ class PolymarketTrader:
             funder: Proxy/funder/deposit wallet that holds collateral.
                 Required when the signing key differs from the funded address
                 (Magic, browser proxy, or deposit-wallet flow).
-            signature_type: 0 = EOA, 1 = email/Magic, 2 = browser proxy,
-                3 = deposit wallet (POLYMARKET_SIGNATURE_TYPE=3).
+            signature_type: 0 = EOA, 1 = email/Magic,
+                2 = Polymarket Gnosis Safe (browser proxy wallet),
+                3 = POLY_1271 (EIP-1271 smart-contract wallet).
+            execution_enabled: Internal code-level breaker. Production callers
+                must leave this false while international Polymarket is
+                public-data/shadow-only.
+
+        Raises:
+            ValueError: if signature_type is not one of 0, 1, 2, 3.
         """
+        if signature_type not in (0, 1, 2, 3):
+            raise ValueError(
+                f"signature_type must be one of 0 (EOA), 1 (email/Magic), "
+                f"2 (Gnosis Safe), 3 (POLY_1271); got {signature_type!r}")
+        self.execution_enabled = bool(execution_enabled)
+        if not self.execution_enabled:
+            raise PermissionError(
+                "Authenticated Polymarket trading is disabled: international "
+                "Polymarket is public-data/shadow-only"
+            )
+        # Fail-closed proxy injection belongs to the authenticated write path:
+        # install (or abort) here, before the CLOB client exists, so read-only
+        # imports of this module never hard-fail on the SDK internal check.
+        proxy_url = os.getenv("POLYMARKET_PROXY_URL")
+        if proxy_url:
+            _install_clob_proxy(proxy_url)
         kwargs: dict = dict(
             host=CLOB_BASE,
             key=private_key,
@@ -315,14 +509,28 @@ class PolymarketTrader:
         self.client.set_api_creds(self.client.create_or_derive_api_key())
 
     def get_balance(self) -> float | None:
-        """Get collateral balance available for trading (USDC / pUSD, 6 decimals)."""
+        """Get collateral balance available for trading (USDC / pUSD, 6 decimals).
+
+        NOTE: the 6-decimal (1e6) unit assumption is carried over from V1 and
+        must be confirmed against a real py-clob-client-v2 balance fixture
+        before any live activation (plan 08, Phase A acceptance).
+        """
         try:
             resp = self.client.get_balance_allowance(
                 BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
             )
-            if resp and "balance" in resp:
-                return float(resp["balance"]) / 1e6
-            return None
+            if not isinstance(resp, dict) or "balance" not in resp:
+                logger.error("Polymarket get_balance: unexpected response schema: %r", resp)
+                return None
+            try:
+                balance = float(resp["balance"])
+            except (TypeError, ValueError):
+                logger.error("Polymarket get_balance: malformed balance value: %r", resp["balance"])
+                return None
+            if math.isnan(balance) or math.isinf(balance) or balance < 0:
+                logger.error("Polymarket get_balance: non-finite/negative balance: %r", resp["balance"])
+                return None
+            return balance / 1e6
         except Exception as e:
             logger.error("Polymarket get_balance failed: %s", e)
             return None
@@ -336,6 +544,7 @@ class PolymarketTrader:
         neg_risk: bool = False,
         tick_size: str = "0.01",
         order_type: str = "GTC",
+        expiration: int | None = None,
     ) -> dict | None:
         """Place an order on the Polymarket CLOB.
 
@@ -347,18 +556,39 @@ class PolymarketTrader:
             neg_risk: Whether this is a negRisk market
             tick_size: Market tick size ("0.1", "0.01", "0.001", "0.0001")
             order_type: "GTC", "FOK", "FAK", or "GTD" (default GTC)
+            expiration: Unix timestamp (seconds) when a GTD order expires.
+                Required (non-zero) for GTD; ignored otherwise.
 
         Returns:
             Order response dict or None on failure.
+
+        Raises:
+            ValueError: if order_type is GTD and expiration is missing or 0.
         """
+        if not getattr(self, "execution_enabled", False):
+            logger.critical(
+                "Blocked Polymarket order: international Polymarket is "
+                "public-data/shadow-only"
+            )
+            return None
+        if str(order_type).upper() == "GTD" and not expiration:
+            raise ValueError("order_type=GTD requires a non-zero expiration timestamp")
         try:
-            ot = _ORDER_TYPE_MAP.get(str(order_type).upper(), OrderType.GTC)
-            order_args = OrderArgs(
+            ot = _ORDER_TYPE_MAP.get(str(order_type).upper())
+            if ot is None:
+                logger.error(
+                    "Unknown order_type %r — refusing to place order (allowed: %s)",
+                    order_type, ", ".join(sorted(_ORDER_TYPE_MAP)))
+                return None
+            order_kwargs: dict = dict(
                 token_id=token_id,
                 price=price,
                 size=size,
                 side=side.upper(),
             )
+            if ot == _ORDER_TYPE_MAP["GTD"]:
+                order_kwargs["expiration"] = int(expiration)
+            order_args = OrderArgs(**order_kwargs)
             options = PartialCreateOrderOptions(
                 tick_size=tick_size,
                 neg_risk=neg_risk,
@@ -379,13 +609,20 @@ class PolymarketTrader:
         """Cancel an open order."""
         try:
             resp = self.client.cancel_order(OrderPayload(orderID=order_id))
-            if resp is None:
+            # Fail closed: only a dict response whose canceled list explicitly
+            # names this order ID counts as a confirmed cancel. Anything else
+            # (None, non-dict, empty list, other IDs) is treated as not canceled.
+            if not isinstance(resp, dict):
+                logger.warning(
+                    "Polymarket cancel_order: non-dict response for %s: %r — treating as not canceled",
+                    order_id, resp)
                 return False
-            if isinstance(resp, dict):
-                canceled = resp.get("canceled") or resp.get("cancelled") or []
-                if isinstance(canceled, list):
-                    return order_id in canceled or any(order_id == str(item) for item in canceled)
-                return bool(canceled)
+            canceled = resp.get("canceled") or resp.get("cancelled")
+            if not isinstance(canceled, list) or (order_id not in canceled and not any(order_id == str(item) for item in canceled)):
+                logger.warning(
+                    "Polymarket cancel_order: %s not confirmed in canceled list %r",
+                    order_id, canceled)
+                return False
             return True
         except Exception as e:
             logger.warning("Polymarket cancel_order failed for %s: %s", order_id, e)

@@ -225,8 +225,7 @@ class TestScanNegRiskInternal:
         pm.get_clob_prices.return_value = None
 
         result = scanner.scan_negrisk_internal([event], min_profit=0.001)
-        assert len(result) >= 1
-        assert result[0]["type"].startswith("NegRisk")
+        assert result == []
 
     def test_no_arb_when_sum_above_one(self):
         scanner = _import_scanner()

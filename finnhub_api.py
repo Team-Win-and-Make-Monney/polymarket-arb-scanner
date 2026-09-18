@@ -47,6 +47,9 @@ class FinnhubNewsClient:
         # Session reuse for HTTP
         self._session = requests.Session()
         self._session.mount("https://", HTTPAdapter(pool_connections=2, pool_maxsize=10))
+        # API key in the X-Finnhub-Token header, NOT the URL query string
+        # (audit S11: query-string keys leak into access / proxy / Sentry logs).
+        self._session.headers["X-Finnhub-Token"] = api_key
 
         self._request_timeout = float(os.getenv("FINNHUB_REQUEST_TIMEOUT", "10.0"))
 
@@ -81,7 +84,6 @@ class FinnhubNewsClient:
             "symbol": symbol,
             "from": from_date,
             "to": to_date,
-            "token": self.api_key,
         }
 
         try:

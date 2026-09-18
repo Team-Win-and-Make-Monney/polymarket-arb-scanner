@@ -1,0 +1,40 @@
+name: Daily P&L Digest
+
+on:
+  schedule:
+    # 12:00 UTC = 8:00am EDT (7:00am EST). Cron is DST-unaware; this tracks the
+    # spec's 8am ET digest during daylight time, an hour earlier in winter.
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Reads go through PostgREST with requests — no supabase-py needed.
+      - name: Install dependencies
+        run: pip install 'requests==2.31.0'
+
+      - name: Build + post P&L digest (read-only, deterministic)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DEPLOYED_CAPITAL_USD: ${{ secrets.DEPLOYED_CAPITAL_USD }}
+        run: python scripts/run_pnl_digest.py

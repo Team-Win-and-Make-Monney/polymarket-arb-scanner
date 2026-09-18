@@ -326,6 +326,24 @@ class TestKalshiOrders:
         assert result is None
 
     @patch("kalshi_api._rate_limit")
+    def test_place_order_blocks_disallowed_ticker_at_client_boundary(self, mock_rl, client):
+        result = client.place_order("KXNFLGAME-26AUG18", "yes", "buy", 1, 0.50)
+
+        assert result is None
+        client.session.request.assert_not_called()
+
+    @patch("kalshi_api._rate_limit")
+    def test_place_order_allows_reducing_disallowed_ticker(self, mock_rl, client):
+        client.session.request.return_value = _mock_response(201, {"order": {"id": "flatten"}})
+
+        result = client.place_order(
+            "KXNFLGAME-26AUG18", "yes", "sell", 1, 0.50, reducing=True,
+        )
+
+        assert result == {"order": {"id": "flatten"}}
+        client.session.request.assert_called_once()
+
+    @patch("kalshi_api._rate_limit")
     def test_get_order_status_success(self, mock_rl, client):
         """get_order_status returns order dict."""
         client.session.request.return_value = _mock_response(
@@ -381,6 +399,253 @@ class TestKalshiOrders:
         """get_positions returns [] on error."""
         client.session.request.return_value = _mock_response(500)
         assert client.get_positions() == []
+
+    @patch("kalshi_api._rate_limit")
+    def test_get_positions_raises_on_error_when_opted_in(self, mock_rl, client):
+        """Finding #4 support: raise_on_error=True must not silently return
+        [] on failure — a bare [] is indistinguishable from confirmed-flat
+        to the MM pilot's startup reconciliation gate."""
+        from kalshi_api import KalshiPortfolioQueryError
+        client.session.request.return_value = _mock_response(500)
+        with pytest.raises(KalshiPortfolioQueryError):
+            client.get_positions(raise_on_error=True)
+
+    @patch("kalshi_api._rate_limit")
+    def test_get_positions_success_with_raise_on_error_true(self, mock_rl, client):
+        """raise_on_error=True must not change the success path."""
+        positions = [{"ticker": "T1", "position": 10}]
+        client.session.request.return_value = _mock_response(200, {"market_positions": positions})
+        assert client.get_positions(raise_on_error=True) == positions
+
+    @patch("kalshi_api._rate_limit")
+    def test_get_positions_walks_all_pages(self, mock_rl, client):
+        """Codex round-2 finding: get_positions used to fetch a single page
+        (limit=200) and ignore the documented cursor field entirely — an
+        account with a pilot-market position on page 2 would never see it.
+        Mirrors the pagination already proven correct for get_fills/
+        get_open_orders/get_settlements in this same file."""
+        page1 = _mock_response(200, {
+            "market_positions": [{"ticker": "T1", "position_fp": "1"}],
+            "cursor": "abc",
+        })
+        page2 = _mock_response(200, {
+            "market_positions": [{"ticker": "T2", "position_fp": "2"}],
+            "cursor": "",
+        })
+        client.session.request.side_effect = [page1, page2]
+        result = client.get_positions()
+        assert [p["ticker"] for p in result] == ["T1", "T2"]
+        assert client.session.request.call_count == 2
+
+    @patch("kalshi_api._rate_limit")
+    def test_get_positions_raises_on_second_page_failure_when_opted_in(
+            self, mock_rl, client):
+        """A failure on page 2+ must ALSO raise when opted in, not return
+        the page-1 partial result as if it were complete — same ambiguity
+        as a first-page failure, just discovered later."""
+        from kalshi_api import KalshiPortfolioQueryError
+        page1 = _mock_response(200, {
+            "market_positions": [{"ticker": "T1", "position_fp": "1"}],
+            "cursor": "abc",
+        })
+        page2 = _mock_response(500)
+        client.session.request.side_effect = [page1, page2]
+        with pytest.raises(KalshiPortfolioQueryError):
+            client.get_positions(raise_on_error=True)
+
+    @patch("kalshi_api._rate_limit")
+    def test_get_positions_second_page_failure_returns_partial_when_not_opted_in(
+            self, mock_rl, client):
+        """Default (raise_on_error=False) keeps the original silent-partial
+        behavior — matches get_fills's convention exactly."""
+        page1 = _mock_response(200, {
+            "market_positions": [{"ticker": "T1", "position_fp": "1"}],
+            "cursor": "abc",
+        })
+        page2 = _mock_response(500)
+        client.session.request.side_effect = [page1, page2]
+        result = client.get_positions()
+        assert [p["ticker"] for p in result] == ["T1"]
+
+    @patch("kalshi_api._rate_limit")
+    def test_get_positions_stops_at_max_pages(self, mock_rl, client):
+        """Pagination is bounded — an endlessly-cursoring response can't
+        spin forever. Default raise_on_error=False keeps this silent."""
+        page = _mock_response(200, {
+            "market_positions": [{"ticker": "T1", "position_fp": "1"}],
+            "cursor": "always-more",
+        })
+        client.session.request.return_value = page
+        result = client.get_positions(max_pages=3)
+        assert client.session.request.call_count == 3
+        assert len(result) == 3
+
+    @patch("kalshi_api._rate_limit")
+    def test_get_positions_raises_when_max_pages_exhausted_with_live_cursor(
+            self, mock_rl, client):
+        """Codex round-3 finding: every page fetch here SUCCEEDS (unlike
+        the earlier failure-mid-pagination tests) but the cursor is STILL
+        non-empty after the last one allowed by max_pages — more positions
+        genuinely exist beyond what was fetched. This must be exactly as
+        ambiguous to a raise_on_error=True caller as an HTTP failure would
+        be, not silently returned as if it were a confirmed-complete
+        result."""
+        from kalshi_api import KalshiPortfolioQueryError
+        page = _mock_response(200, {
+            "market_positions": [{"ticker": "T1", "position_fp": "1"}],
+            "cursor": "always-more",  # never terminates on its own
+        })
+        client.session.request.return_value = page
+        with pytest.raises(KalshiPortfolioQueryError):
+            client.get_positions(max_pages=3, raise_on_error=True)
+        assert client.session.request.call_count == 3
+
+    @patch("kalshi_api._rate_limit")
+    def test_get_positions_max_pages_with_cursor_finally_empty_does_not_raise(
+            self, mock_rl, client):
+        """Sanity check: if the LAST page (at exactly max_pages) happens to
+        have an empty cursor, that's genuine completion, not exhaustion —
+        must not raise even with raise_on_error=True."""
+        page1 = _mock_response(200, {
+            "market_positions": [{"ticker": "T1", "position_fp": "1"}],
+            "cursor": "more",
+        })
+        page2 = _mock_response(200, {
+            "market_positions": [{"ticker": "T2", "position_fp": "1"}],
+            "cursor": "",  # done, right at the max_pages boundary
+        })
+        client.session.request.side_effect = [page1, page2]
+        result = client.get_positions(max_pages=2, raise_on_error=True)
+        assert [p["ticker"] for p in result] == ["T1", "T2"]
+
+
+# ---------------------------------------------------------------------------
+# Finding #3 / #4: get_fills / get_open_orders raise_on_error contract.
+# Fail-before: get_fills had no raise_on_error parameter at all (mm_pilot's
+# poll_fills / reconcile calling it with raise_on_error=True would hit a
+# TypeError), and a page-fetch failure was always silently swallowed into
+# whatever fills had been accumulated so far — ambiguous partial vs. empty.
+# get_open_orders did not exist at all.
+# ---------------------------------------------------------------------------
+
+class TestKalshiPortfolioQueryRaiseOnError:
+    @patch("kalshi_api._rate_limit")
+    def test_get_fills_default_preserves_silent_partial_return(self, mock_rl, client):
+        """Default raise_on_error=False must be byte-for-byte the original
+        behavior for existing callers (kalshi_vip.py) — partial results on
+        a mid-pagination failure, no exception."""
+        page1 = _mock_response(200, {"fills": [{"trade_id": "t1"}], "cursor": "abc"})
+        page2 = _mock_response(500)
+        client.session.request.side_effect = [page1, page2]
+        result = client.get_fills()
+        assert result == [{"trade_id": "t1"}]
+
+    @patch("kalshi_api._rate_limit")
+    def test_get_fills_raises_on_first_page_failure_when_opted_in(self, mock_rl, client):
+        from kalshi_api import KalshiPortfolioQueryError
+        client.session.request.return_value = _mock_response(500)
+        with pytest.raises(KalshiPortfolioQueryError):
+            client.get_fills(raise_on_error=True)
+
+    @patch("kalshi_api._rate_limit")
+    def test_get_fills_raises_on_later_page_failure_when_opted_in(self, mock_rl, client):
+        """A failure on page 2+ must ALSO raise, not return the page-1
+        partial result as if it were the complete/confirmed list."""
+        from kalshi_api import KalshiPortfolioQueryError
+        page1 = _mock_response(200, {"fills": [{"trade_id": "t1"}], "cursor": "abc"})
+        page2 = _mock_response(500)
+        client.session.request.side_effect = [page1, page2]
+        with pytest.raises(KalshiPortfolioQueryError):
+            client.get_fills(raise_on_error=True)
+
+    @patch("kalshi_api._rate_limit")
+    def test_get_fills_success_with_raise_on_error_true(self, mock_rl, client):
+        client.session.request.return_value = _mock_response(
+            200, {"fills": [{"trade_id": "t1"}], "cursor": ""})
+        result = client.get_fills(raise_on_error=True)
+        assert result == [{"trade_id": "t1"}]
+
+    @patch("kalshi_api._rate_limit")
+    def test_get_fills_raises_when_max_pages_exhausted_with_live_cursor(
+            self, mock_rl, client):
+        """Codex round-3 finding: every page fetch succeeds but the cursor
+        is STILL non-empty after the last page allowed by max_pages — more
+        fills genuinely exist for this min_ts window beyond what was
+        fetched. Must raise under raise_on_error=True exactly like an HTTP
+        failure would, not silently return a partial fill list that looks
+        confirmed-complete."""
+        from kalshi_api import KalshiPortfolioQueryError
+        page = _mock_response(200, {
+            "fills": [{"trade_id": "t1"}], "cursor": "always-more",
+        })
+        client.session.request.return_value = page
+        with pytest.raises(KalshiPortfolioQueryError):
+            client.get_fills(max_pages=3, raise_on_error=True)
+        assert client.session.request.call_count == 3
+
+    @patch("kalshi_api._rate_limit")
+    def test_get_fills_max_pages_exhausted_without_raise_on_error_is_silent(
+            self, mock_rl, client):
+        """Default raise_on_error=False preserves the original
+        silent-partial-return behavior even for the max-pages-exhausted
+        case — only opting in changes anything."""
+        page = _mock_response(200, {
+            "fills": [{"trade_id": "t1"}], "cursor": "always-more",
+        })
+        client.session.request.return_value = page
+        result = client.get_fills(max_pages=3)
+        assert len(result) == 3
+
+    @patch("kalshi_api._rate_limit")
+    def test_get_open_orders_single_page(self, mock_rl, client):
+        client.session.request.return_value = _mock_response(
+            200, {"orders": [{"order_id": "o1"}, {"order_id": "o2"}], "cursor": ""})
+        result = client.get_open_orders()
+        assert len(result) == 2
+
+    @patch("kalshi_api._rate_limit")
+    def test_get_open_orders_pagination(self, mock_rl, client):
+        page1 = _mock_response(200, {"orders": [{"order_id": "o1"}], "cursor": "xyz"})
+        page2 = _mock_response(200, {"orders": [{"order_id": "o2"}], "cursor": ""})
+        client.session.request.side_effect = [page1, page2]
+        result = client.get_open_orders()
+        assert len(result) == 2
+        assert client.session.request.call_count == 2
+
+    @patch("kalshi_api._rate_limit")
+    def test_get_open_orders_always_raises_on_failure(self, mock_rl, client):
+        """Unlike get_fills/get_positions, get_open_orders has no
+        pre-existing caller relying on silent-empty — it always raises."""
+        from kalshi_api import KalshiPortfolioQueryError
+        client.session.request.return_value = _mock_response(500)
+        with pytest.raises(KalshiPortfolioQueryError):
+            client.get_open_orders()
+
+    @patch("kalshi_api._rate_limit")
+    def test_get_open_orders_filters_by_ticker_param(self, mock_rl, client):
+        client.session.request.return_value = _mock_response(
+            200, {"orders": [{"order_id": "o1"}], "cursor": ""})
+        client.get_open_orders(ticker="KXTEST-26DEC31")
+        params = client.session.request.call_args[1]["params"]
+        assert params["ticker"] == "KXTEST-26DEC31"
+        assert params["status"] == "resting"
+
+    @patch("kalshi_api._rate_limit")
+    def test_get_open_orders_raises_when_max_pages_exhausted_with_live_cursor(
+            self, mock_rl, client):
+        """Codex round-3 finding: every page fetch succeeds but the cursor
+        is STILL non-empty after the last page allowed by max_pages — more
+        resting orders genuinely exist beyond what was fetched.
+        get_open_orders always raises on ambiguity (no raise_on_error
+        flag) — this case must be no exception."""
+        from kalshi_api import KalshiPortfolioQueryError
+        page = _mock_response(200, {
+            "orders": [{"order_id": "o1"}], "cursor": "always-more",
+        })
+        client.session.request.return_value = page
+        with pytest.raises(KalshiPortfolioQueryError):
+            client.get_open_orders(max_pages=3)
+        assert client.session.request.call_count == 3
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +717,173 @@ class TestKalshiFetchData:
         """Returns [] on non-200."""
         client.session.request.return_value = _mock_response(404)
         assert client.fetch_markets_for_event("EVT1") == []
+
+    @patch("kalshi_api._rate_limit")
+    def test_fetch_market_success(self, mock_rl, client):
+        """Returns the unwrapped market dict on 200."""
+        client.session.request.return_value = _mock_response(
+            200, {"market": {"ticker": "TICK", "status": "settled", "result": "yes"}}
+        )
+        result = client.fetch_market("TICK")
+        assert result == {"ticker": "TICK", "status": "settled", "result": "yes"}
+
+    @patch("kalshi_api._rate_limit")
+    def test_fetch_market_requests_correct_path(self, mock_rl, client):
+        """Calls GET /markets/{ticker} (not the account-scoped settlements endpoint)."""
+        client.session.request.return_value = _mock_response(200, {"market": {}})
+        client.fetch_market("KXEARNINGSMENTIONBA-26JUL01")
+        call_args = client.session.request.call_args
+        assert call_args[0][0] == "GET"
+        assert call_args[0][1] == KALSHI_BASE_URL + KALSHI_API_PATH + "/markets/KXEARNINGSMENTIONBA-26JUL01"
+
+    @patch("kalshi_api._rate_limit")
+    def test_fetch_market_returns_none_on_error(self, mock_rl, client):
+        """Returns None on non-200 (e.g. 404 for an unknown ticker)."""
+        client.session.request.return_value = _mock_response(404)
+        assert client.fetch_market("NOPE") is None
+
+    def test_fetch_market_returns_none_when_request_raises(self, client):
+        client._request = MagicMock(side_effect=RuntimeError("transport failed"))
+        assert client.fetch_market("NOPE") is None
+
+    @patch("kalshi_api._rate_limit")
+    def test_fetch_market_handles_unwrapped_response(self, mock_rl, client):
+        """Some responses may not nest under 'market' — falls back to the raw dict."""
+        client.session.request.return_value = _mock_response(
+            200, {"ticker": "TICK", "status": "active"}
+        )
+        result = client.fetch_market("TICK")
+        assert result == {"ticker": "TICK", "status": "active"}
+
+    @patch("kalshi_api._rate_limit")
+    def test_fetch_settled_markets_single_page(self, mock_rl, client):
+        """Single page of settled markets with no cursor returns all."""
+        client.session.request.return_value = _mock_response(200, {
+            "markets": [{"ticker": "M1", "result": "yes"}, {"ticker": "M2", "result": "no"}],
+            "cursor": "",
+        })
+        result = client.fetch_settled_markets(min_close_ts=1000)
+        assert len(result) == 2
+
+    @patch("kalshi_api._rate_limit")
+    def test_fetch_settled_markets_pagination(self, mock_rl, client):
+        """Multiple pages are fetched until an empty cursor."""
+        page1 = _mock_response(200, {"markets": [{"ticker": "M1"}], "cursor": "abc"})
+        page2 = _mock_response(200, {"markets": [{"ticker": "M2"}], "cursor": ""})
+        client.session.request.side_effect = [page1, page2]
+        result = client.fetch_settled_markets(min_close_ts=1000)
+        assert len(result) == 2
+        assert client.session.request.call_count == 2
+
+    @patch("kalshi_api._rate_limit")
+    def test_fetch_settled_markets_raises_on_request_failure(self, mock_rl, client):
+        """A failed request (even the very first page) raises rather than
+        silently returning a partial (here: empty) list as if it were
+        complete -- a caller advancing a time watermark off a silently
+        partial list could skip markets forever."""
+        client.session.request.return_value = _mock_response(500)
+        with pytest.raises(RuntimeError):
+            client.fetch_settled_markets(min_close_ts=1000)
+
+    def test_fetch_settled_markets_translates_request_exception(self, client):
+        client._request = MagicMock(side_effect=RuntimeError("transport failed"))
+        with pytest.raises(RuntimeError, match="0 markets fetched"):
+            client.fetch_settled_markets(min_close_ts=1000)
+
+    @patch("kalshi_api._rate_limit")
+    def test_fetch_settled_markets_raises_on_mid_pagination_failure(self, mock_rl, client):
+        """Page 1 succeeds (more data signaled via a live cursor); page 2
+        fails -- must raise, not return page 1's markets as if complete."""
+        page1 = _mock_response(200, {"markets": [{"ticker": "M1"}], "cursor": "abc"})
+        page2 = _mock_response(500)
+        client.session.request.side_effect = [page1, page2]
+        with pytest.raises(RuntimeError):
+            client.fetch_settled_markets(min_close_ts=1000)
+
+    @patch("kalshi_api._rate_limit")
+    def test_fetch_settled_markets_raises_when_page_budget_exhausted(self, mock_rl, client):
+        """Every page returns a live cursor -- pagination never naturally
+        terminates within max_pages, so this must raise rather than return
+        a silently-truncated list."""
+        page = _mock_response(200, {"markets": [{"ticker": "M1"}], "cursor": "still-more"})
+        client.session.request.return_value = page
+        with pytest.raises(RuntimeError):
+            client.fetch_settled_markets(min_close_ts=1000, max_pages=3)
+        assert client.session.request.call_count == 3
+
+    @patch("kalshi_api._rate_limit")
+    def test_fetch_settled_markets_continues_through_empty_live_cursor(self, mock_rl, client):
+        page1 = _mock_response(200, {"markets": [], "cursor": "abc"})
+        page2 = _mock_response(200, {"markets": [{"ticker": "M2"}], "cursor": ""})
+        client.session.request.side_effect = [page1, page2]
+        assert client.fetch_settled_markets(min_close_ts=1000) == [{"ticker": "M2"}]
+        assert client.session.request.call_count == 2
+
+    @patch("kalshi_api._rate_limit")
+    def test_fetch_settled_markets_sends_status_and_min_close_ts(self, mock_rl, client):
+        """Params include status=settled and the caller's min_close_ts watermark."""
+        client.session.request.return_value = _mock_response(200, {"markets": [], "cursor": ""})
+        client.fetch_settled_markets(min_close_ts=1735000000)
+        sent_params = client.session.request.call_args.kwargs["params"]
+        assert sent_params["status"] == "settled"
+        assert sent_params["min_close_ts"] == 1735000000
+
+    @patch("kalshi_api._rate_limit")
+    def test_fetch_candlesticks_success(self, mock_rl, client):
+        """Returns the unwrapped candlesticks list on 200."""
+        candles = [{"end_period_ts": 1000, "price": {"close_dollars": "0.2200"}}]
+        client.session.request.return_value = _mock_response(200, {"candlesticks": candles})
+        result = client.fetch_candlesticks("KXEARNINGSMENTIONBA", "KXEARNINGSMENTIONBA-26Q2", 100, 200)
+        assert result == candles
+
+    @patch("kalshi_api._rate_limit")
+    def test_fetch_candlesticks_requests_correct_path_and_params(self, mock_rl, client):
+        """Calls GET /series/{series}/markets/{ticker}/candlesticks with the time window."""
+        client.session.request.return_value = _mock_response(200, {"candlesticks": []})
+        client.fetch_candlesticks("KXEARNINGSMENTIONBA", "KXEARNINGSMENTIONBA-26Q2", 100, 200, period_interval=60)
+        call_args = client.session.request.call_args
+        assert call_args[0][0] == "GET"
+        assert call_args[0][1] == (
+            KALSHI_BASE_URL + KALSHI_API_PATH
+            + "/series/KXEARNINGSMENTIONBA/markets/KXEARNINGSMENTIONBA-26Q2/candlesticks"
+        )
+        sent_params = call_args.kwargs["params"]
+        assert sent_params == {"start_ts": 100, "end_ts": 200, "period_interval": 60}
+
+    @patch("kalshi_api._rate_limit")
+    def test_fetch_candlesticks_returns_none_on_error(self, mock_rl, client):
+        """Returns None (the failure sentinel) on non-200 (e.g. wrong series
+        ticker -> 404) -- NOT [], which must mean "succeeded, no data"."""
+        client.session.request.return_value = _mock_response(404)
+        assert client.fetch_candlesticks("BADSERIES", "TICK", 100, 200) is None
+
+    @patch("kalshi_api._rate_limit")
+    def test_fetch_candlesticks_returns_empty_list_on_success_with_no_data(self, mock_rl, client):
+        """A 200 OK with zero candles (e.g. the market didn't exist yet in
+        this window) is a genuinely empty list, distinct from None -- a
+        successful request that found nothing, not a failed request."""
+        client.session.request.return_value = _mock_response(200, {"candlesticks": []})
+        result = client.fetch_candlesticks("KXEARNINGSMENTIONBA", "TICK", 100, 200)
+        assert result == []
+        assert result is not None
+
+    @patch("kalshi_api._rate_limit")
+    def test_fetch_candlesticks_returns_none_on_connection_error_after_retries(self, mock_rl, client):
+        """_request retries ConnectionError internally (tenacity) and
+        re-raises once exhausted (reraise=True) -- fetch_candlesticks must
+        catch that and convert it to the same None failure sentinel, not
+        let it propagate uncaught and crash the whole OOS cycle."""
+        import requests as _req
+        client.session.request.side_effect = _req.ConnectionError("down")
+        assert client.fetch_candlesticks("S", "TICK", 100, 200) is None
+
+    @patch("kalshi_api._rate_limit")
+    def test_fetch_candlesticks_returns_none_on_rate_limit_exhausted(self, mock_rl, client):
+        """Repeated 429s exhaust tenacity's retries and re-raise
+        _RateLimitError (reraise=True) -- also must convert to None, not
+        propagate."""
+        client.session.request.return_value = _mock_response(429)
+        assert client.fetch_candlesticks("S", "TICK", 100, 200) is None
 
     @patch("kalshi_api._rate_limit")
     def test_fetch_order_book_success(self, mock_rl, client):
@@ -609,3 +1041,99 @@ class TestBestAskBidHelpers:
         result = best_yes_ask({"yes_bids": [], "no_bids": [(0.40, 100.0)]})
         assert result[0] == pytest.approx(0.60)
         assert result[1] == 100.0
+
+
+# ---------------------------------------------------------------------------
+# TestFetchIncentivePrograms
+# ---------------------------------------------------------------------------
+
+class TestFetchIncentivePrograms:
+    """LIP pool list via GET /incentive_programs (verified live 2026-06-11)."""
+
+    def _client(self):
+        c = KalshiClient()
+        c.authenticated = True
+        return c
+
+    def test_normalizes_period_reward_to_dollars(self):
+        c = self._client()
+        page = {"incentive_programs": [
+            {"market_ticker": "KXCPI-26JUN", "period_reward": 1150000,
+             "discount_factor_bps": 5000},
+        ], "next_cursor": None}
+        with patch.object(c, "_request", return_value=_mock_response(200, page)):
+            progs = c.fetch_incentive_programs()
+        assert len(progs) == 1
+        assert progs[0]["period_reward_dollars"] == pytest.approx(115.0)
+
+    def test_paginates_until_cursor_exhausted(self):
+        c = self._client()
+        p1 = {"incentive_programs": [{"market_ticker": "A", "period_reward": 400000}],
+              "next_cursor": "abc"}
+        p2 = {"incentive_programs": [{"market_ticker": "B", "period_reward": 100000}],
+              "next_cursor": None}
+        with patch.object(c, "_request",
+                          side_effect=[_mock_response(200, p1), _mock_response(200, p2)]) as req:
+            progs = c.fetch_incentive_programs()
+        assert [p["market_ticker"] for p in progs] == ["A", "B"]
+        assert req.call_count == 2
+        # Second call must carry the cursor
+        assert req.call_args_list[1][1]["params"]["cursor"] == "abc"
+
+    def test_default_cap_covers_current_program_volume(self):
+        """Current active LIP inventory exceeds the old 20-page cap."""
+        c = self._client()
+        pages = []
+        for index in range(22):
+            pages.append(_mock_response(200, {
+                "incentive_programs": [{
+                    "market_ticker": f"M{index}",
+                    "period_reward": 10000,
+                }],
+                "next_cursor": f"cursor-{index}" if index < 21 else None,
+            }))
+        with patch.object(c, "_request", side_effect=pages) as req:
+            progs = c.fetch_incentive_programs()
+        assert len(progs) == 22
+        assert req.call_count == 22
+
+    def test_passes_status_and_type_filters(self):
+        c = self._client()
+        page = {"incentive_programs": [], "next_cursor": None}
+        with patch.object(c, "_request", return_value=_mock_response(200, page)) as req:
+            c.fetch_incentive_programs(status="active", incentive_type="liquidity")
+        params = req.call_args[1]["params"]
+        assert params["status"] == "active"
+        assert params["type"] == "liquidity"
+
+    def test_returns_empty_on_failure(self):
+        c = self._client()
+        with patch.object(c, "_request", return_value=_mock_response(500)):
+            assert c.fetch_incentive_programs() == []
+        with patch.object(c, "_request", return_value=None):
+            assert c.fetch_incentive_programs() == []
+
+    def test_discards_partial_results_on_later_page_failure(self):
+        c = self._client()
+        first = {
+            "incentive_programs": [{"market_ticker": "A", "period_reward": 400000}],
+            "next_cursor": "abc",
+        }
+        with patch.object(c, "_request", side_effect=[_mock_response(200, first), None]):
+            assert c.fetch_incentive_programs() == []
+
+    def test_discards_partial_results_when_page_cap_exhausted(self):
+        c = self._client()
+        page = {
+            "incentive_programs": [{"market_ticker": "A", "period_reward": 400000}],
+            "next_cursor": "still-more",
+        }
+        with patch.object(c, "_request", return_value=_mock_response(200, page)):
+            assert c.fetch_incentive_programs(max_pages=1) == []
+
+    def test_missing_period_reward_defaults_zero(self):
+        c = self._client()
+        page = {"incentive_programs": [{"market_ticker": "X"}], "next_cursor": None}
+        with patch.object(c, "_request", return_value=_mock_response(200, page)):
+            progs = c.fetch_incentive_programs()
+        assert progs[0]["period_reward_dollars"] == 0.0

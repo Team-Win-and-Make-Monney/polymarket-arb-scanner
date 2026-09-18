@@ -130,10 +130,10 @@ class TestConsensusThreshold:
         result = _validate_consensus(0.85, min_threshold=0.90)
         assert result is False
 
-    def test_rejects_zero_consensus(self):
-        """Consensus of 0.0 should reject any positive threshold."""
+    def test_accepts_zero_as_certain_no_consensus(self):
+        """A zero YES probability is a 100% NO consensus."""
         result = _validate_consensus(0.0, min_threshold=0.90)
-        assert result is False
+        assert result is True
 
     def test_rejects_none_consensus(self):
         """None consensus should return False."""
@@ -144,6 +144,10 @@ class TestConsensusThreshold:
         """Non-numeric consensus should return False."""
         result = _validate_consensus("0.95", min_threshold=0.90)
         assert result is False
+
+    def test_rejects_boolean_consensus(self):
+        """Booleans are not valid probabilities despite subclassing int."""
+        assert _validate_consensus(True, min_threshold=0.90) is False
 
     def test_accepts_very_high_consensus(self):
         """Consensus of 0.99 should easily pass threshold."""
@@ -268,7 +272,7 @@ class TestScanStage1:
         assert len(opps) == 0
 
     def test_returns_guaranteed_gain(self):
-        """Opportunity should include _guaranteed_gain = buy_below_price - target_price."""
+        """Opportunity should include target minus executable outcome price."""
         now = 1712282400
         resolution_ts = int(now + (24 * 3600))
 
@@ -293,10 +297,8 @@ class TestScanStage1:
         )
 
         assert len(opps) == 1
-        # guaranteed_gain = buy_below_price - target_price
-        # = 0.95 - 0.95 = 0.00 (at limit; should still be included)
         assert "_guaranteed_gain" in opps[0]
-        assert opps[0]["_guaranteed_gain"] >= 0.0
+        assert opps[0]["_guaranteed_gain"] == pytest.approx(0.05)
 
     def test_consensus_side_yes_when_high(self):
         """Consensus >0.50 should set _consensus_side = YES."""
@@ -335,7 +337,7 @@ class TestScanStage1:
                 "id": "market_7",
                 "question": "Market crash?",
                 "resolutionSource": {"timestamp": resolution_ts},
-                "price": 0.08,  # Low price = market says 92% NO
+                "price": 0.12,  # Market price offers NO at 0.88
             }
         }
 
@@ -346,11 +348,13 @@ class TestScanStage1:
             markets_by_key,
             mock_aggregator,
             min_hours_to_expiry=48,
-            min_consensus=0.08,  # Lower threshold for NO side
+            min_consensus=0.90,
         )
 
         assert len(opps) == 1
         assert opps[0]["_consensus_side"] == "NO"
+        assert opps[0]["_current_price"] == pytest.approx(0.88)
+        assert opps[0]["_guaranteed_gain"] == pytest.approx(0.04)
 
 
 # ---------------------------------------------------------------------------
@@ -599,6 +603,33 @@ class TestEdgeCases:
         opps = scan_time_decay(markets_by_key, mock_aggregator)
 
         assert len(opps) == 0
+
+    def test_market_nonnumeric_resolution_timestamp(self):
+        markets_by_key = {
+            "market_1": {
+                "question": "Test?",
+                "resolutionSource": {"timestamp": "unknown"},
+                "price": 0.90,
+            }
+        }
+        mock_aggregator = MagicMock()
+        mock_aggregator.get_consensus.return_value = 0.95
+
+        assert scan_time_decay(markets_by_key, mock_aggregator) == []
+
+    def test_market_boolean_price_is_skipped(self):
+        now = 1712282400
+        markets_by_key = {
+            "market_1": {
+                "question": "Test?",
+                "resolutionSource": {"timestamp": int(now + 24 * 3600)},
+                "price": False,
+            }
+        }
+        mock_aggregator = MagicMock()
+        mock_aggregator.get_consensus.return_value = 0.95
+
+        assert scan_time_decay(markets_by_key, mock_aggregator) == []
 
     def test_market_none_consensus(self):
         """Market with None consensus should be skipped."""

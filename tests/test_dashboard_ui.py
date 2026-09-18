@@ -41,6 +41,13 @@ class TestRenderSmoke:
         html = dashboard_ui.get_dashboard_html()
         assert "chart.js" in html.lower()
 
+    def test_chart_js_has_sri_and_crossorigin(self):
+        # Audit S07: the CDN script must be integrity-pinned so a CDN compromise
+        # can't inject arbitrary JS into the trading dashboard.
+        html = dashboard_ui.get_dashboard_html()
+        assert 'integrity="sha384-' in html
+        assert 'crossorigin="anonymous"' in html
+
 
 # ---------------------------------------------------------------------------
 # REFRESH_SECONDS substitution

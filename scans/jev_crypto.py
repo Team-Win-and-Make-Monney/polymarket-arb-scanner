@@ -148,9 +148,13 @@ def scan_jev_crypto(
     Returns:
         List of refined JevCrypto opportunity dicts.
     """
-    import config as _cfg
-    is_enabled = getattr(_cfg, "JEV_CRYPTO_ENABLED", JEV_CRYPTO_ENABLED)
-    if not is_enabled and not force:
+    import sys
+    mod = sys.modules.get(__name__)
+    enabled_flag = getattr(mod, "JEV_CRYPTO_ENABLED", None)
+    if enabled_flag is None:
+        import config as _cfg
+        enabled_flag = getattr(_cfg, "JEV_CRYPTO_ENABLED", JEV_CRYPTO_ENABLED)
+    if not enabled_flag and not force:
         logger.debug("JEV_CRYPTO_ENABLED is False and not forced; skipping Jev scan")
         return []
 

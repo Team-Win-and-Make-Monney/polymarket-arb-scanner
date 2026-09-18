@@ -32,10 +32,18 @@ for mod in [
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scans.jev_crypto import (
-    _extract_strike_and_asset,
-    scan_jev_crypto,
-)
+import importlib
+import scans.jev_crypto
+
+def _get_module():
+    return sys.modules.get("scans.jev_crypto") or importlib.import_module("scans.jev_crypto")
+
+def scan_jev_crypto(*args, **kwargs):
+    return _get_module().scan_jev_crypto(*args, **kwargs)
+
+def _extract_strike_and_asset(*args, **kwargs):
+    return _get_module()._extract_strike_and_asset(*args, **kwargs)
+
 
 
 class TestScansJevCrypto(unittest.TestCase):

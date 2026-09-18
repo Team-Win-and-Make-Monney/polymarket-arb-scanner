@@ -155,6 +155,7 @@ class TestScansJevCrypto(unittest.TestCase):
             spot_prices=spot_prices,
             min_profit=0.01,
             jev_client=mock_client,
+            force=True,
         )
 
         self.assertEqual(len(opps), 1)
@@ -173,34 +174,34 @@ class TestScansJevCrypto(unittest.TestCase):
         mock_clob.return_value = {
             "yes_ask": 0.55,
             "no_ask": 0.45,
-            "yes_ask_size": 100.0,
-            "no_ask_size": 100.0,
+            "yes_ask_size": 200.0,
+            "no_ask_size": 200.0,
         }
 
         mock_client = MagicMock()
         mock_client.is_available.return_value = True
         mock_client.query_decisions.return_value = {
             "answers": {
-                "strike_probability": {"type": "noul", "noul": 0.56},
+                "strike_probability": {"type": "noul", "noul": 0.50},
                 "recommended_action": {
                     "type": "choice",
                     "choice": "pass_fair",
                     "confidence": 0.75,
                 },
-                "tail_risk": {"type": "score", "score": 1.2},
+                "tail_risk": {"type": "score", "score": 1.0},
                 "conviction": {"type": "score", "score": 0.5},
             }
         }
 
         mock_market = {
             "question": "Will Bitcoin reach $90,000 by December 31, 2026?",
-            "outcomePrices": json.dumps(["0.55", "0.45"]),
+            "outcomePrices": json.dumps(["0.50", "0.50"]),
             "clobTokenIds": ["token_yes", "token_no"],
             "endDate": "2026-12-31T23:59:59Z",
         }
 
         spot_prices = {
-            "BTC": {"price": 81000.0, "change_24h": 1.0, "vwap_24h": 81000.0}
+            "BTC": {"price": 81000.0, "change_24h": 3.5, "vwap_24h": 80500.0}
         }
 
         opps = scan_jev_crypto(
@@ -208,6 +209,7 @@ class TestScansJevCrypto(unittest.TestCase):
             spot_prices=spot_prices,
             min_profit=0.01,
             jev_client=mock_client,
+            force=True,
         )
 
         self.assertEqual(len(opps), 0)
@@ -249,6 +251,7 @@ class TestScansJevCrypto(unittest.TestCase):
             min_profit=0.01,
             jev_client=mock_client,
             db=mock_db,
+            force=True,
         )
 
         self.assertTrue(mock_db.record_jev_decision.called)

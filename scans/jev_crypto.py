@@ -148,7 +148,9 @@ def scan_jev_crypto(
     Returns:
         List of refined JevCrypto opportunity dicts.
     """
-    if not (JEV_CRYPTO_ENABLED or force):
+    import config as _cfg
+    is_enabled = getattr(_cfg, "JEV_CRYPTO_ENABLED", JEV_CRYPTO_ENABLED)
+    if not is_enabled and not force:
         logger.debug("JEV_CRYPTO_ENABLED is False and not forced; skipping Jev scan")
         return []
 
@@ -261,11 +263,17 @@ def _refine_jev_crypto_with_clob(
             # Stage 2 requires real CLOB order book data; fail closed
             continue
 
-        best_yes_ask = clob_data.get("yes_ask") or clob_data.get("best_ask")
-        best_no_ask = clob_data.get("no_ask")
+        best_yes_ask_raw = clob_data.get("yes_ask") or clob_data.get("best_ask")
+        best_no_ask_raw = clob_data.get("no_ask")
+
+        try:
+            best_yes_ask = float(best_yes_ask_raw) if best_yes_ask_raw is not None else 0.0
+            best_no_ask = float(best_no_ask_raw) if best_no_ask_raw is not None else 0.0
+        except (TypeError, ValueError):
+            continue
 
         # Refinement requires verified positive ask prices
-        if not best_yes_ask or not best_no_ask or best_yes_ask <= 0 or best_no_ask <= 0:
+        if best_yes_ask <= 0 or best_no_ask <= 0:
             continue
 
         spot_info = cand["spot_info"]

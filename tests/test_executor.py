@@ -256,6 +256,26 @@ class TestTokenIdPropagation:
         opp_fail = {"type": "JevCrypto", "net_profit": 0.10, "total_cost": "$1.00", "_confidence": 0.30}
         assert executor._revalidate(opp_fail, None) is False
 
+    def test_revalidate_jev_crypto_price_and_edge(self, executor):
+        # Opportunity with target token and model probability 0.65 (raw edge = 0.65 - 0.40 = 0.25 >= JEV_MIN_EDGE)
+        opp = {
+            "type": "JevCrypto",
+            "net_profit": 0.10,
+            "total_cost": 50.0,
+            "_confidence": 0.85,
+            "_action": "buy_yes",
+            "_token_ids": ["tok_yes", "tok_no"],
+            "_model_prob": 0.65,
+        }
+        now = time.time()
+        price_cache = {("polymarket", "tok_yes"): {"best_ask": 0.40, "_ts": now}}
+        assert executor._revalidate(opp, price_cache) is True
+        assert opp["_exec_price"] == 0.40
+
+        # Now suppose price moved up to 0.64 (edge = 0.65 - 0.64 = 0.01 < JEV_MIN_EDGE 0.04)
+        price_cache_collapsed = {("polymarket", "tok_yes"): {"best_ask": 0.64, "_ts": now}}
+        assert executor._revalidate(opp, price_cache_collapsed) is False
+
 
 # ---------------------------------------------------------------------------
 # _parse_price

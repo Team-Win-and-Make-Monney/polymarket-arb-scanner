@@ -170,6 +170,7 @@ def run_monitor_cycle(db: TradeDB, asset_filter: str | None = None) -> None:
         min_profit=0.005,
         jev_client=client,
         db=db,
+        force=True,
     )
 
     print("\n" + "-" * 75)

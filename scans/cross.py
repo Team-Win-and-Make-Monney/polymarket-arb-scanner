@@ -149,20 +149,25 @@ def _refine_cross_with_clob(opportunities: list[dict], markets_by_key: dict, min
             opp["_clob_depth"] = min(pm_yes_depth or 0, pm_no_depth or 0)
             if partial:
                 opp["_partial_clob"] = True
-            try:
-                from config import JEV_CROSS_EQUIVALENCE_ENABLED, JEV_CONFIDENCE_THRESHOLD
-                if JEV_CROSS_EQUIVALENCE_ENABLED:
+            import config as _config
+            if getattr(_config, "JEV_CROSS_EQUIVALENCE_ENABLED", False):
+                conf_thresh = getattr(_config, "JEV_CONFIDENCE_THRESHOLD", 0.70)
+                try:
                     from matcher import verify_cross_platform_equivalence_jev
                     ma = {"question": opp.get("market", "")}
                     mb = {"title": opp.get("kalshi", "")}
                     is_eq, _, reason = verify_cross_platform_equivalence_jev(
-                        ma, mb, "polymarket", "kalshi", min_confidence=JEV_CONFIDENCE_THRESHOLD
+                        ma, mb, "polymarket", "kalshi", min_confidence=conf_thresh
                     )
-                    if not is_eq:
-                        logger.info("Cross dropped by Jev equivalence gate: %s | %s", opp.get("market", ""), reason)
-                        continue
-            except Exception as e:
-                logger.debug("Jev cross equivalence check error: %s", e)
+                except Exception as e:
+                    logger.warning(
+                        "Cross dropped (fail-closed): Jev equivalence check error for %s: %s",
+                        opp.get("market", ""), e,
+                    )
+                    continue
+                if not is_eq:
+                    logger.info("Cross dropped by Jev equivalence gate: %s | %s", opp.get("market", ""), reason)
+                    continue
 
             refined.append(opp)
         else:

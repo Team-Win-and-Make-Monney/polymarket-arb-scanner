@@ -163,7 +163,17 @@ class PartialFillHedger:
             token_id=token_id, side="SELL", price=bid, size=float(size),
             order_type="FOK",
         )
-        return bool(resp and resp.get("success"))
+        if not resp or not resp.get("success"):
+            return False
+        order_id = resp.get("orderID") or resp.get("order_id")
+        if order_id and hasattr(self.pm_trader, "get_order_status"):
+            try:
+                status = self.pm_trader.get_order_status(order_id)
+                if isinstance(status, dict):
+                    return str(status.get("status", "")).lower() in ("matched", "filled")
+            except Exception as e:
+                logger.warning("Failed to check Polymarket hedge order status %s: %s", order_id, e)
+        return True
 
     def _hedge_kalshi(self, ticker: str, fill_price: float, size: float, max_loss: float,
                       side: str, action: str = "sell",

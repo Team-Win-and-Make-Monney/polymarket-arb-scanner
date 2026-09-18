@@ -271,10 +271,18 @@ class OpportunityIndex:
         opp_type = opp.get("type", "")
 
         # Polymarket token IDs
-        token_ids = opp.get("_token_ids", [])
-        for tid in token_ids:
-            if tid:
-                keys.append(("polymarket", tid))
+        if opp_type == "JevCrypto":
+            action = opp.get("_action", "buy_yes")
+            token_ids = opp.get("_token_ids", [])
+            if action == "buy_yes" and len(token_ids) > 0 and token_ids[0]:
+                keys.append(("polymarket", token_ids[0]))
+            elif action == "buy_no" and len(token_ids) > 1 and token_ids[1]:
+                keys.append(("polymarket", token_ids[1]))
+        else:
+            token_ids = opp.get("_token_ids", [])
+            for tid in token_ids:
+                if tid:
+                    keys.append(("polymarket", tid))
 
         # Kalshi tickers
         kalshi_ticker = opp.get("_kalshi_ticker", "")

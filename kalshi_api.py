@@ -45,6 +45,10 @@ def _legacy_side_action_to_v2(
     """
     side_l = (side or "").lower()
     action_l = (action or "").lower()
+    if side_l not in ("yes", "no"):
+        raise ValueError(f"Unsupported Kalshi side: {side!r}")
+    if action_l not in ("buy", "sell"):
+        raise ValueError(f"Unsupported Kalshi action: {action!r}")
     if side_l == "yes":
         if action_l == "buy":
             return "bid", price_dollars

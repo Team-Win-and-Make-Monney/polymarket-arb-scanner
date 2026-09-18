@@ -122,13 +122,15 @@ class FirecrawlNewsClient:
             cutoff = self._parse_date_epoch(from_date)
             for item in results:
                 published_epoch = self._extract_epoch(item)
-                if cutoff is not None and published_epoch is not None and published_epoch < cutoff:
+                if published_epoch is None:
+                    continue
+                if cutoff is not None and published_epoch < cutoff:
                     continue
                 headlines.append({
                     "headline": item.get("title", ""),
                     "summary": item.get("description", "") or item.get("snippet", ""),
                     "url": item.get("url", ""),
-                    "datetime": published_epoch if published_epoch is not None else time.time(),
+                    "datetime": published_epoch,
                 })
 
             logger.info("Fetched %d news items for %s via Firecrawl search", len(headlines), symbol)

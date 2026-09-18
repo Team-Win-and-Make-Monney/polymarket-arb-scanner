@@ -349,10 +349,20 @@ def _refine_jev_crypto_with_clob(
         risk_ans = answers.get("tail_risk", {})
         conv_ans = answers.get("conviction", {})
 
-        model_prob = float(prob_ans.get("noul", 0.5))
+        noul_val = prob_ans.get("noul")
+        risk_val = risk_ans.get("score")
+        if noul_val is None or risk_val is None:
+            logger.debug("Jev decision missing probability or risk score for %s; skipping", market.get("question"))
+            continue
+
+        try:
+            model_prob = float(noul_val)
+            risk = float(risk_val)
+        except (TypeError, ValueError):
+            continue
+
         action = str(choice_ans.get("choice", "pass_fair"))
         conf = float(choice_ans.get("confidence", 0.0))
-        risk = float(risk_ans.get("score", 1.0))
         conviction = float(conv_ans.get("score", 0.0))
 
         if action == "buy_yes":

@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Stubs for external dependencies
+_INSTALLED_STUBS = []
 for mod in [
     "dotenv",
     "httpx",
@@ -30,9 +31,19 @@ for mod in [
     "py_clob_client_v2.http_helpers.helpers",
 ]:
     if mod not in sys.modules:
-        m = MagicMock()
-        m.__path__ = []
-        sys.modules[mod] = m
+        try:
+            __import__(mod)
+        except ImportError:
+            m = MagicMock()
+            m.__path__ = []
+            sys.modules[mod] = m
+            _INSTALLED_STUBS.append(mod)
+
+
+def tearDownModule():
+    for mod in _INSTALLED_STUBS:
+        if mod in sys.modules:
+            del sys.modules[mod]
 
 
 class TestToxicFlowJev(unittest.TestCase):

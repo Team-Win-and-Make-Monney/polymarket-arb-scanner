@@ -205,40 +205,44 @@ def _score_sentiment_with_jev(
         from jev_client import get_jev_client
         j_client = client or get_jev_client()
         if j_client.is_available():
-            state = {
-                "headline": headline,
-                "summary": summary,
-                "market_question": market_question,
-            }
-            questions = {
-                "outcome_resolution": {
-                    "type": "choice",
-                    "instructions": (
-                        "Given the headline and summary, does this breaking news event definitively "
-                        "confirm the resolution outcome for `market_question` to resolve YES, NO, or is it neutral/inconclusive?"
-                    ),
-                    "criteria": {
-                        "resolves_yes": "The news explicitly confirms the market condition occurred or passed (YES outcome)",
-                        "resolves_no": "The news explicitly confirms the market condition failed, was rejected, or cancelled (NO outcome)",
-                        "neutral_unclear": "The news is speculative, ongoing, unrelated, or inconclusive",
-                    },
+            try:
+                state = {
+                    "headline": headline,
+                    "summary": summary,
+                    "market_question": market_question,
                 }
-            }
-            res = j_client.query_decisions(state, questions)
-            q_ans = res.get("answers", {}).get("outcome_resolution", {})
-            choice = q_ans.get("choice", "neutral_unclear")
-            conf = float(q_ans.get("confidence", 0.0))
+                questions = {
+                    "outcome_resolution": {
+                        "type": "choice",
+                        "instructions": (
+                            "Given the headline and summary, does this breaking news event definitively "
+                            "confirm the resolution outcome for `market_question` to resolve YES, NO, or is it neutral/inconclusive?"
+                        ),
+                        "criteria": {
+                            "resolves_yes": "The news explicitly confirms the market condition occurred or passed (YES outcome)",
+                            "resolves_no": "The news explicitly confirms the market condition failed, was rejected, or cancelled (NO outcome)",
+                            "neutral_unclear": "The news is speculative, ongoing, unrelated, or inconclusive",
+                        },
+                    }
+                }
+                res = j_client.query_decisions(state, questions)
+                q_ans = res.get("answers", {}).get("outcome_resolution", {})
+                choice = q_ans.get("choice", "neutral_unclear")
+                conf = float(q_ans.get("confidence", 0.0))
 
-            if choice == "resolves_yes":
-                return {"sentiment": "YES", "confidence": conf, "source": "jev"}
-            elif choice == "resolves_no":
-                return {"sentiment": "NO", "confidence": conf, "source": "jev"}
-            else:
-                return {"sentiment": None, "confidence": 0.0, "source": "jev"}
+                if choice == "resolves_yes":
+                    return {"sentiment": "YES", "confidence": conf, "source": "jev"}
+                elif choice == "resolves_no":
+                    return {"sentiment": "NO", "confidence": conf, "source": "jev"}
+                else:
+                    return {"sentiment": None, "confidence": 0.0, "source": "jev"}
+            except Exception as e:
+                logger.warning("Active Jev sentiment scoring failed (failing closed): %s", e)
+                return {"sentiment": None, "confidence": 0.0, "source": "jev_failed"}
     except Exception as e:
-        logger.debug("Jev sentiment scoring failed, falling back to keyword scoring: %s", e)
+        logger.debug("Jev client not available: %s", e)
 
-    # Fallback to keyword matching
+    # Fallback to keyword matching only when Jev client is not configured/available
     full_text = (headline + " " + summary).lower()
     kw_res = _score_sentiment(full_text)
     kw_res["source"] = "keyword"

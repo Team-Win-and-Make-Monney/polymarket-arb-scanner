@@ -1384,7 +1384,7 @@ class TradeDB:
         where_clause = " AND ".join(conditions)
         sql = f"""SELECT * FROM jev_decisions
                   WHERE {where_clause}
-                  ORDER BY id ASC LIMIT ?"""
+                  ORDER BY id DESC LIMIT ?"""
         params.append(limit)
 
         with self._lock:

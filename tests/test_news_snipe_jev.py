@@ -7,6 +7,7 @@ import sys
 import unittest
 from unittest.mock import MagicMock
 
+_INSTALLED_STUBS = []
 for mod in [
     "dotenv",
     "thefuzz",
@@ -26,7 +27,17 @@ for mod in [
     "py_clob_client_v2.http_helpers.helpers",
 ]:
     if mod not in sys.modules:
-        sys.modules[mod] = MagicMock()
+        try:
+            __import__(mod)
+        except ImportError:
+            sys.modules[mod] = MagicMock()
+            _INSTALLED_STUBS.append(mod)
+
+
+def tearDownModule():
+    for mod in _INSTALLED_STUBS:
+        if mod in sys.modules:
+            del sys.modules[mod]
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

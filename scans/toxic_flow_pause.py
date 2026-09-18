@@ -84,7 +84,7 @@ def scan_toxic_flow_pause(
                                         break
                             if matched_asset and matched_asset in spots:
                                 sinfo = spots[matched_asset]
-                                change_pct = sinfo.get("change_24h_pct", 0.0) / 100.0
+                                change_pct = float(sinfo.get("change_24h", 0.0))
                                 active_deltas[mk] = {
                                     "asset": matched_asset,
                                     "spot_delta_pct": change_pct,

@@ -777,12 +777,52 @@ class ArbitrageExecutor:
                     reason = "confidence_verified"
             elif opp_type == "JevCrypto":
                 confidence = opportunity.get("_confidence", 0.0)
-                from config import JEV_CONFIDENCE_THRESHOLD
+                from config import JEV_CONFIDENCE_THRESHOLD, JEV_MIN_EDGE, MIN_NET_ROI
+                from fees import net_profit_jev_crypto
                 if confidence < JEV_CONFIDENCE_THRESHOLD:
                     passed = False
                     reason = f"Jev confidence {confidence:.2f} below threshold {JEV_CONFIDENCE_THRESHOLD}"
                 else:
-                    reason = "jev_confidence_verified"
+                    action = opportunity.get("_action", "buy_yes")
+                    token_ids = opportunity.get("_token_ids", [])
+                    token_idx = 0 if action == "buy_yes" else 1
+                    target_token = token_ids[token_idx] if len(token_ids) > token_idx else None
+                    if target_token:
+                        cached = self._check_ws_cache(price_cache, "polymarket", target_token)
+                        curr_ask = _cached_probability(cached, "best_ask", "ask", "price") if cached else None
+                        if curr_ask is None:
+                            try:
+                                book = fetch_order_book(target_token)
+                                ba = get_best_bid_ask(book) if book else {}
+                                curr_ask = ba.get("ask")
+                            except Exception as e:
+                                logger.warning("Failed to fetch orderbook for Jev revalidation: %s", e)
+                                curr_ask = None
+                        if curr_ask is not None and 0.0 < curr_ask < 1.0:
+                            model_prob = float(opportunity.get("_model_prob", 0.5))
+                            prob_target = model_prob if action == "buy_yes" else (1.0 - model_prob)
+                            raw_edge = prob_target - curr_ask
+                            if raw_edge < JEV_MIN_EDGE:
+                                passed = False
+                                reason = f"Jev edge {raw_edge:.4f} collapsed below min {JEV_MIN_EDGE:.4f}"
+                            else:
+                                recalc = net_profit_jev_crypto(
+                                    price=curr_ask,
+                                    model_prob=prob_target,
+                                    size=opportunity.get("total_cost", 50.0),
+                                )
+                                if recalc["net_profit"] <= 0 or recalc["net_roi"] < MIN_NET_ROI:
+                                    passed = False
+                                    reason = f"Jev net ROI {recalc['net_roi']:.4f} below min {MIN_NET_ROI}"
+                                else:
+                                    opportunity["_exec_price"] = curr_ask
+                                    opportunity["net_profit"] = recalc["net_profit"]
+                                    opportunity["net_roi"] = recalc["net_roi"]
+                                    reason = "jev_confidence_and_price_verified"
+                        else:
+                            reason = "jev_confidence_verified"
+                    else:
+                        reason = "jev_confidence_verified"
             elif opp_type == "Correlated":
                 # STRAT-06: Correlated revalidation — check spread hasn't collapsed
                 current_spread = opportunity.get("_spread", 0.0)
@@ -2863,17 +2903,20 @@ class ArbitrageExecutor:
                         # Use actual fill price from the executor; fall back to limit
                         # only if poller couldn't return one (should not happen post-fix).
                         fill_price = leg.get("_fill_price") or leg.get("price", 0)
-                        # Hedge the filled contract/share quantity, not the dollar budget.
-                        fill_qty = leg.get("_fill_qty") or _dollar_size_to_contracts(
-                            size, fill_price or leg.get("price", 0),
-                        )
+                        if leg["platform"] == "polymarket":
+                            fill_qty = leg.get("_fill_qty") or _dollar_size_to_contracts(
+                                size, fill_price or leg.get("price", 0),
+                            )
+                            hedge_size = float(fill_qty)
+                        else:
+                            hedge_size = float(size)
                         hedger.queue_hedge(
                             trade_id=leg.get("_trade_id"),
                             platform=leg["platform"],
                             token_id=leg.get("_token_id", leg.get("_ticker", "")),
                             side=leg.get("side", ""),
                             fill_price=fill_price,
-                            size=float(fill_qty),
+                            size=hedge_size,
                             opportunity_id=opp_id,
                             market_id=leg.get("_market_id"),
                             selection_id=leg.get("_selection_id"),
@@ -3015,16 +3058,20 @@ class ArbitrageExecutor:
                 for i, leg in enumerate(legs):
                     if results.get(i):
                         fill_price = leg.get("_fill_price") or leg.get("price", 0)
-                        fill_qty = leg.get("_fill_qty") or _dollar_size_to_contracts(
-                            size, fill_price or leg.get("price", 0),
-                        )
+                        if leg["platform"] == "polymarket":
+                            fill_qty = leg.get("_fill_qty") or _dollar_size_to_contracts(
+                                size, fill_price or leg.get("price", 0),
+                            )
+                            hedge_size = float(fill_qty)
+                        else:
+                            hedge_size = float(size)
                         hedger.queue_hedge(
                             trade_id=leg.get("_trade_id"),
                             platform=leg["platform"],
                             token_id=leg.get("_token_id", leg.get("_ticker", "")),
                             side=leg.get("side", ""),
                             fill_price=fill_price,
-                            size=float(fill_qty),
+                            size=hedge_size,
                             opportunity_id=opp_id,
                             market_id=leg.get("_market_id"),
                             selection_id=leg.get("_selection_id"),
@@ -3039,17 +3086,17 @@ class ArbitrageExecutor:
 
         return all_filled
 
-    def _persist_order_id(self, leg: dict, order_id: str | None) -> None:
+    def _persist_order_id(self, leg: dict, order_id: str | None) -> bool:
         """Write exchange order_id to SQLite as soon as the venue accepts it.
 
         Must happen before fill polling so crash recovery can reconcile.
         """
         if not order_id:
-            return
+            return False
         leg["_order_id"] = order_id
         trade_id = leg.get("_trade_id")
         if not trade_id:
-            return
+            return True
         try:
             self.db.update_trade_status(
                 trade_id,
@@ -3057,11 +3104,13 @@ class ArbitrageExecutor:
                 order_id=order_id,
                 client_order_id=leg.get("_idempotency_key"),
             )
+            return True
         except Exception as e:
             logger.warning(
                 "Failed to persist order_id=%s for trade #%s: %s",
                 order_id, trade_id, e,
             )
+            return False
 
     def _finalize_leg_trade(
         self,
@@ -3153,7 +3202,13 @@ class ArbitrageExecutor:
             )
             if resp and resp.get("success"):
                 order_id = resp.get("orderID", resp.get("order_id", ""))
-                self._persist_order_id(leg, order_id)
+                if not self._persist_order_id(leg, order_id):
+                    logger.warning("Aborting Polymarket leg: failed to persist order_id=%s; cancelling", order_id)
+                    try:
+                        self.pm_trader.cancel_order(order_id)
+                    except Exception as ce:
+                        logger.warning("Failed to cancel unpersisted Polymarket order %s: %s", order_id, ce)
+                    return False, order_id, None
                 fill_price = self._confirm_fill_pm(order_id, price)
                 if fill_price is None:
                     if use_gtc:
@@ -3241,7 +3296,13 @@ class ArbitrageExecutor:
             if resp:
                 order = resp.get("order", resp)
                 order_id = order.get("order_id", "")
-                self._persist_order_id(leg, order_id)
+                if not self._persist_order_id(leg, order_id):
+                    logger.warning("Aborting Kalshi leg: failed to persist order_id=%s; cancelling", order_id)
+                    try:
+                        self.kalshi_client.cancel_order(order_id)
+                    except Exception as ce:
+                        logger.warning("Failed to cancel unpersisted Kalshi order %s: %s", order_id, ce)
+                    return False, order_id, None
                 status = order.get("status", "")
                 if status == "executed":
                     # FOK filled instantly — extract avg_price directly
@@ -3266,11 +3327,14 @@ class ArbitrageExecutor:
                         # Cancel unfilled GTC order
                         logger.warning("Kalshi GTC order timed out (%.0fs), cancelling: %s",
                                        timeout, order_id)
+                        cancel_confirmed = False
                         try:
-                            self.kalshi_client.cancel_order(order_id)
+                            cancel_confirmed = bool(self.kalshi_client.cancel_order(order_id))
                         except Exception as e:
                             logger.warning("Failed to cancel Kalshi GTC order %s: %s",
                                            order_id, e)
+                        if not cancel_confirmed:
+                            leg["_cancel_unconfirmed"] = True
                         return False, order_id, None
                     if fill_price is None:
                         logger.warning("Kalshi FOK order %s rested then failed (cancel/expire/timeout)", order_id)
@@ -3501,7 +3565,7 @@ class ArbitrageExecutor:
                     matched_qty = float(size_matched) if size_matched not in (None, "") else 0.0
                 except (TypeError, ValueError):
                     matched_qty = 0.0
-                if order_status in ("matched", "filled") or matched_qty > 0:
+                if order_status in ("matched", "filled"):
                     return float(status.get("price", expected_price))
                 elif order_status in ("canceled", "cancelled", "expired"):
                     return None

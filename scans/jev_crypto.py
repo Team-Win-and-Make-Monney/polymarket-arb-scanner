@@ -25,7 +25,7 @@ from config import (
 )
 from fees import net_profit_jev_crypto
 from jev_client import JevClient, get_jev_client
-from .helpers import _fetch_clob_for_market
+from .helpers import _extract_token_ids, _fetch_clob_for_market
 
 logger = logging.getLogger(__name__)
 
@@ -206,7 +206,7 @@ def _refine_jev_crypto_with_clob(
 
     for cand in candidates:
         market = cand["market"]
-        token_ids = market.get("clobTokenIds", [])
+        token_ids = _extract_token_ids(market)
         if not token_ids:
             continue
 

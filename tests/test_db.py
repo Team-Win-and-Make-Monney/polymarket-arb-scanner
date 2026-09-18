@@ -275,3 +275,44 @@ class TestSlippage:
         db.conn.commit()
         avg = db.get_avg_slippage()
         assert avg == pytest.approx(0.02)  # Only counts the one with data
+
+
+# ---------------------------------------------------------------------------
+# Jev Decision Logging
+# ---------------------------------------------------------------------------
+
+class TestJevDecisions:
+    def test_record_and_get_decision(self, db):
+        dec_id = db.record_jev_decision(
+            asset="BTC",
+            strike=95000.0,
+            spot=81089.0,
+            action="pass_fair",
+            market_prob=0.38,
+            jev_prob=0.40,
+            edge=0.02,
+            confidence=0.88,
+            details={"risk": 1.2, "conviction": 0.5},
+        )
+        assert dec_id >= 1
+
+        records = db.get_jev_decisions(asset="BTC", limit=10)
+        assert len(records) == 1
+        r = records[0]
+        assert r["asset"] == "BTC"
+        assert r["strike"] == 95000.0
+        assert r["spot"] == 81089.0
+        assert r["action"] == "pass_fair"
+        assert "risk" in r["details"]
+
+    def test_get_jev_decisions_asset_filter(self, db):
+        db.record_jev_decision("BTC", 90000.0, 81000.0, "buy_yes")
+        db.record_jev_decision("ETH", 3000.0, 2100.0, "pass_fair")
+        db.record_jev_decision("SOL", 180.0, 125.0, "buy_no")
+
+        btc_recs = db.get_jev_decisions(asset="BTC")
+        assert len(btc_recs) == 1
+        assert btc_recs[0]["asset"] == "BTC"
+
+        all_recs = db.get_jev_decisions()
+        assert len(all_recs) == 3

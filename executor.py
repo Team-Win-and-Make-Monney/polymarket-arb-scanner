@@ -729,6 +729,14 @@ class ArbitrageExecutor:
                     reason = f"Confidence {confidence:.2f} below threshold {NEWS_SNIPE_CONFIDENCE_THRESHOLD}"
                 else:
                     reason = "confidence_verified"
+            elif opp_type == "JevCrypto":
+                confidence = opportunity.get("_confidence", 0.0)
+                from config import JEV_CONFIDENCE_THRESHOLD
+                if confidence < JEV_CONFIDENCE_THRESHOLD:
+                    passed = False
+                    reason = f"Jev confidence {confidence:.2f} below threshold {JEV_CONFIDENCE_THRESHOLD}"
+                else:
+                    reason = "jev_confidence_verified"
             elif opp_type == "Correlated":
                 # STRAT-06: Correlated revalidation — check spread hasn't collapsed
                 current_spread = opportunity.get("_spread", 0.0)
@@ -2137,6 +2145,21 @@ class ArbitrageExecutor:
             else:
                 legs = [{"platform": "polymarket", "side": "BUY", "token": "no",
                          "price": opportunity.get("_no_price", 0), "_token_id": no_token}]
+        elif opp_type == "JevCrypto":
+            action = opportunity.get("_action", "buy_yes")
+            token_ids = opportunity.get("_token_ids", [])
+            if not token_ids or len(token_ids) < 2:
+                raise ValueError(f"JevCrypto opp missing token IDs: {opportunity}")
+            yes_token = token_ids[0]
+            no_token = token_ids[1]
+            exec_price = opportunity.get("_exec_price", 0.0)
+
+            if action == "buy_yes":
+                legs = [{"platform": "polymarket", "side": "BUY", "token": "yes",
+                         "price": exec_price, "_token_id": yes_token}]
+            else:
+                legs = [{"platform": "polymarket", "side": "BUY", "token": "no",
+                         "price": exec_price, "_token_id": no_token}]
         elif opp_type == "Correlated":
             # STRAT-06: Correlated Pairs — long underpriced, short overpriced
             long_leg = opportunity.get("_long_leg", {})

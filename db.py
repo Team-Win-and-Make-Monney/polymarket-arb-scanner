@@ -102,6 +102,20 @@ class TradeDB:
                 idempotency_key TEXT NOT NULL UNIQUE,
                 error TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS jev_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                asset TEXT NOT NULL,
+                strike REAL NOT NULL,
+                spot REAL NOT NULL,
+                market_prob REAL,
+                jev_prob REAL,
+                action TEXT NOT NULL,
+                edge REAL,
+                confidence REAL,
+                details TEXT
+            );
         """)
         self.conn.commit()
 
@@ -117,6 +131,8 @@ class TradeDB:
                 ON partial_fills(hedge_status, created_at);
             CREATE INDEX IF NOT EXISTS idx_opportunities_timestamp
                 ON opportunities(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_jev_decisions_asset_timestamp
+                ON jev_decisions(asset, timestamp);
         """)
         self.conn.commit()
 
@@ -1017,6 +1033,87 @@ class TradeDB:
                 (str(int(cutoff)),),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def record_jev_decision(
+        self,
+        asset: str,
+        strike: float,
+        spot: float,
+        action: str,
+        market_prob: float | None = None,
+        jev_prob: float | None = None,
+        edge: float | None = None,
+        confidence: float | None = None,
+        details: dict | str | None = None,
+    ) -> int:
+        """Record a Jev probabilistic evaluation and decision for calibration tracking.
+
+        Args:
+            asset: Underlying crypto asset (e.g. 'BTC', 'ETH', 'SOL', 'XRP').
+            strike: Contract strike price in USD.
+            spot: Observed underlying spot price at decision time.
+            action: Evaluated action ('buy_yes', 'buy_no', 'pass_fair', etc.).
+            market_prob: Current market-implied probability (e.g. Yes ask).
+            jev_prob: Calibrated model probability from Jev noul.
+            edge: Expected edge (model_prob - market_prob or similar).
+            confidence: Jev confidence score.
+            details: Optional dict or string containing risk scores, conviction, etc.
+
+        Returns:
+            Inserted decision record ID.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        details_str = json.dumps(details) if isinstance(details, dict) else (details or "")
+        with self._lock:
+            cur = self.conn.execute(
+                """INSERT INTO jev_decisions
+                   (timestamp, asset, strike, spot, market_prob, jev_prob, action, edge, confidence, details)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    now,
+                    asset,
+                    strike,
+                    spot,
+                    market_prob,
+                    jev_prob,
+                    action,
+                    edge,
+                    confidence,
+                    details_str,
+                ),
+            )
+            self.conn.commit()
+            return cur.lastrowid
+
+    def get_jev_decisions(
+        self,
+        asset: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """Retrieve recent Jev decisions for calibration and performance analysis.
+
+        Args:
+            asset: Optional asset filter (e.g. 'BTC').
+            limit: Maximum number of records to return.
+
+        Returns:
+            List of decision dicts sorted by timestamp descending.
+        """
+        with self._lock:
+            if asset:
+                cur = self.conn.execute(
+                    """SELECT * FROM jev_decisions
+                       WHERE asset = ?
+                       ORDER BY id DESC LIMIT ?""",
+                    (asset.upper(), limit),
+                )
+            else:
+                cur = self.conn.execute(
+                    """SELECT * FROM jev_decisions
+                       ORDER BY id DESC LIMIT ?""",
+                    (limit,),
+                )
+            return [dict(row) for row in cur.fetchall()]
 
     def close(self):
         self.conn.close()

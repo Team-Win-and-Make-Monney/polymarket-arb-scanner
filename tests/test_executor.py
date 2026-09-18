@@ -219,6 +219,43 @@ class TestTokenIdPropagation:
         # Price count (3) != token ID count (1) → returns empty legs
         assert legs == []
 
+    def test_build_legs_jev_crypto_buy_yes(self, executor):
+        opp = {
+            "type": "JevCrypto",
+            "_action": "buy_yes",
+            "_token_ids": ["tok_yes", "tok_no"],
+            "_exec_price": 0.45,
+        }
+        legs = executor._build_legs(opp, 10.0)
+        assert len(legs) == 1
+        assert legs[0]["platform"] == "polymarket"
+        assert legs[0]["side"] == "BUY"
+        assert legs[0]["token"] == "yes"
+        assert legs[0]["price"] == 0.45
+        assert legs[0]["_token_id"] == "tok_yes"
+
+    def test_build_legs_jev_crypto_buy_no(self, executor):
+        opp = {
+            "type": "JevCrypto",
+            "_action": "buy_no",
+            "_token_ids": ["tok_yes", "tok_no"],
+            "_exec_price": 0.55,
+        }
+        legs = executor._build_legs(opp, 10.0)
+        assert len(legs) == 1
+        assert legs[0]["platform"] == "polymarket"
+        assert legs[0]["side"] == "BUY"
+        assert legs[0]["token"] == "no"
+        assert legs[0]["price"] == 0.55
+        assert legs[0]["_token_id"] == "tok_no"
+
+    def test_revalidate_jev_crypto(self, executor):
+        opp_pass = {"type": "JevCrypto", "net_profit": 0.10, "total_cost": "$1.00", "_confidence": 0.75}
+        assert executor._revalidate(opp_pass, None) is True
+
+        opp_fail = {"type": "JevCrypto", "net_profit": 0.10, "total_cost": "$1.00", "_confidence": 0.30}
+        assert executor._revalidate(opp_fail, None) is False
+
 
 # ---------------------------------------------------------------------------
 # _parse_price

@@ -787,7 +787,10 @@ class ArbitrageExecutor:
                     token_ids = opportunity.get("_token_ids", [])
                     token_idx = 0 if action == "buy_yes" else 1
                     target_token = token_ids[token_idx] if len(token_ids) > token_idx else None
-                    if target_token:
+                    if not target_token:
+                        passed = False
+                        reason = "missing_target_token"
+                    else:
                         cached = self._check_ws_cache(price_cache, "polymarket", target_token)
                         curr_ask = _cached_probability(cached, "best_ask", "ask", "price") if cached else None
                         if curr_ask is None:
@@ -798,7 +801,10 @@ class ArbitrageExecutor:
                             except Exception as e:
                                 logger.warning("Failed to fetch orderbook for Jev revalidation: %s", e)
                                 curr_ask = None
-                        if curr_ask is not None and 0.0 < curr_ask < 1.0:
+                        if curr_ask is None or curr_ask <= 0.0 or curr_ask >= 1.0:
+                            passed = False
+                            reason = "price_retrieval_failed"
+                        else:
                             model_prob = float(opportunity.get("_model_prob", 0.5))
                             prob_target = model_prob if action == "buy_yes" else (1.0 - model_prob)
                             raw_edge = prob_target - curr_ask
@@ -806,10 +812,20 @@ class ArbitrageExecutor:
                                 passed = False
                                 reason = f"Jev edge {raw_edge:.4f} collapsed below min {JEV_MIN_EDGE:.4f}"
                             else:
+                                raw_cost = opportunity.get("total_cost", 50.0)
+                                try:
+                                    cost_val = float(str(raw_cost).replace("$", ""))
+                                except (TypeError, ValueError):
+                                    cost_val = 50.0
+                                depth = opportunity.get("_clob_depth", 0)
+                                if hasattr(self, "risk") and self.risk:
+                                    exec_size = self.risk.clamp_size(cost_val, depth, cost_val)
+                                else:
+                                    exec_size = cost_val
                                 recalc = net_profit_jev_crypto(
                                     price=curr_ask,
                                     model_prob=prob_target,
-                                    size=opportunity.get("total_cost", 50.0),
+                                    size=exec_size,
                                 )
                                 if recalc["net_profit"] <= 0 or recalc["net_roi"] < MIN_NET_ROI:
                                     passed = False
@@ -819,10 +835,6 @@ class ArbitrageExecutor:
                                     opportunity["net_profit"] = recalc["net_profit"]
                                     opportunity["net_roi"] = recalc["net_roi"]
                                     reason = "jev_confidence_and_price_verified"
-                        else:
-                            reason = "jev_confidence_verified"
-                    else:
-                        reason = "jev_confidence_verified"
             elif opp_type == "Correlated":
                 # STRAT-06: Correlated revalidation — check spread hasn't collapsed
                 current_spread = opportunity.get("_spread", 0.0)
@@ -3560,11 +3572,6 @@ class ArbitrageExecutor:
             if status:
                 # CLOB returns uppercase statuses (LIVE / MATCHED / CANCELED).
                 order_status = str(status.get("status", "")).lower()
-                size_matched = status.get("size_matched")
-                try:
-                    matched_qty = float(size_matched) if size_matched not in (None, "") else 0.0
-                except (TypeError, ValueError):
-                    matched_qty = 0.0
                 if order_status in ("matched", "filled"):
                     return float(status.get("price", expected_price))
                 elif order_status in ("canceled", "cancelled", "expired"):

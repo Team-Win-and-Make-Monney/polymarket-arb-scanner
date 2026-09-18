@@ -166,13 +166,19 @@ class PartialFillHedger:
         if not resp or not resp.get("success"):
             return False
         order_id = resp.get("orderID") or resp.get("order_id")
-        if order_id and hasattr(self.pm_trader, "get_order_status"):
+        if not order_id:
+            logger.warning("Polymarket hedge order placed without order_id: %s", resp)
+            return False
+        if hasattr(self.pm_trader, "get_order_status"):
             try:
                 status = self.pm_trader.get_order_status(order_id)
                 if isinstance(status, dict):
                     return str(status.get("status", "")).lower() in ("matched", "filled")
+                logger.warning("Polymarket hedge order %s status non-dict or unavailable: %s", order_id, status)
+                return False
             except Exception as e:
                 logger.warning("Failed to check Polymarket hedge order status %s: %s", order_id, e)
+                return False
         return True
 
     def _hedge_kalshi(self, ticker: str, fill_price: float, size: float, max_loss: float,

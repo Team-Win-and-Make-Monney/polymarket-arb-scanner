@@ -280,6 +280,37 @@ class TestScansJevCrypto(unittest.TestCase):
         self.assertEqual(call_kwargs["action"], "pass_fair")
         self.assertEqual(call_kwargs["spot"], 125.0)
 
+    @patch("scans.jev_crypto._fetch_clob_for_market")
+    def test_non_finite_values_skipped(self, mock_clob):
+        """Test NaN or Inf model_prob/risk are rejected without emitting opportunities."""
+        mock_clob.return_value = {
+            "yes_ask": 0.40, "no_ask": 0.60, "yes_ask_size": 500.0, "no_ask_size": 500.0,
+        }
+        mock_client = MagicMock()
+        mock_client.is_available.return_value = True
+        mock_client.query_decisions.return_value = {
+            "answers": {
+                "strike_probability": {"type": "noul", "noul": float("nan")},
+                "recommended_action": {"type": "choice", "choice": "buy_yes", "confidence": 0.85},
+                "tail_risk": {"type": "score", "score": 1.0},
+                "conviction": {"type": "score", "score": 1.5},
+            }
+        }
+        mock_market = {
+            "question": "Will Bitcoin reach $90,000 by December 31, 2026?",
+            "outcomePrices": json.dumps(["0.40", "0.60"]),
+            "clobTokenIds": ["btc_yes", "btc_no"],
+            "endDate": "2026-12-31T23:59:59Z",
+        }
+        opps = scan_jev_crypto(
+            markets_by_key={"btc-90k": mock_market},
+            spot_prices={"BTC": {"price": 85000.0, "change_24h": 1.5, "vwap_24h": 84000.0}},
+            min_profit=0.01,
+            jev_client=mock_client,
+            force=True,
+        )
+        self.assertEqual(opps, [])
+
 
 if __name__ == "__main__":
     unittest.main()

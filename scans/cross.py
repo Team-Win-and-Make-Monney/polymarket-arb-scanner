@@ -7,7 +7,13 @@ from polymarket_api import get_binary_markets, get_clob_prices, parse_outcome_pr
 from kalshi_api import KalshiClient
 from matcher import (match_markets_to_events, match_markets_to_events_semantic,
                      match_cross_platform, match_cross_platform_semantic, detect_inverted)
-from config import FUZZY_MATCH_THRESHOLD, SEMANTIC_MATCHING_ENABLED, SEMANTIC_MATCH_THRESHOLD
+from config import (
+    FUZZY_MATCH_THRESHOLD,
+    SEMANTIC_MATCHING_ENABLED,
+    SEMANTIC_MATCH_THRESHOLD,
+    JEV_CROSS_EQUIVALENCE_ENABLED,
+    JEV_CONFIDENCE_THRESHOLD,
+)
 from fees import (
     net_profit_cross_platform,
     net_profit_cross_betfair,
@@ -149,9 +155,8 @@ def _refine_cross_with_clob(opportunities: list[dict], markets_by_key: dict, min
             opp["_clob_depth"] = min(pm_yes_depth or 0, pm_no_depth or 0)
             if partial:
                 opp["_partial_clob"] = True
-            import config as _config
-            if getattr(_config, "JEV_CROSS_EQUIVALENCE_ENABLED", False):
-                conf_thresh = getattr(_config, "JEV_CONFIDENCE_THRESHOLD", 0.70)
+            if JEV_CROSS_EQUIVALENCE_ENABLED:
+                conf_thresh = JEV_CONFIDENCE_THRESHOLD
                 try:
                     from matcher import verify_cross_platform_equivalence_jev
                     ma = {"question": opp.get("market", "")}

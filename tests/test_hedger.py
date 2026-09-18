@@ -258,6 +258,7 @@ class TestHedgerPartialFills:
         """Polymarket: 50% fill on YES, 100% on NO → hedge sells YES."""
         mock_pm = MagicMock()
         mock_pm.place_order.return_value = {"success": True, "order_id": "pm_hedge_1"}
+        mock_pm.get_order_status.return_value = {"status": "matched"}
         hedger = PartialFillHedger(pm_trader=mock_pm, db=db)
 
         with patch("polymarket_api.fetch_order_book") as mock_fetch:
@@ -276,6 +277,43 @@ class TestHedgerPartialFills:
                 call_args = mock_pm.place_order.call_args
                 assert call_args[1]["side"] == "SELL"
                 assert call_args[1]["size"] == 2.5
+
+    def test_polymarket_partial_fill_hedge_missing_order_id(self, PartialFillHedger, db):
+        """Polymarket: missing order_id returns False (fails closed)."""
+        mock_pm = MagicMock()
+        mock_pm.place_order.return_value = {"success": True}
+        hedger = PartialFillHedger(pm_trader=mock_pm, db=db)
+
+        with patch("polymarket_api.fetch_order_book") as mock_fetch:
+            with patch("polymarket_api.get_best_bid_ask") as mock_best:
+                mock_fetch.return_value = {"bids": [0.35], "asks": [0.40]}
+                mock_best.return_value = {"bid": 0.35, "ask": 0.40}
+
+                pf = {
+                    "id": 1, "platform": "polymarket",
+                    "token_id": "token_yes_123", "fill_price": 0.40,
+                    "size": 2.5, "side": "YES", "hedge_attempts": 0,
+                }
+                assert hedger._attempt_hedge(pf) is False
+
+    def test_polymarket_partial_fill_hedge_status_exception(self, PartialFillHedger, db):
+        """Polymarket: status lookup exception returns False."""
+        mock_pm = MagicMock()
+        mock_pm.place_order.return_value = {"success": True, "order_id": "pm_h1"}
+        mock_pm.get_order_status.side_effect = RuntimeError("network drop")
+        hedger = PartialFillHedger(pm_trader=mock_pm, db=db)
+
+        with patch("polymarket_api.fetch_order_book") as mock_fetch:
+            with patch("polymarket_api.get_best_bid_ask") as mock_best:
+                mock_fetch.return_value = {"bids": [0.35], "asks": [0.40]}
+                mock_best.return_value = {"bid": 0.35, "ask": 0.40}
+
+                pf = {
+                    "id": 1, "platform": "polymarket",
+                    "token_id": "token_yes_123", "fill_price": 0.40,
+                    "size": 2.5, "side": "YES", "hedge_attempts": 0,
+                }
+                assert hedger._attempt_hedge(pf) is False
 
     def test_polymarket_partial_fill_hedge_canceled_status(self, PartialFillHedger, db):
         """Polymarket: if FOK order cancels/expires, hedge returns False."""
@@ -441,6 +479,7 @@ class TestHedgerPartialFills:
         """Hedger logs all hedge transactions with platform, leg, size, price."""
         mock_pm = MagicMock()
         mock_pm.place_order.return_value = {"success": True, "order_id": "pm_h1"}
+        mock_pm.get_order_status.return_value = {"status": "matched"}
         hedger = PartialFillHedger(pm_trader=mock_pm, db=db)
 
         with patch("polymarket_api.fetch_order_book") as mock_fetch:
@@ -464,7 +503,8 @@ class TestHedgerPartialFills:
     def test_multiple_partial_fills_all_hedged(self, PartialFillHedger, db):
         """Multiple partial fills (3+ legs) all hedged correctly."""
         mock_pm = MagicMock()
-        mock_pm.place_order.return_value = {"success": True}
+        mock_pm.place_order.return_value = {"success": True, "order_id": "pm_multi_h"}
+        mock_pm.get_order_status.return_value = {"status": "matched"}
         hedger = PartialFillHedger(pm_trader=mock_pm, db=db)
 
         with patch("polymarket_api.fetch_order_book") as mock_fetch:
@@ -548,7 +588,8 @@ class TestHedgerErrorHandling:
     def test_hedger_logs_all_hedges_multiple_platforms(self, PartialFillHedger, db):
         """Execute hedges on 2 platforms, verify log contains hedge details."""
         mock_pm = MagicMock()
-        mock_pm.place_order.return_value = {"success": True}
+        mock_pm.place_order.return_value = {"success": True, "order_id": "pm_h1"}
+        mock_pm.get_order_status.return_value = {"status": "matched"}
         mock_kalshi = MagicMock()
         mock_kalshi.fetch_order_book.return_value = {"orderbook": {"yes": [["35", 10]]}}
         mock_kalshi.place_order.return_value = {"order_id": "k_h1"}

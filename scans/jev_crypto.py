@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import urllib.request
 from datetime import datetime, timezone
 
@@ -359,6 +360,10 @@ def _refine_jev_crypto_with_clob(
             model_prob = float(noul_val)
             risk = float(risk_val)
         except (TypeError, ValueError):
+            continue
+
+        if not (math.isfinite(model_prob) and math.isfinite(risk)):
+            logger.debug("Jev decision non-finite probability or risk for %s; skipping", market.get("question"))
             continue
 
         action = str(choice_ans.get("choice", "pass_fair"))

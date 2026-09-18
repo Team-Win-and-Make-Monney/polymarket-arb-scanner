@@ -64,6 +64,30 @@ def fetch_spot_prices() -> dict[str, dict]:
     return results
 
 
+def fetch_polymarket_crypto_markets() -> dict[str, dict]:
+    """Fetch active crypto strike markets from Polymarket Gamma API events endpoint."""
+    url = "https://gamma-api.polymarket.com/events?active=true&closed=false&order=volume24hr&ascending=false&limit=100"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            events = json.loads(resp.read().decode("utf-8"))
+            markets_by_key = {}
+            for ev in events:
+                title = ev.get("title", "").lower()
+                if any(w in title for w in ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "ripple", "xrp"]):
+                    for mkt in ev.get("markets", []):
+                        cid = mkt.get("conditionId") or mkt.get("condition_id") or mkt.get("question")
+                        if cid:
+                            markets_by_key[f"polymarket-{cid}" if not str(cid).startswith("polymarket-") else cid] = mkt
+            return markets_by_key
+    except Exception as e:
+        logger.debug("Failed to fetch Polymarket crypto markets: %s", e)
+        return {}
+
+
 # ---------------------------------------------------------------------------
 # Stage 1: Fast Strike & Regime Filter
 # ---------------------------------------------------------------------------
@@ -135,6 +159,18 @@ def scan_jev_crypto(
     if not spots:
         logger.warning("No spot prices available for Jev scan")
         return []
+
+    # Check if markets_by_key contains crypto contracts; if not, fetch targeted crypto events
+    has_crypto = any(
+        any(w in m.get("question", "").lower() for w in ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "ripple", "xrp"])
+        for m in markets_by_key.values()
+    ) if markets_by_key else False
+
+    if not has_crypto:
+        crypto_mkts = fetch_polymarket_crypto_markets()
+        if crypto_mkts:
+            markets_by_key = dict(markets_by_key) if markets_by_key else {}
+            markets_by_key.update(crypto_mkts)
 
     # Stage 1: Candidate pre-filter
     candidates: list[dict] = []

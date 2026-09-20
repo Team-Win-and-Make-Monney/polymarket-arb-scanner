@@ -2055,13 +2055,6 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                             except Exception as e:
                                 logger.error("Failed to fetch %s: %s", key, e)
 
-                if _funnel:
-                    if poly_markets:
-                        _funnel.record_screened(len(poly_markets))
-                    if kalshi_data and len(kalshi_data) >= 2 and kalshi_data[1]:
-                        _kalshi_count = sum(len(m) for m in kalshi_data[1].values())
-                        _funnel.record_screened(_kalshi_count)
-
                 all_opportunities = []
 
                 # Stage 2: Run scans in parallel

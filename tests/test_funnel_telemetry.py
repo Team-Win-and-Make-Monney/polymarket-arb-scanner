@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import sys
 from io import BytesIO
 from pathlib import Path
@@ -194,7 +193,9 @@ class TestScansFunnelTracking:
             "clobTokenIds": '["tok1", "tok2"]',
         }
 
-        with patch("scans.binary._within_resolution_window", return_value=True), \
+        with patch("scans.binary.get_binary_markets", return_value=[market]), \
+             patch("scans.binary.parse_outcome_prices", return_value=[0.40, 0.45]), \
+             patch("scans.binary._within_resolution_window", return_value=True), \
              patch("scans.binary._refine_binary_with_clob", return_value=[]):
             scan_binary_internal([market], min_profit=0.01, funnel=tracker)
 

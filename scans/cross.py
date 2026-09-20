@@ -284,6 +284,8 @@ def scan_cross_platform(
             threshold=FUZZY_MATCH_THRESHOLD, min_confidence=min_confidence,
         )
     logger.info("Found %d event matches. Fetching Kalshi market prices...", len(matched))
+    if funnel:
+        funnel.record_screened(len(matched))
 
     # Pre-fetch Kalshi markets in parallel if not already done
     if kalshi_markets_by_event is None:

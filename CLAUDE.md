@@ -4,6 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 > **Project name:** the GitHub repo and Railway service remain **`polymarket-arb-scanner`**. The codebase is *internally branded* "arbgrid" — a grid of platforms × layers × strategies, not a Polymarket-only scanner — but no GitHub/Railway rename has actually occurred. (A separate exploratory scaffold briefly held the `arbgrid` GitHub repo name; it was archived 2026-06 during the `~/Dev` arbitrage-cluster consolidation, along with a second `prediction-market-arb` scaffold whose Claude market-equivalence discovery was ported here as `market_discovery.py`.) Local clones may use any directory name without functional impact.
 
+This repository supports autonomous trading services, but execution remains governed by current runtime configuration, venue eligibility, operator-owned risk limits, and kill-switch controls. Repository documentation is not transaction authority.
+
 ## Project Overview
 
 Python CLI tool (`arbgrid`) that scans for arbitrage and trading opportunities across prediction markets. Supports one-shot scans, continuous mode with WebSocket feeds, and automated trade execution. Deployed to Railway via GitHub integration.
@@ -90,11 +92,8 @@ Remaining gaps and the build sequence to close them are documented in the v2 fra
 
 ## Current Status
 
-- **Last updated**: 2026-06-13
-- **Branch**: `master`
-- **Worked on**: PRs #45–#48 shipped (NegRisk NO-side scan; exit-liquidity gate + authoritative Kalshi settlement; Polymarket maker-rebate model; #20 tuning-loop age-gate + startup visibility → **#20 now BUILT**, 27 BUILT / 2 PARTIAL). Engine docs added: [`docs/MODE-STRATEGY-MAP.md`](docs/MODE-STRATEGY-MAP.md) + [`docs/STRATEGY-FINANCIAL-FORECAST.md`](docs/STRATEGY-FINANCIAL-FORECAST.md). Engine backlog stood up in the *Polymarket Arb Scanner* Linear project (milestones E1–E5, JOH-78–98).
-- **Next recommended**: E1 quick wins — WS-5 dead `GEMINI_FEE_RATE` cleanup (JOH-78), mode-count 33→34 + `seerium` slot (JOH-79), `continuous.py` dead-scan kwargs fix (JOH-80).
-- **Project type**: dev-only
+See [`STATE.md`](STATE.md) for current state and the single next action. Tasks remain in the Linear workspace `johnsnow`.
+
 ## Commands
 
 ```bash
@@ -375,7 +374,7 @@ Keep using `polymarket_api.py` / `py-clob-client` for execution paths — the CL
 
 The `web3-polymarket` agent skill (`~/.claude/skills/web3-polymarket/`) carries the full integration reference: L1/L2 auth, order types (GTC/GTD/FOK/FAK), tick-size/neg-risk semantics, WebSocket channels, CTF split/merge/redeem, and gasless relayer patterns. Load its reference files when working on `polymarket_api.py`, `ws_feeds.py`, or CTF-related execution.
 
-**Geoblock caveat**: `polymarket clob geoblock` reports this machine's residential IP (US/MI) as blocked for trading endpoints — local order placement via CLI will fail. Read-only commands (markets, books, prices, data) work fine. Production execution runs from Railway (see `POLYMARKET_PROXY_URL` in config). Never store a private key in `~/.config/polymarket/config.json` (plaintext) — the CLI also reads `POLYMARKET_PRIVATE_KEY`, which this project already manages via Infisical.
+**Geoblock caveat**: `polymarket clob geoblock` reports this machine's residential IP (US/MI) as blocked for trading endpoints — local order placement via CLI will fail. Read-only commands (markets, books, prices, data) work fine. Production execution runs from Railway (see `POLYMARKET_PROXY_URL` in config). Never store a private key in `~/.config/polymarket/config.json` (plaintext) — the CLI also reads `POLYMARKET_PRIVATE_KEY`, which this project already manages via Infisical. Run CLI commands via `infisical run --env dev -- polymarket -o json <command>` so the key is injected as an env var for that process only; `~/.config/polymarket/config.json` should only ever hold non-secret fields (`chain_id`, `signature_type`).
 
 ## Agent Team Notes
 
@@ -403,3 +402,9 @@ Default label vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `read
 ### Domain docs
 
 Single-context repo. See `docs/agents/domain.md`.
+
+## Mem0 (cross-tool)
+
+Mem0 `app_id=johnsnow92-polymarket-arb-scanner`. Search this app_id plus `personal-prefs` at session start before rediscovering durable decisions.
+Personal prefs → `personal-prefs`. Open items → Linear. Human notes → Obsidian. Claude Code session learnings → native MEMORY.md.
+Policy: `~/Dev/mem0-knowledge-base/FULL-LEVERAGE.md`.

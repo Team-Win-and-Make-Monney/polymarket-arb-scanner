@@ -26,3 +26,5 @@ arbgrid-roadmap.docx
 ~$*.docx
 PLAN.md
 .claude/claudex/
+data/dryrun-*/
+/backtest_recommendations.json

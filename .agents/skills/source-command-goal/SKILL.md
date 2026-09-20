@@ -16,7 +16,7 @@ cycles. One item per invocation, done properly, beats three items rushed.
 
 ## Orient (always do this first)
 
-1. Read `AGENTS.md` → Current Status, and the project memory (auto-loaded).
+1. Read `STATE.md` (and `AGENTS.md`), and the project memory (auto-loaded).
 2. Fetch the live project board — the shared state for this effort:
    `https://Codex.ai/code/artifact/b995c054-d42a-41d1-a170-eeaead4a4443`
    (WebFetch it; the Remaining Work tab is the ranked backlog, the Go-Live Gate tab is

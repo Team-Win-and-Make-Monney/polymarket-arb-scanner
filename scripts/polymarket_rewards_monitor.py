@@ -195,13 +195,15 @@ def fetch_markets(limit: int = 50) -> tuple[list[dict], str]:
     }
     try:
         payload = _fetch_json("/v1/markets", params)
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
         return [], f"{type(exc).__name__}: {exc}"
 
     if isinstance(payload, list):
         return payload, ""
-    rows = payload.get("markets") or payload.get("data") or payload.get("items") or []
-    return rows if isinstance(rows, list) else [], ""
+    if isinstance(payload, dict):
+        rows = payload.get("markets") or payload.get("data") or payload.get("items") or []
+        return rows if isinstance(rows, list) else [], ""
+    return [], f"Unexpected payload type: {type(payload).__name__}"
 
 
 def market_to_candidate(row: dict) -> dict:
@@ -235,7 +237,7 @@ def market_to_candidate(row: dict) -> dict:
         "reward_timing": "Market-specific.",
         "capital_intensity": "medium_high",
         "execution_risk": "high",
-        "max_capital_usd": rewards_min_size or 0,
+        "max_capital_usd": 0,
         "source_url": DOC_URLS["markets_api"],
         "direct_url": f"https://polymarket.us/event/{slug}" if slug else DOC_URLS["markets_api"],
         "validation_status": "public_api_observed",
@@ -367,6 +369,7 @@ def main(argv: list[str] | None = None) -> int:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(digest + "\n", encoding="utf-8")
         write_csv(candidates, args.csv_output)
+        args.json_output.parent.mkdir(parents=True, exist_ok=True)
         args.json_output.write_text(
             json.dumps(
                 {

@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import datetime as dt
-import os
+import json
 import sys
 import urllib.error
 from pathlib import Path
-from unittest.mock import patch
-
-import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -48,7 +45,8 @@ class TestPolymarketRewardsMonitor:
         candidate = monitor.market_to_candidate(row)
 
         assert candidate["market_slug"] == "will-test-market-resolve-yes"
-        assert candidate["max_capital_usd"] == 2500
+        assert candidate["max_capital_usd"] == 0
+        assert candidate["rewards_min_size"] == "2500.00"
         assert candidate["validation_status"] == "public_api_observed"
         assert candidate["best_bid"] == "0.49"
         assert candidate["best_ask"] == "0.51"
@@ -64,6 +62,17 @@ class TestPolymarketRewardsMonitor:
         assert markets == []
         assert "access denied" in error
 
+    def test_fetch_markets_handles_json_decode_error(self, monkeypatch):
+        def fail(*args, **kwargs):
+            raise json.JSONDecodeError("Expecting value", "<html>502 Bad Gateway</html>", 0)
+
+        monkeypatch.setattr(monitor, "_fetch_json", fail)
+
+        markets, error = monitor.fetch_markets(limit=1)
+
+        assert markets == []
+        assert "JSONDecodeError" in error
+
     def test_render_digest_records_gateway_error(self):
         now = dt.datetime(2026, 7, 3, tzinfo=dt.timezone.utc)
         digest = monitor.render_digest(monitor.build_candidates([]), now, "URLError: access denied", 3)
@@ -71,3 +80,20 @@ class TestPolymarketRewardsMonitor:
         assert "Polymarket Rewards Read-Only Digest" in digest
         assert "Gateway fetch failed" in digest
         assert "No Polymarket credentials" in digest
+
+    def test_main_creates_parent_dirs(self, tmp_path):
+        out_md = tmp_path / "nested" / "output.md"
+        out_csv = tmp_path / "nested" / "output.csv"
+        out_json = tmp_path / "nested" / "sub" / "output.json"
+
+        argv = [
+            "--docs-only",
+            "--output", str(out_md),
+            "--csv-output", str(out_csv),
+            "--json-output", str(out_json),
+        ]
+        rc = monitor.main(argv)
+        assert rc == 0
+        assert out_md.exists()
+        assert out_csv.exists()
+        assert out_json.exists()

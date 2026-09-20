@@ -1208,6 +1208,9 @@ class ArbitrageExecutor:
         if pm_yes is None or pm_no is None or k_yes is None or k_no is None:
             raise _RevalidationAPIError("incomplete prices after re-fetch for cross")
 
+        if opp.get("_inverted", False):
+            k_yes, k_no = k_no, k_yes
+
         result1 = net_profit_cross_platform(pm_yes, k_no, "yes", "no")
         result2 = net_profit_cross_platform(pm_no, k_yes, "no", "yes")
 
@@ -2180,10 +2183,11 @@ class ArbitrageExecutor:
                     # Build YES leg using fee-path-optimal platform
                     yes_leg: dict = {"platform": yes_plat, "side": "BUY", "token": "yes",
                                      "price": yes_price}
+                    is_inverted = bool(opportunity.get("_inverted", False))
                     if yes_plat == "polymarket":
                         yes_leg["_token_id"] = token_ids[0] if len(token_ids) > 0 else ""
                     elif yes_plat == "kalshi":
-                        yes_leg["side"] = "yes"
+                        yes_leg["side"] = "no" if is_inverted else "yes"
                         yes_leg["action"] = "buy"
                         yes_leg["_ticker"] = opportunity.get("_kalshi_ticker", "")
 
@@ -2193,7 +2197,7 @@ class ArbitrageExecutor:
                     if no_plat == "polymarket":
                         no_leg["_token_id"] = token_ids[1] if len(token_ids) > 1 else ""
                     elif no_plat == "kalshi":
-                        no_leg["side"] = "no"
+                        no_leg["side"] = "yes" if is_inverted else "no"
                         no_leg["action"] = "buy"
                         no_leg["_ticker"] = opportunity.get("_kalshi_ticker", "")
 
@@ -2206,16 +2210,18 @@ class ArbitrageExecutor:
             # Default routing: parse prices_str (backward compatible)
             prices_str = opportunity.get("prices", "")
             kalshi_ticker = opportunity.get("_kalshi_ticker", "")
+            is_inverted = bool(opportunity.get("_inverted", False))
             if "PM_Y=" in prices_str and "K_N=" in prices_str:
                 yes_token = token_ids[0] if len(token_ids) > 0 else ""
                 pm_price = self._parse_price(opportunity, "PM_Y=")
                 k_price = self._parse_price(opportunity, "K_N=")
                 if pm_price is None or k_price is None:
                     return []
+                k_side = "yes" if is_inverted else "no"
                 legs = [
                     {"platform": "polymarket", "side": "BUY", "token": "yes",
                      "price": pm_price, "_token_id": yes_token},
-                    {"platform": "kalshi", "side": "no", "action": "buy",
+                    {"platform": "kalshi", "side": k_side, "action": "buy",
                      "price": k_price, "_ticker": kalshi_ticker},
                 ]
             elif "PM_N=" in prices_str and "K_Y=" in prices_str:
@@ -2224,10 +2230,11 @@ class ArbitrageExecutor:
                 k_price = self._parse_price(opportunity, "K_Y=")
                 if pm_price is None or k_price is None:
                     return []
+                k_side = "no" if is_inverted else "yes"
                 legs = [
                     {"platform": "polymarket", "side": "BUY", "token": "no",
                      "price": pm_price, "_token_id": no_token},
-                    {"platform": "kalshi", "side": "yes", "action": "buy",
+                    {"platform": "kalshi", "side": k_side, "action": "buy",
                      "price": k_price, "_ticker": kalshi_ticker},
                 ]
             elif "_platform_a" in opportunity:

@@ -66,6 +66,11 @@ try:
         _metrics = None
 except Exception:
     _metrics = None
+
+try:
+    from funnel import get_funnel_tracker
+except ImportError:
+    get_funnel_tracker = None
 from scans import (
     scan_binary_internal,
     scan_negrisk_internal,
@@ -2010,6 +2015,11 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                 if _paper_tracker:
                     _paper_tracker.on_day_boundary(time.time())
 
+            # Funnel telemetry: initialize cycle
+            _funnel = get_funnel_tracker() if get_funnel_tracker else None
+            if _funnel:
+                _funnel.start_cycle()
+
             try:
                 from concurrent.futures import ThreadPoolExecutor
 
@@ -2044,6 +2054,13 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                                     kalshi_data = result
                             except Exception as e:
                                 logger.error("Failed to fetch %s: %s", key, e)
+
+                if _funnel:
+                    if poly_markets:
+                        _funnel.record_screened(len(poly_markets))
+                    if kalshi_data and len(kalshi_data) >= 2 and kalshi_data[1]:
+                        _kalshi_count = sum(len(m) for m in kalshi_data[1].values())
+                        _funnel.record_screened(_kalshi_count)
 
                 all_opportunities = []
 
@@ -2587,11 +2604,14 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                         logger.debug("Rebalancing check failed: %s", exc)
 
                 # Apply filters
+                _pre_depth_count = len(all_opportunities)
                 if args.min_depth > 0:
                     all_opportunities = [
                         opp for opp in all_opportunities
                         if opp.get("_clob_depth", 0) >= args.min_depth
                     ]
+                    if _funnel:
+                        _funnel.record_depth_dropped(_pre_depth_count - len(all_opportunities))
 
                 all_opportunities.sort(key=_execution_priority, reverse=True)
 
@@ -2606,6 +2626,16 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                 # Send webhook notification
                 if notifier and all_opportunities:
                     notifier.notify(all_opportunities)
+
+                # Finalize funnel metrics for the cycle
+                if _funnel:
+                    _funnel.record_surfaced(len(all_opportunities))
+                    _cycle_funnel = _funnel.finish_cycle()
+                    logger.info(_funnel.summary_log(scan_count))
+                    dashboard_state.funnel_stats = _cycle_funnel
+                    if _metrics:
+                        for _fk, _fv in _cycle_funnel.items():
+                            _metrics.set(f"funnel_{_fk}", value=_fv)
 
                 # Update dashboard state
                 dashboard_state.scan_count = scan_count

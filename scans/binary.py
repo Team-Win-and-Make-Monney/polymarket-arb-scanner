@@ -11,7 +11,8 @@ logger = logging.getLogger(__name__)
 
 
 def _refine_binary_with_clob(opportunities: list[dict], markets_by_question: dict, min_profit: float,
-                             price_cache: dict | None = None) -> list[dict]:
+                             price_cache: dict | None = None,
+                             funnel=None) -> list[dict]:
     """Stage 2: Re-check binary candidates using CLOB ask prices (what you'd actually pay)."""
     if not opportunities:
         return opportunities
@@ -70,6 +71,12 @@ def _refine_binary_with_clob(opportunities: list[dict], markets_by_question: dic
                 clob["no_ask_size"] or 0,
             )
             refined.append(opp)
+        else:
+            if funnel:
+                if result.get("gross_spread", 0) > 0:
+                    funnel.record_fee_dropped(1)
+                else:
+                    funnel.record_clob_dropped(1)
 
     dropped = len(opportunities) - len(refined)
     if dropped:
@@ -78,13 +85,23 @@ def _refine_binary_with_clob(opportunities: list[dict], markets_by_question: dic
 
 
 def scan_binary_internal(markets: list[dict], min_profit: float,
-                         price_cache: dict | None = None) -> list[dict]:
+                         price_cache: dict | None = None,
+                         funnel=None) -> list[dict]:
     """Scan for binary arbitrage on Polymarket (YES + NO < $1.00)."""
+    if funnel is None:
+        try:
+            from funnel import get_funnel_tracker
+            funnel = get_funnel_tracker()
+        except ImportError:
+            funnel = None
+
     opportunities = []
     markets_by_question = {}
 
     binary_markets = get_binary_markets(markets)
     logger.info("Scanning %d binary markets...", len(binary_markets))
+    if funnel:
+        funnel.record_screened(len(binary_markets))
 
     filtered_resolution = 0
     for m in binary_markets:
@@ -131,8 +148,12 @@ def scan_binary_internal(markets: list[dict], min_profit: float,
     if filtered_resolution:
         logger.info("Filtered %d/%d binary markets outside resolution window.", filtered_resolution, len(binary_markets))
 
+    if funnel:
+        funnel.record_mid_candidates(len(opportunities))
+        funnel.record_clob_evaluated(len(opportunities))
+
     # Stage 2: Refine with CLOB ask prices
-    opportunities = _refine_binary_with_clob(opportunities, markets_by_question, min_profit, price_cache=price_cache)
+    opportunities = _refine_binary_with_clob(opportunities, markets_by_question, min_profit, price_cache=price_cache, funnel=funnel)
 
     opportunities = filter_dust(opportunities)
 

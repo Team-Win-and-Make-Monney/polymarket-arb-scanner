@@ -132,6 +132,8 @@ class _DashboardState:
         self.leaderboard_updated_at: float = 0
         # Rewards tracking (Layer 3)
         self.reward_tracker = None
+        # Detection funnel telemetry (Phase 1)
+        self.funnel_stats: dict[str, int] = {}
 
     def update_strategy_metrics(self, strategy_metrics: list[dict]) -> None:
         """Update dashboard with strategy leaderboard metrics.
@@ -157,6 +159,7 @@ class _DashboardState:
             "ws_connections": self.ws_connections,
             "opportunities_found": self.opportunities_found,
             "last_opportunities": self.last_opportunities[:20],
+            "funnel_stats": self.funnel_stats,
             "mm_active_markets": self.mm_active_markets,
             "mm_active_orders": self.mm_active_orders,
             "mm_total_exposure": round(self.mm_total_exposure, 2),
@@ -373,6 +376,7 @@ class _Handler(BaseHTTPRequestHandler):
             "/api/rebalance": self._handle_rebalance,
             "/api/validation": self._handle_validation,
             "/api/jev/calibration": self._handle_jev_calibration,
+            "/api/funnel": self._handle_funnel,
         }
 
         handler_fn = routes.get(path)
@@ -442,6 +446,16 @@ class _Handler(BaseHTTPRequestHandler):
     def _handle_status(self):
         """Scanner state JSON (existing endpoint, preserved for compatibility)."""
         _send_json(self, state.to_dict())
+
+    def _handle_funnel(self):
+        """Detection funnel telemetry endpoint (Phase 1)."""
+        from funnel import get_funnel_tracker
+        tracker = get_funnel_tracker()
+        _send_json(self, {
+            "current_cycle": tracker.current_cycle.to_dict(),
+            "cumulative": tracker.cumulative.to_dict(),
+            "history": tracker.cycle_history[-20:],
+        })
 
     def _handle_metrics(self):
         """Prometheus-compatible metrics endpoint (text exposition format).

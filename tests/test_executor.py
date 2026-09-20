@@ -2915,12 +2915,16 @@ class TestExecutorFrechet:
         assert legs[0]["token"] == "yes"
         assert legs[0]["price"] == pytest.approx(0.45)
         assert legs[0]["_token_id"] == "tok_sup_yes"
+        assert legs[0]["_contracts"] == 6
+        assert legs[0]["size"] == pytest.approx(2.70)
 
         assert legs[1]["platform"] == "polymarket"
         assert legs[1]["side"] == "BUY"
         assert legs[1]["token"] == "no"
         assert legs[1]["price"] == pytest.approx(0.30)
         assert legs[1]["_token_id"] == "tok_sub_no"
+        assert legs[1]["_contracts"] == 6
+        assert legs[1]["size"] == pytest.approx(1.80)
 
     def test_build_legs_frechet_kalshi(self, executor):
         opp = {
@@ -2938,21 +2942,68 @@ class TestExecutorFrechet:
         assert legs[0]["action"] == "buy"
         assert legs[0]["price"] == pytest.approx(0.45)
         assert legs[0]["_ticker"] == "KXBTC-T90k"
+        assert legs[0]["_contracts"] == 6
+        assert legs[0]["size"] == pytest.approx(2.70)
 
         assert legs[1]["platform"] == "kalshi"
         assert legs[1]["side"] == "no"
         assert legs[1]["action"] == "buy"
         assert legs[1]["price"] == pytest.approx(0.30)
         assert legs[1]["_ticker"] == "KXBTC-T100k"
+        assert legs[1]["_contracts"] == 6
+        assert legs[1]["size"] == pytest.approx(1.80)
 
-    def test_revalidate_frechet_kalshi(self, executor):
+    def test_revalidate_frechet_kalshi_passed(self, executor):
         opp = {
             "type": "FrechetArb",
             "_platform": "kalshi",
+            "_buy_yes_ticker": "KXBTC-T90k",
+            "_buy_no_ticker": "KXBTC-T100k",
             "net_profit": 0.20,
         }
+        mock_book_b = {"orderbook": {"yes": [[40, 100]], "no": [[55, 100]]}}
+        mock_book_a = {"orderbook": {"yes": [[70, 100]], "no": [[25, 100]]}}
+
+        def mock_fetch(ticker):
+            return mock_book_b if ticker == "KXBTC-T90k" else mock_book_a
+
+        executor.kalshi_client.fetch_order_book.side_effect = mock_fetch
         passed = executor._revalidate(opp)
         assert passed is True
+        assert opp["_p_b"] == pytest.approx(0.45)
+        assert opp["_p_a"] == pytest.approx(0.70)
+        assert opp["net_profit"] > 0
+
+    def test_revalidate_frechet_kalshi_degraded(self, executor):
+        opp = {
+            "type": "FrechetArb",
+            "_platform": "kalshi",
+            "_buy_yes_ticker": "KXBTC-T90k",
+            "_buy_no_ticker": "KXBTC-T100k",
+            "net_profit": 0.20,
+        }
+        # Books moved so total cost >= 1.0 (no edge)
+        mock_book_b = {"orderbook": {"yes": [[40, 100]], "no": [[45, 100]]}}  # yes_ask = 0.55
+        mock_book_a = {"orderbook": {"yes": [[45, 100]], "no": [[50, 100]]}}  # no_ask = 0.55
+
+        def mock_fetch(ticker):
+            return mock_book_b if ticker == "KXBTC-T90k" else mock_book_a
+
+        executor.kalshi_client.fetch_order_book.side_effect = mock_fetch
+        passed = executor._revalidate(opp)
+        assert passed is False
+
+    def test_revalidate_frechet_kalshi_missing_book(self, executor):
+        opp = {
+            "type": "FrechetArb",
+            "_platform": "kalshi",
+            "_buy_yes_ticker": "KXBTC-T90k",
+            "_buy_no_ticker": "KXBTC-T100k",
+            "net_profit": 0.20,
+        }
+        executor.kalshi_client.fetch_order_book.return_value = None
+        passed = executor._revalidate(opp)
+        assert passed is False
 
     def test_revalidate_frechet_polymarket_passed(self, executor):
         from unittest.mock import patch
@@ -3004,3 +3055,28 @@ class TestExecutorFrechet:
             passed = executor._revalidate(opp)
 
         assert passed is False
+
+    def test_execute_frechet_max_trade_size_clamped(self, executor):
+        from unittest.mock import patch
+        opp = {
+            "type": "FrechetArb",
+            "market": "BTC 100k subset of 90k",
+            "_platform": "polymarket",
+            "_buy_yes_token": "tok_b",
+            "_buy_no_token": "tok_a",
+            "_p_b": 0.45,
+            "_p_a": 0.70,
+            "total_cost": "$0.75",
+            "net_profit": 0.20,
+            "net_roi": "26.7%",
+            "_clob_depth": 500.0,
+        }
+        executor.max_trade_size = 100.0
+        # FRECHET_ARB_MAX_TRADE_SIZE is 20.0
+        with patch("config.FRECHET_ARB_MAX_TRADE_SIZE", 20.0), \
+             patch.object(executor, "_revalidate", return_value=True):
+            legs = executor._build_legs(opp, 20.0)
+            assert len(legs) == 2
+            # 20.0 / 0.75 = 26 contracts
+            assert legs[0]["_contracts"] == 26
+            assert legs[1]["_contracts"] == 26

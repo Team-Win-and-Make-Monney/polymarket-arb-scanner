@@ -1,6 +1,5 @@
 """Tests for pair_relations.py — subset/implication pair discovery."""
 
-import pytest
 import sys
 import os
 
@@ -9,7 +8,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pair_relations import (
     parse_threshold_market,
     discover_subset_pairs,
-    ThresholdSpec,
     _normalize_num,
     _normalize_underlying,
 )

@@ -119,7 +119,7 @@ class TestScansFrechet:
         candidates = _frechet().scan_frechet([m_sub, m_sup], platform="polymarket", funnel=funnel)
         assert len(candidates) == 1
         funnel.record_screened.assert_called_once_with(1)
-        funnel.record_mid_candidate.assert_called_once()
+        funnel.record_mid_candidates.assert_called_once_with(1)
 
     def test_refine_frechet_with_clob_profitable(self):
         m_sub = {
@@ -160,8 +160,8 @@ class TestScansFrechet:
         assert res["_clob_depth"] == 40.0  # min(50.0, 40.0)
         assert res["_p_a"] == pytest.approx(0.70)
         assert res["_p_b"] == pytest.approx(0.45)
-        funnel.record_clob_evaluated.assert_called_once()
-        funnel.record_surfaced.assert_called_once()
+        funnel.record_clob_evaluated.assert_called_once_with(1)
+        funnel.record_surfaced.assert_called_once_with(1)
 
     def test_refine_frechet_with_clob_drops_unprofitable(self):
         m_sub = {"condition_id": "0xsub"}
@@ -184,4 +184,4 @@ class TestScansFrechet:
             refined = _frechet()._refine_frechet_with_clob([cand], min_profit=0.01, funnel=funnel)
 
         assert len(refined) == 0
-        funnel.record_clob_dropped.assert_called_once()
+        funnel.record_clob_dropped.assert_called_once_with(1)

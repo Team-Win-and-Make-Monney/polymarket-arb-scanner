@@ -851,7 +851,15 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
     # Plan 02: Fréchet-Bound Logical Arbitrage
     if args.mode in ("all", "frechet"):
         from config import FRECHET_ARB_ENABLED, FRECHET_MIN_VIOLATION
-        if FRECHET_ARB_ENABLED or args.mode == "frechet":
+        is_dry_run = getattr(args, "dry_run", None)
+        if is_dry_run is None:
+            is_dry_run = getattr(executor, "dry_run", True)
+        if args.mode == "frechet" and not FRECHET_ARB_ENABLED and not is_dry_run:
+            logger.error(
+                "Fréchet arbitrage mode requested but FRECHET_ARB_ENABLED=false in non-dry-run execution. "
+                "Refusing to scan without explicit enablement."
+            )
+        elif FRECHET_ARB_ENABLED or (args.mode == "frechet" and is_dry_run):
             logger.info("--- Fréchet-Bound Logical Arbitrage Scan ---")
             try:
                 frechet_opps = scan_frechet(

@@ -440,7 +440,13 @@ class ArbitrageExecutor:
             desired_size = self.risk.calculate_dynamic_size(opportunity, self.sizing_aggressiveness)
         else:
             desired_size = self.max_trade_size
+        if opp_type == "FrechetArb":
+            from config import FRECHET_ARB_MAX_TRADE_SIZE
+            desired_size = min(desired_size, FRECHET_ARB_MAX_TRADE_SIZE)
         size = self.risk.clamp_size(desired_size, depth, per_leg_budget)
+        if opp_type == "FrechetArb":
+            from config import FRECHET_ARB_MAX_TRADE_SIZE
+            size = min(size, FRECHET_ARB_MAX_TRADE_SIZE)
         if size <= 0:
             logger.info(f"{prefix}Size 0 after constraints. Skipping.")
             self._log_skipped(opportunity, "zero_size")
@@ -1035,7 +1041,52 @@ class ArbitrageExecutor:
         """
         platform = opp.get("_platform", "polymarket")
         if platform == "kalshi":
-            return True, original_profit, "live_orderbook"
+            ticker_b = opp.get("_buy_yes_ticker")
+            ticker_a = opp.get("_buy_no_ticker")
+            if not ticker_b or not ticker_a or not self.kalshi_client:
+                logger.warning("Revalidation: missing tickers or Kalshi client for Kalshi FrechetArb")
+                raise _RevalidationAPIError("no tickers or no Kalshi client for FrechetArb")
+            book_b = self.kalshi_client.fetch_order_book(ticker_b)
+            if not book_b:
+                raise _RevalidationAPIError(f"failed to fetch Kalshi order book for {ticker_b}")
+            book_a = self.kalshi_client.fetch_order_book(ticker_a)
+            if not book_a:
+                raise _RevalidationAPIError(f"failed to fetch Kalshi order book for {ticker_a}")
+
+            from kalshi_api import parse_orderbook, best_yes_ask, best_no_ask, _audit_raw_orderbook
+            _audit_raw_orderbook(ticker_b, book_b)
+            _audit_raw_orderbook(ticker_a, book_a)
+            parsed_b = parse_orderbook(book_b)
+            parsed_a = parse_orderbook(book_a)
+            yes_b_tup = best_yes_ask(parsed_b)
+            no_a_tup = best_no_ask(parsed_a)
+            if yes_b_tup is None or no_a_tup is None:
+                raise _RevalidationAPIError(f"missing ask sides for Kalshi FrechetArb ({ticker_b}, {ticker_a})")
+            b_yes_ask = yes_b_tup[0]
+            a_no_ask = no_a_tup[0]
+
+            from fees import net_profit_frechet_implication
+            result = net_profit_frechet_implication(
+                p_a=1.0 - a_no_ask,
+                p_b=b_yes_ask,
+                platform="kalshi",
+            )
+            reval_profit = result["net_profit"]
+            threshold = self._get_revalidation_threshold(original_profit, opp)
+            if reval_profit < threshold:
+                logger.info(
+                    "Revalidation: Kalshi FrechetArb profit degraded %.4f -> %.4f (threshold=%.4f)",
+                    original_profit, reval_profit, threshold,
+                )
+                return False, reval_profit, "profit_below_floor"
+
+            opp["_kalshi_b_yes"] = b_yes_ask
+            opp["_kalshi_a_no"] = a_no_ask
+            opp["_p_b"] = b_yes_ask
+            opp["_p_a"] = 1.0 - a_no_ask
+            opp["prices"] = f"Ask(B)={b_yes_ask:.3f} + Ask(¬A)={a_no_ask:.3f}"
+            opp["net_profit"] = reval_profit
+            return True, reval_profit, "passed"
 
         buy_yes_token = opp.get("_buy_yes_token")
         buy_no_token = opp.get("_buy_no_token")
@@ -1950,23 +2001,45 @@ class ArbitrageExecutor:
                 ]
         elif opp_type == "FrechetArb":
             # Buy YES on superset (B) + Buy NO on subset (A)
+            # Both legs must be sized with an equal contract quantity to maintain
+            # the guaranteed Dutch book payoff (1:1 hedge ratio).
             platform = opportunity.get("_platform", "polymarket")
             if platform == "kalshi":
+                price_b = float(opportunity.get("_kalshi_b_yes", opportunity.get("_p_b", 0.5)))
+                price_a = float(opportunity.get("_kalshi_a_no", 1.0 - opportunity.get("_p_a", 0.5)))
+                unit_cost = price_b + price_a
+                contracts = int(size / unit_cost) if unit_cost > 0 else 0
+                if contracts < 1:
+                    return []
                 legs = [
                     {"platform": "kalshi", "side": "yes", "action": "buy",
-                     "price": opportunity.get("_kalshi_b_yes", opportunity.get("_p_b", 0.5)),
+                     "price": price_b,
+                     "size": round(contracts * price_b, 4),
+                     "_contracts": contracts,
                      "_ticker": opportunity.get("_buy_yes_ticker", "")},
                     {"platform": "kalshi", "side": "no", "action": "buy",
-                     "price": opportunity.get("_kalshi_a_no", 1.0 - opportunity.get("_p_a", 0.5)),
+                     "price": price_a,
+                     "size": round(contracts * price_a, 4),
+                     "_contracts": contracts,
                      "_ticker": opportunity.get("_buy_no_ticker", "")},
                 ]
             else:
+                price_b = float(opportunity.get("_p_b", 0.5))
+                price_a = float(1.0 - opportunity.get("_p_a", 0.5))
+                unit_cost = price_b + price_a
+                contracts = int(size / unit_cost) if unit_cost > 0 else 0
+                if contracts < 1:
+                    return []
                 legs = [
                     {"platform": "polymarket", "side": "BUY", "token": "yes",
-                     "price": opportunity.get("_p_b", 0.5),
+                     "price": price_b,
+                     "size": round(contracts * price_b, 4),
+                     "_contracts": contracts,
                      "_token_id": opportunity.get("_buy_yes_token", "")},
                     {"platform": "polymarket", "side": "BUY", "token": "no",
-                     "price": 1.0 - opportunity.get("_p_a", 0.5),
+                     "price": price_a,
+                     "size": round(contracts * price_a, 4),
+                     "_contracts": contracts,
                      "_token_id": opportunity.get("_buy_no_token", "")},
                 ]
         elif opp_type == "BetfairBackAll":
@@ -2810,7 +2883,7 @@ class ArbitrageExecutor:
                 platform=leg["platform"],
                 side=leg.get("side", leg.get("token", "")),
                 price=leg.get("price", 0),
-                size=size,
+                size=leg.get("size", size),
                 status="dry_run",
                 outcome=leg.get("outcome") or leg.get("token"),
             )
@@ -2869,12 +2942,13 @@ class ArbitrageExecutor:
 
         # Log all trades as pending
         for i, leg in enumerate(legs):
+            leg_size = leg.get("size", size)
             trade_id = self.db.log_trade(
                 opportunity_id=opp_id,
                 platform=leg["platform"],
                 side=leg.get("side", leg.get("token", "")),
                 price=leg.get("price", 0),
-                size=size,
+                size=leg_size,
                 status="pending",
                 outcome=leg.get("outcome") or leg.get("token"),
             )
@@ -2889,7 +2963,7 @@ class ArbitrageExecutor:
         for leg in legs:
             price = leg.get("price", 0)
             if price > 0:
-                count = _dollar_size_to_contracts(size, price)
+                count = leg.get("_contracts") or _dollar_size_to_contracts(leg.get("size", size), price)
                 plat = leg["platform"]
                 cost_per_platform[plat] = cost_per_platform.get(plat, 0) + count * price
         for plat, cost in cost_per_platform.items():
@@ -2909,7 +2983,7 @@ class ArbitrageExecutor:
             with ThreadPoolExecutor(max_workers=len(legs)) as pool:
                 futures = {}
                 for i, leg in enumerate(legs):
-                    future = pool.submit(self._execute_single_leg, leg, size, opportunity)
+                    future = pool.submit(self._execute_single_leg, leg, leg.get("size", size), opportunity)
                     futures[future] = (i, leg)
                 for future in as_completed(futures):
                     idx, leg = futures[future]
@@ -2933,7 +3007,7 @@ class ArbitrageExecutor:
             # Same-platform: execute legs sequentially, abort on first failure
             for i, leg in enumerate(legs):
                 try:
-                    success, order_id, fill_price = self._execute_single_leg(leg, size, opportunity)
+                    success, order_id, fill_price = self._execute_single_leg(leg, leg.get("size", size), opportunity)
                     self._finalize_leg_trade(leg, success, order_id, fill_price)
                     results[i] = success
                     if success:
@@ -3112,7 +3186,7 @@ class ArbitrageExecutor:
                 platform=leg["platform"],
                 side=leg.get("side", leg.get("token", "")),
                 price=leg.get("price", 0),
-                size=size,
+                size=leg.get("size", size),
                 status="pending",
                 outcome=leg.get("outcome") or leg.get("token"),
             )
@@ -3124,7 +3198,7 @@ class ArbitrageExecutor:
         with ThreadPoolExecutor(max_workers=len(legs)) as pool:
             futures = {}
             for i, leg in enumerate(legs):
-                future = pool.submit(self._execute_single_leg, leg, size, opportunity)
+                future = pool.submit(self._execute_single_leg, leg, leg.get("size", size), opportunity)
                 futures[future] = (i, leg)
             for future in as_completed(futures):
                 idx, leg = futures[future]
@@ -3272,6 +3346,7 @@ class ArbitrageExecutor:
         """Execute a single trade leg. Returns (success, order_id, fill_price)."""
         platform = leg["platform"]
         price = leg.get("price", 0)
+        leg_size = leg.get("size", size)
 
         # --- Platform whitelist guard ---
         if platform not in ENABLED_EXECUTION_PLATFORMS:
@@ -3284,9 +3359,9 @@ class ArbitrageExecutor:
 
         # --- Minimum order size guard ---
         min_size = PLATFORM_MIN_ORDER_SIZE.get(platform, 0)
-        if size < min_size:
+        if leg_size < min_size:
             logger.warning(
-                f"Order size ${size:.2f} below {platform} minimum "
+                f"Order size ${leg_size:.2f} below {platform} minimum "
                 f"${min_size:.2f}. Skipping leg."
             )
             return False, None, None
@@ -3302,11 +3377,11 @@ class ArbitrageExecutor:
             neg_risk = "NegRisk" in opportunity.get("type", "")
 
             # size is dollars; Polymarket place_order expects share count
-            share_count = _dollar_size_to_contracts(size, price)
+            share_count = leg.get("_contracts") or _dollar_size_to_contracts(leg_size, price)
             if share_count < 1:
                 logger.warning(
                     "Polymarket order size $%.2f @ $%.3f buys 0 shares. Skipping.",
-                    size, price,
+                    leg_size, price,
                 )
                 return False, None, None
             leg["_qty"] = share_count
@@ -3387,11 +3462,11 @@ class ArbitrageExecutor:
             side = leg.get("side", "yes")
             action = leg.get("action", "buy")
             # Convert dollar size to contracts (1 contract = $1 payout)
-            count = _dollar_size_to_contracts(size, price)
+            count = leg.get("_contracts") or _dollar_size_to_contracts(leg_size, price)
             if count < 1:
                 logger.warning(
                     "Kalshi order size $%.2f @ $%.3f buys 0 contracts. Skipping.",
-                    size, price,
+                    leg_size, price,
                 )
                 return False, None, None
             leg["_qty"] = count

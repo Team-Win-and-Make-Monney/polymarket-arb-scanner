@@ -107,7 +107,7 @@ def scan_frechet(
             continue
 
         if funnel:
-            funnel.record_mid_candidate()
+            funnel.record_mid_candidates(1)
 
         # Run fee & payout model
         category = sub_mkt.get("category") or sup_mkt.get("category")
@@ -121,7 +121,7 @@ def scan_frechet(
         net_profit = result["net_profit"]
         if net_profit < min_profit:
             if funnel:
-                funnel.record_fee_dropped()
+                funnel.record_fee_dropped(1)
             continue
 
         # Extract tokens/tickers for execution
@@ -232,7 +232,7 @@ def _refine_frechet_with_clob(
 
     for opp in candidates:
         if funnel:
-            funnel.record_clob_evaluated()
+            funnel.record_clob_evaluated(1)
 
         mkt_platform = opp.get("_platform", "polymarket")
         if mkt_platform == "polymarket":
@@ -243,7 +243,7 @@ def _refine_frechet_with_clob(
 
             if not sub_clob or not sup_clob:
                 if funnel:
-                    funnel.record_clob_dropped()
+                    funnel.record_clob_dropped(1)
                 continue
 
             b_yes_ask = sup_clob.get("yes_ask")
@@ -251,7 +251,7 @@ def _refine_frechet_with_clob(
 
             if b_yes_ask is None or a_no_ask is None or b_yes_ask <= 0 or a_no_ask <= 0:
                 if funnel:
-                    funnel.record_clob_dropped()
+                    funnel.record_clob_dropped(1)
                 continue
 
             # Effective probabilities from executable ask prices
@@ -268,7 +268,7 @@ def _refine_frechet_with_clob(
 
             if result["net_profit"] < min_profit:
                 if funnel:
-                    funnel.record_clob_dropped()
+                    funnel.record_clob_dropped(1)
                 continue
 
             depth_b = sup_clob.get("yes_ask_size") or sup_clob.get("yes_depth") or 0.0
@@ -286,14 +286,14 @@ def _refine_frechet_with_clob(
             opp_copy["_clob_refined"] = True
 
             if funnel:
-                funnel.record_surfaced()
+                funnel.record_surfaced(1)
 
             refined.append(opp_copy)
 
         elif mkt_platform == "kalshi":
             # For Kalshi, mid prices from REST are executable snapshot quotes
             if funnel:
-                funnel.record_surfaced()
+                funnel.record_surfaced(1)
             refined.append(opp)
 
     return refined

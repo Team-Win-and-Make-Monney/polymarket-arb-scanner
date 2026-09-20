@@ -484,3 +484,66 @@ class TestDisputeGate:
         allowed, reason = rm.check(valid_opportunity, mock_db)
         assert allowed is True
         assert reason == "OK"
+
+    def test_negrisk_missing_dispute_state_rejected(self, default_config, mock_db, valid_opportunity):
+        default_config["dispute_gate_enabled"] = True
+        rm = RiskManager(default_config)
+        valid_opportunity["type"] = "NegRisk"
+        valid_opportunity["_condition_ids"] = ["0xknown_clear", "0xmissing"]
+
+        def mock_lookup(cid):
+            if cid == "0xknown_clear":
+                return {"condition_id": "0xknown_clear", "state": "open", "blocked": False, "reason": "clear"}
+            return None
+
+        mock_db.get_dispute_state.side_effect = mock_lookup
+
+        allowed, reason = rm.check(valid_opportunity, mock_db)
+        assert allowed is False
+        assert "UMA dispute state unverified (0xmissing)" in reason
+
+    def test_temporal_arb_kalshi_only_always_allowed(self, default_config, mock_db, valid_opportunity):
+        default_config["dispute_gate_enabled"] = True
+        rm = RiskManager(default_config)
+        valid_opportunity["type"] = "TemporalArb"
+        valid_opportunity["_platform"] = "kalshi"
+        valid_opportunity["_condition_id"] = "ticker-123"
+
+        mock_db.get_dispute_state.return_value = None
+
+        allowed, reason = rm.check(valid_opportunity, mock_db)
+        assert allowed is True
+        assert reason == "OK"
+        mock_db.get_dispute_state.assert_not_called()
+
+    def test_frechet_kalshi_allowed_without_dispute_lookup(self, default_config, mock_db, valid_opportunity):
+        default_config["dispute_gate_enabled"] = True
+        rm = RiskManager(default_config)
+        valid_opportunity["type"] = "FrechetArb"
+        valid_opportunity["_platform"] = "kalshi"
+        valid_opportunity["_condition_ids"] = ["KX-A", "KX-B"]
+
+        mock_db.get_dispute_state.return_value = None
+
+        allowed, reason = rm.check(valid_opportunity, mock_db)
+        assert allowed is True
+        assert reason == "OK"
+        mock_db.get_dispute_state.assert_not_called()
+
+    def test_frechet_polymarket_blocked_when_disputed(self, default_config, mock_db, valid_opportunity):
+        default_config["dispute_gate_enabled"] = True
+        rm = RiskManager(default_config)
+        valid_opportunity["type"] = "FrechetArb"
+        valid_opportunity["_platform"] = "polymarket"
+        valid_opportunity["_condition_ids"] = ["0xclean", "0xdisputed"]
+
+        def mock_lookup(cid):
+            if cid == "0xdisputed":
+                return {"condition_id": cid, "state": "disputed", "blocked": True, "reason": "uma_disputed"}
+            return {"condition_id": cid, "state": "open", "blocked": False, "reason": "clear"}
+
+        mock_db.get_dispute_state.side_effect = mock_lookup
+
+        allowed, reason = rm.check(valid_opportunity, mock_db)
+        assert allowed is False
+        assert reason == "UMA dispute window (uma_disputed)"

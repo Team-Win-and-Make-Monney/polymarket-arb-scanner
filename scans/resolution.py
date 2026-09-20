@@ -44,7 +44,11 @@ def scan_resolution_snipes(
 
     for market in markets:
         title = market.get("question") or market.get("title", "")
-        market_key = market.get("condition_id") or market.get("id", "")
+        market_key = (
+            market.get("conditionId")
+            or market.get("condition_id")
+            or market.get("id", "")
+        )
 
         # Check if market is approaching resolution
         if not _is_near_resolution(market):

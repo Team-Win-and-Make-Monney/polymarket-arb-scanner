@@ -117,6 +117,115 @@ class TestResolutionSnipeScan:
         assert result["yes"] == 0.96
         assert result["no"] == 0.04
 
+    def test_resolution_snipe_extracts_normalized_condition_id_and_risk_gate(self):
+        from scans.resolution import scan_resolution_snipes
+        from risk_manager import RiskManager
+
+        market = {
+            "conditionId": "0xres_cond_123",
+            "id": "gamma_res_mkt",
+            "question": "Will candidate win?",
+            "status": "determination_pending",
+            "tokens": [
+                {"outcome": "Yes", "price": 0.95},
+                {"outcome": "No", "price": 0.05},
+            ],
+        }
+        opps = scan_resolution_snipes([market], platform="polymarket", min_probability=0.90, min_profit=0.01)
+        assert len(opps) == 1
+        opp = opps[0]
+        opp["_clob_depth"] = 100.0
+        assert opp["_condition_id"] == "0xres_cond_123"
+
+        rm = RiskManager({"dispute_gate_enabled": True})
+        mock_db = MagicMock()
+        mock_db.get_daily_pnl.return_value = 0.0
+        mock_db.get_open_positions_count.return_value = 0
+        mock_db.is_market_active.return_value = False
+
+        # Blocked market
+        mock_db.get_dispute_state.return_value = {
+            "condition_id": "0xres_cond_123",
+            "state": "proposed",
+            "blocked": True,
+            "reason": "uma_proposed",
+        }
+        allowed, reason = rm.check(opp, mock_db)
+        assert allowed is False
+        assert reason == "UMA dispute window (uma_proposed)"
+
+        # Clear market
+        mock_db.get_dispute_state.return_value = {
+            "condition_id": "0xres_cond_123",
+            "state": "open",
+            "blocked": False,
+            "reason": "clear",
+        }
+        allowed, reason = rm.check(opp, mock_db)
+        assert allowed is True
+        assert reason == "OK"
+
+
+# ---------------------------------------------------------------------------
+# Settlement timing scan tests
+# ---------------------------------------------------------------------------
+
+class TestSettlementTimingScan:
+    def test_settlement_timing_extracts_normalized_condition_id_and_risk_gate(self, monkeypatch):
+        import scans.settlement_timing as st_mod
+        monkeypatch.setattr(st_mod, "SETTLEMENT_TIMING_ENABLED", True)
+
+        from scans.settlement_timing import scan_settlement_timing
+        from risk_manager import RiskManager
+
+        matched_pair = {
+            "market_a": {"status": "settled", "result": "yes", "platform": "kalshi"},
+            "platform_a": "kalshi",
+            "market_b": {
+                "conditionId": "0xsettle_cond_456",
+                "id": "gamma_mkt_456",
+                "status": "open",
+                "yes_price": 0.90,
+                "tokens": [{"outcome": "Yes", "price": 0.90}, {"outcome": "No", "price": 0.10}],
+                "platform": "polymarket",
+            },
+            "platform_b": "polymarket",
+        }
+
+        opps = scan_settlement_timing([matched_pair], min_profit=0.01, min_discount=0.01)
+        assert len(opps) == 1
+        opp = opps[0]
+        opp["_clob_depth"] = 100.0
+        assert opp["_condition_id"] == "0xsettle_cond_456"
+
+        rm = RiskManager({"dispute_gate_enabled": True})
+        mock_db = MagicMock()
+        mock_db.get_daily_pnl.return_value = 0.0
+        mock_db.get_open_positions_count.return_value = 0
+        mock_db.is_market_active.return_value = False
+
+        # Blocked market
+        mock_db.get_dispute_state.return_value = {
+            "condition_id": "0xsettle_cond_456",
+            "state": "closed",
+            "blocked": True,
+            "reason": "closed_unresolved",
+        }
+        allowed, reason = rm.check(opp, mock_db)
+        assert allowed is False
+        assert reason == "UMA dispute window (closed_unresolved)"
+
+        # Clear market
+        mock_db.get_dispute_state.return_value = {
+            "condition_id": "0xsettle_cond_456",
+            "state": "open",
+            "blocked": False,
+            "reason": "clear",
+        }
+        allowed, reason = rm.check(opp, mock_db)
+        assert allowed is True
+        assert reason == "OK"
+
 
 # ---------------------------------------------------------------------------
 # Convergence scan tests

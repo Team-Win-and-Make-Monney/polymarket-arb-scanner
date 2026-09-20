@@ -937,3 +937,24 @@ class TestDisputeGateCLI:
             _cli_mod._run_oneshot(args, min_profit=0.01, kalshi_client=None, executor=_make_executor(), db=mock_db)
 
         mock_db.upsert_dispute_state.assert_not_called()
+
+    def test_dispute_gate_includes_events_cache_when_enabled(self, monkeypatch):
+        import config
+        from unittest.mock import MagicMock, patch
+        monkeypatch.setattr(config, "DISPUTE_GATE_ENABLED", True)
+
+        args = _make_args(mode="negrisk")
+        mock_db = MagicMock()
+        poly_events = [{"id": "evt1", "markets": [{"conditionId": "0xevent_cid", "umaResolutionStatus": "disputed"}]}]
+
+        with patch.object(_cli_mod, "fetch_all_markets", return_value=[]), \
+             patch.object(_cli_mod, "fetch_events", return_value=poly_events), \
+             patch.object(_cli_mod, "scan_negrisk_internal", return_value=[]), \
+             patch.object(_cli_mod, "display_results"), \
+             patch.object(_cli_mod, "dashboard_state"):
+            _cli_mod._run_oneshot(args, min_profit=0.01, kalshi_client=None, executor=_make_executor(), db=mock_db)
+
+        mock_db.upsert_dispute_state.assert_called_once()
+        states = mock_db.upsert_dispute_state.call_args[0][0]
+        assert "0xevent_cid" in states
+        assert states["0xevent_cid"]["blocked"] is True

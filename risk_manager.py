@@ -153,7 +153,12 @@ class RiskManager:
                 return False, f"MM inventory limit reached ({abs(inventory):.0f} >= {self.mm_max_inventory_per_market:.0f})"
 
         # 8. UMA dispute gate — block resolution-held Polymarket arbs on disputed markets
-        if self.dispute_gate_enabled and opp_type.split("(")[0] in self._DISPUTE_GATED_TYPES:
+        base_opp_type = opp_type.split("(")[0]
+        if self.dispute_gate_enabled and base_opp_type in self._DISPUTE_GATED_TYPES:
+            platform = (opportunity.get("_platform") or "").lower()
+            if base_opp_type == "TemporalArb" or platform == "kalshi":
+                return True, "OK"
+
             cids: list[str] = []
             if opportunity.get("_condition_ids"):
                 cids.extend([c for c in opportunity["_condition_ids"] if c])
@@ -162,9 +167,17 @@ class RiskManager:
             elif opportunity.get("_market_key"):
                 cids.append(opportunity["_market_key"])
 
+            is_negrisk = base_opp_type in ("NegRisk", "NegRiskNO")
+            if is_negrisk and (not cids or not db):
+                return False, "UMA dispute state unverified"
+
             for cid in cids:
                 ds = db.get_dispute_state(cid) if db else None
-                if ds and ds.get("blocked"):
+                if ds is None:
+                    if is_negrisk:
+                        return False, f"UMA dispute state unverified ({cid})"
+                    continue
+                if ds.get("blocked"):
                     return False, f"UMA dispute window ({ds['reason']})"
 
         return True, "OK"

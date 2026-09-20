@@ -2101,8 +2101,12 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                     try:
                         items = list(poly_markets or []) + list(poly_events or [])
                         db.upsert_dispute_state(fetch_dispute_states(items))
+                        if executor and hasattr(executor, "risk_manager"):
+                            executor.risk_manager.uma_state_unavailable = False
                     except Exception as e:
-                        logger.warning("Failed to update UMA dispute states: %s", e)
+                        logger.error("Failed to update UMA dispute states (failing closed): %s", e)
+                        if executor and hasattr(executor, "risk_manager"):
+                            executor.risk_manager.uma_state_unavailable = True
 
                 all_opportunities = []
 

@@ -24,6 +24,7 @@ class RiskManager:
         # Daily trade limit (0 = unlimited)
         self.max_daily_trades = config.get("max_daily_trades", 0)
         self.dispute_gate_enabled = config.get("dispute_gate_enabled", False)
+        self.uma_state_unavailable = False
 
     _DISPUTE_GATED_TYPES = frozenset({
         "Binary", "NegRisk", "NegRiskNO", "FrechetArb", "TemporalArb",
@@ -158,6 +159,9 @@ class RiskManager:
             platform = (opportunity.get("_platform") or "").lower()
             if base_opp_type == "TemporalArb" or platform == "kalshi":
                 return True, "OK"
+
+            if getattr(self, "uma_state_unavailable", False):
+                return False, "UMA dispute state unavailable (cache refresh failed)"
 
             cids: list[str] = []
             if opportunity.get("_condition_ids"):

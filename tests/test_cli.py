@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import sys
 import os
 import argparse
+import config
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -902,8 +903,6 @@ class TestDisputeGateCLI:
     """Verify UMA dispute cache population in _run_oneshot."""
 
     def test_dispute_gate_populates_cache_when_enabled(self, monkeypatch):
-        import config
-        from unittest.mock import MagicMock, patch
         monkeypatch.setattr(config, "DISPUTE_GATE_ENABLED", True)
 
         args = _make_args(mode="binary")
@@ -922,8 +921,6 @@ class TestDisputeGateCLI:
         assert states["0xabc"]["blocked"] is True
 
     def test_dispute_gate_skips_cache_when_disabled(self, monkeypatch):
-        import config
-        from unittest.mock import MagicMock, patch
         monkeypatch.setattr(config, "DISPUTE_GATE_ENABLED", False)
 
         args = _make_args(mode="binary")
@@ -939,8 +936,6 @@ class TestDisputeGateCLI:
         mock_db.upsert_dispute_state.assert_not_called()
 
     def test_dispute_gate_includes_events_cache_when_enabled(self, monkeypatch):
-        import config
-        from unittest.mock import MagicMock, patch
         monkeypatch.setattr(config, "DISPUTE_GATE_ENABLED", True)
 
         args = _make_args(mode="negrisk")
@@ -958,3 +953,20 @@ class TestDisputeGateCLI:
         states = mock_db.upsert_dispute_state.call_args[0][0]
         assert "0xevent_cid" in states
         assert states["0xevent_cid"]["blocked"] is True
+
+    def test_dispute_gate_refresh_failure_fails_closed(self, monkeypatch):
+        monkeypatch.setattr(config, "DISPUTE_GATE_ENABLED", True)
+
+        args = _make_args(mode="binary")
+        mock_db = MagicMock()
+        mock_db.upsert_dispute_state.side_effect = RuntimeError("Database locked")
+        poly_markets = [{"conditionId": "0xabc", "umaResolutionStatus": "disputed"}]
+        executor = _make_executor()
+
+        with patch.object(_cli_mod, "fetch_all_markets", return_value=poly_markets), \
+             patch.object(_cli_mod, "scan_binary_internal", return_value=[]), \
+             patch.object(_cli_mod, "display_results"), \
+             patch.object(_cli_mod, "dashboard_state"):
+            _cli_mod._run_oneshot(args, min_profit=0.01, kalshi_client=None, executor=executor, db=mock_db)
+
+        assert executor.risk_manager.uma_state_unavailable is True

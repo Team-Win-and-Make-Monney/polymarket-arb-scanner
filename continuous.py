@@ -1207,6 +1207,27 @@ def _scan_time_decay_layer4(poly_markets, price_cache, mode,
     )
 
 
+def _scan_frechet_layer1(poly_markets, mode, min_profit, price_cache=None, funnel=None) -> list[dict]:
+    """Plan 02 Fréchet-bound logical arbitrage. Returns [] when the gate is off or there are no markets."""
+    if mode not in ("all", "frechet") or not getattr(config, "FRECHET_ARB_ENABLED", False):
+        return []
+    if not poly_markets:
+        return []
+    try:
+        from scans.frechet import scan_frechet, _refine_frechet_with_clob
+        cands = scan_frechet(
+            poly_markets,
+            min_profit=min_profit,
+            min_violation=getattr(config, "FRECHET_MIN_VIOLATION", 0.02),
+            funnel=funnel,
+            platform="polymarket",
+        )
+        return _refine_frechet_with_clob(cands, min_profit=min_profit, price_cache=price_cache, funnel=funnel)
+    except Exception as exc:
+        logger.warning("Fréchet arbitrage scan failed: %s", exc)
+        return []
+
+
 def _scan_jev_crypto_continuous(
     poly_markets,
     mode: str,
@@ -2414,6 +2435,19 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                     )
                 except Exception as exc:
                     logger.warning("Jev crypto scan failed: %s", exc)
+
+                try:
+                    all_opportunities.extend(
+                        _scan_frechet_layer1(
+                            poly_markets,
+                            args.mode,
+                            min_profit,
+                            price_cache=price_cache,
+                            funnel=_funnel,
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning("Fréchet scan failed: %s", exc)
 
                 # Structural alpha: Combinatorial logical arbitrage (Phase 9)
                 if args.mode in ("all", "logical-arb"):

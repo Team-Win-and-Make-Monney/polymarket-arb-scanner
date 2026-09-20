@@ -2892,3 +2892,115 @@ class TestMmPilotBlocksLegacyKalshiRewards:
         assert result is True
         opps = db.get_recent_opportunities()
         assert opps[-1]["action"] != "skipped:mm_pilot_owns_kalshi"
+
+
+# ---------------------------------------------------------------------------
+# TestExecutorFrechet
+# ---------------------------------------------------------------------------
+
+class TestExecutorFrechet:
+    def test_build_legs_frechet_polymarket(self, executor):
+        opp = {
+            "type": "FrechetArb",
+            "_platform": "polymarket",
+            "_buy_yes_token": "tok_sup_yes",
+            "_buy_no_token": "tok_sub_no",
+            "_p_b": 0.45,
+            "_p_a": 0.70,
+        }
+        legs = executor._build_legs(opp, 5.0)
+        assert len(legs) == 2
+        assert legs[0]["platform"] == "polymarket"
+        assert legs[0]["side"] == "BUY"
+        assert legs[0]["token"] == "yes"
+        assert legs[0]["price"] == pytest.approx(0.45)
+        assert legs[0]["_token_id"] == "tok_sup_yes"
+
+        assert legs[1]["platform"] == "polymarket"
+        assert legs[1]["side"] == "BUY"
+        assert legs[1]["token"] == "no"
+        assert legs[1]["price"] == pytest.approx(0.30)
+        assert legs[1]["_token_id"] == "tok_sub_no"
+
+    def test_build_legs_frechet_kalshi(self, executor):
+        opp = {
+            "type": "FrechetArb",
+            "_platform": "kalshi",
+            "_buy_yes_ticker": "KXBTC-T90k",
+            "_buy_no_ticker": "KXBTC-T100k",
+            "_p_b": 0.45,
+            "_p_a": 0.70,
+        }
+        legs = executor._build_legs(opp, 5.0)
+        assert len(legs) == 2
+        assert legs[0]["platform"] == "kalshi"
+        assert legs[0]["side"] == "yes"
+        assert legs[0]["action"] == "buy"
+        assert legs[0]["price"] == pytest.approx(0.45)
+        assert legs[0]["_ticker"] == "KXBTC-T90k"
+
+        assert legs[1]["platform"] == "kalshi"
+        assert legs[1]["side"] == "no"
+        assert legs[1]["action"] == "buy"
+        assert legs[1]["price"] == pytest.approx(0.30)
+        assert legs[1]["_ticker"] == "KXBTC-T100k"
+
+    def test_revalidate_frechet_kalshi(self, executor):
+        opp = {
+            "type": "FrechetArb",
+            "_platform": "kalshi",
+            "net_profit": 0.20,
+        }
+        passed = executor._revalidate(opp)
+        assert passed is True
+
+    def test_revalidate_frechet_polymarket_passed(self, executor):
+        from unittest.mock import patch
+        opp = {
+            "type": "FrechetArb",
+            "_platform": "polymarket",
+            "_buy_yes_token": "tok_b",
+            "_buy_no_token": "tok_a",
+            "net_profit": 0.20,
+        }
+        # Mock order books:
+        # tok_b (YES on B): ask 0.45
+        # tok_a (NO on A): ask 0.30 (implied P(A) = 0.70)
+        def mock_fetch(tok):
+            return {"book": tok}
+
+        def mock_bba(book):
+            if book["book"] == "tok_b":
+                return {"ask": 0.45, "bid": 0.43}
+            else:
+                return {"ask": 0.30, "bid": 0.28}
+
+        with patch("executor.fetch_order_book", side_effect=mock_fetch), \
+             patch("executor.get_best_bid_ask", side_effect=mock_bba):
+            passed = executor._revalidate(opp)
+
+        assert passed is True
+        assert opp["_p_b"] == 0.45
+        assert opp["_p_a"] == pytest.approx(0.70)
+
+    def test_revalidate_frechet_polymarket_degraded(self, executor):
+        from unittest.mock import patch
+        opp = {
+            "type": "FrechetArb",
+            "_platform": "polymarket",
+            "_buy_yes_token": "tok_b",
+            "_buy_no_token": "tok_a",
+            "net_profit": 0.20,
+        }
+        # Prices moved so cost is 0.50 + 0.50 = 1.00 -> profit is negative
+        def mock_fetch(tok):
+            return {"book": tok}
+
+        def mock_bba(book):
+            return {"ask": 0.50, "bid": 0.48}
+
+        with patch("executor.fetch_order_book", side_effect=mock_fetch), \
+             patch("executor.get_best_bid_ask", side_effect=mock_bba):
+            passed = executor._revalidate(opp)
+
+        assert passed is False

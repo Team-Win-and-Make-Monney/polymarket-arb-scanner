@@ -98,6 +98,8 @@ from scans import (
     scan_convergence,
     scan_polymarket_rewards,
     scan_kalshi_rewards,
+    scan_frechet,
+    _refine_frechet_with_clob,
 )
 import config
 from config import (
@@ -846,6 +848,24 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
             except Exception as e:
                 logger.error("Correlated pairs scan failed: %s", e)
 
+    # Plan 02: Fréchet-Bound Logical Arbitrage
+    if args.mode in ("all", "frechet"):
+        from config import FRECHET_ARB_ENABLED, FRECHET_MIN_VIOLATION
+        if FRECHET_ARB_ENABLED or args.mode == "frechet":
+            logger.info("--- Fréchet-Bound Logical Arbitrage Scan ---")
+            try:
+                frechet_opps = scan_frechet(
+                    poly_markets or [],
+                    min_profit=min_profit,
+                    min_violation=FRECHET_MIN_VIOLATION,
+                    platform="polymarket",
+                )
+                frechet_opps = _refine_frechet_with_clob(frechet_opps, min_profit=min_profit)
+                all_opportunities.extend(frechet_opps)
+                logger.info("Found %d Fréchet arbitrage opportunities.", len(frechet_opps))
+            except Exception as e:
+                logger.error("Fréchet arbitrage scan failed: %s", e)
+
     # STRAT-07: Time Decay Convergence
     if args.mode in ("all", "time-decay"):
         from config import TIME_DECAY_ENABLED
@@ -1237,9 +1257,9 @@ def main():
                  "imbalance", "news-snipe", "correlated", "time-decay",
                  "logical-arb", "whale-copy",
                  "fee-promo", "cross-mm",
-                 "lead-lag-mm", "toxic-flow", "vol-mm", "mm-pilot", "jev-crypto"],
+                 "lead-lag-mm", "toxic-flow", "vol-mm", "mm-pilot", "jev-crypto", "frechet"],
         default="all",
-        help="Scan mode: all, binary, negrisk, negrisk-no, cross, kalshi, cross-all, spread, betfair, smarkets, sxbet, matchbook, gemini, ibkr, event, triangular, stale, resolution, convergence, mm, mm-pilot, rewards, imbalance, news-snipe, correlated, time-decay, fee-promo, cross-mm, jev-crypto",
+        help="Scan mode: all, binary, negrisk, negrisk-no, cross, kalshi, cross-all, spread, betfair, smarkets, sxbet, matchbook, gemini, ibkr, event, triangular, stale, resolution, convergence, mm, mm-pilot, rewards, imbalance, news-snipe, correlated, time-decay, fee-promo, cross-mm, jev-crypto, frechet",
     )
     parser.add_argument(
         "--min-profit",

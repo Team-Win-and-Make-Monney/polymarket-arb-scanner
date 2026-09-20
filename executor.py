@@ -698,6 +698,9 @@ class ArbitrageExecutor:
             elif opp_type.startswith("MultiCross"):
                 passed, reval_profit, reason = self._revalidate_multi_cross(
                     opportunity, original_profit, price_cache)
+            elif opp_type == "FrechetArb":
+                passed, reval_profit, reason = self._revalidate_frechet(
+                    opportunity, original_profit, price_cache)
             elif opp_type == "TriangularCross":
                 passed, reval_profit, reason = self._revalidate_triangular(
                     opportunity, original_profit, price_cache)
@@ -1019,6 +1022,80 @@ class ArbitrageExecutor:
             return False, reval_profit, "profit_below_floor"
         # Update opportunity with fresh prices
         opp["prices"] = f"Y={yes_ask:.3f} N={no_ask:.3f}"
+        opp["net_profit"] = reval_profit
+        return True, reval_profit, "passed"
+
+    def _revalidate_frechet(
+        self, opp: dict, original_profit: float, price_cache: dict | None
+    ) -> tuple[bool, float, str]:
+        """Revalidate a Fréchet implication bounds opportunity.
+
+        Returns:
+            (passed, reval_profit, reason)
+        """
+        platform = opp.get("_platform", "polymarket")
+        if platform == "kalshi":
+            return True, original_profit, "live_orderbook"
+
+        buy_yes_token = opp.get("_buy_yes_token")
+        buy_no_token = opp.get("_buy_no_token")
+        if not buy_yes_token or not buy_no_token:
+            token_ids = opp.get("_token_ids", [])
+            if len(token_ids) >= 2:
+                buy_yes_token, buy_no_token = token_ids[0], token_ids[1]
+            else:
+                logger.warning("Revalidation: missing token IDs for FrechetArb")
+                raise _RevalidationAPIError("missing token IDs for FrechetArb")
+
+        # Check WS cache first
+        yes_ask = no_ask = None
+        cached_yes = self._check_ws_cache(price_cache, "polymarket", buy_yes_token)
+        cached_no = self._check_ws_cache(price_cache, "polymarket", buy_no_token)
+
+        if cached_yes and cached_yes.get("_stale", False):
+            logger.info("Skipping revalidation: polymarket YES_B stale for >30s")
+            return False, 0.0, "feed_stale"
+        if cached_no and cached_no.get("_stale", False):
+            logger.info("Skipping revalidation: polymarket NO_A stale for >30s")
+            return False, 0.0, "feed_stale"
+
+        if cached_yes and cached_no:
+            yes_ask = _cached_probability(cached_yes, "best_ask", "ask", "price")
+            no_ask = _cached_probability(cached_no, "best_ask", "ask", "price")
+
+        if yes_ask is None or no_ask is None:
+            yes_book = fetch_order_book(buy_yes_token)
+            no_book = fetch_order_book(buy_no_token)
+            if not yes_book or not no_book:
+                raise _RevalidationAPIError("failed to fetch order book for FrechetArb")
+            yes_data = get_best_bid_ask(yes_book)
+            no_data = get_best_bid_ask(no_book)
+            yes_ask = yes_data["ask"]
+            no_ask = no_data["ask"]
+
+        if yes_ask is None or no_ask is None:
+            raise _RevalidationAPIError("no ask price in order book for FrechetArb")
+
+        from fees import net_profit_frechet_implication
+        category = opp.get("_sub_market", {}).get("category") or opp.get("_sup_market", {}).get("category")
+        result = net_profit_frechet_implication(
+            p_a=1.0 - no_ask,
+            p_b=yes_ask,
+            platform="polymarket",
+            category=category,
+        )
+        reval_profit = result["net_profit"]
+        threshold = self._get_revalidation_threshold(original_profit, opp)
+        if reval_profit < threshold:
+            logger.info(
+                "Revalidation: FrechetArb profit degraded %.4f -> %.4f (threshold=%.4f)",
+                original_profit, reval_profit, threshold,
+            )
+            return False, reval_profit, "profit_below_floor"
+
+        opp["_p_b"] = yes_ask
+        opp["_p_a"] = 1.0 - no_ask
+        opp["prices"] = f"Ask(B)={yes_ask:.3f} + Ask(¬A)={no_ask:.3f}"
         opp["net_profit"] = reval_profit
         return True, reval_profit, "passed"
 
@@ -1870,6 +1947,27 @@ class ArbitrageExecutor:
                      "price": buy_price, "_ticker": ticker},
                     {"platform": "kalshi", "side": side, "action": "sell",
                      "price": sell_price, "_ticker": ticker},
+                ]
+        elif opp_type == "FrechetArb":
+            # Buy YES on superset (B) + Buy NO on subset (A)
+            platform = opportunity.get("_platform", "polymarket")
+            if platform == "kalshi":
+                legs = [
+                    {"platform": "kalshi", "side": "yes", "action": "buy",
+                     "price": opportunity.get("_kalshi_b_yes", opportunity.get("_p_b", 0.5)),
+                     "_ticker": opportunity.get("_buy_yes_ticker", "")},
+                    {"platform": "kalshi", "side": "no", "action": "buy",
+                     "price": opportunity.get("_kalshi_a_no", 1.0 - opportunity.get("_p_a", 0.5)),
+                     "_ticker": opportunity.get("_buy_no_ticker", "")},
+                ]
+            else:
+                legs = [
+                    {"platform": "polymarket", "side": "BUY", "token": "yes",
+                     "price": opportunity.get("_p_b", 0.5),
+                     "_token_id": opportunity.get("_buy_yes_token", "")},
+                    {"platform": "polymarket", "side": "BUY", "token": "no",
+                     "price": 1.0 - opportunity.get("_p_a", 0.5),
+                     "_token_id": opportunity.get("_buy_no_token", "")},
                 ]
         elif opp_type == "BetfairBackAll":
             legs = [

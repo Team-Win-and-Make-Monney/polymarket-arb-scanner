@@ -349,6 +349,20 @@ class TestRunOneshotModeRouting:
 
     @patch.object(_cli_mod, "display_results")
     @patch.object(_cli_mod, "dashboard_state")
+    @patch.object(_cli_mod, "_refine_frechet_with_clob", return_value=[])
+    @patch.object(_cli_mod, "scan_frechet", return_value=[])
+    @patch.object(_cli_mod, "fetch_all_markets", return_value=[{"title": "M1"}])
+    def test_frechet_mode_runs_frechet_scan(
+        self, mock_fetch, mock_scan, mock_refine, mock_dash, mock_display
+    ):
+        args = _make_args(mode="frechet")
+        _cli_mod._run_oneshot(args, 0.01, None, _make_executor(), _make_db())
+        mock_scan.assert_called_once()
+        mock_refine.assert_called_once()
+
+
+    @patch.object(_cli_mod, "display_results")
+    @patch.object(_cli_mod, "dashboard_state")
     @patch.object(_cli_mod, "scan_polymarket_rewards", return_value=[])
     @patch.object(_cli_mod, "fetch_reward_markets", return_value=[{"conditionId": "reward"}])
     @patch.object(_cli_mod, "fetch_all_markets")

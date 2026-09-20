@@ -106,6 +106,8 @@ __all__ = [
     "_refine_jev_crypto_with_clob",
     "scan_frechet",
     "_refine_frechet_with_clob",
+    "scan_temporal_arb",
+    "_refine_temporal_with_clob",
     "get_clob_prices",
     "match_cross_platform",
     "match_cross_platform_semantic",

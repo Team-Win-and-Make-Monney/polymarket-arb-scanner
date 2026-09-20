@@ -3080,3 +3080,135 @@ class TestExecutorFrechet:
             # 20.0 / 0.75 = 26 contracts
             assert legs[0]["_contracts"] == 26
             assert legs[1]["_contracts"] == 26
+
+
+class TestExecutorTemporal:
+    """Test executor leg building, contract quantity matching, and revalidation for TemporalArb."""
+
+    def test_build_legs_temporal_equal_contract_quantities(self, executor) -> None:
+        opp = {
+            "type": "TemporalArb",
+            "_platform": "kalshi",
+            "_late_ticker": "KXBTC-26JUN30-T100000",
+            "_early_ticker": "KXBTC-26MAR31-T100000",
+            "_p_late": 0.45,
+            "_p_early": 0.70,
+            "_kalshi_late_yes": 0.45,
+            "_kalshi_early_no": 0.30,
+        }
+        # unit cost = 0.45 + 0.30 = 0.75
+        # size = 15.0 -> contracts = 20
+        legs = executor._build_legs(opp, 15.0)
+        assert len(legs) == 2
+        assert legs[0]["platform"] == "kalshi"
+        assert legs[0]["side"] == "yes"
+        assert legs[0]["action"] == "buy"
+        assert legs[0]["price"] == 0.45
+        assert legs[0]["_ticker"] == "KXBTC-26JUN30-T100000"
+        assert legs[0]["_contracts"] == 20
+        assert legs[0]["size"] == 9.0  # 20 * 0.45
+
+        assert legs[1]["platform"] == "kalshi"
+        assert legs[1]["side"] == "no"
+        assert legs[1]["action"] == "buy"
+        assert legs[1]["price"] == 0.30
+        assert legs[1]["_ticker"] == "KXBTC-26MAR31-T100000"
+        assert legs[1]["_contracts"] == 20
+        assert legs[1]["size"] == 6.0  # 20 * 0.30
+
+    def test_build_legs_temporal_contracts_zero(self, executor) -> None:
+        opp = {
+            "type": "TemporalArb",
+            "_platform": "kalshi",
+            "_late_ticker": "KXBTC-26JUN30-T100000",
+            "_early_ticker": "KXBTC-26MAR31-T100000",
+            "_p_late": 0.45,
+            "_p_early": 0.70,
+            "_kalshi_late_yes": 0.50,
+            "_kalshi_early_no": 0.50,
+        }
+        # unit cost = 1.00, size = 0.50 -> contracts = 0
+        legs = executor._build_legs(opp, 0.50)
+        assert legs == []
+
+    def test_revalidate_temporal_success(self, executor) -> None:
+        from unittest.mock import MagicMock
+        opp = {
+            "type": "TemporalArb",
+            "_late_ticker": "KXBTC-26JUN30-T100000",
+            "_early_ticker": "KXBTC-26MAR31-T100000",
+            "net_profit": 0.15,
+        }
+        mock_kalshi = MagicMock()
+        mock_kalshi.fetch_order_book.side_effect = [
+            # late ticker book: NO bid 0.52 -> YES ask = 0.48
+            {"orderbook_fp": {"yes_dollars": [["0.45", "100"]], "no_dollars": [["0.52", "100"]]}},
+            # early ticker book: YES bid 0.68 -> NO ask = 0.32
+            {"orderbook_fp": {"yes_dollars": [["0.68", "100"]], "no_dollars": [["0.28", "100"]]}},
+        ]
+        executor.kalshi_client = mock_kalshi
+
+        passed = executor._revalidate(opp)
+        assert passed is True
+        assert opp["_kalshi_late_yes"] == 0.48
+        assert opp["_kalshi_early_no"] == 0.32
+        assert opp["_p_late"] == 0.48
+        assert opp["_p_early"] == 0.68
+
+    def test_revalidate_temporal_spread_degradation_fails(self, executor) -> None:
+        from unittest.mock import MagicMock
+        opp = {
+            "type": "TemporalArb",
+            "_late_ticker": "KXBTC-26JUN30-T100000",
+            "_early_ticker": "KXBTC-26MAR31-T100000",
+            "net_profit": 0.20,
+        }
+        mock_kalshi = MagicMock()
+        # Spread moved so cost = 0.50 + 0.50 = 1.00 -> profit is negative
+        mock_kalshi.fetch_order_book.side_effect = [
+            {"orderbook_fp": {"yes_dollars": [["0.45", "100"]], "no_dollars": [["0.50", "100"]]}},
+            {"orderbook_fp": {"yes_dollars": [["0.50", "100"]], "no_dollars": [["0.45", "100"]]}},
+        ]
+        executor.kalshi_client = mock_kalshi
+
+        passed = executor._revalidate(opp)
+        assert passed is False
+
+    def test_revalidate_temporal_missing_client_raises(self, executor) -> None:
+        from executor import _RevalidationAPIError
+        import pytest
+        opp = {
+            "type": "TemporalArb",
+            "_late_ticker": "KXBTC-26JUN30-T100000",
+            "_early_ticker": "KXBTC-26MAR31-T100000",
+            "net_profit": 0.10,
+        }
+        executor.kalshi_client = None
+        with pytest.raises(_RevalidationAPIError):
+            executor._revalidate_temporal(opp, 0.10)
+
+    def test_execute_temporal_max_trade_size_clamped(self, executor) -> None:
+        from unittest.mock import patch
+        opp = {
+            "type": "TemporalArb",
+            "market": "KXBTC-26MAR31 subset of KXBTC-26JUN30",
+            "_platform": "kalshi",
+            "_late_ticker": "KXBTC-26JUN30-T100000",
+            "_early_ticker": "KXBTC-26MAR31-T100000",
+            "_p_late": 0.45,
+            "_p_early": 0.70,
+            "_kalshi_late_yes": 0.45,
+            "_kalshi_early_no": 0.30,
+            "total_cost": "$0.75",
+            "net_profit": 0.20,
+            "net_roi": "26.7%",
+            "_clob_depth": 500.0,
+        }
+        executor.max_trade_size = 100.0
+        with patch("config.TEMPORAL_ARB_MAX_TRADE_SIZE", 15.0), \
+             patch.object(executor, "_revalidate", return_value=(True, 0.20, "passed")):
+            legs = executor._build_legs(opp, 15.0)
+            assert len(legs) == 2
+            # 15.0 / 0.75 = 20 contracts
+            assert legs[0]["_contracts"] == 20
+            assert legs[1]["_contracts"] == 20

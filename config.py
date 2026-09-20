@@ -258,7 +258,7 @@ STRATEGY_LAYERS: dict[str, int] = {
     "IBKRBinary": 1,
     "Spread": 1,
     # #30-#32: New Layer 1 strategies
-    "ConditionalArb": 1, "BracketArb": 1, "NWayArb": 1, "FrechetArb": 1,
+    "ConditionalArb": 1, "BracketArb": 1, "NWayArb": 1, "FrechetArb": 1, "TemporalArb": 1,
     # Layer 2 — Near-Arbitrage
     "StalePriceOpp": 2, "ResolutionSnipeOpp": 2, "FeePromo": 2,
     # #33-#35: New Layer 2 strategies
@@ -662,6 +662,11 @@ POLYGONSCAN_API_KEY = os.getenv("POLYGONSCAN_API_KEY", "")
 FRECHET_ARB_ENABLED = _env_bool("FRECHET_ARB_ENABLED", "false")
 FRECHET_MIN_VIOLATION = _env_float("FRECHET_MIN_VIOLATION", "0.02")
 FRECHET_ARB_MAX_TRADE_SIZE = _env_float("FRECHET_ARB_MAX_TRADE_SIZE", "25.0")
+
+# Plan 03: Cross-Date / Nested Temporal Arbitrage — D_early < D_late monotonicity bounds P(early) <= P(late)
+TEMPORAL_ARB_ENABLED = _env_bool("TEMPORAL_ARB_ENABLED", "false")
+TEMPORAL_MIN_VIOLATION = _env_float("TEMPORAL_MIN_VIOLATION", "0.02")
+TEMPORAL_ARB_MAX_TRADE_SIZE = _env_float("TEMPORAL_ARB_MAX_TRADE_SIZE", "25.0")
 
 # #30: Conditional Market Arbitrage — P(X|Y) × P(Y) ≠ P(X) detection
 CONDITIONAL_ARB_ENABLED = _env_bool("CONDITIONAL_ARB_ENABLED", "false")

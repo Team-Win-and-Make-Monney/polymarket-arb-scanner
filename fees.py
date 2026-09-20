@@ -1650,6 +1650,10 @@ def net_profit_frechet_implication(
     }
 
 
+# Plan 03: Cross-date temporal arbitrage shares identical Dutch book implication payoff economics
+net_profit_temporal_implication = net_profit_frechet_implication
+
+
 # ---------------------------------------------------------------------------
 # Whale Copy Trading fee calculator
 # ---------------------------------------------------------------------------

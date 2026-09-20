@@ -443,10 +443,16 @@ class ArbitrageExecutor:
         if opp_type == "FrechetArb":
             from config import FRECHET_ARB_MAX_TRADE_SIZE
             desired_size = min(desired_size, FRECHET_ARB_MAX_TRADE_SIZE)
+        elif opp_type == "TemporalArb":
+            from config import TEMPORAL_ARB_MAX_TRADE_SIZE
+            desired_size = min(desired_size, TEMPORAL_ARB_MAX_TRADE_SIZE)
         size = self.risk.clamp_size(desired_size, depth, per_leg_budget)
         if opp_type == "FrechetArb":
             from config import FRECHET_ARB_MAX_TRADE_SIZE
             size = min(size, FRECHET_ARB_MAX_TRADE_SIZE)
+        elif opp_type == "TemporalArb":
+            from config import TEMPORAL_ARB_MAX_TRADE_SIZE
+            size = min(size, TEMPORAL_ARB_MAX_TRADE_SIZE)
         if size <= 0:
             logger.info(f"{prefix}Size 0 after constraints. Skipping.")
             self._log_skipped(opportunity, "zero_size")
@@ -706,6 +712,9 @@ class ArbitrageExecutor:
                     opportunity, original_profit, price_cache)
             elif opp_type == "FrechetArb":
                 passed, reval_profit, reason = self._revalidate_frechet(
+                    opportunity, original_profit, price_cache)
+            elif opp_type == "TemporalArb":
+                passed, reval_profit, reason = self._revalidate_temporal(
                     opportunity, original_profit, price_cache)
             elif opp_type == "TriangularCross":
                 passed, reval_profit, reason = self._revalidate_triangular(
@@ -1147,6 +1156,66 @@ class ArbitrageExecutor:
         opp["_p_b"] = yes_ask
         opp["_p_a"] = 1.0 - no_ask
         opp["prices"] = f"Ask(B)={yes_ask:.3f} + Ask(¬A)={no_ask:.3f}"
+        opp["net_profit"] = reval_profit
+        return True, reval_profit, "passed"
+
+    def _revalidate_temporal(
+        self, opp: dict, original_profit: float, price_cache: dict | None = None
+    ) -> tuple[bool, float, str]:
+        """Revalidate a Kalshi TemporalArb opportunity against live order books.
+
+        Fetches live order books for late_ticker and early_ticker,
+        verifies best ask prices, recomputes implication net profit, and ensures
+        it has not degraded below threshold.
+        """
+        ticker_late = opp.get("_late_ticker") or opp.get("_buy_yes_ticker")
+        ticker_early = opp.get("_early_ticker") or opp.get("_buy_no_ticker")
+
+        if not ticker_late or not ticker_early or not self.kalshi_client:
+            logger.warning("Revalidation: missing tickers or Kalshi client for TemporalArb")
+            raise _RevalidationAPIError("no tickers or no Kalshi client for TemporalArb")
+
+        book_late = self.kalshi_client.fetch_order_book(ticker_late)
+        if not book_late:
+            raise _RevalidationAPIError(f"failed to fetch Kalshi order book for {ticker_late}")
+        book_early = self.kalshi_client.fetch_order_book(ticker_early)
+        if not book_early:
+            raise _RevalidationAPIError(f"failed to fetch Kalshi order book for {ticker_early}")
+
+        from kalshi_api import parse_orderbook, best_yes_ask, best_no_ask, _audit_raw_orderbook
+        _audit_raw_orderbook(ticker_late, book_late)
+        _audit_raw_orderbook(ticker_early, book_early)
+        parsed_late = parse_orderbook(book_late)
+        parsed_early = parse_orderbook(book_early)
+
+        yes_late_tup = best_yes_ask(parsed_late)
+        no_early_tup = best_no_ask(parsed_early)
+        if yes_late_tup is None or no_early_tup is None:
+            raise _RevalidationAPIError(f"missing ask sides for Kalshi TemporalArb ({ticker_late}, {ticker_early})")
+
+        late_yes_ask = round(yes_late_tup[0], 4)
+        early_no_ask = round(no_early_tup[0], 4)
+
+        from fees import net_profit_frechet_implication
+        result = net_profit_frechet_implication(
+            p_a=1.0 - early_no_ask,
+            p_b=late_yes_ask,
+            platform="kalshi",
+        )
+        reval_profit = result["net_profit"]
+        threshold = self._get_revalidation_threshold(original_profit, opp)
+        if reval_profit < threshold:
+            logger.info(
+                "Revalidation: Kalshi TemporalArb profit degraded %.4f -> %.4f (threshold=%.4f)",
+                original_profit, reval_profit, threshold,
+            )
+            return False, reval_profit, "profit_below_floor"
+
+        opp["_kalshi_late_yes"] = late_yes_ask
+        opp["_kalshi_early_no"] = early_no_ask
+        opp["_p_late"] = late_yes_ask
+        opp["_p_early"] = round(1.0 - early_no_ask, 4)
+        opp["prices"] = f"Ask(Late)={late_yes_ask:.3f} + Ask(Early NO)={early_no_ask:.3f}"
         opp["net_profit"] = reval_profit
         return True, reval_profit, "passed"
 
@@ -2042,6 +2111,28 @@ class ArbitrageExecutor:
                      "_contracts": contracts,
                      "_token_id": opportunity.get("_buy_no_token", "")},
                 ]
+        elif opp_type == "TemporalArb":
+            # Buy YES on later deadline + Buy NO on earlier deadline
+            # Both legs must be sized with an equal contract quantity to maintain
+            # the guaranteed Dutch book payoff (1:1 hedge ratio).
+            price_late = float(opportunity.get("_kalshi_late_yes", opportunity.get("_p_late", 0.5)))
+            price_early = float(opportunity.get("_kalshi_early_no", 1.0 - opportunity.get("_p_early", 0.5)))
+            unit_cost = price_late + price_early
+            contracts = int(size / unit_cost) if unit_cost > 0 else 0
+            if contracts < 1:
+                return []
+            legs = [
+                {"platform": "kalshi", "side": "yes", "action": "buy",
+                 "price": price_late,
+                 "size": round(contracts * price_late, 4),
+                 "_contracts": contracts,
+                 "_ticker": opportunity.get("_late_ticker") or opportunity.get("_buy_yes_ticker", "")},
+                {"platform": "kalshi", "side": "no", "action": "buy",
+                 "price": price_early,
+                 "size": round(contracts * price_early, 4),
+                 "_contracts": contracts,
+                 "_ticker": opportunity.get("_early_ticker") or opportunity.get("_buy_no_ticker", "")},
+            ]
         elif opp_type == "BetfairBackAll":
             legs = [
                 {"platform": "betfair", "side": "BACK",

@@ -1512,3 +1512,39 @@ class TestTemporalContinuousScan:
         assert res == mock_refined
         p_scan.assert_called_once()
         p_ref.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# UMA Dispute Gate Continuous Integration (Plan 05)
+# ---------------------------------------------------------------------------
+
+class TestDisputeGateContinuous:
+    """Verify UMA dispute cache update wiring in continuous mode."""
+
+    def test_continuous_contains_dispute_gate_wiring(self):
+        src_path = os.path.join(os.path.dirname(__file__), "..", "continuous.py")
+        with open(src_path, encoding="utf-8") as fh:
+            src = fh.read()
+        assert "if config.DISPUTE_GATE_ENABLED and poly_markets and db:" in src
+        assert "from uma_monitor import fetch_dispute_states" in src
+        assert "db.upsert_dispute_state(fetch_dispute_states(poly_markets))" in src
+
+    def test_dispute_cache_update_behavior(self, monkeypatch):
+        import config
+        from unittest.mock import MagicMock
+        from uma_monitor import fetch_dispute_states
+
+        monkeypatch.setattr(config, "DISPUTE_GATE_ENABLED", True)
+        mock_db = MagicMock()
+        poly_markets = [
+            {"conditionId": "0xabc", "umaResolutionStatus": "disputed"},
+            {"conditionId": "0xdef", "umaResolutionStatus": "resolved"},
+        ]
+
+        if config.DISPUTE_GATE_ENABLED and poly_markets and mock_db:
+            mock_db.upsert_dispute_state(fetch_dispute_states(poly_markets))
+
+        mock_db.upsert_dispute_state.assert_called_once()
+        states = mock_db.upsert_dispute_state.call_args[0][0]
+        assert states["0xabc"]["blocked"] is True
+        assert states["0xdef"]["blocked"] is False

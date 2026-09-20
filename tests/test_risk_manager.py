@@ -390,3 +390,97 @@ class TestDynamicSizing:
         opp = {"net_profit": 0.10, "total_cost": "$0.9000", "_clob_depth": 100.0}
         size = rm.calculate_dynamic_size(opp, aggressiveness=0)
         assert size == rm.max_trade_size
+
+
+# ---------------------------------------------------------------------------
+# UMA Dispute Risk Gate (Plan 05)
+# ---------------------------------------------------------------------------
+
+class TestDisputeGate:
+    """Test Gate #8: UMA dispute window blocking for resolution-held strategies."""
+
+    def test_gate_blocks_disputed_binary_opportunity(self, default_config, mock_db, valid_opportunity):
+        default_config["dispute_gate_enabled"] = True
+        rm = RiskManager(default_config)
+        valid_opportunity["type"] = "Binary"
+        valid_opportunity["_condition_id"] = "0xdisputed123"
+
+        mock_db.get_dispute_state.return_value = {
+            "condition_id": "0xdisputed123",
+            "state": "disputed",
+            "blocked": True,
+            "reason": "uma_disputed",
+        }
+
+        allowed, reason = rm.check(valid_opportunity, mock_db)
+        assert allowed is False
+        assert reason == "UMA dispute window (uma_disputed)"
+        mock_db.get_dispute_state.assert_called_with("0xdisputed123")
+
+    def test_gate_blocks_parametric_negrisk_opportunity(self, default_config, mock_db, valid_opportunity):
+        default_config["dispute_gate_enabled"] = True
+        rm = RiskManager(default_config)
+        valid_opportunity["type"] = "NegRiskNO(4)"
+        valid_opportunity["_condition_ids"] = ["0xclean1", "0xproposed2"]
+
+        def mock_get_state(cid):
+            if cid == "0xproposed2":
+                return {"condition_id": cid, "state": "proposed", "blocked": True, "reason": "uma_proposed"}
+            return {"condition_id": cid, "state": "open", "blocked": False, "reason": "clear"}
+
+        mock_db.get_dispute_state.side_effect = mock_get_state
+
+        allowed, reason = rm.check(valid_opportunity, mock_db)
+        assert allowed is False
+        assert reason == "UMA dispute window (uma_proposed)"
+
+    def test_gate_allows_when_dispute_state_clear(self, default_config, mock_db, valid_opportunity):
+        default_config["dispute_gate_enabled"] = True
+        rm = RiskManager(default_config)
+        valid_opportunity["type"] = "Binary"
+        valid_opportunity["_condition_id"] = "0xclear123"
+
+        mock_db.get_dispute_state.return_value = {
+            "condition_id": "0xclear123",
+            "state": "open",
+            "blocked": False,
+            "reason": "clear",
+        }
+
+        allowed, reason = rm.check(valid_opportunity, mock_db)
+        assert allowed is True
+        assert reason == "OK"
+
+    def test_gate_allows_when_gate_disabled(self, default_config, mock_db, valid_opportunity):
+        default_config["dispute_gate_enabled"] = False
+        rm = RiskManager(default_config)
+        valid_opportunity["type"] = "Binary"
+        valid_opportunity["_condition_id"] = "0xdisputed123"
+
+        mock_db.get_dispute_state.return_value = {
+            "condition_id": "0xdisputed123",
+            "state": "disputed",
+            "blocked": True,
+            "reason": "uma_disputed",
+        }
+
+        allowed, reason = rm.check(valid_opportunity, mock_db)
+        assert allowed is True
+        assert reason == "OK"
+
+    def test_gate_ignores_non_resolution_types(self, default_config, mock_db, valid_opportunity):
+        default_config["dispute_gate_enabled"] = True
+        rm = RiskManager(default_config)
+        valid_opportunity["type"] = "BetfairBackAll"
+        valid_opportunity["_condition_id"] = "0xdisputed123"
+
+        mock_db.get_dispute_state.return_value = {
+            "condition_id": "0xdisputed123",
+            "state": "disputed",
+            "blocked": True,
+            "reason": "uma_disputed",
+        }
+
+        allowed, reason = rm.check(valid_opportunity, mock_db)
+        assert allowed is True
+        assert reason == "OK"

@@ -94,6 +94,7 @@ def scan_resolution_snipes(
                 "_price": price,
                 "_consensus": consensus,
                 "_market_key": market_key,
+                "_condition_id": market_key,
                 "_direction": "BUY_YES" if outcome_name == "yes" else "BUY_NO",
             }
             opportunity["_efficiency"] = capital_efficiency_score(opportunity)

@@ -149,6 +149,12 @@ def scan_frechet(
         else:
             days_to_res = days_sub if days_sub is not None else days_sup
 
+        frechet_cids = [
+            mkt.get("conditionId") or mkt.get("condition_id")
+            for mkt in (sub_mkt, sup_mkt)
+            if mkt and (mkt.get("conditionId") or mkt.get("condition_id"))
+        ]
+
         candidates.append({
             "type": "FrechetArb",
             "_layer": 1,
@@ -171,6 +177,8 @@ def scan_frechet(
             "_p_a": p_a,
             "_p_b": p_b,
             "_token_ids": [buy_yes_token, buy_no_token] if buy_yes_token and buy_no_token else [],
+            "_condition_ids": frechet_cids,
+            "_condition_id": frechet_cids[0] if frechet_cids else "",
             "_days_to_resolution": days_to_res,
             "_clob_depth": None,
         })

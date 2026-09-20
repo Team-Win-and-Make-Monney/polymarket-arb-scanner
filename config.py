@@ -668,6 +668,9 @@ TEMPORAL_ARB_ENABLED = _env_bool("TEMPORAL_ARB_ENABLED", "false")
 TEMPORAL_MIN_VIOLATION = _env_float("TEMPORAL_MIN_VIOLATION", "0.02")
 TEMPORAL_ARB_MAX_TRADE_SIZE = _env_float("TEMPORAL_ARB_MAX_TRADE_SIZE", "25.0")
 
+# Plan 05: UMA oracle dispute-risk gate (defensive) — block resolution-held Polymarket arbs in proposal/dispute window
+DISPUTE_GATE_ENABLED = _env_bool("DISPUTE_GATE_ENABLED", "false")
+
 # #30: Conditional Market Arbitrage — P(X|Y) × P(Y) ≠ P(X) detection
 CONDITIONAL_ARB_ENABLED = _env_bool("CONDITIONAL_ARB_ENABLED", "false")
 CONDITIONAL_ARB_MIN_DIVERGENCE = _env_float("CONDITIONAL_ARB_MIN_DIVERGENCE", "0.05")

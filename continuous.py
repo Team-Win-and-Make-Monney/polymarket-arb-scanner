@@ -2096,6 +2096,13 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                             except Exception as e:
                                 logger.error("Failed to fetch %s: %s", key, e)
 
+                if config.DISPUTE_GATE_ENABLED and poly_markets and db:
+                    from uma_monitor import fetch_dispute_states
+                    try:
+                        db.upsert_dispute_state(fetch_dispute_states(poly_markets))
+                    except Exception as e:
+                        logger.warning("Failed to update UMA dispute states: %s", e)
+
                 all_opportunities = []
 
                 # Stage 2: Run scans in parallel

@@ -185,6 +185,7 @@ def scan_settlement_timing(
             "net_roi": result.get("net_roi", 0),
             "confidence": 0.95,
             "_market_key": slow_market.get("condition_id") or slow_market.get("id", ""),
+            "_condition_id": slow_market.get("condition_id") or slow_market.get("id", ""),
             "_platform": slow_platform,
             "_slow_market": slow_market,
             "_winning_side": winning_side,

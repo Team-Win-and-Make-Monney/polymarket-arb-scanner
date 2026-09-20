@@ -892,3 +892,48 @@ class TestOptionalClientStartup:
 
         assert result is client
         client.login.assert_called_once_with(api_key="token")
+
+
+# ---------------------------------------------------------------------------
+# UMA Dispute Gate CLI Wiring (Plan 05)
+# ---------------------------------------------------------------------------
+
+class TestDisputeGateCLI:
+    """Verify UMA dispute cache population in _run_oneshot."""
+
+    def test_dispute_gate_populates_cache_when_enabled(self, monkeypatch):
+        import config
+        from unittest.mock import MagicMock, patch
+        monkeypatch.setattr(config, "DISPUTE_GATE_ENABLED", True)
+
+        args = _make_args(mode="binary")
+        mock_db = MagicMock()
+        poly_markets = [{"conditionId": "0xabc", "umaResolutionStatus": "disputed"}]
+
+        with patch.object(_cli_mod, "fetch_all_markets", return_value=poly_markets), \
+             patch.object(_cli_mod, "scan_binary_internal", return_value=[]), \
+             patch.object(_cli_mod, "display_results"), \
+             patch.object(_cli_mod, "dashboard_state"):
+            _cli_mod._run_oneshot(args, min_profit=0.01, kalshi_client=None, executor=_make_executor(), db=mock_db)
+
+        mock_db.upsert_dispute_state.assert_called_once()
+        states = mock_db.upsert_dispute_state.call_args[0][0]
+        assert "0xabc" in states
+        assert states["0xabc"]["blocked"] is True
+
+    def test_dispute_gate_skips_cache_when_disabled(self, monkeypatch):
+        import config
+        from unittest.mock import MagicMock, patch
+        monkeypatch.setattr(config, "DISPUTE_GATE_ENABLED", False)
+
+        args = _make_args(mode="binary")
+        mock_db = MagicMock()
+        poly_markets = [{"conditionId": "0xabc", "umaResolutionStatus": "disputed"}]
+
+        with patch.object(_cli_mod, "fetch_all_markets", return_value=poly_markets), \
+             patch.object(_cli_mod, "scan_binary_internal", return_value=[]), \
+             patch.object(_cli_mod, "display_results"), \
+             patch.object(_cli_mod, "dashboard_state"):
+            _cli_mod._run_oneshot(args, min_profit=0.01, kalshi_client=None, executor=_make_executor(), db=mock_db)
+
+        mock_db.upsert_dispute_state.assert_not_called()

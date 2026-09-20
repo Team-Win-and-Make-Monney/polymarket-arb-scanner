@@ -141,6 +141,7 @@ def scan_binary_internal(markets: list[dict], min_profit: float,
                 "net_roi": f"{result['net_profit'] / (yes_price + no_price) * 100:.2f}%",
                 "volume": f"${float(m.get('volume', 0) or 0):,.0f}",
                 "_market_key": market_key,
+                "_condition_id": m.get("conditionId") or m.get("condition_id") or market_key,
                 "_token_ids": token_ids,
                 "_days_to_resolution": _days_to_resolution(m, "polymarket"),
             })

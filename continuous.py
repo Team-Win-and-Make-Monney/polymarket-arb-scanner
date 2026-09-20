@@ -1228,6 +1228,26 @@ def _scan_frechet_layer1(poly_markets, mode, min_profit, price_cache=None, funne
         return []
 
 
+def _scan_temporal_layer1(kalshi_markets, mode, min_profit, kalshi_client=None, funnel=None) -> list[dict]:
+    """Plan 03 Cross-date temporal arbitrage. Returns [] when the gate is off or there are no markets."""
+    if mode not in ("all", "temporal") or not getattr(config, "TEMPORAL_ARB_ENABLED", False):
+        return []
+    if not kalshi_markets:
+        return []
+    try:
+        from scans.temporal import scan_temporal_arb, _refine_temporal_with_clob
+        cands = scan_temporal_arb(
+            kalshi_markets,
+            min_profit=min_profit,
+            min_violation=getattr(config, "TEMPORAL_MIN_VIOLATION", 0.02),
+            funnel=funnel,
+        )
+        return _refine_temporal_with_clob(cands, min_profit=min_profit, kalshi_client=kalshi_client, funnel=funnel)
+    except Exception as exc:
+        logger.warning("Temporal arbitrage scan failed: %s", exc)
+        return []
+
+
 def _scan_jev_crypto_continuous(
     poly_markets,
     mode: str,
@@ -2059,7 +2079,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                             fetch_futures["poly_events"] = pool.submit(fetch_events)
                         if polymarket_reward_fetch_enabled(args.mode) and CONFIG_REWARDS_ENABLED:
                             fetch_futures["poly_reward_markets"] = pool.submit(fetch_reward_markets)
-                        if args.mode in ("all", "kalshi", "cross", "spread", "multi-cross", "rewards") and kalshi_client:
+                        if args.mode in ("all", "kalshi", "cross", "spread", "multi-cross", "rewards", "temporal") and kalshi_client:
                             fetch_futures["kalshi_data"] = pool.submit(_fetch_kalshi_data, kalshi_client)
 
                         for key, future in fetch_futures.items():
@@ -2448,6 +2468,24 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                     )
                 except Exception as exc:
                     logger.warning("Fréchet scan failed: %s", exc)
+
+                try:
+                    kalshi_flat = []
+                    if kalshi_data and kalshi_data[0]:
+                        for evt in kalshi_data[0]:
+                            for mkt in evt.get("markets", [evt]):
+                                kalshi_flat.append(mkt)
+                    all_opportunities.extend(
+                        _scan_temporal_layer1(
+                            kalshi_flat,
+                            args.mode,
+                            min_profit,
+                            kalshi_client=kalshi_client,
+                            funnel=_funnel,
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning("Temporal scan failed: %s", exc)
 
                 # Structural alpha: Combinatorial logical arbitrage (Phase 9)
                 if args.mode in ("all", "logical-arb"):

@@ -42,6 +42,7 @@ for _mod in _EXTERNAL_MODS:
         del sys.modules[_mod]
 _stashed.clear()
 sys.modules.pop("scans.frechet", None)
+sys.modules.pop("scans.temporal", None)
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +375,35 @@ class TestRunOneshotModeRouting:
         executor.dry_run = False
         with patch("config.FRECHET_ARB_ENABLED", False):
             _cli_mod._run_oneshot(args, 0.01, None, executor, _make_db())
+        mock_scan.assert_not_called()
+        mock_refine.assert_not_called()
+
+    @patch.object(_cli_mod, "display_results")
+    @patch.object(_cli_mod, "dashboard_state")
+    @patch.object(_cli_mod, "_fetch_kalshi_data", return_value=([{"markets": [{"ticker": "KXBTC-26MAR31-T100000"}]}], {}))
+    @patch.object(_cli_mod, "_refine_temporal_with_clob", return_value=[])
+    @patch.object(_cli_mod, "scan_temporal_arb", return_value=[])
+    def test_temporal_mode_runs_temporal_scan(
+        self, mock_scan, mock_refine, mock_fetch_kalshi, mock_dash, mock_display
+    ):
+        args = _make_args(mode="temporal")
+        _cli_mod._run_oneshot(args, 0.01, MagicMock(), _make_executor(), _make_db())
+        mock_scan.assert_called_once()
+        mock_refine.assert_called_once()
+
+    @patch.object(_cli_mod, "display_results")
+    @patch.object(_cli_mod, "dashboard_state")
+    @patch.object(_cli_mod, "_fetch_kalshi_data", return_value=([{"markets": [{"ticker": "KXBTC-26MAR31-T100000"}]}], {}))
+    @patch.object(_cli_mod, "_refine_temporal_with_clob", return_value=[])
+    @patch.object(_cli_mod, "scan_temporal_arb", return_value=[])
+    def test_temporal_mode_refuses_non_dry_run_without_flag(
+        self, mock_scan, mock_refine, mock_fetch_kalshi, mock_dash, mock_display
+    ):
+        args = _make_args(mode="temporal", dry_run=False)
+        executor = _make_executor()
+        executor.dry_run = False
+        with patch("config.TEMPORAL_ARB_ENABLED", False):
+            _cli_mod._run_oneshot(args, 0.01, MagicMock(), executor, _make_db())
         mock_scan.assert_not_called()
         mock_refine.assert_not_called()
 

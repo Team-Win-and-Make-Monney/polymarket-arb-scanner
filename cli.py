@@ -100,6 +100,8 @@ from scans import (
     scan_kalshi_rewards,
     scan_frechet,
     _refine_frechet_with_clob,
+    scan_temporal_arb,
+    _refine_temporal_with_clob,
 )
 import config
 from config import (
@@ -214,7 +216,7 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
             fetch_futures["poly_events"] = pool.submit(fetch_events)
         if polymarket_reward_fetch_enabled(args.mode) and CONFIG_REWARDS_ENABLED:
             fetch_futures["poly_reward_markets"] = pool.submit(fetch_reward_markets)
-        if args.mode in ("all", "kalshi", "cross", "spread", "rewards") and kalshi_client:
+        if args.mode in ("all", "kalshi", "cross", "spread", "rewards", "temporal") and kalshi_client:
             fetch_futures["kalshi_data"] = pool.submit(_fetch_kalshi_data, kalshi_client)
 
         for key, future in fetch_futures.items():
@@ -874,6 +876,41 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
             except Exception as e:
                 logger.error("Fréchet arbitrage scan failed: %s", e)
 
+    # Plan 03: Cross-Date / Nested Temporal Arbitrage
+    if args.mode in ("all", "temporal"):
+        from config import TEMPORAL_ARB_ENABLED, TEMPORAL_MIN_VIOLATION
+        is_dry_run = getattr(args, "dry_run", None)
+        if is_dry_run is None:
+            is_dry_run = getattr(executor, "dry_run", True)
+        if args.mode == "temporal" and not TEMPORAL_ARB_ENABLED and not is_dry_run:
+            logger.error(
+                "Temporal arbitrage mode requested but TEMPORAL_ARB_ENABLED=false in non-dry-run execution. "
+                "Refusing to scan without explicit enablement."
+            )
+        elif TEMPORAL_ARB_ENABLED or (args.mode == "temporal" and is_dry_run):
+            logger.info("--- Cross-Date / Nested Temporal Arbitrage Scan ---")
+            try:
+                kalshi_markets_flat = []
+                if kalshi_data and kalshi_data[0]:
+                    for evt in kalshi_data[0]:
+                        for mkt in evt.get("markets", [evt]):
+                            kalshi_markets_flat.append(mkt)
+                if kalshi_markets_flat:
+                    temporal_opps = scan_temporal_arb(
+                        kalshi_markets_flat,
+                        min_profit=min_profit,
+                        min_violation=TEMPORAL_MIN_VIOLATION,
+                    )
+                    temporal_opps = _refine_temporal_with_clob(
+                        temporal_opps,
+                        min_profit=min_profit,
+                        kalshi_client=kalshi_client,
+                    )
+                    all_opportunities.extend(temporal_opps)
+                    logger.info("Found %d temporal arbitrage opportunities.", len(temporal_opps))
+            except Exception as e:
+                logger.error("Temporal arbitrage scan failed: %s", e)
+
     # STRAT-07: Time Decay Convergence
     if args.mode in ("all", "time-decay"):
         from config import TIME_DECAY_ENABLED
@@ -1265,9 +1302,9 @@ def main():
                  "imbalance", "news-snipe", "correlated", "time-decay",
                  "logical-arb", "whale-copy",
                  "fee-promo", "cross-mm",
-                 "lead-lag-mm", "toxic-flow", "vol-mm", "mm-pilot", "jev-crypto", "frechet"],
+                 "lead-lag-mm", "toxic-flow", "vol-mm", "mm-pilot", "jev-crypto", "frechet", "temporal"],
         default="all",
-        help="Scan mode: all, binary, negrisk, negrisk-no, cross, kalshi, cross-all, spread, betfair, smarkets, sxbet, matchbook, gemini, ibkr, event, triangular, stale, resolution, convergence, mm, mm-pilot, rewards, imbalance, news-snipe, correlated, time-decay, fee-promo, cross-mm, jev-crypto, frechet",
+        help="Scan mode: all, binary, negrisk, negrisk-no, cross, kalshi, cross-all, spread, betfair, smarkets, sxbet, matchbook, gemini, ibkr, event, triangular, stale, resolution, convergence, mm, mm-pilot, rewards, imbalance, news-snipe, correlated, time-decay, fee-promo, cross-mm, jev-crypto, frechet, temporal",
     )
     parser.add_argument(
         "--min-profit",

@@ -1475,3 +1475,40 @@ class TestFrechetContinuousScan:
         assert res == mock_refined
         p_scan.assert_called_once()
         p_ref.assert_called_once()
+
+
+class TestTemporalContinuousScan:
+    """Test _scan_temporal_layer1 continuous dispatch and gating."""
+
+    def test_temporal_disabled_returns_empty(self, monkeypatch):
+        import config
+        from continuous import _scan_temporal_layer1
+        monkeypatch.setattr(config, "TEMPORAL_ARB_ENABLED", False)
+        markets = [{"ticker": "KXBTC-26MAR31-T100000"}]
+        res = _scan_temporal_layer1(markets, mode="all", min_profit=0.01)
+        assert res == []
+
+    def test_temporal_unmatched_mode_returns_empty(self, monkeypatch):
+        import config
+        from continuous import _scan_temporal_layer1
+        monkeypatch.setattr(config, "TEMPORAL_ARB_ENABLED", True)
+        markets = [{"ticker": "KXBTC-26MAR31-T100000"}]
+        res = _scan_temporal_layer1(markets, mode="binary", min_profit=0.01)
+        assert res == []
+
+    def test_temporal_enabled_dispatches_scan_and_refine(self, monkeypatch):
+        from unittest.mock import patch
+        import config
+        from continuous import _scan_temporal_layer1
+        monkeypatch.setattr(config, "TEMPORAL_ARB_ENABLED", True)
+        markets = [{"ticker": "KXBTC-26MAR31-T100000"}]
+        mock_cands = [{"type": "TemporalArb", "net_profit": 0.05}]
+        mock_refined = [{"type": "TemporalArb", "net_profit": 0.04}]
+
+        with patch("scans.temporal.scan_temporal_arb", return_value=mock_cands) as p_scan, \
+             patch("scans.temporal._refine_temporal_with_clob", return_value=mock_refined) as p_ref:
+            res = _scan_temporal_layer1(markets, mode="all", min_profit=0.01)
+
+        assert res == mock_refined
+        p_scan.assert_called_once()
+        p_ref.assert_called_once()

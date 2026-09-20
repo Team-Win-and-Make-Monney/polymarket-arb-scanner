@@ -41,6 +41,7 @@ for _mod in _EXTERNAL_MODS:
     elif _mod in sys.modules and isinstance(sys.modules[_mod], MagicMock):
         del sys.modules[_mod]
 _stashed.clear()
+sys.modules.pop("scans.frechet", None)
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +347,36 @@ class TestRunOneshotModeRouting:
         _cli_mod._run_oneshot(args, 0.01, None, _make_executor(), _make_db(),
                               extra_clients={"ibkr": ibkr_client})
         mock_ibkr.assert_called_once()
+
+    @patch.object(_cli_mod, "display_results")
+    @patch.object(_cli_mod, "dashboard_state")
+    @patch.object(_cli_mod, "_refine_frechet_with_clob", return_value=[])
+    @patch.object(_cli_mod, "scan_frechet", return_value=[])
+    @patch.object(_cli_mod, "fetch_all_markets", return_value=[{"title": "M1"}])
+    def test_frechet_mode_runs_frechet_scan(
+        self, mock_fetch, mock_scan, mock_refine, mock_dash, mock_display
+    ):
+        args = _make_args(mode="frechet")
+        _cli_mod._run_oneshot(args, 0.01, None, _make_executor(), _make_db())
+        mock_scan.assert_called_once()
+        mock_refine.assert_called_once()
+
+    @patch.object(_cli_mod, "display_results")
+    @patch.object(_cli_mod, "dashboard_state")
+    @patch.object(_cli_mod, "_refine_frechet_with_clob", return_value=[])
+    @patch.object(_cli_mod, "scan_frechet", return_value=[])
+    @patch.object(_cli_mod, "fetch_all_markets", return_value=[{"title": "M1"}])
+    def test_frechet_mode_refuses_non_dry_run_without_flag(
+        self, mock_fetch, mock_scan, mock_refine, mock_dash, mock_display
+    ):
+        args = _make_args(mode="frechet", dry_run=False)
+        executor = _make_executor()
+        executor.dry_run = False
+        with patch("config.FRECHET_ARB_ENABLED", False):
+            _cli_mod._run_oneshot(args, 0.01, None, executor, _make_db())
+        mock_scan.assert_not_called()
+        mock_refine.assert_not_called()
+
 
     @patch.object(_cli_mod, "display_results")
     @patch.object(_cli_mod, "dashboard_state")

@@ -1433,3 +1433,45 @@ class TestMMPilotModeIsolation:
         source = inspect.getsource(continuous.run_continuous)
         assert "config.MM_KALSHI_PILOT_ENABLED" in source
         assert 'getattr(args, "mode", None) == "mm-pilot"' in source
+
+
+class TestFrechetContinuousScan:
+    def test_frechet_disabled_by_default(self, monkeypatch):
+        import config
+        from continuous import _scan_frechet_layer1
+        monkeypatch.setattr(config, "FRECHET_ARB_ENABLED", False)
+        markets = [{"title": "Will BTC be above $100k?"}]
+        res = _scan_frechet_layer1(markets, mode="all", min_profit=0.01)
+        assert res == []
+
+    def test_frechet_empty_markets(self, monkeypatch):
+        import config
+        from continuous import _scan_frechet_layer1
+        monkeypatch.setattr(config, "FRECHET_ARB_ENABLED", True)
+        res = _scan_frechet_layer1([], mode="all", min_profit=0.01)
+        assert res == []
+
+    def test_frechet_irrelevant_mode(self, monkeypatch):
+        import config
+        from continuous import _scan_frechet_layer1
+        monkeypatch.setattr(config, "FRECHET_ARB_ENABLED", True)
+        markets = [{"title": "Will BTC be above $100k?"}]
+        res = _scan_frechet_layer1(markets, mode="binary", min_profit=0.01)
+        assert res == []
+
+    def test_frechet_enabled_dispatches_scan_and_refine(self, monkeypatch):
+        from unittest.mock import patch, MagicMock
+        import config
+        from continuous import _scan_frechet_layer1
+        monkeypatch.setattr(config, "FRECHET_ARB_ENABLED", True)
+        markets = [{"title": "Will BTC be above $100k?"}]
+        mock_cands = [{"type": "FrechetArb", "net_profit": 0.05}]
+        mock_refined = [{"type": "FrechetArb", "net_profit": 0.04}]
+
+        with patch("scans.frechet.scan_frechet", return_value=mock_cands) as p_scan, \
+             patch("scans.frechet._refine_frechet_with_clob", return_value=mock_refined) as p_ref:
+            res = _scan_frechet_layer1(markets, mode="all", min_profit=0.01)
+
+        assert res == mock_refined
+        p_scan.assert_called_once()
+        p_ref.assert_called_once()

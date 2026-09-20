@@ -1587,6 +1587,70 @@ def net_profit_logical_arb(price_if_yes: float, price_then_yes: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Fréchet-Bound Logical Arbitrage fee calculator
+# ---------------------------------------------------------------------------
+
+
+def net_profit_frechet_implication(
+    p_a: float,
+    p_b: float,
+    platform: str = "polymarket",
+    category: str | None = None,
+) -> dict:
+    """Calculate net profit for an implication-violation lock on A ⊆ B.
+
+    Coherence requires P(A) <= P(B). When P(A) > P(B), buy YES on B and NO on A.
+    Payoffs across reachable states (A ⊆ B forbids A=1, B=0):
+      - A=1, B=1: YES_B pays $1, NO_A pays $0 -> payout $1.00
+      - A=0, B=1: YES_B pays $1, NO_A pays $1 -> payout $2.00
+      - A=0, B=0: YES_B pays $0, NO_A pays $1 -> payout $1.00
+    Minimum guaranteed payoff = $1.00.
+    Total cost = P(YES_B) + P(NO_A) = P(B) + (1.0 - P(A)) = 1.0 + P(B) - P(A).
+    Gross spread = 1.0 - Total cost = P(A) - P(B).
+    Profit = (P(A) - P(B)) - fees.
+
+    Args:
+        p_a: Probability/price of subset event A.
+        p_b: Probability/price of superset event B.
+        platform: Execution platform ("polymarket" or "kalshi").
+        category: Market category for Polymarket dynamic taker fee.
+
+    Returns:
+        Dict with keys: gross_spread, fees, net_profit, net_roi, total_cost.
+    """
+    gross_spread = p_a - p_b
+    total_cost = 1.0 + p_b - p_a
+    if gross_spread <= 0:
+        return {
+            "gross_spread": gross_spread,
+            "fees": 0.0,
+            "net_profit": gross_spread,
+            "net_roi": 0.0,
+            "total_cost": total_cost,
+        }
+
+    if platform == "kalshi":
+        fee = kalshi_taker_fee(p_b) + kalshi_taker_fee(1.0 - p_a)
+        gas = 0.0
+    else:
+        fee = (polymarket_taker_fee(p_b, category=category)
+               + polymarket_taker_fee(1.0 - p_a, category=category))
+        gas = POLYGON_GAS_ESTIMATE * 2
+
+    total_fees = fee + gas
+    net_profit = gross_spread - total_fees
+    net_roi = net_profit / total_cost if total_cost > 0 else 0.0
+
+    return {
+        "gross_spread": gross_spread,
+        "fees": total_fees,
+        "net_profit": net_profit,
+        "net_roi": net_roi,
+        "total_cost": total_cost,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Whale Copy Trading fee calculator
 # ---------------------------------------------------------------------------
 

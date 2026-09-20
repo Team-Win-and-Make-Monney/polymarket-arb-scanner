@@ -39,6 +39,7 @@ from scans.expert_divergence import scan_expert_divergence
 from scans.insider_pattern import scan_insider_pattern, get_order_flow_tracker
 from scans.cross_category import scan_cross_category, get_signal_fetcher
 from scans.jev_crypto import scan_jev_crypto, _refine_jev_crypto_with_clob
+from scans.frechet import scan_frechet, _refine_frechet_with_clob
 from scans.helpers import _extract_token_ids, _fetch_clob_for_market, _parallel_fetch_kalshi, capital_efficiency_score
 
 __all__ = [
@@ -102,4 +103,6 @@ __all__ = [
     "get_signal_fetcher",
     "scan_jev_crypto",
     "_refine_jev_crypto_with_clob",
+    "scan_frechet",
+    "_refine_frechet_with_clob",
 ]

@@ -37,7 +37,6 @@ sys.modules["dashboard"] = mock_dashboard
 sys.modules["display"] = MagicMock()
 sys.modules["recovery"] = MagicMock()
 
-import continuous as continuous_module
 from continuous import (
     OpportunityIndex,
     _StageTimer,
@@ -1526,6 +1525,7 @@ class TestDisputeGateContinuous:
         import asyncio
         import signal as signal_module
         import config
+        continuous_module = sys.modules["continuous"]
 
         monkeypatch.setattr(config, "DISPUTE_GATE_ENABLED", True)
 
@@ -1541,7 +1541,8 @@ class TestDisputeGateContinuous:
             try:
                 await asyncio.sleep(60)
             except asyncio.CancelledError:
-                pass
+                # Coroutine cancelled on test shutdown
+                return
         mock_feed.run = mock_feed_run
         monkeypatch.setattr(continuous_module, "FeedManager", lambda *a, **kw: mock_feed)
         monkeypatch.setattr(continuous_module, "reconcile_orphaned_positions", MagicMock())
@@ -1605,6 +1606,7 @@ class TestDisputeGateContinuous:
         import asyncio
         import signal as signal_module
         import config
+        continuous_module = sys.modules["continuous"]
 
         monkeypatch.setattr(config, "DISPUTE_GATE_ENABLED", True)
 
@@ -1620,7 +1622,8 @@ class TestDisputeGateContinuous:
             try:
                 await asyncio.sleep(60)
             except asyncio.CancelledError:
-                pass
+                # Coroutine cancelled on test shutdown
+                return
         mock_feed.run = mock_feed_run
         monkeypatch.setattr(continuous_module, "FeedManager", lambda *a, **kw: mock_feed)
         monkeypatch.setattr(continuous_module, "reconcile_orphaned_positions", MagicMock())

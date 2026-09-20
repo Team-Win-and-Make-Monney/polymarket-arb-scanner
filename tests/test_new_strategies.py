@@ -175,7 +175,6 @@ class TestSettlementTimingScan:
         import scans.settlement_timing as st_mod
         monkeypatch.setattr(st_mod, "SETTLEMENT_TIMING_ENABLED", True)
 
-        from scans.settlement_timing import scan_settlement_timing
         from risk_manager import RiskManager
 
         matched_pair = {
@@ -192,7 +191,7 @@ class TestSettlementTimingScan:
             "platform_b": "polymarket",
         }
 
-        opps = scan_settlement_timing([matched_pair], min_profit=0.01, min_discount=0.01)
+        opps = st_mod.scan_settlement_timing([matched_pair], min_profit=0.01, min_discount=0.01)
         assert len(opps) == 1
         opp = opps[0]
         opp["_clob_depth"] = 100.0

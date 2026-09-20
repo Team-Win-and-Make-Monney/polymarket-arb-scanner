@@ -207,9 +207,8 @@ class TestConfigPrecedence:
         env.pop("MIN_PROFIT_THRESHOLD", None)
         with patch.dict(os.environ, env, clear=True):
             args = argparse.Namespace(min_profit=None)
-            from config import DEFAULT_MIN_PROFIT
-            min_profit = args.min_profit or float(os.getenv("MIN_PROFIT_THRESHOLD", str(DEFAULT_MIN_PROFIT)))
-            assert min_profit == pytest.approx(DEFAULT_MIN_PROFIT)
+            min_profit = args.min_profit or float(os.getenv("MIN_PROFIT_THRESHOLD", str(config.DEFAULT_MIN_PROFIT)))
+            assert min_profit == pytest.approx(config.DEFAULT_MIN_PROFIT)
 
     def test_dry_run_cli_true_overrides_env(self):
         """--dry-run flag overrides DRY_RUN env."""

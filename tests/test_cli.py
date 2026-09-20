@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import sys
 import os
 import argparse
+import config
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -206,9 +207,8 @@ class TestConfigPrecedence:
         env.pop("MIN_PROFIT_THRESHOLD", None)
         with patch.dict(os.environ, env, clear=True):
             args = argparse.Namespace(min_profit=None)
-            from config import DEFAULT_MIN_PROFIT
-            min_profit = args.min_profit or float(os.getenv("MIN_PROFIT_THRESHOLD", str(DEFAULT_MIN_PROFIT)))
-            assert min_profit == pytest.approx(DEFAULT_MIN_PROFIT)
+            min_profit = args.min_profit or float(os.getenv("MIN_PROFIT_THRESHOLD", str(config.DEFAULT_MIN_PROFIT)))
+            assert min_profit == pytest.approx(config.DEFAULT_MIN_PROFIT)
 
     def test_dry_run_cli_true_overrides_env(self):
         """--dry-run flag overrides DRY_RUN env."""
@@ -892,3 +892,80 @@ class TestOptionalClientStartup:
 
         assert result is client
         client.login.assert_called_once_with(api_key="token")
+
+
+# ---------------------------------------------------------------------------
+# UMA Dispute Gate CLI Wiring (Plan 05)
+# ---------------------------------------------------------------------------
+
+class TestDisputeGateCLI:
+    """Verify UMA dispute cache population in _run_oneshot."""
+
+    def test_dispute_gate_populates_cache_when_enabled(self, monkeypatch):
+        monkeypatch.setattr(config, "DISPUTE_GATE_ENABLED", True)
+
+        args = _make_args(mode="binary")
+        mock_db = MagicMock()
+        poly_markets = [{"conditionId": "0xabc", "umaResolutionStatus": "disputed"}]
+
+        with patch.object(_cli_mod, "fetch_all_markets", return_value=poly_markets), \
+             patch.object(_cli_mod, "scan_binary_internal", return_value=[]), \
+             patch.object(_cli_mod, "display_results"), \
+             patch.object(_cli_mod, "dashboard_state"):
+            _cli_mod._run_oneshot(args, min_profit=0.01, kalshi_client=None, executor=_make_executor(), db=mock_db)
+
+        mock_db.upsert_dispute_state.assert_called_once()
+        states = mock_db.upsert_dispute_state.call_args[0][0]
+        assert "0xabc" in states
+        assert states["0xabc"]["blocked"] is True
+
+    def test_dispute_gate_skips_cache_when_disabled(self, monkeypatch):
+        monkeypatch.setattr(config, "DISPUTE_GATE_ENABLED", False)
+
+        args = _make_args(mode="binary")
+        mock_db = MagicMock()
+        poly_markets = [{"conditionId": "0xabc", "umaResolutionStatus": "disputed"}]
+
+        with patch.object(_cli_mod, "fetch_all_markets", return_value=poly_markets), \
+             patch.object(_cli_mod, "scan_binary_internal", return_value=[]), \
+             patch.object(_cli_mod, "display_results"), \
+             patch.object(_cli_mod, "dashboard_state"):
+            _cli_mod._run_oneshot(args, min_profit=0.01, kalshi_client=None, executor=_make_executor(), db=mock_db)
+
+        mock_db.upsert_dispute_state.assert_not_called()
+
+    def test_dispute_gate_includes_events_cache_when_enabled(self, monkeypatch):
+        monkeypatch.setattr(config, "DISPUTE_GATE_ENABLED", True)
+
+        args = _make_args(mode="negrisk")
+        mock_db = MagicMock()
+        poly_events = [{"id": "evt1", "markets": [{"conditionId": "0xevent_cid", "umaResolutionStatus": "disputed"}]}]
+
+        with patch.object(_cli_mod, "fetch_all_markets", return_value=[]), \
+             patch.object(_cli_mod, "fetch_events", return_value=poly_events), \
+             patch.object(_cli_mod, "scan_negrisk_internal", return_value=[]), \
+             patch.object(_cli_mod, "display_results"), \
+             patch.object(_cli_mod, "dashboard_state"):
+            _cli_mod._run_oneshot(args, min_profit=0.01, kalshi_client=None, executor=_make_executor(), db=mock_db)
+
+        mock_db.upsert_dispute_state.assert_called_once()
+        states = mock_db.upsert_dispute_state.call_args[0][0]
+        assert "0xevent_cid" in states
+        assert states["0xevent_cid"]["blocked"] is True
+
+    def test_dispute_gate_refresh_failure_fails_closed(self, monkeypatch):
+        monkeypatch.setattr(config, "DISPUTE_GATE_ENABLED", True)
+
+        args = _make_args(mode="binary")
+        mock_db = MagicMock()
+        mock_db.upsert_dispute_state.side_effect = RuntimeError("Database locked")
+        poly_markets = [{"conditionId": "0xabc", "umaResolutionStatus": "disputed"}]
+        executor = _make_executor()
+
+        with patch.object(_cli_mod, "fetch_all_markets", return_value=poly_markets), \
+             patch.object(_cli_mod, "scan_binary_internal", return_value=[]), \
+             patch.object(_cli_mod, "display_results"), \
+             patch.object(_cli_mod, "dashboard_state"):
+            _cli_mod._run_oneshot(args, min_profit=0.01, kalshi_client=None, executor=executor, db=mock_db)
+
+        assert executor.risk_manager.uma_state_unavailable is True

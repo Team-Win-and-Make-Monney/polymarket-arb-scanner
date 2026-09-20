@@ -119,6 +119,14 @@ class TradeDB:
                 resolved_outcome REAL,
                 resolved_at TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS dispute_state (
+                condition_id TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                blocked INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
         """)
         self.conn.commit()
 
@@ -1390,6 +1398,84 @@ class TradeDB:
         with self._lock:
             cur = self.conn.execute(sql, tuple(params))
             return [dict(row) for row in cur.fetchall()]
+
+    # ---------------------------------------------------------------------------
+    # UMA Dispute State Cache (Plan 05)
+    # ---------------------------------------------------------------------------
+
+    def upsert_dispute_state(self, states: dict[str, dict] | list[dict]) -> int:
+        """Insert or replace dispute state rows in SQLite.
+
+        Args:
+            states: Dict mapping condition_id -> dict, or list of dispute state dicts.
+                    Each dict must contain 'condition_id', 'state', 'blocked', 'reason'.
+
+        Returns:
+            Number of rows upserted.
+        """
+        if not states:
+            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        rows = []
+        items = states.values() if isinstance(states, dict) else states
+        for s in items:
+            if not isinstance(s, dict):
+                continue
+            cid = s.get("condition_id")
+            if not cid:
+                continue
+            rows.append((
+                cid,
+                s.get("state", ""),
+                1 if s.get("blocked") else 0,
+                s.get("reason", ""),
+                now,
+            ))
+        if not rows:
+            return 0
+        with self._lock:
+            self.conn.executemany(
+                """
+                INSERT OR REPLACE INTO dispute_state
+                (condition_id, state, blocked, reason, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            self.conn.commit()
+        return len(rows)
+
+    def get_dispute_state(self, condition_id: str) -> dict | None:
+        """Retrieve the cached dispute state for a given condition_id.
+
+        Args:
+            condition_id: The Polymarket conditionId.
+
+        Returns:
+            Dict with condition_id, state, blocked (bool), reason, updated_at,
+            or None if not found.
+        """
+        if not condition_id:
+            return None
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                SELECT condition_id, state, blocked, reason, updated_at
+                FROM dispute_state
+                WHERE condition_id = ?
+                """,
+                (condition_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return {
+                "condition_id": row["condition_id"],
+                "state": row["state"],
+                "blocked": bool(row["blocked"]),
+                "reason": row["reason"],
+                "updated_at": row["updated_at"],
+            }
 
     def close(self):
         self.conn.close()

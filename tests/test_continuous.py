@@ -1512,3 +1512,162 @@ class TestTemporalContinuousScan:
         assert res == mock_refined
         p_scan.assert_called_once()
         p_ref.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# UMA Dispute Gate Continuous Integration (Plan 05)
+# ---------------------------------------------------------------------------
+
+class TestDisputeGateContinuous:
+    """Verify UMA dispute cache update wiring in continuous mode."""
+
+    def test_continuous_dispute_cache_refresh_success(self, monkeypatch):
+        import asyncio
+        import signal as signal_module
+        import config
+        continuous_module = sys.modules["continuous"]
+
+        monkeypatch.setattr(config, "DISPUTE_GATE_ENABLED", True)
+
+        captured_signals = {}
+        def capture_sig(sig, handler):
+            if getattr(handler, "__name__", "") == "_signal_handler":
+                captured_signals[sig] = handler
+
+        monkeypatch.setattr(continuous_module.signal, "signal", capture_sig)
+
+        mock_feed = MagicMock()
+        async def mock_feed_run():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                # Coroutine cancelled on test shutdown
+                return
+        mock_feed.run = mock_feed_run
+        monkeypatch.setattr(continuous_module, "FeedManager", lambda *a, **kw: mock_feed)
+        monkeypatch.setattr(continuous_module, "reconcile_orphaned_positions", MagicMock())
+        monkeypatch.setattr(continuous_module, "display_results", MagicMock())
+        monkeypatch.setattr(continuous_module, "capture_scan_heartbeat", MagicMock())
+
+        sample_markets = [
+            {"conditionId": "0xabc", "umaResolutionStatus": "disputed"},
+            {"conditionId": "0xdef", "umaResolutionStatus": "resolved"},
+        ]
+        sample_events = [
+            {"id": "evt1", "markets": [{"conditionId": "0xevent_cid", "umaResolutionStatus": "proposed"}]}
+        ]
+        monkeypatch.setattr(continuous_module, "fetch_all_markets", lambda: sample_markets)
+        monkeypatch.setattr(continuous_module, "fetch_events", lambda: sample_events)
+        monkeypatch.setattr(continuous_module, "scan_binary_internal", lambda *a, **kw: [])
+
+        mock_db = MagicMock()
+        captured_states = {}
+
+        def on_upsert(states):
+            captured_states.update(states)
+            handler = captured_signals[signal_module.SIGTERM]
+            cells = dict(zip(handler.__code__.co_freevars, handler.__closure__ or ()))
+            cells["shutdown_event"].cell_contents.set()
+            return len(states)
+
+        mock_db.upsert_dispute_state.side_effect = on_upsert
+
+        args = MagicMock()
+        args.mode = "all"
+        args.interval = 1
+        args.top = 10
+        args.min_depth = 0
+        args.max_trade = 10
+        args.exec_mode = "manual"
+
+        mock_executor = MagicMock()
+
+        continuous_module.run_continuous(
+            args=args,
+            min_profit=0.01,
+            kalshi_client=None,
+            kalshi_api_key_id=None,
+            kalshi_private_key_path=None,
+            executor=mock_executor,
+            db=mock_db,
+            price_cache={},
+        )
+
+        mock_db.upsert_dispute_state.assert_called_once()
+        assert "0xabc" in captured_states
+        assert captured_states["0xabc"]["blocked"] is True
+        assert "0xdef" in captured_states
+        assert captured_states["0xdef"]["blocked"] is False
+        assert "0xevent_cid" in captured_states
+        assert captured_states["0xevent_cid"]["blocked"] is True
+        assert mock_executor.risk_manager.uma_state_unavailable is False
+
+    def test_continuous_dispute_cache_refresh_handles_db_exception(self, monkeypatch):
+        import asyncio
+        import signal as signal_module
+        import config
+        continuous_module = sys.modules["continuous"]
+
+        monkeypatch.setattr(config, "DISPUTE_GATE_ENABLED", True)
+
+        captured_signals = {}
+        def capture_sig(sig, handler):
+            if getattr(handler, "__name__", "") == "_signal_handler":
+                captured_signals[sig] = handler
+
+        monkeypatch.setattr(continuous_module.signal, "signal", capture_sig)
+
+        mock_feed = MagicMock()
+        async def mock_feed_run():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                # Coroutine cancelled on test shutdown
+                return
+        mock_feed.run = mock_feed_run
+        monkeypatch.setattr(continuous_module, "FeedManager", lambda *a, **kw: mock_feed)
+        monkeypatch.setattr(continuous_module, "reconcile_orphaned_positions", MagicMock())
+        monkeypatch.setattr(continuous_module, "display_results", MagicMock())
+        monkeypatch.setattr(continuous_module, "capture_scan_heartbeat", MagicMock())
+
+        sample_markets = [
+            {"conditionId": "0xabc", "umaResolutionStatus": "disputed"},
+        ]
+        monkeypatch.setattr(continuous_module, "fetch_all_markets", lambda: sample_markets)
+        monkeypatch.setattr(continuous_module, "fetch_events", lambda: [])
+        monkeypatch.setattr(continuous_module, "scan_binary_internal", lambda *a, **kw: [])
+
+        mock_db = MagicMock()
+
+        def on_upsert_error(states):
+            handler = captured_signals[signal_module.SIGTERM]
+            cells = dict(zip(handler.__code__.co_freevars, handler.__closure__ or ()))
+            cells["shutdown_event"].cell_contents.set()
+            raise RuntimeError("Database connection failure")
+
+        mock_db.upsert_dispute_state.side_effect = on_upsert_error
+
+        args = MagicMock()
+        args.mode = "binary"
+        args.interval = 1
+        args.top = 10
+        args.min_depth = 0
+        args.max_trade = 10
+        args.exec_mode = "manual"
+
+        mock_executor = MagicMock()
+
+        # The loop must catch the exception, set fail-closed, and finish safely
+        continuous_module.run_continuous(
+            args=args,
+            min_profit=0.01,
+            kalshi_client=None,
+            kalshi_api_key_id=None,
+            kalshi_private_key_path=None,
+            executor=mock_executor,
+            db=mock_db,
+            price_cache={},
+        )
+
+        mock_db.upsert_dispute_state.assert_called_once()
+        assert mock_executor.risk_manager.uma_state_unavailable is True

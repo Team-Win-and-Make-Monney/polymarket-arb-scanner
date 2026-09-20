@@ -23,6 +23,13 @@ class RiskManager:
         self.mm_max_total_exposure = config.get("mm_max_total_exposure", 500.0)
         # Daily trade limit (0 = unlimited)
         self.max_daily_trades = config.get("max_daily_trades", 0)
+        self.dispute_gate_enabled = config.get("dispute_gate_enabled", False)
+        self.uma_state_unavailable = False
+
+    _DISPUTE_GATED_TYPES = frozenset({
+        "Binary", "NegRisk", "NegRiskNO", "FrechetArb", "TemporalArb",
+        "ResolutionSnipeOpp", "SettlementTimingArb",
+    })
 
     # Opportunity types that skip depth and dedup checks
     _SKIP_DEPTH_TYPES = frozenset({
@@ -145,6 +152,37 @@ class RiskManager:
             inventory = opportunity.get("_inventory", 0)
             if abs(inventory) >= self.mm_max_inventory_per_market:
                 return False, f"MM inventory limit reached ({abs(inventory):.0f} >= {self.mm_max_inventory_per_market:.0f})"
+
+        # 8. UMA dispute gate — block resolution-held Polymarket arbs on disputed markets
+        base_opp_type = opp_type.split("(")[0]
+        if self.dispute_gate_enabled and base_opp_type in self._DISPUTE_GATED_TYPES:
+            platform = (opportunity.get("_platform") or "").lower()
+            if base_opp_type == "TemporalArb" or platform == "kalshi":
+                return True, "OK"
+
+            if getattr(self, "uma_state_unavailable", False):
+                return False, "UMA dispute state unavailable (cache refresh failed)"
+
+            cids: list[str] = []
+            if opportunity.get("_condition_ids"):
+                cids.extend([c for c in opportunity["_condition_ids"] if c])
+            elif opportunity.get("_condition_id"):
+                cids.append(opportunity["_condition_id"])
+            elif opportunity.get("_market_key"):
+                cids.append(opportunity["_market_key"])
+
+            is_negrisk = base_opp_type in ("NegRisk", "NegRiskNO")
+            if is_negrisk and (not cids or not db):
+                return False, "UMA dispute state unverified"
+
+            for cid in cids:
+                ds = db.get_dispute_state(cid) if db else None
+                if ds is None:
+                    if is_negrisk:
+                        return False, f"UMA dispute state unverified ({cid})"
+                    continue
+                if ds.get("blocked"):
+                    return False, f"UMA dispute window ({ds['reason']})"
 
         return True, "OK"
 

@@ -2096,6 +2096,18 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                             except Exception as e:
                                 logger.error("Failed to fetch %s: %s", key, e)
 
+                if config.DISPUTE_GATE_ENABLED and db and (poly_markets or poly_events):
+                    from uma_monitor import fetch_dispute_states
+                    try:
+                        items = list(poly_markets or []) + list(poly_events or [])
+                        db.upsert_dispute_state(fetch_dispute_states(items))
+                        if executor and hasattr(executor, "risk_manager"):
+                            executor.risk_manager.uma_state_unavailable = False
+                    except Exception as e:
+                        logger.error("Failed to update UMA dispute states (failing closed): %s", e)
+                        if executor and hasattr(executor, "risk_manager"):
+                            executor.risk_manager.uma_state_unavailable = True
+
                 all_opportunities = []
 
                 # Stage 2: Run scans in parallel

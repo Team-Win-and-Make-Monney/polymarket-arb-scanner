@@ -349,3 +349,69 @@ class TestStrategyPnl:
         assert cross["total_pnl"] == pytest.approx(0.05)   # once, not 0.10
         assert cross["win_count"] == 1                     # one opportunity, not two legs
         assert cross["trade_count"] == 2                   # two legs counted
+
+
+# ---------------------------------------------------------------------------
+# UMA Dispute State Cache (Plan 05)
+# ---------------------------------------------------------------------------
+
+class TestDisputeStateDB:
+    def test_upsert_and_get_dispute_state(self, db):
+        states = {
+            "0xcond1": {
+                "condition_id": "0xcond1",
+                "state": "disputed",
+                "blocked": True,
+                "reason": "uma_disputed",
+            },
+            "0xcond2": {
+                "condition_id": "0xcond2",
+                "state": "open",
+                "blocked": False,
+                "reason": "clear",
+            },
+        }
+        count = db.upsert_dispute_state(states)
+        assert count == 2
+
+        res1 = db.get_dispute_state("0xcond1")
+        assert res1 is not None
+        assert res1["condition_id"] == "0xcond1"
+        assert res1["state"] == "disputed"
+        assert res1["blocked"] is True
+        assert res1["reason"] == "uma_disputed"
+        assert res1["updated_at"] is not None
+
+        res2 = db.get_dispute_state("0xcond2")
+        assert res2 is not None
+        assert res2["condition_id"] == "0xcond2"
+        assert res2["blocked"] is False
+        assert res2["reason"] == "clear"
+
+    def test_upsert_updates_existing_record(self, db):
+        db.upsert_dispute_state({
+            "0xcond3": {
+                "condition_id": "0xcond3",
+                "state": "proposed",
+                "blocked": True,
+                "reason": "uma_proposed",
+            }
+        })
+        res = db.get_dispute_state("0xcond3")
+        assert res["blocked"] is True
+        assert res["reason"] == "uma_proposed"
+
+        # Now market resolves -> clear
+        db.upsert_dispute_state([{
+            "condition_id": "0xcond3",
+            "state": "resolved",
+            "blocked": False,
+            "reason": "clear",
+        }])
+        updated = db.get_dispute_state("0xcond3")
+        assert updated["blocked"] is False
+        assert updated["reason"] == "clear"
+
+    def test_get_unknown_condition_returns_none(self, db):
+        assert db.get_dispute_state("0xnonexistent") is None
+        assert db.get_dispute_state("") is None

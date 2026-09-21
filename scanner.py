@@ -54,6 +54,7 @@ from scans.cross_mm import scan_cross_mm  # noqa: F401
 from scans.jev_crypto import scan_jev_crypto, _refine_jev_crypto_with_clob  # noqa: F401
 from scans.frechet import scan_frechet, _refine_frechet_with_clob  # noqa: F401
 from scans.temporal import scan_temporal_arb, _refine_temporal_with_clob  # noqa: F401
+from scans.ctf import scan_ctf, _refine_ctf_with_clob  # noqa: F401
 from display import display_results as _display_results  # noqa: F401
 from continuous import check_settlements as _check_settlements, run_continuous as _run_continuous  # noqa: F401
 from cli import main, _run_oneshot  # noqa: F401
@@ -108,6 +109,8 @@ __all__ = [
     "_refine_frechet_with_clob",
     "scan_temporal_arb",
     "_refine_temporal_with_clob",
+    "scan_ctf",
+    "_refine_ctf_with_clob",
     "get_clob_prices",
     "match_cross_platform",
     "match_cross_platform_semantic",

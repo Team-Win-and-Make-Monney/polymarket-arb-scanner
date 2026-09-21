@@ -1248,6 +1248,35 @@ def _scan_temporal_layer1(kalshi_markets, mode, min_profit, kalshi_client=None, 
         return []
 
 
+def _scan_ctf_layer1(poly_markets, mode, min_profit, price_cache=None, funnel=None) -> list[dict]:
+    """Plan 04 CTF Primitives arbitrage. Returns [] when disabled or no markets."""
+    if mode not in ("all", "ctf"):
+        return []
+    is_explicit = (mode == "ctf")
+    is_dry_run = getattr(config, "DRY_RUN", True)
+    enabled = (
+        getattr(config, "CTF_ENABLED", False)
+        or getattr(config, "CTF_MERGE_ENABLED", False)
+        or getattr(config, "CTF_MINT_SELL_ENABLED", False)
+    )
+    if not enabled and not (is_explicit and is_dry_run):
+        return []
+    if not poly_markets:
+        return []
+    try:
+        from scans.ctf import scan_ctf
+        return scan_ctf(
+            poly_markets,
+            min_profit=min_profit,
+            price_cache=price_cache,
+            funnel=funnel,
+        )
+    except Exception as exc:
+        logger.warning("CTF primitives scan failed: %s", exc)
+        return []
+
+
+
 def _scan_jev_crypto_continuous(
     poly_markets,
     mode: str,
@@ -2498,6 +2527,19 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                     )
                 except Exception as exc:
                     logger.warning("Temporal scan failed: %s", exc)
+
+                try:
+                    all_opportunities.extend(
+                        _scan_ctf_layer1(
+                            poly_markets,
+                            args.mode,
+                            min_profit,
+                            price_cache=price_cache,
+                            funnel=_funnel,
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning("CTF primitives scan failed: %s", exc)
 
                 # Structural alpha: Combinatorial logical arbitrage (Phase 9)
                 if args.mode in ("all", "logical-arb"):

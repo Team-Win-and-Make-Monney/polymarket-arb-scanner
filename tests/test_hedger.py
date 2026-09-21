@@ -912,3 +912,51 @@ class TestLimitlessHedge:
         }
         assert hedger._attempt_hedge(pf) is False
         mock_limitless.place_order.assert_not_called()
+
+    def test_limitless_native_hedge_places_buy_on_sell_fill(self, PartialFillHedger, db):
+        mock_limitless = MagicMock()
+        mock_limitless.authenticated = True
+        mock_limitless.get_order_book.return_value = {
+            "bids": [{"price": 0.48, "amount": 20.0}],
+            "asks": [{"price": 0.51, "amount": 20.0}],
+        }
+        mock_limitless.place_order.return_value = {"order_id": "lim_h_buy"}
+        hedger = PartialFillHedger(limitless_client=mock_limitless, db=db)
+
+        pf = {
+            "id": 105, "platform": "limitless",
+            "token_id": "mkt_lim_1", "fill_price": 0.50,
+            "size": 10.0, "side": "ask",
+            "hedge_attempts": 0,
+        }
+        assert hedger._attempt_hedge(pf) is True
+        mock_limitless.place_order.assert_called_once()
+        call_args = mock_limitless.place_order.call_args[1]
+        assert call_args["side"] == "buy"
+        assert call_args["price"] == 0.51
+
+    def test_limitless_cross_hedge_polymarket_places_buy_on_sell_fill(self, PartialFillHedger, db):
+        mock_pm = MagicMock()
+        mock_pm.place_order.return_value = {"success": True, "order_id": "pm_h_buy"}
+        mock_pm.get_order_status.return_value = {"status": "matched"}
+        hedger = PartialFillHedger(pm_trader=mock_pm, db=db)
+
+        with patch("polymarket_api.fetch_order_book") as mock_fetch:
+            with patch("polymarket_api.get_best_bid_ask") as mock_best:
+                mock_fetch.return_value = {"bids": [0.48], "asks": [0.51]}
+                mock_best.return_value = {"bid": 0.48, "ask": 0.51}
+
+                pf = {
+                    "id": 106, "platform": "limitless",
+                    "token_id": "0xpm_token_456",
+                    "hedge_platform": "polymarket",
+                    "fill_price": 0.50,
+                    "size": 10.0,
+                    "side": "sell",
+                    "hedge_attempts": 0,
+                }
+                assert hedger._attempt_hedge(pf) is True
+                mock_pm.place_order.assert_called_once()
+                call_args = mock_pm.place_order.call_args[1]
+                assert call_args["side"] == "BUY"
+                assert call_args["price"] == 0.51

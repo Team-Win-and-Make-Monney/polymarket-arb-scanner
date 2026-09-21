@@ -53,6 +53,7 @@ from config import (
     NEWS_SNIPE_ENABLED as CONFIG_NEWS_SNIPE_ENABLED,
     CORRELATED_ENABLED as CONFIG_CORRELATED_ENABLED,
     TIME_DECAY_ENABLED as CONFIG_TIME_DECAY_ENABLED,
+    LIMITLESS_REWARDS_ENABLED as CONFIG_LIMITLESS_REWARDS_ENABLED,
     polymarket_scan_enabled,
     polymarket_reward_fetch_enabled,
 )
@@ -94,6 +95,7 @@ from scans import (
     scan_multi_cross,
     scan_polymarket_rewards,
     scan_kalshi_rewards,
+    scan_limitless_rewards,
     scan_lead_lag_mm,
     scan_toxic_flow_pause,
     scan_volatility_adjusted_mm,
@@ -1791,6 +1793,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
             sxbet_client=extra_clients.get("sxbet"),
             matchbook_client=extra_clients.get("matchbook"),
             gemini_client=extra_clients.get("gemini"),
+            limitless_client=extra_clients.get("limitless"),
             db=db,
         )
 
@@ -1866,6 +1869,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
         "matchbook": extra_clients.get("matchbook"),
         "gemini": extra_clients.get("gemini"),
         "ibkr": extra_clients.get("ibkr"),
+        "limitless": extra_clients.get("limitless"),
     }
     # Remove None clients
     platform_clients = {k: v for k, v in platform_clients.items() if v is not None}
@@ -2409,30 +2413,41 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                     all_opportunities.extend(mc_opps)
 
                 # Layer 3: Liquidity Rewards
-                if args.mode in ("all", "rewards") and CONFIG_REWARDS_ENABLED:
+                if (args.mode in ("all", "rewards") and CONFIG_REWARDS_ENABLED) or args.mode == "limitless-rewards":
                     try:
                         pm_reward_opps = []
                         k_reward_opps = []
-                        if poly_reward_markets and _reward_tracker:
-                            pm_reward_opps = scan_polymarket_rewards(
-                                markets=poly_reward_markets,
-                                reward_tracker=_reward_tracker,
+                        lim_reward_opps = []
+                        if args.mode in ("all", "rewards") and CONFIG_REWARDS_ENABLED:
+                            if poly_reward_markets and _reward_tracker:
+                                pm_reward_opps = scan_polymarket_rewards(
+                                    markets=poly_reward_markets,
+                                    reward_tracker=_reward_tracker,
+                                    price_cache=price_cache,
+                                )
+                                all_opportunities.extend(pm_reward_opps)
+
+                            if kalshi_client and _kalshi_reward_tracker:
+                                k_reward_opps = scan_kalshi_rewards(
+                                    kalshi_client=kalshi_client,
+                                    reward_tracker=_kalshi_reward_tracker,
+                                    kalshi_data=kalshi_data,
+                                )
+                                all_opportunities.extend(k_reward_opps)
+
+                        limitless_client = extra_clients.get("limitless")
+                        if (args.mode in ("all", "rewards", "limitless-rewards")) and (CONFIG_LIMITLESS_REWARDS_ENABLED or args.mode == "limitless-rewards") and limitless_client:
+                            lim_reward_opps = scan_limitless_rewards(
+                                limitless_client=limitless_client,
                                 price_cache=price_cache,
                             )
-                            all_opportunities.extend(pm_reward_opps)
-
-                        if kalshi_client and _kalshi_reward_tracker:
-                            k_reward_opps = scan_kalshi_rewards(
-                                kalshi_client=kalshi_client,
-                                reward_tracker=_kalshi_reward_tracker,
-                                kalshi_data=kalshi_data,
-                            )
-                            all_opportunities.extend(k_reward_opps)
+                            all_opportunities.extend(lim_reward_opps)
 
                         logger.debug(
-                            "Rewards scan complete: %d Polymarket + %d Kalshi opps",
+                            "Rewards scan complete: %d Polymarket + %d Kalshi + %d Limitless opps",
                             len(pm_reward_opps),
                             len(k_reward_opps),
+                            len(lim_reward_opps),
                         )
                     except Exception as exc:
                         logger.debug("Rewards scanning error: %s", exc)

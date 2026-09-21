@@ -24,23 +24,13 @@ logger = logging.getLogger(__name__)
 LIMITLESS_BASE_URL = os.getenv("LIMITLESS_BASE_URL", "https://api.limitless.exchange")
 LIMITLESS_RATE_LIMIT = float(os.getenv("LIMITLESS_RATE_LIMIT", "0.2"))  # 5 req/sec
 
-# Thread-safe rate limiter state
-_last_request_time = 0.0
-_rate_lock = threading.Lock()
-
 # Circuit breaker: opens after 3 consecutive failures, resets after 30s
 _circuit = PlatformCircuitBreaker("limitless", fail_limit=3, reset_timeout=30.0)
 
 
 def _rate_limit() -> None:
     """Enforce rate limit between outgoing HTTP requests."""
-    global _last_request_time
-    with _rate_lock:
-        now = time.time()
-        elapsed = now - _last_request_time
-        if elapsed < LIMITLESS_RATE_LIMIT:
-            time.sleep(LIMITLESS_RATE_LIMIT - elapsed)
-        _last_request_time = time.time()
+    LimitlessClient._rate_limit()
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +44,19 @@ class LimitlessClient:
     Supports reading public markets and orderbooks, querying liquidity reward
     programs, and submitting EIP-712 typed-data signed limit orders.
     """
+
+    _last_request_time: float = 0.0
+    _rate_lock = threading.Lock()
+
+    @classmethod
+    def _rate_limit(cls) -> None:
+        """Enforce rate limit between outgoing HTTP requests."""
+        with cls._rate_lock:
+            now = time.time()
+            elapsed = now - cls._last_request_time
+            if elapsed < LIMITLESS_RATE_LIMIT:
+                time.sleep(LIMITLESS_RATE_LIMIT - elapsed)
+            cls._last_request_time = time.time()
 
     def __init__(self, base_url: str | None = None):
         self.session = requests.Session()
@@ -70,10 +73,7 @@ class LimitlessClient:
         self.dry_run: bool = os.getenv("DRY_RUN", "true").lower() in ("true", "1", "yes")
 
         self.chain_id: int = int(os.getenv("LIMITLESS_CHAIN_ID", "8453"))  # Base mainnet
-        self.exchange_contract: str = os.getenv(
-            "LIMITLESS_EXCHANGE_CONTRACT",
-            "0x0000000000000000000000000000000000000000",
-        )
+        self.exchange_contract: str = os.getenv("LIMITLESS_EXCHANGE_CONTRACT", "")
         self._account_address: str | None = None
 
         # Caching for markets scan
@@ -262,25 +262,28 @@ class LimitlessClient:
                     yes_price = float(p0)
                 if p1 is not None:
                     no_price = float(p1)
-            except (TypeError, ValueError):
-                pass
+            except (TypeError, ValueError) as exc:
+                logger.debug("Failed parsing outcome prices in market %s: %s", market_id, exc)
 
         if yes_price is None and raw.get("yesPrice") is not None:
             try:
                 yes_price = float(raw["yesPrice"])
-            except (TypeError, ValueError):
-                pass
+            except (TypeError, ValueError) as exc:
+                logger.debug("Failed parsing yesPrice in market %s: %s", market_id, exc)
         if no_price is None and raw.get("noPrice") is not None:
             try:
                 no_price = float(raw["noPrice"])
-            except (TypeError, ValueError):
-                pass
+            except (TypeError, ValueError) as exc:
+                logger.debug("Failed parsing noPrice in market %s: %s", market_id, exc)
 
         # Reward metadata if attached to market
         reward_info = raw.get("rewardProgram") or raw.get("rewards") or {}
         pool_usdc = 0.0
         if isinstance(reward_info, dict):
-            pool_usdc = float(reward_info.get("pool_size_usdc") or reward_info.get("dailyRate") or 0.0)
+            try:
+                pool_usdc = float(reward_info.get("pool_size_usdc") or reward_info.get("dailyRate") or 0.0)
+            except (TypeError, ValueError) as exc:
+                logger.debug("Failed parsing pool_size_usdc in market %s: %s", market_id, exc)
 
         return {
             "id": market_id,
@@ -443,8 +446,8 @@ class LimitlessClient:
         Returns:
             Order dict on success, None on failure.
         """
-        # Dry-run or unauthenticated fallback
-        if self.dry_run or not self.authenticated:
+        # Dry-run returns synthetic order response
+        if self.dry_run:
             order_id = f"dry_limitless_{market_id}_{side}_{int(time.time() * 1000)}"
             logger.info(
                 "Limitless DRY-RUN order: %s %s %s @ %.4f qty=%.2f -> %s",
@@ -463,9 +466,19 @@ class LimitlessClient:
                 "dry_run": True,
             }
 
+        # Fail closed in live mode if not authenticated
+        if not self.authenticated:
+            logger.error("Limitless: live order placement requires authenticated client")
+            return None
+
         # Live mode requires both authentication and private key
         if not self.private_key:
             logger.error("Limitless: live order placement requires private key for EIP-712 signing")
+            return None
+
+        # Live mode requires valid non-zero verifyingContract address
+        if not self.exchange_contract or self.exchange_contract == "0x0000000000000000000000000000000000000000":
+            logger.error("Limitless: live order placement requires valid non-zero verifyingContract address")
             return None
 
         domain, order_struct = self.build_order_struct(
@@ -530,5 +543,6 @@ class LimitlessClient:
 
         try:
             return float(resp.get("balance") or resp.get("usdcBalance") or 0.0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as exc:
+            logger.debug("Failed to parse Limitless balance: %s", exc)
             return None

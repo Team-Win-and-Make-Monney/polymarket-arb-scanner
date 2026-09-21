@@ -704,14 +704,26 @@ class TestCTFConfig:
         monkeypatch.setattr(cfg, "DRY_RUN", False)
         monkeypatch.setattr(cfg, "LIMITLESS_REWARDS_ENABLED", True)
         monkeypatch.setattr(cfg, "LIMITLESS_API_KEY", "")
+        monkeypatch.setattr(cfg, "LIMITLESS_PRIVATE_KEY", "")
+        monkeypatch.setattr(cfg, "LIMITLESS_EXCHANGE_CONTRACT", "")
         monkeypatch.setattr(cfg, "ENABLED_EXECUTION_PLATFORMS", frozenset(["kalshi"]))
 
         # Missing API key in live mode fails
         with pytest.raises(cfg.ConfigError, match="requires LIMITLESS_API_KEY"):
             cfg.validate_config()
 
-        # Missing limitless in execution whitelist fails
+        # Missing private key in live mode fails
         monkeypatch.setattr(cfg, "LIMITLESS_API_KEY", "valid-key")
+        with pytest.raises(cfg.ConfigError, match="requires LIMITLESS_PRIVATE_KEY"):
+            cfg.validate_config()
+
+        # Missing exchange contract in live mode fails
+        monkeypatch.setattr(cfg, "LIMITLESS_PRIVATE_KEY", "valid-pk")
+        with pytest.raises(cfg.ConfigError, match="requires valid non-zero LIMITLESS_EXCHANGE_CONTRACT address"):
+            cfg.validate_config()
+
+        # Missing limitless in execution whitelist fails
+        monkeypatch.setattr(cfg, "LIMITLESS_EXCHANGE_CONTRACT", "0x" + "2" * 40)
         with pytest.raises(cfg.ConfigError, match="requires 'limitless' in ENABLED_EXECUTION_PLATFORMS"):
             cfg.validate_config()
 
@@ -719,9 +731,11 @@ class TestCTFConfig:
         monkeypatch.setattr(cfg, "ENABLED_EXECUTION_PLATFORMS", frozenset(["kalshi", "limitless"]))
         cfg.validate_config()
 
-        # Dry run passes even without API key
+        # Dry run passes even without credentials
         monkeypatch.setattr(cfg, "DRY_RUN", True)
         monkeypatch.setattr(cfg, "LIMITLESS_API_KEY", "")
+        monkeypatch.setattr(cfg, "LIMITLESS_PRIVATE_KEY", "")
+        monkeypatch.setattr(cfg, "LIMITLESS_EXCHANGE_CONTRACT", "")
         cfg.validate_config()
 
 

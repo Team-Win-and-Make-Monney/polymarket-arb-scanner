@@ -431,6 +431,17 @@ class TestLimitless:
                     "max_incentive_spread": 0.04,
                 },
             },
+            {
+                "id": "mkt-inactive",
+                "title": "Inactive reward market",
+                "yes_price": 0.50,
+                "reward_program": {
+                    "pool_size_usdc": 100.0,
+                    "min_incentive_size": 5.0,
+                    "max_incentive_spread": 0.04,
+                    "active": False,
+                },
+            },
         ]
         client.get_order_book.return_value = {
             "bids": [{"price": 0.48, "amount": 50.0}],
@@ -461,6 +472,7 @@ class TestLimitless:
         market_keys = [o["_market_key"] for o in opps]
         assert "mkt-small-pool" not in market_keys
         assert "mkt-invalid-meta" not in market_keys
+        assert "mkt-inactive" not in market_keys
 
     def test_clob_refinement_drops_crossing_quotes(self, mock_limitless_client):
         from scans.rewards import scan_limitless_rewards

@@ -202,7 +202,8 @@ class QuoteManager:
     Wraps platform-specific order placement APIs behind a common interface.
     """
 
-    def __init__(self):
+    def __init__(self, dry_run: bool = True):
+        self.dry_run = dry_run
         self._active_orders: dict[str, dict] = {}  # order_id -> order_info
         self._lock = threading.Lock()
 
@@ -228,8 +229,8 @@ class QuoteManager:
         Returns:
             Order ID or None on failure.
         """
-        if trader is None:
-            logger.debug("No trader for %s — dry run quote %s %s @ %.4f",
+        if trader is None or self.dry_run or (getattr(trader, "dry_run", False) is True):
+            logger.debug("No trader or dry run for %s — dry run quote %s %s @ %.4f",
                          platform, side, market_key, price)
             # Dry run: generate a fake order ID for tracking
             order_id = f"dry_{platform}_{market_key}_{side}_{time.time():.0f}"
@@ -246,6 +247,34 @@ class QuoteManager:
             return order_id
 
         norm_platform = platform.lower()
+        from config import ENABLED_EXECUTION_PLATFORMS
+        if norm_platform not in ENABLED_EXECUTION_PLATFORMS:
+            logger.error(
+                "Platform %s not in ENABLED_EXECUTION_PLATFORMS (%s); rejecting quote",
+                norm_platform, ENABLED_EXECUTION_PLATFORMS,
+            )
+            return None
+
+        if norm_platform == "limitless":
+            from config import LIMITLESS_MAX_INVENTORY
+            with self._lock:
+                current_active = sum(
+                    o.get("size", 0) for o in self._active_orders.values()
+                    if o.get("platform") == "limitless" and o.get("market_key") == market_key
+                )
+            if current_active + size > LIMITLESS_MAX_INVENTORY:
+                logger.warning(
+                    "Limitless quote exceeds LIMITLESS_MAX_INVENTORY (active $%.2f + size $%.2f > max $%.2f); rejecting",
+                    current_active, size, LIMITLESS_MAX_INVENTORY,
+                )
+                return None
+
+        if norm_platform == "kalshi":
+            from kalshi_policy import live_kalshi_submit_allowed
+            if not live_kalshi_submit_allowed(market_key, reducing=False):
+                logger.warning("Kalshi quote rejected by policy guard for ticker %s", market_key)
+                return None
+
         order_side = "buy" if side.lower() in ("bid", "buy") else "sell"
         quantity = max(1, int(round(size / price))) if price > 0 else 1
 
@@ -444,7 +473,7 @@ class MarketMaker:
     ):
         self.inventory = inventory or InventoryTracker(max_inventory, max_total_exposure)
         self.quote_engine = quote_engine or QuoteEngine(min_spread)
-        self.quote_manager = quote_manager or QuoteManager()
+        self.quote_manager = quote_manager or QuoteManager(dry_run=dry_run)
         self.quote_size = quote_size
         self.max_inventory = max_inventory
         self.refresh_interval = refresh_interval
@@ -735,7 +764,7 @@ class CrossPlatformMaker:
         self.inventory_a = inventory_a or InventoryTracker(max_inventory)
         self.inventory_b = inventory_b or InventoryTracker(max_inventory)
         self.quote_engine = quote_engine or QuoteEngine(min_spread)
-        self.quote_manager = quote_manager or QuoteManager()
+        self.quote_manager = quote_manager or QuoteManager(dry_run=dry_run)
         self.quote_size = quote_size
         self.max_inventory = max_inventory
         self.hedger = hedger

@@ -580,6 +580,7 @@ def scan_limitless_rewards(
     filtered_no_incentives = 0
     filtered_small_pool = 0
     filtered_invalid_metadata = 0
+    filtered_inactive = 0
 
     for market in markets:
         market_key = market.get("id") or market.get("market_id")
@@ -601,6 +602,10 @@ def scan_limitless_rewards(
 
         if not _validate_reward_metadata(reward_info):
             filtered_invalid_metadata += 1
+            continue
+
+        if not reward_info.get("active", True):
+            filtered_inactive += 1
             continue
 
         pool_size = float(reward_info.get("pool_size_usdc", 0) or reward_info.get("daily_rate_usdc", 0))
@@ -652,6 +657,10 @@ def scan_limitless_rewards(
             "net_roi": 0.0,
             "reward_daily_rate_usdc": reward_daily_rate,
             "reward_density_score": reward_density,
+            # Note: _execution_eligible is False because rewards opportunities
+            # represent passive market-making quote recommendations (placed via
+            # QuoteManager.place_quote) rather than instant taker arbitrage legs
+            # executed by ArbitrageExecutor.
             "_execution_eligible": False,
             "_market_key": market_key,
             "_market_volume": float(market.get("volume", 0) or 0),
@@ -659,6 +668,8 @@ def scan_limitless_rewards(
 
     if filtered_no_incentives:
         logger.info("Filtered %d Limitless markets without reward programs.", filtered_no_incentives)
+    if filtered_inactive:
+        logger.info("Filtered %d Limitless markets with inactive reward programs.", filtered_inactive)
     if filtered_small_pool:
         logger.info("Filtered %d Limitless markets with reward pool < $%.2f.", filtered_small_pool, min_pool_usdc)
     if filtered_invalid_metadata:

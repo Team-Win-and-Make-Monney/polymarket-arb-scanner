@@ -533,6 +533,7 @@ REWARDS_MAX_MARKETS = _env_int("REWARDS_MAX_MARKETS", "100")
 LIMITLESS_API_KEY = os.getenv("LIMITLESS_API_KEY", "")
 LIMITLESS_PRIVATE_KEY = os.getenv("LIMITLESS_PRIVATE_KEY", "")
 LIMITLESS_BASE_URL = os.getenv("LIMITLESS_BASE_URL", "https://api.limitless.exchange")
+LIMITLESS_EXCHANGE_CONTRACT = os.getenv("LIMITLESS_EXCHANGE_CONTRACT", "")
 LIMITLESS_REWARDS_ENABLED = _env_bool("LIMITLESS_REWARDS_ENABLED", "false")
 LIMITLESS_MAX_INVENTORY = _env_float("LIMITLESS_MAX_INVENTORY", "200.0")
 LIMITLESS_RATE_LIMIT = _env_float("LIMITLESS_RATE_LIMIT", "0.2")
@@ -1536,6 +1537,15 @@ def validate_config() -> list[str]:
         if not LIMITLESS_API_KEY:
             raise ConfigError(
                 "LIMITLESS_REWARDS_ENABLED=true and DRY_RUN=false requires LIMITLESS_API_KEY"
+            )
+        if not LIMITLESS_PRIVATE_KEY:
+            raise ConfigError(
+                "LIMITLESS_REWARDS_ENABLED=true and DRY_RUN=false requires LIMITLESS_PRIVATE_KEY"
+            )
+        if not _is_valid_eth_address(LIMITLESS_EXCHANGE_CONTRACT):
+            raise ConfigError(
+                f"LIMITLESS_REWARDS_ENABLED=true and DRY_RUN=false requires valid non-zero "
+                f"LIMITLESS_EXCHANGE_CONTRACT address, got {LIMITLESS_EXCHANGE_CONTRACT!r}"
             )
         if "limitless" not in ENABLED_EXECUTION_PLATFORMS:
             raise ConfigError(

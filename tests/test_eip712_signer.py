@@ -55,6 +55,29 @@ class TestEIP712Signer:
         recovered = recover_order_signer(self._sample_domain, self._sample_order, sig)
         assert recovered.lower() == self._sample_address.lower()
 
+    def test_deterministic_limitless_reference_vector(self) -> None:
+        """Verify signature generation matches an independent reference vector and canonical schema."""
+        expected_domain_types = [
+            {"name": "name", "type": "string"},
+            {"name": "version", "type": "string"},
+            {"name": "chainId", "type": "uint256"},
+            {"name": "verifyingContract", "type": "address"},
+        ]
+        payload = build_eip712_payload(self._sample_domain, self._sample_order)
+        assert payload["types"]["EIP712Domain"] == expected_domain_types
+        assert payload["domain"] == self._sample_domain
+        assert payload["message"] == self._sample_order
+
+        sig = sign_order(self._sample_domain, self._sample_order, self._SAMPLE_KEY)
+        expected_sig = (
+            "0x0eee9646b0100e93bbaa68af11bc079f4c91b28c37d57493cc095e2e922be8d4"
+            "4b77c56d34d36c650202c1b79145fe2ffa34ee9c4339ca26cbb61d09fa1dc65b1c"
+        )
+        assert sig == expected_sig
+
+        recovered = recover_order_signer(self._sample_domain, self._sample_order, expected_sig)
+        assert recovered.lower() == "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a"
+
     def test_private_key_normalization_accepts_0x_and_raw(self) -> None:
         """Verify normalize_private_key handles keys with and without '0x' prefix."""
         raw_key = self._SAMPLE_KEY[2:]

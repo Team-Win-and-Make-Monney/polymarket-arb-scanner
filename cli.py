@@ -1043,12 +1043,14 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
         if limitless_rewards_active:
             try:
                 # Limitless rewards scan
-                from limitless_api import LimitlessClient
-                limitless_client = LimitlessClient()
-                api_key = getattr(config, "LIMITLESS_API_KEY", "")
-                pk = getattr(config, "LIMITLESS_PRIVATE_KEY", "")
-                if api_key:
-                    limitless_client.login(api_key=api_key, private_key=pk)
+                limitless_client = extra_clients.get("limitless") if extra_clients else None
+                if not limitless_client:
+                    from limitless_api import LimitlessClient
+                    limitless_client = LimitlessClient()
+                    api_key = getattr(config, "LIMITLESS_API_KEY", "")
+                    pk = getattr(config, "LIMITLESS_PRIVATE_KEY", "")
+                    if api_key:
+                        limitless_client.login(api_key=api_key, private_key=pk)
                 l_reward_opps = scan_limitless_rewards(limitless_client, min_pool_usdc=10.0)
                 all_opportunities.extend(l_reward_opps)
                 logger.info("Found %d Limitless reward opportunities.", len(l_reward_opps))
@@ -1675,6 +1677,22 @@ def main():
     except Exception as exc:
         logger.debug("CTFClient not initialized: %s", exc)
 
+    limitless_client = None
+    try:
+        from config import (
+            LIMITLESS_API_KEY as CONFIG_LIMITLESS_API_KEY,
+            LIMITLESS_PRIVATE_KEY as CONFIG_LIMITLESS_PRIVATE_KEY,
+            LIMITLESS_REWARDS_ENABLED as CONFIG_LIMITLESS_REWARDS_ENABLED,
+        )
+        if CONFIG_LIMITLESS_REWARDS_ENABLED or args.mode in ("all", "rewards", "limitless-rewards"):
+            from limitless_api import LimitlessClient
+            limitless_client = LimitlessClient()
+            limitless_client.dry_run = dry_run
+            if CONFIG_LIMITLESS_API_KEY:
+                limitless_client.login(api_key=CONFIG_LIMITLESS_API_KEY, private_key=CONFIG_LIMITLESS_PRIVATE_KEY)
+    except Exception as exc:
+        logger.debug("LimitlessClient not initialized: %s", exc)
+
     executor = ArbitrageExecutor(
         pm_trader=pm_trader,
         kalshi_client=kalshi_client,
@@ -1707,6 +1725,7 @@ def main():
         "matchbook": matchbook_client,
         "gemini": gemini_client,
         "ibkr": ibkr_client,
+        "limitless": limitless_client,
     }
 
     # Initialize webhook notifier

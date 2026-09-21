@@ -10,7 +10,6 @@ import requests
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import limitless_api
-from limitless_api import LimitlessClient
 
 TEST_PRIVATE_KEY = "0x" + "1" * 64
 TEST_ADDRESS = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
@@ -26,13 +25,14 @@ def reset_limitless_circuit_breaker():
 
 @pytest.fixture
 def unauthed_client():
-    return LimitlessClient()
+    return limitless_api.LimitlessClient()
 
 
 @pytest.fixture
 def authed_client():
-    c = LimitlessClient()
+    c = limitless_api.LimitlessClient()
     c.dry_run = False
+    c.exchange_contract = "0x" + "2" * 40
     c.login(api_key="test-api-key", private_key=TEST_PRIVATE_KEY)
     return c
 
@@ -165,9 +165,26 @@ class TestLimitlessOrders:
         assert resp["order_id"].startswith("dry_limitless_mkt-999_buy_")
         assert resp["status"] == "resting"
 
-    def test_live_order_without_private_key_returns_none(self):
-        c = LimitlessClient()
+    def test_live_order_without_auth_returns_none(self):
+        c = limitless_api.LimitlessClient()
         c.dry_run = False
+        assert c.authenticated is False
+        resp = c.place_order("mkt-1", "buy", "yes", 10, 0.50)
+        assert resp is None
+
+    def test_live_order_without_verifying_contract_returns_none(self):
+        c = limitless_api.LimitlessClient()
+        c.dry_run = False
+        c.exchange_contract = ""
+        c.login(api_key="valid-key", private_key=TEST_PRIVATE_KEY)
+        assert c.authenticated is True
+        resp = c.place_order("mkt-1", "buy", "yes", 10, 0.50)
+        assert resp is None
+
+    def test_live_order_without_private_key_returns_none(self):
+        c = limitless_api.LimitlessClient()
+        c.dry_run = False
+        c.exchange_contract = "0x" + "2" * 40
         c.login(api_key="valid-key", private_key=None)
         assert c.authenticated is True
         resp = c.place_order("mkt-1", "buy", "yes", 10, 0.50)

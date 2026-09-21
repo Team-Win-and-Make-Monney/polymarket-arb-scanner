@@ -141,8 +141,8 @@ class PartialFillHedger:
 
         return False
 
-    def _hedge_polymarket(self, token_id: str, fill_price: float, size: float, max_loss: float) -> bool:
-        """Sell a Polymarket position at current bid.
+    def _hedge_polymarket(self, token_id: str, fill_price: float, size: float, max_loss: float, side: str = "SELL") -> bool:
+        """Hedge a Polymarket position at current touch (bid for SELL, ask for BUY).
 
         ``size`` is the filled share quantity (not dollars).
         """
@@ -153,18 +153,26 @@ class PartialFillHedger:
         if not book:
             return False
         ba = get_best_bid_ask(book)
-        bid = ba.get("bid")
-        if bid is None or bid <= 0:
-            return False
-        loss = fill_price - bid
+        side_upper = side.upper()
+        if side_upper == "BUY":
+            price = ba.get("ask")
+            if price is None or price <= 0:
+                return False
+            loss = price - fill_price
+        else:
+            price = ba.get("bid")
+            if price is None or price <= 0:
+                return False
+            loss = fill_price - price
+
         if loss > max_loss:
-            logger.info("Polymarket hedge: bid $%.3f too far from fill $%.3f (loss $%.3f > max $%.3f)",
-                        bid, fill_price, loss, max_loss)
+            logger.info("Polymarket hedge: %s price $%.3f too far from fill $%.3f (loss $%.3f > max $%.3f)",
+                        side_upper, price, fill_price, loss, max_loss)
             return False
         if size <= 0:
             return False
         resp = self.pm_trader.place_order(
-            token_id=token_id, side="SELL", price=bid, size=float(size),
+            token_id=token_id, side=side_upper, price=price, size=float(size),
             order_type="FOK",
         )
         if not resp or not resp.get("success"):
@@ -361,6 +369,11 @@ class PartialFillHedger:
 
     def _hedge_limitless(self, pf: dict, fill_price: float, size: float, max_loss: float) -> bool:
         """Hedge a Limitless position delta-neutrally on Polymarket or natively on Limitless."""
+        original_side = str(pf.get("side", "buy")).lower()
+        is_buy_fill = original_side in ("buy", "bid", "yes")
+        hedge_action = "sell" if is_buy_fill else "buy"
+        pm_side = "SELL" if is_buy_fill else "BUY"
+
         # Cross-platform delta-neutral hedging to Polymarket
         matched_pm_token = (
             pf.get("_pm_token_id")
@@ -370,9 +383,9 @@ class PartialFillHedger:
         )
 
         if matched_pm_token and self.pm_trader:
-            return self._hedge_polymarket(matched_pm_token, fill_price, size, max_loss)
+            return self._hedge_polymarket(matched_pm_token, fill_price, size, max_loss, side=pm_side)
 
-        # Native Limitless sell-to-flatten hedge
+        # Native Limitless flatten hedge
         if not self.limitless_client or not getattr(self.limitless_client, "authenticated", False):
             return False
 
@@ -381,36 +394,45 @@ class PartialFillHedger:
             return False
 
         book = self.limitless_client.get_order_book(market_id, limit=5)
-        if not book or not book.get("bids"):
+        if not book:
             return False
 
         try:
-            best_bid = max(float(b.get("price", 0)) for b in book["bids"])
+            if hedge_action == "sell":
+                if not book.get("bids"):
+                    return False
+                best_price = max(float(b.get("price", 0)) for b in book["bids"])
+                loss = fill_price - best_price
+            else:
+                if not book.get("asks"):
+                    return False
+                best_price = min(float(a.get("price", 0)) for a in book["asks"])
+                loss = best_price - fill_price
         except (ValueError, TypeError):
             return False
 
-        if best_bid <= 0:
+        if best_price <= 0:
             return False
 
-        loss = fill_price - best_bid
         if loss > max_loss:
             logger.info(
-                "Limitless hedge: bid $%.3f too far from fill $%.3f (loss $%.3f > max $%.3f)",
-                best_bid, fill_price, loss, max_loss,
+                "Limitless hedge (%s): price $%.3f too far from fill $%.3f (loss $%.3f > max $%.3f)",
+                hedge_action, best_price, fill_price, loss, max_loss,
             )
             return False
 
-        outcome = pf.get("side", "yes").lower()
+        outcome = pf.get("outcome") or pf.get("side", "yes")
+        outcome = str(outcome).lower()
         if outcome not in ("yes", "no"):
             outcome = "yes"
 
-        quantity = max(1, int(round(size / best_bid))) if best_bid > 0 else 1
+        quantity = max(1, int(round(size / best_price))) if best_price > 0 else 1
         resp = self.limitless_client.place_order(
             market_id=market_id,
-            side="sell",
+            side=hedge_action,
             outcome=outcome,
             quantity=quantity,
-            price=best_bid,
+            price=best_price,
             time_in_force="ioc",
         )
         return resp is not None

@@ -200,11 +200,8 @@ class TestCredentialHealthChecker(unittest.TestCase):
     def test_limitless_auth_failure_none_fires_critical_alert(self):
         """Test that get_balance returning None (auth failure) escalates to CRITICAL after 3 attempts."""
         unauthed_mock = mock.MagicMock(return_value=None)
-        setattr(
-            self.mock_clients["limitless"],
-            HEALTH_ENDPOINTS["limitless"]["method"],
-            unauthed_mock,
-        )
+        self.mock_clients["limitless"].get_balance = unauthed_mock
+        self.assertEqual("get_balance", HEALTH_ENDPOINTS["limitless"]["method"])
 
         for platform in self.mock_clients:
             if platform != "limitless":
@@ -216,6 +213,7 @@ class TestCredentialHealthChecker(unittest.TestCase):
         try:
             # Attempt 1
             loop.run_until_complete(self.health_checker.check_all_platforms())
+            unauthed_mock.assert_called_once_with()
             self.assertEqual(1, self.health_checker._consecutive_failures.get("limitless", 0))
 
             # Attempt 2

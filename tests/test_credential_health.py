@@ -160,6 +160,43 @@ class TestCredentialHealthChecker(unittest.TestCase):
         finally:
             loop.close()
 
+    def test_three_consecutive_exception_failures_fire_critical_alert(self):
+        """Test that 3 consecutive exception failures (e.g. Limitless) fire CRITICAL alert."""
+        limitless_mock = mock.MagicMock(side_effect=Exception("API connection timeout"))
+        setattr(
+            self.mock_clients["limitless"],
+            HEALTH_ENDPOINTS["limitless"]["method"],
+            limitless_mock,
+        )
+
+        for platform in self.mock_clients:
+            if platform != "limitless":
+                method_name = HEALTH_ENDPOINTS[platform]["method"]
+                setattr(self.mock_clients[platform], method_name, mock.MagicMock(return_value=[{"id": 1}]))
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            # First check: 1 failure
+            loop.run_until_complete(self.health_checker.check_all_platforms())
+            self.assertEqual(1, self.health_checker._consecutive_failures.get("limitless", 0))
+
+            # Second check: 2 failures
+            loop.run_until_complete(self.health_checker.check_all_platforms())
+            self.assertEqual(2, self.health_checker._consecutive_failures.get("limitless", 0))
+
+            # Third check: 3 failures - should fire CRITICAL alert
+            self.mock_alert_manager.reset_mock()
+            loop.run_until_complete(self.health_checker.check_all_platforms())
+            self.assertEqual(3, self.health_checker._consecutive_failures.get("limitless", 0))
+
+            self.mock_alert_manager.alert.assert_called()
+            call_args = self.mock_alert_manager.alert.call_args
+            self.assertIn("CRITICAL", call_args[0])
+            self.assertIn("limitless", str(call_args[0]).lower())
+        finally:
+            loop.close()
+
     def test_timeout_is_info_severity(self):
         """Test that timeout exceptions fire INFO severity alerts."""
         # Mock the _async_call method to raise TimeoutError

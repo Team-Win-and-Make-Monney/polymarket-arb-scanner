@@ -390,32 +390,84 @@ class TestRewardsContinuousMode:
         assert "polymarket" in reward_info
         assert reward_info["polymarket"]["pool_size_usdc"] > 0
 
-    def test_continuous_rewards_gate_logic(self):
-        """Verify the rewards gate allows entry when only Limitless rewards are enabled."""
-        from unittest.mock import MagicMock
-        args = MagicMock()
-        args.mode = "all"
-        CONFIG_REWARDS_ENABLED = False
-        CONFIG_LIMITLESS_REWARDS_ENABLED = True
+    def test_continuous_rewards_gate_logic(self, monkeypatch):
+        """Verify the rewards gate allows entry and calls scanners based on mode and flags."""
+        import config
+        from continuous import _scan_rewards_continuous
 
-        should_enter = (
-            (args.mode in ("all", "rewards") and (CONFIG_REWARDS_ENABLED or CONFIG_LIMITLESS_REWARDS_ENABLED))
-            or args.mode == "limitless-rewards"
-        )
-        assert should_enter is True
+        mock_limitless_client = MagicMock()
+        mock_reward_tracker = MagicMock()
+        mock_kalshi_client = MagicMock()
+        mock_kalshi_tracker = MagicMock()
 
-        # And when both are False
-        CONFIG_LIMITLESS_REWARDS_ENABLED = False
-        should_enter = (
-            (args.mode in ("all", "rewards") and (CONFIG_REWARDS_ENABLED or CONFIG_LIMITLESS_REWARDS_ENABLED))
-            or args.mode == "limitless-rewards"
-        )
-        assert should_enter is False
+        with patch("continuous.scan_limitless_rewards") as mock_scan_limitless, \
+             patch("continuous.scan_polymarket_rewards") as mock_scan_poly, \
+             patch("continuous.scan_kalshi_rewards") as mock_scan_kalshi:
 
-        # And for explicit limitless-rewards mode
-        args.mode = "limitless-rewards"
-        should_enter = (
-            (args.mode in ("all", "rewards") and (CONFIG_REWARDS_ENABLED or CONFIG_LIMITLESS_REWARDS_ENABLED))
-            or args.mode == "limitless-rewards"
-        )
-        assert should_enter is True
+            mock_scan_limitless.return_value = [{"type": "LimitlessReward", "net_profit": 5.0}]
+            mock_scan_poly.return_value = [{"type": "PolyReward", "net_profit": 3.0}]
+            mock_scan_kalshi.return_value = [{"type": "KalshiReward", "net_profit": 2.0}]
+
+            # Case 1: mode='all', REWARDS_ENABLED=False, LIMITLESS_REWARDS_ENABLED=True
+            monkeypatch.setattr(config, "REWARDS_ENABLED", False)
+            monkeypatch.setattr(config, "LIMITLESS_REWARDS_ENABLED", True)
+            opps = _scan_rewards_continuous(
+                mode="all",
+                poly_reward_markets=[{"condition_id": "c1"}],
+                reward_tracker=mock_reward_tracker,
+                kalshi_client=mock_kalshi_client,
+                kalshi_reward_tracker=mock_kalshi_tracker,
+                limitless_client=mock_limitless_client,
+            )
+            mock_scan_limitless.assert_called_once()
+            mock_scan_poly.assert_not_called()
+            mock_scan_kalshi.assert_not_called()
+            assert len(opps) == 1
+            assert opps[0]["type"] == "LimitlessReward"
+
+            mock_scan_limitless.reset_mock()
+            mock_scan_poly.reset_mock()
+            mock_scan_kalshi.reset_mock()
+
+            # Case 2: mode='all', both flags False -> gate closed, no scans executed
+            monkeypatch.setattr(config, "REWARDS_ENABLED", False)
+            monkeypatch.setattr(config, "LIMITLESS_REWARDS_ENABLED", False)
+            opps = _scan_rewards_continuous(
+                mode="all",
+                poly_reward_markets=[{"condition_id": "c1"}],
+                reward_tracker=mock_reward_tracker,
+                kalshi_client=mock_kalshi_client,
+                kalshi_reward_tracker=mock_kalshi_tracker,
+                limitless_client=mock_limitless_client,
+            )
+            mock_scan_limitless.assert_not_called()
+            mock_scan_poly.assert_not_called()
+            mock_scan_kalshi.assert_not_called()
+            assert opps == []
+
+            # Case 3: mode='limitless-rewards', flags False -> explicit mode forces Limitless scan
+            monkeypatch.setattr(config, "REWARDS_ENABLED", False)
+            monkeypatch.setattr(config, "LIMITLESS_REWARDS_ENABLED", False)
+            opps = _scan_rewards_continuous(
+                mode="limitless-rewards",
+                limitless_client=mock_limitless_client,
+            )
+            mock_scan_limitless.assert_called_once()
+            mock_scan_poly.assert_not_called()
+            mock_scan_kalshi.assert_not_called()
+            assert len(opps) == 1
+            assert opps[0]["type"] == "LimitlessReward"
+
+            mock_scan_limitless.reset_mock()
+
+            # Case 4: mode='binary' (unrelated mode) -> skipped completely
+            monkeypatch.setattr(config, "REWARDS_ENABLED", True)
+            monkeypatch.setattr(config, "LIMITLESS_REWARDS_ENABLED", True)
+            opps = _scan_rewards_continuous(
+                mode="binary",
+                limitless_client=mock_limitless_client,
+            )
+            mock_scan_limitless.assert_not_called()
+            mock_scan_poly.assert_not_called()
+            mock_scan_kalshi.assert_not_called()
+            assert opps == []

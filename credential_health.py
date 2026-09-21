@@ -86,25 +86,7 @@ class CredentialHealthChecker:
                     self._consecutive_failures[platform_name] = 0
                     self._last_check[platform_name] = time.time()
                 else:
-                    # Increment failure count
-                    self._consecutive_failures[platform_name] = \
-                        self._consecutive_failures.get(platform_name, 0) + 1
-
-                    # Fire alert after 3 consecutive failures
-                    fail_count = self._consecutive_failures[platform_name]
-                    if fail_count == 3:
-                        self._fire_credential_alert(
-                            platform_name,
-                            "CRITICAL",
-                            f"Credential health check failed 3 times: {platform_name}",
-                        )
-                    elif fail_count == 1:
-                        # Log first failure for debugging
-                        logger.warning(
-                            "Credential health check failed for %s (attempt %d)",
-                            platform_name,
-                            fail_count,
-                        )
+                    self._record_failure(platform_name)
 
             except Exception as e:
                 logger.error(
@@ -114,14 +96,32 @@ class CredentialHealthChecker:
                     exc_info=False,
                 )
                 results[platform_name] = False
-                self._consecutive_failures[platform_name] = \
-                    self._consecutive_failures.get(platform_name, 0) + 1
+                self._record_failure(platform_name)
 
         ok_count = sum(1 for v in results.values() if v)
         total = len(results)
         logger.info("Credential health check complete: %d/%d platforms OK", ok_count, total)
 
         return results
+
+    def _record_failure(self, platform_name: str) -> None:
+        """Record consecutive failure and fire alert if threshold reached."""
+        self._consecutive_failures[platform_name] = (
+            self._consecutive_failures.get(platform_name, 0) + 1
+        )
+        fail_count = self._consecutive_failures[platform_name]
+        if fail_count == 3:
+            self._fire_credential_alert(
+                platform_name,
+                "CRITICAL",
+                f"Credential health check failed 3 times: {platform_name}",
+            )
+        elif fail_count == 1:
+            logger.warning(
+                "Credential health check failed for %s (attempt %d)",
+                platform_name,
+                fail_count,
+            )
 
     @retry(
         stop=stop_after_attempt(2),

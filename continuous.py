@@ -1312,6 +1312,67 @@ def _scan_jev_crypto_continuous(
     )
 
 
+def _scan_rewards_continuous(
+    mode: str,
+    poly_reward_markets: list[dict] | None = None,
+    reward_tracker=None,
+    kalshi_client=None,
+    kalshi_reward_tracker=None,
+    kalshi_data=None,
+    limitless_client=None,
+    price_cache: dict | None = None,
+) -> list[dict]:
+    """Execute Layer 3 liquidity rewards scanning across configured platforms."""
+    rewards_enabled = getattr(config, "REWARDS_ENABLED", CONFIG_REWARDS_ENABLED)
+    limitless_rewards_enabled = getattr(config, "LIMITLESS_REWARDS_ENABLED", CONFIG_LIMITLESS_REWARDS_ENABLED)
+
+    if not (
+        (mode in ("all", "rewards") and (rewards_enabled or limitless_rewards_enabled))
+        or mode == "limitless-rewards"
+    ):
+        return []
+
+    opps: list[dict] = []
+    try:
+        pm_reward_opps: list[dict] = []
+        k_reward_opps: list[dict] = []
+        lim_reward_opps: list[dict] = []
+        if mode in ("all", "rewards") and rewards_enabled:
+            if poly_reward_markets and reward_tracker:
+                pm_reward_opps = scan_polymarket_rewards(
+                    markets=poly_reward_markets,
+                    reward_tracker=reward_tracker,
+                    price_cache=price_cache or {},
+                )
+                opps.extend(pm_reward_opps)
+
+            if kalshi_client and kalshi_reward_tracker:
+                k_reward_opps = scan_kalshi_rewards(
+                    kalshi_client=kalshi_client,
+                    reward_tracker=kalshi_reward_tracker,
+                    kalshi_data=kalshi_data,
+                )
+                opps.extend(k_reward_opps)
+
+        if (mode in ("all", "rewards", "limitless-rewards")) and (limitless_rewards_enabled or mode == "limitless-rewards") and limitless_client:
+            lim_reward_opps = scan_limitless_rewards(
+                limitless_client=limitless_client,
+                price_cache=price_cache or {},
+            )
+            opps.extend(lim_reward_opps)
+
+        logger.debug(
+            "Rewards scan complete: %d Polymarket + %d Kalshi + %d Limitless opps",
+            len(pm_reward_opps),
+            len(k_reward_opps),
+            len(lim_reward_opps),
+        )
+    except Exception as exc:
+        logger.debug("Rewards scanning error: %s", exc)
+
+    return opps
+
+
 def heal_kalshi_client(executor, platform_clients, hedger, notifier):
     """Attempt one Kalshi re-auth from env creds and rewire dependents.
 
@@ -2413,47 +2474,17 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                     all_opportunities.extend(mc_opps)
 
                 # Layer 3: Liquidity Rewards
-                if (
-                    (args.mode in ("all", "rewards") and (CONFIG_REWARDS_ENABLED or CONFIG_LIMITLESS_REWARDS_ENABLED))
-                    or args.mode == "limitless-rewards"
-                ):
-                    try:
-                        pm_reward_opps = []
-                        k_reward_opps = []
-                        lim_reward_opps = []
-                        if args.mode in ("all", "rewards") and CONFIG_REWARDS_ENABLED:
-                            if poly_reward_markets and _reward_tracker:
-                                pm_reward_opps = scan_polymarket_rewards(
-                                    markets=poly_reward_markets,
-                                    reward_tracker=_reward_tracker,
-                                    price_cache=price_cache,
-                                )
-                                all_opportunities.extend(pm_reward_opps)
-
-                            if kalshi_client and _kalshi_reward_tracker:
-                                k_reward_opps = scan_kalshi_rewards(
-                                    kalshi_client=kalshi_client,
-                                    reward_tracker=_kalshi_reward_tracker,
-                                    kalshi_data=kalshi_data,
-                                )
-                                all_opportunities.extend(k_reward_opps)
-
-                        limitless_client = extra_clients.get("limitless")
-                        if (args.mode in ("all", "rewards", "limitless-rewards")) and (CONFIG_LIMITLESS_REWARDS_ENABLED or args.mode == "limitless-rewards") and limitless_client:
-                            lim_reward_opps = scan_limitless_rewards(
-                                limitless_client=limitless_client,
-                                price_cache=price_cache,
-                            )
-                            all_opportunities.extend(lim_reward_opps)
-
-                        logger.debug(
-                            "Rewards scan complete: %d Polymarket + %d Kalshi + %d Limitless opps",
-                            len(pm_reward_opps),
-                            len(k_reward_opps),
-                            len(lim_reward_opps),
-                        )
-                    except Exception as exc:
-                        logger.debug("Rewards scanning error: %s", exc)
+                reward_opps = _scan_rewards_continuous(
+                    mode=args.mode,
+                    poly_reward_markets=poly_reward_markets,
+                    reward_tracker=_reward_tracker,
+                    kalshi_client=kalshi_client,
+                    kalshi_reward_tracker=_kalshi_reward_tracker,
+                    kalshi_data=kalshi_data,
+                    limitless_client=extra_clients.get("limitless"),
+                    price_cache=price_cache,
+                )
+                all_opportunities.extend(reward_opps)
 
                 # Kalshi VIP: passive volume-rebate tracking (no execution path).
                 if _kalshi_vip_tracker is not None:

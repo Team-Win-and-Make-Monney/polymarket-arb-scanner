@@ -1,0 +1,8 @@
+{
+  "arb-production": {
+    "projectName": "polymarket-arb-scanner",
+    "environmentName": "production",
+    "projectId": "66c8da70-55d7-4dbc-b84b-c200a018dc05",
+    "environmentId": "b68bb4ec-165c-45b3-90f2-4ae798cee5d4"
+  }
+}

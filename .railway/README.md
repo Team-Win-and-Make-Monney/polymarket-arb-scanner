@@ -1,6 +1,6 @@
 # Railway infrastructure migration
 
-This configuration preserves the live environment inventory imported on 21 September 2026. Secrets remain in Railway through `preserve()`. The entrypoint refuses unknown project/environment names. Verify the linked project ID and environment ID before every command; names are the authoring guard, not a substitute for account identity.
+This configuration preserves the live environment inventory imported on 21 September 2026. Secrets remain in Railway through `preserve()`. The entrypoint compares both immutable IDs and names with `audited-targets.json`, refusing a same-named project or environment with different IDs. IDs live in this separate audited target registry; resource definitions use the product DSL and names. Verify the linked account before every command.
 
 Prerequisites: Node.js 22 or newer, Railway CLI 5.58.0, and the pinned Railway SDK. The SDK does not install the CLI. Run commands from the repository root:
 

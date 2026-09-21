@@ -16,6 +16,13 @@ import scans.ctf as ctf_mod
 class TestCTFScan:
     """Test suite for two-stage CTFMerge and CTFMint scan."""
 
+    @pytest.fixture(autouse=True)
+    def _bind_real_polymarket_helpers(self, monkeypatch) -> None:
+        """Ensure scans.ctf uses production polymarket_api helpers even if ambient sys.modules is mocked."""
+        import polymarket_api
+        monkeypatch.setattr(ctf_mod, "get_binary_markets", polymarket_api.get_binary_markets)
+        monkeypatch.setattr(ctf_mod, "parse_outcome_prices", polymarket_api.parse_outcome_prices)
+
     def _sample_markets(self) -> list[dict]:
         from datetime import datetime, timezone, timedelta
         future_date = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()

@@ -402,7 +402,10 @@ class PartialFillHedger:
         if not self.limitless_client or not getattr(self.limitless_client, "authenticated", False):
             return False
 
-        market_id = pf.get("_market_id") or pf.get("token_id", "")
+        is_cross_pm = (pf.get("_hedge_platform") or pf.get("hedge_platform")) == "polymarket"
+        market_id = pf.get("_market_id") or pf.get("limitless_market_id") or (
+            "" if is_cross_pm else pf.get("token_id", "")
+        )
         if not market_id:
             return False
 

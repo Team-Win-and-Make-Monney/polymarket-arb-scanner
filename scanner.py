@@ -109,6 +109,8 @@ __all__ = [
     "_refine_frechet_with_clob",
     "scan_temporal_arb",
     "_refine_temporal_with_clob",
+    "scan_ctf",
+    "_refine_ctf_with_clob",
     "get_clob_prices",
     "match_cross_platform",
     "match_cross_platform_semantic",

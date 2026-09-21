@@ -936,6 +936,7 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
                 "CTF mode requested but CTF_ENABLED=false in non-dry-run execution. "
                 "Refusing to scan without explicit enablement."
             )
+            sys.exit(1)
         elif (CTF_ENABLED or CTF_MERGE_ENABLED or CTF_MINT_SELL_ENABLED) or (args.mode == "ctf" and is_dry_run):
             logger.info("--- CTF Primitives Scan (Polymarket Merge / Split) ---")
             try:

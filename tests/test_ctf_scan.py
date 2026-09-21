@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scans.ctf import _refine_ctf_with_clob, scan_ctf
+from scans.ctf import scan_ctf
 
 
 class TestCTFScan:

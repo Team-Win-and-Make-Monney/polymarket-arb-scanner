@@ -168,7 +168,7 @@ CANARY_LIVE_ACK = os.getenv("CANARY_LIVE_ACK", "").strip()
 # Comma-separated list of platform names. Platforms not listed here will still
 # be scanned for price data but will never execute trades.
 _VALID_PLATFORMS = frozenset([
-    "polymarket", "kalshi", "betfair", "smarkets",
+    "polymarket", "polymarket_ctf", "kalshi", "betfair", "smarkets",
     "sxbet", "matchbook", "gemini", "ibkr",
 ])
 _raw_enabled = os.getenv("ENABLED_EXECUTION_PLATFORMS", "kalshi")
@@ -213,6 +213,7 @@ def polymarket_reward_fetch_enabled(mode: str) -> bool:
 # client-side to prevent API rejections and costly partial-fill hedging.
 PLATFORM_MIN_ORDER_SIZE: dict[str, float] = {
     "polymarket": 0.01,
+    "polymarket_ctf": 0.01,
     "kalshi": 0.01,
     "sxbet": 1.00,
     "gemini": 0.01,
@@ -1511,6 +1512,11 @@ def validate_config() -> list[str]:
             raise ConfigError(
                 "CTF strategies enabled with DRY_RUN=false, but CONDITIONAL_TOKENS_ADDRESS "
                 "or COLLATERAL_TOKEN_ADDRESS is missing."
+            )
+        if CTF_CONVERT_ENABLED and not NEG_RISK_ADAPTER_ADDRESS:
+            raise ConfigError(
+                "CTF convert enabled (CTF_CONVERT_ENABLED=true) with DRY_RUN=false, "
+                "but NEG_RISK_ADAPTER_ADDRESS is missing."
             )
 
     # --- Strategy-specific validation (Phase 8) ---

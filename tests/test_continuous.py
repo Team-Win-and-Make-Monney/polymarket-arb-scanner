@@ -1551,6 +1551,17 @@ class TestCTFContinuousScan:
         assert res == mock_opps
         p_scan.assert_called_once()
 
+    def test_ctf_explicit_mode_in_live_disabled_returns_empty(self, monkeypatch):
+        import config
+        from continuous import _scan_ctf_layer1
+        monkeypatch.setattr(config, "CTF_ENABLED", False)
+        monkeypatch.setattr(config, "CTF_MERGE_ENABLED", False)
+        monkeypatch.setattr(config, "CTF_MINT_SELL_ENABLED", False)
+        monkeypatch.setattr(config, "DRY_RUN", False)
+        markets = [{"conditionId": "0x123"}]
+        res = _scan_ctf_layer1(markets, mode="ctf", min_profit=0.01)
+        assert res == []
+
 
 # ---------------------------------------------------------------------------
 # UMA Dispute Gate Continuous Integration (Plan 05)

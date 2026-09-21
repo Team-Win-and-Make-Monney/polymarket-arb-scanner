@@ -12,17 +12,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ctf_api import CTFClient
 from db import TradeDB
-from executor import ArbitrageExecutor
+import executor as executor_mod
 from risk_manager import RiskManager
 
 
 class TestExecutorCTF:
     """Test suite for executor CTF leg construction, revalidation, and simulation."""
 
-    def _setup_executor(self, dry_run: bool = True) -> ArbitrageExecutor:
-        import sys
-        import executor as executor_mod
-        curr_class = getattr(sys.modules.get("executor"), "ArbitrageExecutor", ArbitrageExecutor)
+    def _setup_executor(self, dry_run: bool = True) -> executor_mod.ArbitrageExecutor:
+        curr_class = getattr(sys.modules.get("executor"), "ArbitrageExecutor", executor_mod.ArbitrageExecutor)
         db = MagicMock(spec=TradeDB)
         risk = MagicMock(spec=RiskManager)
         ctf_client = CTFClient(dry_run=dry_run)
@@ -126,7 +124,6 @@ class TestExecutorCTF:
 
     def test_revalidate_ctf_merge_success_and_failure(self) -> None:
         """Verify _revalidate_ctf for CTFMerge passes when asks < 1.00 and fails when asks rise."""
-        import executor as executor_mod
         import polymarket_api
         executor = self._setup_executor()
         opp = {
@@ -161,7 +158,6 @@ class TestExecutorCTF:
 
     def test_revalidate_ctf_mint_success_and_failure(self) -> None:
         """Verify _revalidate_ctf for CTFMint passes when bids > 1.00 and fails when bids fall."""
-        import executor as executor_mod
         import polymarket_api
         executor = self._setup_executor()
         opp = {
@@ -206,8 +202,8 @@ class TestExecutorCTF:
         }
         opp = {"type": "CTFMerge", "market": "Test market"}
 
-        # Enable polymarket in whitelist so guard passes
-        with patch("executor.ENABLED_EXECUTION_PLATFORMS", frozenset({"polymarket", "kalshi"})):
+        # Enable polymarket_ctf in whitelist so guard passes
+        with patch("executor.ENABLED_EXECUTION_PLATFORMS", frozenset({"polymarket", "polymarket_ctf", "kalshi"})):
             success, tx_id, fill_price = executor._execute_single_leg(leg, 10.0, opp)
             assert success is True
             assert tx_id is not None
@@ -228,6 +224,6 @@ class TestExecutorCTF:
         }
         opp = {"type": "CTFMerge", "market": "Test market"}
 
-        with patch("executor.ENABLED_EXECUTION_PLATFORMS", frozenset({"polymarket", "kalshi"})):
+        with patch("executor.ENABLED_EXECUTION_PLATFORMS", frozenset({"polymarket", "polymarket_ctf", "kalshi"})):
             with pytest.raises(NotImplementedError):
                 executor._execute_single_leg(leg, 10.0, opp)

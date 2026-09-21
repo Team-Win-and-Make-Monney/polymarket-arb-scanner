@@ -1253,12 +1253,13 @@ def _scan_ctf_layer1(poly_markets, mode, min_profit, price_cache=None, funnel=No
     if mode not in ("all", "ctf"):
         return []
     is_explicit = (mode == "ctf")
+    is_dry_run = getattr(config, "DRY_RUN", True)
     enabled = (
         getattr(config, "CTF_ENABLED", False)
         or getattr(config, "CTF_MERGE_ENABLED", False)
         or getattr(config, "CTF_MINT_SELL_ENABLED", False)
     )
-    if not is_explicit and not enabled:
+    if not enabled and not (is_explicit and is_dry_run):
         return []
     if not poly_markets:
         return []

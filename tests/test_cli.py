@@ -1013,3 +1013,19 @@ class TestCTFModeCLI:
         opps = mock_display.call_args[0][0]
         assert len(opps) == 1
         assert opps[0]["type"] == "CTFMerge"
+
+    def test_run_oneshot_ctf_live_disabled_exits_fast(self, monkeypatch):
+        monkeypatch.setattr(config, "CTF_ENABLED", False)
+        monkeypatch.setattr(config, "CTF_MERGE_ENABLED", False)
+        monkeypatch.setattr(config, "CTF_MINT_SELL_ENABLED", False)
+        args = _make_args(mode="ctf")
+        args.dry_run = False
+        executor = _make_executor(dry_run=False)
+
+        with patch.object(_cli_mod, "fetch_all_markets", return_value=[]), \
+             patch.object(_cli_mod, "scan_ctf") as mock_scan, \
+             pytest.raises(SystemExit) as exc_info:
+            _cli_mod._run_oneshot(args, min_profit=0.01, kalshi_client=None, executor=executor, db=MagicMock())
+
+        assert exc_info.value.code == 1
+        mock_scan.assert_not_called()

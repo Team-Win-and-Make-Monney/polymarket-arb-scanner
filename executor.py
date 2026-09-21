@@ -95,7 +95,8 @@ from fees import (
 try:
     from ctf_api import CTFClient
 except ImportError:
-    CTFClient = None  # type: ignore
+    class CTFClient:  # type: ignore[no-redef]
+        pass
 
 logger = logging.getLogger(__name__)
 
@@ -3600,9 +3601,7 @@ class ArbitrageExecutor:
         leg_size = leg.get("size", size)
 
         # --- Platform whitelist guard ---
-        if platform not in ENABLED_EXECUTION_PLATFORMS and not (
-            platform == "polymarket_ctf" and "polymarket" in ENABLED_EXECUTION_PLATFORMS
-        ):
+        if platform not in ENABLED_EXECUTION_PLATFORMS:
             logger.warning(
                 f"Platform '{platform}' not in ENABLED_EXECUTION_PLATFORMS "
                 f"({', '.join(sorted(ENABLED_EXECUTION_PLATFORMS))}). "

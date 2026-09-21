@@ -635,6 +635,46 @@ class TestWhaleCopyConfig:
 
 
 # ---------------------------------------------------------------------------
+# Plan 04: CTF Primitives Config
+# ---------------------------------------------------------------------------
+
+class TestCTFConfig:
+    def test_polymarket_ctf_in_valid_platforms(self):
+        from config import _VALID_PLATFORMS
+        assert "polymarket_ctf" in _VALID_PLATFORMS
+
+    def test_ctf_convert_requires_neg_risk_adapter_in_live(self, monkeypatch, tmp_path):
+        from live_envelope_fixtures import write_test_envelope
+        monkeypatch.setenv("LIVE_ENVELOPE_PATH", str(write_test_envelope(tmp_path)))
+        import config as cfg
+        monkeypatch.setattr(cfg, "DRY_RUN", False)
+        monkeypatch.setattr(cfg, "CTF_ENABLED", True)
+        monkeypatch.setattr(cfg, "CTF_CONVERT_ENABLED", True)
+        monkeypatch.setattr(cfg, "CONDITIONAL_TOKENS_ADDRESS", "0x1111")
+        monkeypatch.setattr(cfg, "COLLATERAL_TOKEN_ADDRESS", "0x2222")
+        monkeypatch.setattr(cfg, "NEG_RISK_ADAPTER_ADDRESS", "")
+        monkeypatch.setattr(cfg, "ENABLED_EXECUTION_PLATFORMS", frozenset(["kalshi"]))
+
+        with pytest.raises(cfg.ConfigError, match="NEG_RISK_ADAPTER_ADDRESS is missing"):
+            cfg.validate_config()
+
+    def test_ctf_convert_passes_with_adapter_address(self, monkeypatch, tmp_path):
+        from live_envelope_fixtures import write_test_envelope
+        monkeypatch.setenv("LIVE_ENVELOPE_PATH", str(write_test_envelope(tmp_path)))
+        import config as cfg
+        monkeypatch.setattr(cfg, "DRY_RUN", False)
+        monkeypatch.setattr(cfg, "CTF_ENABLED", True)
+        monkeypatch.setattr(cfg, "CTF_CONVERT_ENABLED", True)
+        monkeypatch.setattr(cfg, "CONDITIONAL_TOKENS_ADDRESS", "0x1111")
+        monkeypatch.setattr(cfg, "COLLATERAL_TOKEN_ADDRESS", "0x2222")
+        monkeypatch.setattr(cfg, "NEG_RISK_ADAPTER_ADDRESS", "0x3333")
+        monkeypatch.setattr(cfg, "ENABLED_EXECUTION_PLATFORMS", frozenset(["kalshi"]))
+
+        # Must not raise
+        cfg.validate_config()
+
+
+# ---------------------------------------------------------------------------
 # Env hygiene — no personal/global env files merged into the bot environment
 # ---------------------------------------------------------------------------
 

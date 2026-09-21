@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 # Save any real modules already loaded so we can restore them after import
 _saved_modules = {}
 _modules_to_mock = [
-    "kalshi_api", "polymarket_api", "dashboard", "display", "recovery",
+    "kalshi_api", "dashboard", "display", "recovery",
 ]
 for _mod_name in _modules_to_mock:
     if _mod_name in sys.modules:
@@ -27,8 +27,6 @@ mock_kalshi.KALSHI_BASE_URL = "https://api.elections.kalshi.com"
 mock_kalshi.KALSHI_API_PATH = "/trade-api/v2"
 sys.modules["kalshi_api"] = mock_kalshi
 
-mock_pm = MagicMock()
-sys.modules["polymarket_api"] = mock_pm
 
 mock_dashboard = MagicMock()
 mock_dashboard.state = MagicMock()

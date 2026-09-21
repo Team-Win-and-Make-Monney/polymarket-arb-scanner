@@ -72,6 +72,11 @@ def paper_dataset():
 
 
 class TestWorkflowCoverage:
+    def test_vendored_runtime_matches_documented_provenance(self):
+        expected = "1d652c67847f2eb743e5b286e8d5de8f74f2ea0501b293ae4ccfae60d8d31cd6"
+        assert hashlib.sha256((ROOT / "research_jev" / "runtime.py").read_bytes()).hexdigest() == expected
+        assert f"SHA-256 `{expected}`." in (ROOT / "docs" / "JEV-RESEARCH.md").read_text()
+
     def test_injected_client_without_explicit_mode_stays_off(self):
         client = FakeJev()
         del client.mode

@@ -159,6 +159,7 @@ establish calibration, simulate orders, or claim profitability.
 
 Vendored runtime: `research_jev/runtime.py`, portable runtime version `1.0.0`,
 SHA-256 `1d652c67847f2eb743e5b286e8d5de8f74f2ea0501b293ae4ccfae60d8d31cd6`.
+The research tests verify both these vendored bytes and the documented checksum.
 Pinned model: `jev-1.13.0`. Requests use the fixed direct endpoint, no redirects,
 no retries, and bounded request/response bodies and deadlines. Keys and raw
 provider errors never enter output. Unknown usage remains null.

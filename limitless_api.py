@@ -76,9 +76,9 @@ class LimitlessClient:
         self.exchange_contract: str = os.getenv("LIMITLESS_EXCHANGE_CONTRACT", "")
         self._account_address: str | None = None
 
-        # Caching for markets scan
-        self._markets_cache: list[dict] | None = None
-        self._markets_cache_ts: float = 0.0
+        # Caching for markets scan keyed by fetch limit
+        self._markets_cache: dict[int, list[dict]] = {}
+        self._markets_cache_ts: dict[int, float] = {}
         self._markets_cache_ttl: float = float(os.getenv("LIMITLESS_MARKETS_CACHE_TTL", "30.0"))
         self._markets_cache_lock = threading.Lock()
 
@@ -140,12 +140,18 @@ class LimitlessClient:
             if resp.status_code == 200:
                 _circuit.record_success()
                 return resp.json()
+            elif resp.status_code == 404:
+                return None
             elif resp.status_code == 429:
                 _circuit.record_failure()
                 logger.warning("Limitless rate limited (429) on %s", endpoint)
                 return None
-            else:
+            elif resp.status_code >= 500:
                 _circuit.record_failure()
+                logger.warning("Limitless server error %d on %s: %s",
+                               resp.status_code, endpoint, resp.text[:200])
+                return None
+            else:
                 logger.warning("Limitless public request failed %d on %s: %s",
                                resp.status_code, endpoint, resp.text[:200])
                 return None
@@ -218,8 +224,10 @@ class LimitlessClient:
         """
         now = time.time()
         with self._markets_cache_lock:
-            if self._markets_cache is not None and (now - self._markets_cache_ts) < self._markets_cache_ttl:
-                return self._markets_cache
+            cached_data = self._markets_cache.get(limit)
+            cached_ts = self._markets_cache_ts.get(limit, 0.0)
+            if cached_data is not None and (now - cached_ts) < self._markets_cache_ttl:
+                return cached_data
 
         data = self._public_request("/markets", params={"limit": limit})
         if not data:
@@ -238,8 +246,8 @@ class LimitlessClient:
                 normalized.append(norm)
 
         with self._markets_cache_lock:
-            self._markets_cache = normalized
-            self._markets_cache_ts = now
+            self._markets_cache[limit] = normalized
+            self._markets_cache_ts[limit] = now
 
         return normalized
 

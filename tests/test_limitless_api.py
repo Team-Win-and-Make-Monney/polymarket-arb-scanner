@@ -113,6 +113,12 @@ class TestLimitlessMarkets:
             authed_client.fetch_all_markets()
             assert mock_req.call_count == 1
 
+    def test_fetch_all_markets_caches_per_limit(self, authed_client):
+        with patch.object(authed_client, "_public_request", return_value={"markets": []}) as mock_req:
+            authed_client.fetch_all_markets(limit=1)
+            authed_client.fetch_all_markets(limit=100)
+            assert mock_req.call_count == 2
+
     def test_get_order_book_parses_bids_asks(self, authed_client):
         raw_book = {
             "bids": [{"price": 0.58, "amount": 100.0}],
@@ -254,3 +260,13 @@ class TestLimitlessCircuitBreaker:
             res = authed_client._public_request("/markets")
             assert res is None
             mock_get.assert_not_called()
+
+    def test_404_does_not_trip_circuit(self, authed_client):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        with patch.object(authed_client.session, "get", return_value=mock_resp):
+            for _ in range(5):
+                res = authed_client._public_request("/markets/missing")
+                assert res is None
+
+        assert limitless_api._circuit.is_open() is False

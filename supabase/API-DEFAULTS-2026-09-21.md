@@ -20,6 +20,32 @@ EXECUTE entries; it does not and is not intended to override the global
 backend grant. See the [PostgreSQL default privilege documentation](https://www.postgresql.org/docs/17/sql-alterdefaultprivileges.html).
 The applied migration files retain their original bytes.
 
+## Broker guard variants
+
+The deployed migration history defines `broker_reject_mutation` and
+`broker_reject_truncate`; repository `0005` instead wires its append-only
+triggers to `broker_block_append_only`. The ordered prerequisite `172505`
+creates the two compatibility functions only when absent and pins the
+repository guard when present. It preserves existing bodies and trigger
+bindings. The already-applied `172506` pin migration stays byte-identical.
+
+On an existing deployment, fetch and reconcile the actual remote history
+before applying this newly recorded earlier prerequisite. Do not replay the
+repository `0001`–`0006` over a deployed schema: those historical schema
+variants are not interchangeable. When both deployed reject functions exist
+and block_append_only is absent, the prerequisite changes no function.
+
+The clean replay fixture uses every repository migration in order and tests
+the actual `0005` trigger bindings, including the additional attempts table:
+
+```sh
+bash tests/supabase-clean-replay.sh
+```
+
+Set PGHOST/PGPORT/PGUSER/PGDATABASE to an empty disposable PostgreSQL 17
+database with the three Supabase application roles already present. The
+script rejects a nonempty public schema before running migrations.
+
 ## Reproducible local verification
 
 Run only in a fresh disposable PostgreSQL 17 database, as `postgres`, with

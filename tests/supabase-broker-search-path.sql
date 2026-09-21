@@ -11,6 +11,17 @@ BEGIN
   RAISE EXCEPTION '% is append-only (truncate blocked)', tg_table_name;
 END;
 $$;
+CREATE TEMP TABLE broker_guard_definitions_before AS
+SELECT oid, pg_get_functiondef(oid) AS definition FROM pg_proc
+WHERE oid IN ('public.broker_reject_mutation()'::regprocedure,
+              'public.broker_reject_truncate()'::regprocedure);
+\ir ../supabase/migrations/20260921172505_prepare_broker_guard_variants.sql
+DO $$ BEGIN
+  IF EXISTS (SELECT FROM broker_guard_definitions_before
+             WHERE pg_get_functiondef(oid) IS DISTINCT FROM definition) THEN
+    RAISE EXCEPTION 'Compatibility prerequisite changed an existing guard';
+  END IF;
+END $$;
 \ir ../supabase/migrations/20260921172506_pin_broker_function_search_paths.sql
 BEGIN;
 CREATE TABLE public.broker_pin_probe(id integer);

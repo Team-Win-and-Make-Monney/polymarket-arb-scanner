@@ -111,7 +111,7 @@ class TestScansJevCrypto(unittest.TestCase):
         mock_client.query_decisions.return_value = {
             "answers": {
                 "strike_probability": {"type": "noul", "noul": 0.70},
-                "recommended_action": {"type": "choice", "choice": "buy_yes", "confidence": 0.85},
+                "contract_interpretation": {"type": "choice", "choice": "touch_above", "confidence": 0.85},
                 "tail_risk": {"type": "score", "score": 1.0},
                 "conviction": {"type": "score", "score": 1.5},
             }
@@ -120,7 +120,8 @@ class TestScansJevCrypto(unittest.TestCase):
             "question": "Will Bitcoin reach $90,000 by December 31, 2026?",
             "outcomePrices": json.dumps(["0.40", "0.60"]),
             "clobTokenIds": ["token_yes", "token_no"],
-            "endDate": "2026-12-31T23:59:59Z",
+            "endDate": "2099-12-31T23:59:59Z",
+            "description": "YES if the named asset reaches the stated barrier on index X before expiration.",
         }
         spot_prices = {"BTC": {"price": 81000.0, "change_24h": 3.5, "vwap_24h": 80500.0}}
         opps = scan_jev_crypto(
@@ -148,9 +149,9 @@ class TestScansJevCrypto(unittest.TestCase):
         mock_client.query_decisions.return_value = {
             "answers": {
                 "strike_probability": {"type": "noul", "noul": 0.65},
-                "recommended_action": {
+                "contract_interpretation": {
                     "type": "choice",
-                    "choice": "buy_yes",
+                    "choice": "touch_above",
                     "confidence": 0.82,
                 },
                 "tail_risk": {"type": "score", "score": 1.1},
@@ -162,7 +163,8 @@ class TestScansJevCrypto(unittest.TestCase):
             "question": "Will Bitcoin reach $90,000 by December 31, 2026?",
             "outcomePrices": json.dumps(["0.40", "0.60"]),
             "clobTokenIds": ["token_yes", "token_no"],
-            "endDate": "2026-12-31T23:59:59Z",
+            "endDate": "2099-12-31T23:59:59Z",
+            "description": "YES if the named asset reaches the stated barrier on index X before expiration.",
         }
 
         spot_prices = {
@@ -202,9 +204,9 @@ class TestScansJevCrypto(unittest.TestCase):
         mock_client.query_decisions.return_value = {
             "answers": {
                 "strike_probability": {"type": "noul", "noul": 0.50},
-                "recommended_action": {
+                "contract_interpretation": {
                     "type": "choice",
-                    "choice": "pass_fair",
+                    "choice": "unclear",
                     "confidence": 0.75,
                 },
                 "tail_risk": {"type": "score", "score": 1.0},
@@ -216,7 +218,8 @@ class TestScansJevCrypto(unittest.TestCase):
             "question": "Will Bitcoin reach $90,000 by December 31, 2026?",
             "outcomePrices": json.dumps(["0.50", "0.50"]),
             "clobTokenIds": ["token_yes", "token_no"],
-            "endDate": "2026-12-31T23:59:59Z",
+            "endDate": "2099-12-31T23:59:59Z",
+            "description": "YES if the named asset reaches the stated barrier on index X before expiration.",
         }
 
         spot_prices = {
@@ -249,7 +252,7 @@ class TestScansJevCrypto(unittest.TestCase):
         mock_client.query_decisions.return_value = {
             "answers": {
                 "strike_probability": {"type": "noul", "noul": 0.50},
-                "recommended_action": {"type": "choice", "choice": "pass_fair", "confidence": 0.80},
+                "contract_interpretation": {"type": "choice", "choice": "unclear", "confidence": 0.80},
                 "tail_risk": {"type": "score", "score": 1.0},
                 "conviction": {"type": "score", "score": 0.2},
             }
@@ -259,7 +262,8 @@ class TestScansJevCrypto(unittest.TestCase):
             "question": "Will Solana reach $150 by December 31, 2026?",
             "outcomePrices": json.dumps(["0.45", "0.55"]),
             "clobTokenIds": ["sol_yes", "sol_no"],
-            "endDate": "2026-12-31T23:59:59Z",
+            "endDate": "2099-12-31T23:59:59Z",
+            "description": "YES if the named asset reaches the stated barrier on index X before expiration.",
         }
 
         mock_db = MagicMock()
@@ -291,7 +295,7 @@ class TestScansJevCrypto(unittest.TestCase):
         mock_client.query_decisions.return_value = {
             "answers": {
                 "strike_probability": {"type": "noul", "noul": float("nan")},
-                "recommended_action": {"type": "choice", "choice": "buy_yes", "confidence": 0.85},
+                "contract_interpretation": {"type": "choice", "choice": "touch_above", "confidence": 0.85},
                 "tail_risk": {"type": "score", "score": 1.0},
                 "conviction": {"type": "score", "score": 1.5},
             }
@@ -300,7 +304,8 @@ class TestScansJevCrypto(unittest.TestCase):
             "question": "Will Bitcoin reach $90,000 by December 31, 2026?",
             "outcomePrices": json.dumps(["0.40", "0.60"]),
             "clobTokenIds": ["btc_yes", "btc_no"],
-            "endDate": "2026-12-31T23:59:59Z",
+            "endDate": "2099-12-31T23:59:59Z",
+            "description": "YES if the named asset reaches the stated barrier on index X before expiration.",
         }
         opps = scan_jev_crypto(
             markets_by_key={"btc-90k": mock_market},

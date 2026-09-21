@@ -273,33 +273,15 @@ def verify_cross_platform_equivalence_jev(
         if not j_client.is_available():
             return False, 0.0, "Jev unavailable; fail-closed safety gate"
 
-        title_a = _get_title(market_a)
-        title_b = _get_title(market_b)
-
+        from jev_semantics import equivalence_questions, settlement_rules
+        rules_a, rules_b = settlement_rules(market_a), settlement_rules(market_b)
+        if not rules_a or not rules_b:
+            return False, 0.0, "Review required: missing settlement rules; fail-closed"
         state = {
-            "platform_a": platform_a,
-            "title_a": title_a,
-            "platform_b": platform_b,
-            "title_b": title_b,
+            "platform_a": platform_a, "question_a": _get_title(market_a), "rules_a": rules_a,
+            "platform_b": platform_b, "question_b": _get_title(market_b), "rules_b": rules_b,
         }
-        questions = {
-            "is_equivalent": {
-                "type": "choice",
-                "instructions": (
-                    "Do the markets `title_a` on `platform_a` and `title_b` on `platform_b` "
-                    "have 100% equivalent resolution conditions and outcomes?"
-                ),
-                "criteria": {
-                    "identical": "Guaranteed identical settlement in all scenarios",
-                    "divergent": "Potential divergence in edge cases or definitions",
-                    "different_events": "Different events or criteria",
-                },
-            },
-            "probability": {
-                "type": "noul",
-                "instructions": "Are these two prediction markets guaranteed to settle identically?",
-            },
-        }
+        questions = equivalence_questions()
 
         resp = j_client.query_decisions(state, questions)
         answers = resp.get("answers", {})
@@ -307,7 +289,7 @@ def verify_cross_platform_equivalence_jev(
         conf = float(answers.get("is_equivalent", {}).get("confidence", 0.0))
         noul_p = float(answers.get("probability", {}).get("noul", 0.0))
 
-        equiv = (choice == "identical") and (noul_p >= 0.85) and (conf >= min_confidence)
+        equiv = (choice == "identical") and (0.85 <= noul_p <= 1.0) and (max(0.90, min_confidence) <= conf <= 1.0)
         return equiv, conf, f"Jev: choice={choice}, P={noul_p:.2f}, conf={conf:.2f}"
     except Exception as e:
         logger.debug("Jev equivalence check failed: %s", e)

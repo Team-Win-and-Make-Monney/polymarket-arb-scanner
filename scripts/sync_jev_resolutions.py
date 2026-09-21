@@ -35,62 +35,43 @@ logger = logging.getLogger(__name__)
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 
 
-def fetch_market_by_question(question: str) -> dict | None:
-    """Fetch market state from Polymarket Gamma API by question string."""
+def fetch_market_by_id(market_id: str) -> dict | None:
+    """Fetch and verify an exact condition ID; title searches are not identity."""
     try:
-        encoded_q = urllib.parse.quote(question)
-        url = f"{GAMMA_BASE}/markets?search={encoded_q}&limit=5"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        query = urllib.parse.urlencode({"condition_ids": market_id, "limit": 2})
+        req = urllib.request.Request(f"{GAMMA_BASE}/markets?{query}", headers={"User-Agent": "JevResearch/1"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             markets = json.loads(resp.read().decode("utf-8"))
-            if not markets:
-                return None
-            for m in markets:
-                if m.get("question", "").strip().lower() == question.strip().lower():
-                    return m
-            return None
-    except Exception as e:
-        logger.debug("Failed to fetch market for question '%s': %s", question, e)
+        matches = [m for m in markets if m.get("conditionId") == market_id]
+        return matches[0] if len(matches) == 1 else None
+    except Exception as exc:
+        logger.debug("Market resolution lookup failed: %s", type(exc).__name__)
         return None
 
 
 def parse_resolution_outcome(market: dict) -> float | None:
-    """Parse ground-truth resolution outcome from a Polymarket market dict.
+    """Require final UMA status and exact binary settlement, with explicit labels.
 
-    Returns:
-        1.0 for Yes, 0.0 for No, or None if still active/unresolved.
+    Closed markets, proposed/disputed outcomes and 0.99 prices are not finality.
+    Non-binary/split settlements are excluded from binary calibration.
     """
-    if not market.get("closed") and not market.get("resolvedOutcome"):
+    if market.get("closed") is not True or market.get("umaResolutionStatus") != "resolved":
         return None
-
-    res_outcome = market.get("resolvedOutcome")
-    if res_outcome is not None:
-        val_str = str(res_outcome).strip().lower()
-        if val_str in ("yes", "1", "true"):
-            return 1.0
-        elif val_str in ("no", "0", "false"):
-            return 0.0
-
-    raw_prices = market.get("outcomePrices")
-    if raw_prices:
-        try:
-            prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
-            yes_p = float(prices[0])
-            no_p = float(prices[1])
-            if yes_p >= 0.99:
-                return 1.0
-            if no_p >= 0.99:
-                return 0.0
-        except (ValueError, IndexError, TypeError):
-            pass
-
-    tokens = market.get("tokens", [])
-    if len(tokens) >= 2:
-        if tokens[0].get("winner") is True:
-            return 1.0
-        if tokens[1].get("winner") is True:
-            return 0.0
-
+    try:
+        outcomes = market.get("outcomes", [])
+        prices = market.get("outcomePrices", [])
+        outcomes = json.loads(outcomes) if isinstance(outcomes, str) else outcomes
+        prices = json.loads(prices) if isinstance(prices, str) else prices
+        if not isinstance(outcomes, list) or not isinstance(prices, list) or len(outcomes) != 2 or len(prices) != 2:
+            return None
+        labels = [str(label).strip().lower() for label in outcomes]
+        if set(labels) != {"yes", "no"}:
+            return None
+        values = dict(zip(labels, map(float, prices)))
+        if (values["yes"], values["no"]) in ((1.0, 0.0), (0.0, 1.0)):
+            return values["yes"]
+    except (ValueError, TypeError):
+        logger.debug("Malformed settlement values")
     return None
 
 
@@ -124,7 +105,7 @@ def sync_resolutions(
 
     logger.info("Checking %d unresolved decisions for settlement...", len(unresolved))
 
-    # Cache market lookups by question to minimize API calls
+    # Cache market lookups by stable condition ID to minimize API calls
     market_cache: dict[str, dict | None] = {}
     resolved_count = 0
     skipped_count = 0
@@ -137,23 +118,35 @@ def sync_resolutions(
             details = {}
 
         question = details.get("question") if isinstance(details, dict) else None
-        if not question:
+        market_id = details.get("market_id") if isinstance(details, dict) else None
+        if not isinstance(market_id, str) or not market_id:
             skipped_count += 1
             continue
 
-        if question not in market_cache:
-            market_cache[question] = fetch_market_by_question(question)
+        if market_id not in market_cache:
+            market_cache[market_id] = fetch_market_by_id(market_id)
 
-        mkt = market_cache[question]
+        mkt = market_cache[market_id]
         if not mkt:
             skipped_count += 1
             continue
 
         outcome = parse_resolution_outcome(mkt)
         if outcome is not None:
-            resolved_at = mkt.get("endDate") or datetime.now(timezone.utc).isoformat()
+            # This is when finality was observed, never an invented event-resolution time.
+            resolved_at = datetime.now(timezone.utc).isoformat()
+            details["resolution_source"] = "gamma_final_uma"
+            details["resolution_checked_at"] = resolved_at
+            details["resolution_status"] = mkt["umaResolutionStatus"]
+            details["resolution_outcomes"] = mkt.get("outcomes")
+            details["resolution_prices"] = mkt.get("outcomePrices")
             if not dry_run:
-                db.update_jev_resolution(dec["id"], outcome=outcome, resolved_at=resolved_at)
+                with db._lock, db.conn:
+                    db.conn.execute(
+                        "UPDATE jev_decisions SET resolved_outcome=?, resolved_at=?, details=? "
+                        "WHERE id=? AND resolved_outcome IS NULL",
+                        (outcome, resolved_at, json.dumps(details), dec["id"]),
+                    )
             outcome_label = "YES (1.0)" if outcome == 1.0 else "NO (0.0)"
             logger.info("Decision #%d resolved: %s -> %s", dec["id"], question, outcome_label)
             resolved_count += 1

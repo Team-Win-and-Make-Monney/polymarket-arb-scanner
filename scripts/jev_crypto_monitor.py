@@ -2,8 +2,7 @@
 """Multi-Asset Jev System One Crypto Monitor (BTC, ETH, SOL, XRP).
 
 Monitors live crypto prediction contracts on Polymarket against real-time
-Binance.US spot prices, evaluating calibrated probabilities, edge, and
-mispricings via TypeSafe's Jev-1.13 System One Decisions API.
+Binance.US spot prices, recording uncalibrated probability hypotheses and semantic interpretations via TypeSafe's Jev-1.13 System One Decisions API.
 
 All evaluations are logged to the TradeDB SQLite database (`jev_decisions` table)
 for empirical calibration curves and Brier score tracking.
@@ -28,7 +27,6 @@ from datetime import datetime, timezone
 # Add project root to sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import OPENROUTER_API_KEY
 from db import TradeDB
 from jev_client import get_jev_client
 from scans.jev_crypto import fetch_spot_prices, scan_jev_crypto
@@ -136,7 +134,7 @@ def run_monitor_cycle(db: TradeDB, asset_filter: str | None = None) -> None:
     """Run one monitoring iteration across spot venues, Polymarket, and Jev."""
     client = get_jev_client()
     if not client.is_available():
-        logger.error("JevClient not available. Ensure OPENROUTER_API_KEY is configured.")
+        logger.error("JevClient not available. Ensure TYPESAFE_API_KEY or TYPESAFE_API_KEY_FILE is configured.")
         return
 
     logger.info("Fetching Binance spot feeds for BTC, ETH, SOL, XRP...")
@@ -177,16 +175,16 @@ def run_monitor_cycle(db: TradeDB, asset_filter: str | None = None) -> None:
     print(f" JEV DECISION SCAN RESULTS ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')})")
     print("-" * 75)
     if not opps:
-        print("No mispriced opportunities passing deterministic risk/edge filters.")
+        print("No experimental paper candidates passing the research filters.")
         print("(Decisions and fair-pricing evaluations logged to database)")
     else:
-        print(f"FOUND {len(opps)} STATISTICALLY MISPRICED OPPORTUNITIES:")
+        print(f"FOUND {len(opps)} EXPERIMENTAL PAPER CANDIDATES (UNCALIBRATED):")
         for i, opp in enumerate(opps, 1):
             print(f"\n[{i}] {opp['market']}")
             print(f"    Action:     {opp['_action'].upper()}")
             print(f"    Exec Price: ${opp['_exec_price']:.3f} | Model Prob: {opp['_model_prob']:.1%}")
             print(f"    Confidence: {opp['_confidence']:.1%} | Risk Score: {opp['_risk_score']:.2f}")
-            print(f"    Net Profit: ${opp['net_profit']:.2f} (ROI: {opp['net_roi']:.2%})")
+            print(f"    Hypothetical EV: ${opp['net_profit']:.2f} (ROI: {opp['net_roi']:.2%})")
             print(f"    Total Cost: {opp['total_cost']}")
     print("-" * 75 + "\n")
 
@@ -203,9 +201,10 @@ def main() -> None:
     parser.add_argument("--interval", type=int, default=60, help="Interval in seconds between scans (default: 60)")
     parser.add_argument("--stats", action="store_true", help="Display calibration statistics from database and exit")
     parser.add_argument("--asset", type=str, default=None, help="Filter by specific asset (BTC, ETH, SOL, XRP)")
+    parser.add_argument("--db", required=True, help="Isolated research SQLite database path")
     args = parser.parse_args()
 
-    db = TradeDB()
+    db = TradeDB(args.db)
 
     if args.stats:
         display_stats(db, asset_filter=args.asset)

@@ -53,9 +53,11 @@ class TestBrierMath:
         assert calculate_brier_score(forecasts, outcomes) == 0.25
 
     def test_empty_or_mismatched_inputs_safe(self):
-        assert calculate_brier_score([], []) == 0.0
-        assert calculate_brier_score([0.5], []) == 0.0
-        assert calculate_brier_score([], [1.0]) == 0.0
+        assert calculate_brier_score([], []) is None
+        with pytest.raises(ValueError):
+            calculate_brier_score([0.5], [])
+        with pytest.raises(ValueError):
+            calculate_brier_score([], [1.0])
         with pytest.raises(ValueError, match="Mismatched input lengths"):
             calculate_brier_score([0.5], [1.0, 0.0])
 
@@ -126,28 +128,30 @@ class TestEdgeRealization:
             "action": "buy_yes",
             "market_prob": 0.60,
             "resolved_outcome": 1.0,
+            "details": {"yes_ask": 0.60, "no_ask": 0.45, "fees_usd": 1.0, "slippage_usd": 0.5},
         }]
         res = calculate_edge_realization(decisions, standard_stake=50.0)
         assert res["total_recommended"] == 1
         assert res["wins"] == 1
         assert res["win_rate"] == 1.0
-        # Cost = 50 * 0.60 = $30. Payout = $50. PnL = +$20
-        assert pytest.approx(res["total_pnl"], abs=1e-2) == 20.0
-        assert pytest.approx(res["total_cost"], abs=1e-2) == 30.0
-        assert pytest.approx(res["roi"], abs=1e-2) == (20.0 / 30.0)
+        # Buy $50 of contracts at $0.60; add explicit fees/slippage.
+        assert pytest.approx(res["total_pnl"], abs=1e-2) == (50 / 0.60 - 51.5)
+        assert pytest.approx(res["total_cost"], abs=1e-2) == 51.5
+        assert pytest.approx(res["roi"], abs=1e-2) == ((50 / 0.60 - 51.5) / 51.5)
 
     def test_buy_no_winning(self):
         decisions = [{
             "action": "buy_no",
             "market_prob": 0.70,  # YES is 0.70 -> NO cost is 0.30
             "resolved_outcome": 0.0,  # NO won!
+            "details": {"yes_ask": 0.70, "no_ask": 0.35, "fees_usd": 1.0, "slippage_usd": 0.5},
         }]
         res = calculate_edge_realization(decisions, standard_stake=50.0)
         assert res["total_recommended"] == 1
         assert res["wins"] == 1
         assert res["win_rate"] == 1.0
-        # Cost = 50 * 0.30 = $15. Payout = $50. PnL = +$35
-        assert pytest.approx(res["total_pnl"], abs=1e-2) == 35.0
+        # Use the actual NO ask of $0.35, never the complement of YES.
+        assert pytest.approx(res["total_pnl"], abs=1e-2) == (50 / 0.35 - 51.5)
 
     def test_mixed_trades_attribution(self):
         decisions = [
@@ -155,6 +159,8 @@ class TestEdgeRealization:
             {"action": "buy_yes", "market_prob": 0.50, "resolved_outcome": 0.0},  # Loss: -$25
             {"action": "pass_fair", "market_prob": 0.50, "resolved_outcome": 1.0}, # Ignored
         ]
+        for row in decisions:
+            row["details"] = {"yes_ask": 0.5, "no_ask": 0.55, "fees_usd": 0, "slippage_usd": 0}
         res = calculate_edge_realization(decisions, standard_stake=50.0)
         assert res["total_recommended"] == 2
         assert res["wins"] == 1
@@ -234,17 +240,18 @@ class TestDbResolutionMethods:
 class TestResolutionOutcomeParser:
     """Test parsing Polymarket Gamma API market dictionaries."""
 
-    def test_parse_resolved_outcome_string(self):
-        assert parse_resolution_outcome({"closed": True, "resolvedOutcome": "Yes"}) == 1.0
-        assert parse_resolution_outcome({"closed": True, "resolvedOutcome": "No"}) == 0.0
-        assert parse_resolution_outcome({"closed": True, "resolvedOutcome": "1"}) == 1.0
-        assert parse_resolution_outcome({"closed": True, "resolvedOutcome": "0"}) == 0.0
+    def test_closed_or_explicit_label_without_finality_is_insufficient(self):
+        assert parse_resolution_outcome({"closed": True, "resolvedOutcome": "Yes"}) is None
+        assert parse_resolution_outcome({"closed": True, "outcomePrices": '["1", "0"]'}) is None
 
     def test_parse_outcome_prices(self):
-        mkt_yes = {"closed": True, "outcomePrices": '["1", "0"]'}
-        mkt_no = {"closed": True, "outcomePrices": '["0", "1"]'}
-        assert parse_resolution_outcome(mkt_yes) == 1.0
-        assert parse_resolution_outcome(mkt_no) == 0.0
+        base = {"closed": True, "umaResolutionStatus": "resolved", "outcomes": '["Yes", "No"]'}
+        assert parse_resolution_outcome(dict(base, outcomePrices='["1", "0"]')) == 1.0
+        assert parse_resolution_outcome(dict(base, outcomePrices='["0", "1"]')) == 0.0
+        assert parse_resolution_outcome(dict(base, outcomePrices='["0.99", "0.01"]')) is None
+        assert parse_resolution_outcome(dict(base, outcomePrices='["0.5", "0.5"]')) is None
+        assert parse_resolution_outcome(dict(base, umaResolutionStatus="disputed", outcomePrices='["1", "0"]')) is None
+        assert parse_resolution_outcome(dict(base, outcomes='["No", "Yes"]', outcomePrices='["0", "1"]')) == 1.0
 
     def test_parse_unresolved_returns_none(self):
         mkt_open = {"closed": False, "outcomePrices": '["0.65", "0.35"]'}
@@ -268,7 +275,7 @@ class TestReportAndAsciiDiagram:
             ("SOL", 0.90, 0.75, "buy_yes", 1.0),
             ("SOL", 0.20, 0.40, "buy_no", 0.0),
         ]
-        for asset, j_prob, m_prob, action, outcome in samples:
+        for i, (asset, j_prob, m_prob, action, outcome) in enumerate(samples):
             dec_id = db.record_jev_decision(
                 asset=asset,
                 strike=100.0,
@@ -276,8 +283,14 @@ class TestReportAndAsciiDiagram:
                 action=action,
                 market_prob=m_prob,
                 jev_prob=j_prob,
+                details={"market_id": f"market-{i}", "observed_at": "2026-09-20T12:00:00Z",
+                         "expires_at": "2026-12-31T23:59:59Z", "contract_hash": "fixture",
+                         "model": "jev-1.13.0", "prompt_version": "fixture",
+                         "quote_method": "orderbook-extrema-v1", "resolution_source": "gamma_final_uma", "resolution_status": "resolved",
+                         "yes_ask": m_prob, "no_ask": 1 - m_prob + 0.02,
+                         "fees_usd": 0.5, "slippage_usd": 0.25},
             )
-            db.update_jev_resolution(dec_id, outcome=outcome)
+            db.update_jev_resolution(dec_id, outcome=outcome, resolved_at="2027-01-01T00:00:00Z")
 
         yield db
         db.close()

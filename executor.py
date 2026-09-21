@@ -324,6 +324,12 @@ class ArbitrageExecutor:
         opp_type = opportunity.get("type", "")
         market = opportunity.get("market", "Unknown")
 
+        # Experimental Jev forecasts have no demonstrated trading calibration.
+        # Check the type as well as the marker so a plain dict cannot omit the guard.
+        if not self.dry_run and (opp_type == "JevCrypto" or opportunity.get("_research_only")):
+            self._log_skipped(opportunity, "jev_research_only")
+            return False
+
         # 0. Kill switch — abort all execution when dashboard pause is engaged
         try:
             from dashboard import is_paused
@@ -1448,8 +1454,8 @@ class ArbitrageExecutor:
         jev_cross_enabled = getattr(_cfg, "JEV_CROSS_EQUIVALENCE_ENABLED", JEV_CROSS_EQUIVALENCE_ENABLED) if _cfg else JEV_CROSS_EQUIVALENCE_ENABLED
         if jev_cross_enabled:
             from matcher import verify_cross_platform_equivalence_jev
-            ma = {"question": opp.get("market", "")}
-            mb = {"title": opp.get("kalshi", "")}
+            ma = {"question": opp.get("market", ""), "rules": opp.get("_rules_a", "")}
+            mb = {"title": opp.get("kalshi", ""), "rules": opp.get("_rules_b", "")}
             conf_thresh = getattr(_cfg, "JEV_CONFIDENCE_THRESHOLD", JEV_CONFIDENCE_THRESHOLD) if _cfg else JEV_CONFIDENCE_THRESHOLD
             is_eq, conf, reason = verify_cross_platform_equivalence_jev(
                 ma, mb, "polymarket", "kalshi", min_confidence=conf_thresh

@@ -36,6 +36,8 @@ def format_terminal_report(report: dict) -> str:
     lines.append(f"Total Evaluated:    {report.get('total_logged', 0)}")
     lines.append(f"Total Resolved:     {report.get('total_resolved', 0)}")
 
+    lines.append(f"Sample window: {report.get('sample_window', 'unspecified')}")
+    lines.append(f"Record exclusions: {report.get('exclusions', {})}")
     if report.get("status") == "pending_resolutions":
         lines.append("-" * w)
         lines.append("NOTICE: " + report.get("message", "No resolved decisions found."))
@@ -62,11 +64,11 @@ def format_terminal_report(report: dict) -> str:
 
     # Edge realization
     edge = report.get("edge_realization", {})
-    if edge and edge.get("total_recommended", 0) > 0:
+    if edge and edge.get("evaluated_trades", 0) > 0:
         lines.append("-" * w)
-        lines.append("EDGE REALIZATION & SIMULATED EXECUTION PERFORMANCE")
+        lines.append("HYPOTHETICAL FILLS — COST ASSUMPTIONS, NOT REALIZED RETURNS")
         lines.append("-" * w)
-        rec = edge.get("total_recommended", 0)
+        rec = edge.get("evaluated_trades", 0)
         w_cnt = edge.get("wins", 0)
         l_cnt = edge.get("losses", 0)
         wr = edge.get("win_rate", 0.0) * 100
@@ -74,8 +76,11 @@ def format_terminal_report(report: dict) -> str:
         roi = edge.get("roi", 0.0) * 100
         lines.append(f"  Actionable Decisions:          {rec} trades (buy_yes / buy_no)")
         lines.append(f"  Win / Loss Record:             {w_cnt}W - {l_cnt}L ({wr:.1f}% win rate)")
-        lines.append(f"  Simulated Net PnL ($50 stake): ${pnl:+.2f} ({roi:+.2f}% ROI)")
+        lines.append(f"  Hypothetical net PnL (explicit USD budgets): ${pnl:+.2f} ({roi:+.2f}% ROI)")
 
+    lines.append(f"Excluded cost-incomplete rows: {edge.get('excluded_records', 0)}")
+    lines.append(f"Research exclusions: {report.get('exclusions', {})}")
+    lines.append("No trading-readiness conclusion follows from this descriptive report.")
     # Asset breakdown table
     per_asset = report.get("per_asset", {})
     if per_asset:
@@ -130,11 +135,15 @@ def format_markdown_report(report: dict) -> str:
     lines.append(f"- **Resolved Decisions**: `{report.get('total_resolved', 0)}`")
     lines.append("")
 
+    lines.append(f"Sample window: {report.get('sample_window', 'unspecified')}")
+    lines.append(f"Record exclusions: {report.get('exclusions', {})}")
     if report.get("status") == "pending_resolutions":
         lines.append("> [!NOTE]")
         lines.append(f"> {report.get('message')}")
         return "\n".join(lines)
 
+    lines.append(f"Research exclusions: {report.get('exclusions', {})}")
+    lines.append("Hypothetical fills only. Missing quotes/costs are excluded; this is not realized P&L.")
     lines.append("## Summary Metrics")
     lines.append("")
     lines.append("| Metric | Value | Reference / Meaning |")
@@ -148,12 +157,13 @@ def format_markdown_report(report: dict) -> str:
     lines.append("")
 
     edge = report.get("edge_realization", {})
-    if edge and edge.get("total_recommended", 0) > 0:
+    lines.append(f"Cost-incomplete rows excluded: {edge.get('excluded_records', 0)}")
+    if edge and edge.get("evaluated_trades", 0) > 0:
         lines.append("## Simulated Edge Realization")
         lines.append("")
         wr = edge.get("win_rate", 0.0) * 100
         roi = edge.get("roi", 0.0) * 100
-        lines.append(f"- **Actionable Trades**: {edge.get('total_recommended')} (`{edge.get('wins')}W - {edge.get('losses')}L`)")
+        lines.append(f"- **Evaluated Trades**: {edge.get('evaluated_trades')} (`{edge.get('wins')}W - {edge.get('losses')}L`)")
         lines.append(f"- **Win Rate**: `{wr:.1f}%`")
         lines.append(rf"- **Simulated PnL**: `\${edge.get('total_pnl'):+.2f}` (`{roi:+.2f}%` ROI)")
         lines.append("")

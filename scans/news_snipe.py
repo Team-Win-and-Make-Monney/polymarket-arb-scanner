@@ -1,6 +1,7 @@
 """News-driven resolution sniping strategy using Finnhub news headlines."""
 
 import logging
+from jev_semantics import settlement_rules as extract_settlement_rules
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -154,7 +155,8 @@ def extract_news_signals(
 
             # Score sentiment using Jev semantic resolution with keyword fallback
             sentiment_result = _score_sentiment_with_jev(
-                headline_text, summary_text, market.get("question", ""), client=jev_client
+                headline_text, summary_text, market.get("question", ""), client=jev_client,
+                settlement_rules=extract_settlement_rules(market)
             )
             if sentiment_result["sentiment"] is None:
                 continue
@@ -189,6 +191,7 @@ def _score_sentiment_with_jev(
     summary: str,
     market_question: str,
     client=None,
+    settlement_rules: str = "",
 ) -> dict:
     """Score sentiment using Jev System One semantic evaluation, with keyword fallback.
 
@@ -206,30 +209,23 @@ def _score_sentiment_with_jev(
         j_client = client or get_jev_client()
         if j_client.is_available():
             try:
+                from jev_semantics import news_question
+                if not settlement_rules.strip():
+                    return {"sentiment": None, "confidence": 0.0, "source": "jev_missing_rules"}
                 state = {
-                    "headline": headline,
-                    "summary": summary,
-                    "market_question": market_question,
+                    "headline": headline, "summary": summary,
+                    "market_question": market_question, "settlement_rules": settlement_rules,
                 }
-                questions = {
-                    "outcome_resolution": {
-                        "type": "choice",
-                        "instructions": (
-                            "Given the headline and summary, does this breaking news event definitively "
-                            "confirm the resolution outcome for `market_question` to resolve YES, NO, or is it neutral/inconclusive?"
-                        ),
-                        "criteria": {
-                            "resolves_yes": "The news explicitly confirms the market condition occurred or passed (YES outcome)",
-                            "resolves_no": "The news explicitly confirms the market condition failed, was rejected, or cancelled (NO outcome)",
-                            "neutral_unclear": "The news is speculative, ongoing, unrelated, or inconclusive",
-                        },
-                    }
-                }
+                questions = {"outcome_resolution": news_question()}
                 res = j_client.query_decisions(state, questions)
                 q_ans = res.get("answers", {}).get("outcome_resolution", {})
                 choice = q_ans.get("choice", "neutral_unclear")
                 conf = float(q_ans.get("confidence", 0.0))
 
+                if choice == "neutral_unclear":
+                    return {"sentiment": None, "confidence": 0.0, "source": "jev"}
+                if not 0.90 <= conf <= 1.0:
+                    return {"sentiment": None, "confidence": conf, "source": "jev_review"}
                 if choice == "resolves_yes":
                     return {"sentiment": "YES", "confidence": conf, "source": "jev"}
                 elif choice == "resolves_no":

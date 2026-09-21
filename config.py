@@ -948,7 +948,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 # Jev System One Decision Engine
 # ---------------------------------------------------------------------------
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-JEV_MODEL = os.getenv("JEV_MODEL", "typesafe/jev-1.13")
+JEV_MODEL = os.getenv("TYPESAFE_MODEL", "jev-1.13.0")
 JEV_CONFIDENCE_THRESHOLD = _env_float("JEV_CONFIDENCE_THRESHOLD", "0.70")
 JEV_MIN_EDGE = _env_float("JEV_MIN_EDGE", "0.04")
 JEV_CRYPTO_ENABLED = _env_bool("JEV_CRYPTO_ENABLED", "false")

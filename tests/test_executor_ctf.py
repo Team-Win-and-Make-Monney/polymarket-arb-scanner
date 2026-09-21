@@ -19,12 +19,12 @@ from risk_manager import RiskManager
 class TestExecutorCTF:
     """Test suite for executor CTF leg construction, revalidation, and simulation."""
 
-    def _setup_executor(self, dry_run: bool = True) -> executor_mod.ArbitrageExecutor:
-        curr_class = getattr(sys.modules.get("executor"), "ArbitrageExecutor", executor_mod.ArbitrageExecutor)
+    def _setup_executor(self, dry_run: bool = True):
+        import executor as curr_exec
         db = MagicMock(spec=TradeDB)
         risk = MagicMock(spec=RiskManager)
         ctf_client = CTFClient(dry_run=dry_run)
-        return curr_class(
+        return curr_exec.ArbitrageExecutor(
             pm_trader=None,
             kalshi_client=None,
             db=db,
@@ -124,6 +124,7 @@ class TestExecutorCTF:
 
     def test_revalidate_ctf_merge_success_and_failure(self) -> None:
         """Verify _revalidate_ctf for CTFMerge passes when asks < 1.00 and fails when asks rise."""
+        import executor as curr_exec
         import polymarket_api
         executor = self._setup_executor()
         opp = {
@@ -134,8 +135,10 @@ class TestExecutorCTF:
             "_token_ids": ["token_yes_123", "token_no_456"],
         }
         mock_book = {"bids": [], "asks": []}
-        with patch.object(executor_mod, "fetch_order_book", return_value=mock_book), \
-             patch.object(executor_mod, "get_best_bid_ask") as mock_gba, \
+        with patch.object(curr_exec, "fetch_order_book", return_value=mock_book), \
+             patch.object(curr_exec, "get_best_bid_ask") as mock_gba, \
+             patch.object(executor_mod, "fetch_order_book", return_value=mock_book), \
+             patch.object(executor_mod, "get_best_bid_ask", mock_gba), \
              patch.object(polymarket_api, "fetch_order_book", return_value=mock_book), \
              patch.object(polymarket_api, "get_best_bid_ask", mock_gba):
             # 1. Asks remain low (0.42 and 0.45) -> passes
@@ -158,6 +161,7 @@ class TestExecutorCTF:
 
     def test_revalidate_ctf_mint_success_and_failure(self) -> None:
         """Verify _revalidate_ctf for CTFMint passes when bids > 1.00 and fails when bids fall."""
+        import executor as curr_exec
         import polymarket_api
         executor = self._setup_executor()
         opp = {
@@ -168,8 +172,10 @@ class TestExecutorCTF:
             "_token_ids": ["token_yes_123", "token_no_456"],
         }
         mock_book = {"bids": [], "asks": []}
-        with patch.object(executor_mod, "fetch_order_book", return_value=mock_book), \
-             patch.object(executor_mod, "get_best_bid_ask") as mock_gba, \
+        with patch.object(curr_exec, "fetch_order_book", return_value=mock_book), \
+             patch.object(curr_exec, "get_best_bid_ask") as mock_gba, \
+             patch.object(executor_mod, "fetch_order_book", return_value=mock_book), \
+             patch.object(executor_mod, "get_best_bid_ask", mock_gba), \
              patch.object(polymarket_api, "fetch_order_book", return_value=mock_book), \
              patch.object(polymarket_api, "get_best_bid_ask", mock_gba):
             # 1. Bids remain high (0.55 and 0.53) -> passes
@@ -192,6 +198,7 @@ class TestExecutorCTF:
 
     def test_execute_single_leg_dry_run_simulation(self) -> None:
         """Verify _execute_single_leg simulates CTF calldata build in dry-run mode."""
+        import executor as curr_exec
         executor = self._setup_executor(dry_run=True)
         leg = {
             "platform": "polymarket_ctf",
@@ -203,7 +210,8 @@ class TestExecutorCTF:
         opp = {"type": "CTFMerge", "market": "Test market"}
 
         # Enable polymarket_ctf in whitelist so guard passes
-        with patch("executor.ENABLED_EXECUTION_PLATFORMS", frozenset({"polymarket", "polymarket_ctf", "kalshi"})):
+        with patch.object(curr_exec, "ENABLED_EXECUTION_PLATFORMS", frozenset({"polymarket", "polymarket_ctf", "kalshi"})), \
+             patch.object(executor_mod, "ENABLED_EXECUTION_PLATFORMS", frozenset({"polymarket", "polymarket_ctf", "kalshi"})):
             success, tx_id, fill_price = executor._execute_single_leg(leg, 10.0, opp)
             assert success is True
             assert tx_id is not None
@@ -214,6 +222,7 @@ class TestExecutorCTF:
 
     def test_execute_single_leg_live_fails_closed_in_phase_4a(self) -> None:
         """Phase 4a constraint: live execution must raise NotImplementedError."""
+        import executor as curr_exec
         executor = self._setup_executor(dry_run=False)
         leg = {
             "platform": "polymarket_ctf",
@@ -224,6 +233,7 @@ class TestExecutorCTF:
         }
         opp = {"type": "CTFMerge", "market": "Test market"}
 
-        with patch("executor.ENABLED_EXECUTION_PLATFORMS", frozenset({"polymarket", "polymarket_ctf", "kalshi"})):
+        with patch.object(curr_exec, "ENABLED_EXECUTION_PLATFORMS", frozenset({"polymarket", "polymarket_ctf", "kalshi"})), \
+             patch.object(executor_mod, "ENABLED_EXECUTION_PLATFORMS", frozenset({"polymarket", "polymarket_ctf", "kalshi"})):
             with pytest.raises(NotImplementedError):
                 executor._execute_single_leg(leg, 10.0, opp)

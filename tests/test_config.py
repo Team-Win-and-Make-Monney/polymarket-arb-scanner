@@ -646,7 +646,7 @@ class TestCTFConfig:
     def test_ctf_convert_requires_neg_risk_adapter_in_live(self, monkeypatch, tmp_path):
         from live_envelope_fixtures import write_test_envelope
         monkeypatch.setenv("LIVE_ENVELOPE_PATH", str(write_test_envelope(tmp_path)))
-        import config as cfg
+        cfg = _reload_config()
         monkeypatch.setattr(cfg, "DRY_RUN", False)
         monkeypatch.setattr(cfg, "CTF_ENABLED", True)
         monkeypatch.setattr(cfg, "CTF_CONVERT_ENABLED", True)
@@ -661,7 +661,7 @@ class TestCTFConfig:
     def test_ctf_convert_passes_with_adapter_address(self, monkeypatch, tmp_path):
         from live_envelope_fixtures import write_test_envelope
         monkeypatch.setenv("LIVE_ENVELOPE_PATH", str(write_test_envelope(tmp_path)))
-        import config as cfg
+        cfg = _reload_config()
         monkeypatch.setattr(cfg, "DRY_RUN", False)
         monkeypatch.setattr(cfg, "CTF_ENABLED", True)
         monkeypatch.setattr(cfg, "CTF_CONVERT_ENABLED", True)

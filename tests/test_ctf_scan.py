@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scans.ctf import scan_ctf
+import scans.ctf as ctf_mod
 
 
 class TestCTFScan:
@@ -19,7 +19,6 @@ class TestCTFScan:
     @pytest.fixture(autouse=True)
     def _ensure_polymarket_funcs(self):
         """Ensure scans.ctf has valid binary parsing functions even if stubbed by prior tests."""
-        import scans.ctf as ctf_mod
         orig_gbm = getattr(ctf_mod, "get_binary_markets", None)
         orig_pop = getattr(ctf_mod, "parse_outcome_prices", None)
 
@@ -130,7 +129,7 @@ class TestCTFScan:
         mock_fetch_clob.side_effect = mock_clob_impl
 
         markets = self._sample_markets()
-        opps = scan_ctf(markets, min_profit=0.005)
+        opps = ctf_mod.scan_ctf(markets, min_profit=0.005)
 
         # Should find 2 opportunities (Market 1 Merge and Market 2 Mint; Market 3 expired)
         types = [o["type"] for o in opps]
@@ -166,7 +165,7 @@ class TestCTFScan:
         mock_fetch_clob.side_effect = mock_clob_impl
 
         markets = [self._sample_markets()[0]]
-        opps = scan_ctf(markets, min_profit=0.005)
+        opps = ctf_mod.scan_ctf(markets, min_profit=0.005)
         assert len(opps) == 0
 
     @patch("scans.ctf._fetch_clob_for_market")
@@ -185,9 +184,9 @@ class TestCTFScan:
         markets = self._sample_markets()
 
         # Only merge
-        merge_only = scan_ctf(markets, min_profit=0.005, enable_merge=True, enable_mint=False)
+        merge_only = ctf_mod.scan_ctf(markets, min_profit=0.005, enable_merge=True, enable_mint=False)
         assert all(o["type"] == "CTFMerge" for o in merge_only)
 
         # Only mint
-        mint_only = scan_ctf(markets, min_profit=0.005, enable_merge=False, enable_mint=True)
+        mint_only = ctf_mod.scan_ctf(markets, min_profit=0.005, enable_merge=False, enable_mint=True)
         assert all(o["type"] == "CTFMint" for o in mint_only)

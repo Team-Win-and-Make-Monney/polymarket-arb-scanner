@@ -983,8 +983,8 @@ class TestCTFModeCLI:
                  patch("cli.TradeDB"):
                 try:
                     main()
-                except SystemExit:
-                    pass
+                except SystemExit as exc:
+                    assert exc.code in (0, None)
                 assert mock_oneshot.called
                 args = mock_oneshot.call_args[0][0]
                 assert args.mode == "ctf"

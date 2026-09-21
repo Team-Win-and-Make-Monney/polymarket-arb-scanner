@@ -185,7 +185,7 @@ CANARY_LIVE_ACK = os.getenv("CANARY_LIVE_ACK", "").strip()
 # be scanned for price data but will never execute trades.
 _VALID_PLATFORMS = frozenset([
     "polymarket", "polymarket_ctf", "kalshi", "betfair", "smarkets",
-    "sxbet", "matchbook", "gemini", "ibkr",
+    "sxbet", "matchbook", "gemini", "ibkr", "limitless",
 ])
 _raw_enabled = os.getenv("ENABLED_EXECUTION_PLATFORMS", "kalshi")
 if _raw_enabled.strip().lower() in ("all", "all platforms", "*"):
@@ -237,6 +237,7 @@ PLATFORM_MIN_ORDER_SIZE: dict[str, float] = {
     "betfair": 2.50,
     "smarkets": 6.25,
     "matchbook": 5.50,
+    "limitless": 0.01,
 }
 
 # Polygon gas cost estimate (per transaction, in dollars)
@@ -527,6 +528,15 @@ REWARDS_MAX_SPREAD = _env_float("REWARDS_MAX_SPREAD", "0.05")
 REWARDS_POLL_INTERVAL = _env_int("REWARDS_POLL_INTERVAL", "60")
 REWARDS_MIN_RESTING_TIME = _env_int("REWARDS_MIN_RESTING_TIME", "300")
 REWARDS_MAX_MARKETS = _env_int("REWARDS_MAX_MARKETS", "100")
+
+# Limitless Exchange (Base CLOB) & delta-neutral reward farming
+LIMITLESS_API_KEY = os.getenv("LIMITLESS_API_KEY", "")
+LIMITLESS_PRIVATE_KEY = os.getenv("LIMITLESS_PRIVATE_KEY", "")
+LIMITLESS_BASE_URL = os.getenv("LIMITLESS_BASE_URL", "https://api.limitless.exchange")
+LIMITLESS_EXCHANGE_CONTRACT = os.getenv("LIMITLESS_EXCHANGE_CONTRACT", "")
+LIMITLESS_REWARDS_ENABLED = _env_bool("LIMITLESS_REWARDS_ENABLED", "false")
+LIMITLESS_MAX_INVENTORY = _env_float("LIMITLESS_MAX_INVENTORY", "200.0")
+LIMITLESS_RATE_LIMIT = _env_float("LIMITLESS_RATE_LIMIT", "0.2")
 
 # Kalshi Liquidity Incentive Program (LIP) — snapshot scoring of resting orders.
 KALSHI_LIP_ENABLED = _env_bool("KALSHI_LIP_ENABLED", "false")
@@ -1521,6 +1531,27 @@ def validate_config() -> list[str]:
             "DRY_RUN=true for detection-only, or remove sxbet from "
             "ENABLED_EXECUTION_PLATFORMS."
         )
+
+    # Limitless reward farming validation
+    if LIMITLESS_REWARDS_ENABLED and not DRY_RUN:
+        if not LIMITLESS_API_KEY:
+            raise ConfigError(
+                "LIMITLESS_REWARDS_ENABLED=true and DRY_RUN=false requires LIMITLESS_API_KEY"
+            )
+        if not LIMITLESS_PRIVATE_KEY:
+            raise ConfigError(
+                "LIMITLESS_REWARDS_ENABLED=true and DRY_RUN=false requires LIMITLESS_PRIVATE_KEY"
+            )
+        if not _is_valid_eth_address(LIMITLESS_EXCHANGE_CONTRACT):
+            raise ConfigError(
+                f"LIMITLESS_REWARDS_ENABLED=true and DRY_RUN=false requires valid non-zero "
+                f"LIMITLESS_EXCHANGE_CONTRACT address, got {LIMITLESS_EXCHANGE_CONTRACT!r}"
+            )
+        if "limitless" not in ENABLED_EXECUTION_PLATFORMS:
+            raise ConfigError(
+                "LIMITLESS_REWARDS_ENABLED=true and DRY_RUN=false requires 'limitless' in "
+                "ENABLED_EXECUTION_PLATFORMS. Add limitless to the execution whitelist."
+            )
 
     # Plan 04: CTF validation — require valid non-zero 20-byte addresses if CTF features are enabled
     if CTF_ENABLED or CTF_MERGE_ENABLED or CTF_MINT_SELL_ENABLED or CTF_CONVERT_ENABLED:

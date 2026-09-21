@@ -697,6 +697,47 @@ class TestCTFConfig:
         monkeypatch.setattr(cfg, "NEG_RISK_ADAPTER_ADDRESS", "0x" + "3" * 40)
         cfg.validate_config()
 
+    def test_limitless_rewards_validation(self, monkeypatch, tmp_path):
+        from live_envelope_fixtures import write_test_envelope
+        monkeypatch.setenv("LIVE_ENVELOPE_PATH", str(write_test_envelope(tmp_path)))
+        cfg = _reload_config()
+        monkeypatch.setattr(cfg, "DRY_RUN", False)
+        monkeypatch.setattr(cfg, "LIMITLESS_REWARDS_ENABLED", True)
+        monkeypatch.setattr(cfg, "LIMITLESS_API_KEY", "")
+        monkeypatch.setattr(cfg, "LIMITLESS_PRIVATE_KEY", "")
+        monkeypatch.setattr(cfg, "LIMITLESS_EXCHANGE_CONTRACT", "")
+        monkeypatch.setattr(cfg, "ENABLED_EXECUTION_PLATFORMS", frozenset(["kalshi"]))
+
+        # Missing API key in live mode fails
+        with pytest.raises(cfg.ConfigError, match="requires LIMITLESS_API_KEY"):
+            cfg.validate_config()
+
+        # Missing private key in live mode fails
+        monkeypatch.setattr(cfg, "LIMITLESS_API_KEY", "valid-key")
+        with pytest.raises(cfg.ConfigError, match="requires LIMITLESS_PRIVATE_KEY"):
+            cfg.validate_config()
+
+        # Missing exchange contract in live mode fails
+        monkeypatch.setattr(cfg, "LIMITLESS_PRIVATE_KEY", "valid-pk")
+        with pytest.raises(cfg.ConfigError, match="requires valid non-zero LIMITLESS_EXCHANGE_CONTRACT address"):
+            cfg.validate_config()
+
+        # Missing limitless in execution whitelist fails
+        monkeypatch.setattr(cfg, "LIMITLESS_EXCHANGE_CONTRACT", "0x" + "2" * 40)
+        with pytest.raises(cfg.ConfigError, match="requires 'limitless' in ENABLED_EXECUTION_PLATFORMS"):
+            cfg.validate_config()
+
+        # Valid live configuration passes
+        monkeypatch.setattr(cfg, "ENABLED_EXECUTION_PLATFORMS", frozenset(["kalshi", "limitless"]))
+        cfg.validate_config()
+
+        # Dry run passes even without credentials
+        monkeypatch.setattr(cfg, "DRY_RUN", True)
+        monkeypatch.setattr(cfg, "LIMITLESS_API_KEY", "")
+        monkeypatch.setattr(cfg, "LIMITLESS_PRIVATE_KEY", "")
+        monkeypatch.setattr(cfg, "LIMITLESS_EXCHANGE_CONTRACT", "")
+        cfg.validate_config()
+
 
 # ---------------------------------------------------------------------------
 # Env hygiene — no personal/global env files merged into the bot environment

@@ -1029,3 +1029,46 @@ class TestCTFModeCLI:
 
         assert exc_info.value.code == 1
         mock_scan.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Limitless Rewards Mode CLI Tests
+# ---------------------------------------------------------------------------
+
+
+class TestLimitlessRewardsModeCLI:
+    def test_cli_parser_accepts_limitless_rewards_mode(self):
+        from cli import main
+        with patch.object(sys, "argv", ["scanner.py", "--mode", "limitless-rewards", "--dry-run"]):
+            with patch("cli._run_oneshot") as mock_oneshot, \
+                 patch("cli.build_client_from_env", return_value=None), \
+                 patch("cli.TradeDB"):
+                try:
+                    main()
+                except SystemExit as exc:
+                    assert exc.code in (0, None)
+                assert mock_oneshot.called
+                args = mock_oneshot.call_args[0][0]
+                assert args.mode == "limitless-rewards"
+
+    def test_run_oneshot_dispatches_limitless_rewards(self):
+        args = _make_args(mode="limitless-rewards")
+        mock_opp = {
+            "type": "LimitlessRewards",
+            "market": "Test Limitless Market",
+            "net_profit": 0.0,
+            "net_roi": 0.0,
+            "reward_pool_usdc": 100.0,
+            "total_cost": "$5.00",
+        }
+
+        with patch.object(_cli_mod, "scan_limitless_rewards", return_value=[mock_opp]) as mock_scan, \
+             patch.object(_cli_mod, "display_results") as mock_display, \
+             patch.object(_cli_mod, "dashboard_state"):
+            _cli_mod._run_oneshot(args, min_profit=0.0, kalshi_client=None, executor=_make_executor(), db=_make_db())
+
+        mock_scan.assert_called_once()
+        mock_display.assert_called_once()
+        opps = mock_display.call_args[0][0]
+        assert len(opps) == 1
+        assert opps[0]["type"] == "LimitlessRewards"

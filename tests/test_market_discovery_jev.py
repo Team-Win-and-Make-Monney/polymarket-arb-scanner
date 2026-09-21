@@ -95,10 +95,13 @@ class TestMarketDiscoveryJev(unittest.TestCase):
             question_a="Will TikTok be banned in the US in 2025?",
             venue_b="kalshi",
             question_b="Will TikTok be sold by ByteDance by Dec 2025?",
+            rules_a="YES if a US ban takes effect during 2025.",
+            rules_b="YES if ByteDance completes a sale before 2026.",
         )
 
         judgment = judge.judge_pair(pair)
         self.assertFalse(judgment.equivalent)
+        mock_client.query_decisions.assert_called_once()
 
     def test_verify_cross_platform_equivalence_jev(self):
         """Test matcher gate verification helper."""
@@ -139,6 +142,25 @@ class TestMarketDiscoveryJev(unittest.TestCase):
         )
         self.assertFalse(equiv)
         self.assertIn("fail-closed", reason)
+
+    def test_verify_cross_platform_equivalence_jev_opp_rules(self):
+        """Test that market dicts with rules from opp pass through settlement_rules to Jev query."""
+        mock_client = MagicMock()
+        mock_client.is_available.return_value = True
+        mock_client.query_decisions.return_value = {
+            "answers": {
+                "is_equivalent": {"type": "choice", "choice": "identical", "confidence": 0.95},
+                "probability": {"type": "noul", "noul": 0.96},
+            }
+        }
+
+        ma = {"question": "Fed cut in Dec 2026?", "rules": "Official FOMC statement cuts target rate."}
+        mb = {"title": "Fed rate cut Dec 2026?", "rules": "FOMC press release indicates rate reduction."}
+        equiv, conf, _ = verify_cross_platform_equivalence_jev(ma, mb, "polymarket", "kalshi", client=mock_client)
+        self.assertTrue(equiv)
+        call_state = mock_client.query_decisions.call_args[0][0]
+        self.assertEqual(call_state["rules_a"], "Official FOMC statement cuts target rate.")
+        self.assertEqual(call_state["rules_b"], "FOMC press release indicates rate reduction.")
 
 
 if __name__ == "__main__":

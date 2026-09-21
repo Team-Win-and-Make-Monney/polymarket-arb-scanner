@@ -577,3 +577,13 @@ class TestBestBidAskValidation:
             "asks": [{"price": "0.51", "size": "8"}],
         })
         assert result == {"bid": 0.49, "bid_size": 12.0, "ask": 0.51, "ask_size": 8.0}
+
+
+class TestOrderbookOrdering:
+    def test_best_prices_do_not_depend_on_array_order(self):
+        result = _real_get_best_bid_ask({
+            "asks": [{"price": "0.999", "size": "9"}, {"price": "0.41", "size": "12"},
+                     {"price": "0.60", "size": "5"}, {"price": "0.41", "size": "3"}],
+            "bids": [{"price": "0.01", "size": "9"}, {"price": "0.39", "size": "7"}],
+        })
+        assert result == {"ask": 0.41, "ask_size": 15, "bid": 0.39, "bid_size": 7}

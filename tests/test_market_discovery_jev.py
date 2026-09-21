@@ -63,7 +63,9 @@ class TestMarketDiscoveryJev(unittest.TestCase):
             venue_a="polymarket",
             question_a="Will Bitcoin hit $100k before 2027?",
             venue_b="kalshi",
-            question_b="Bitcoin above $100,000 by Dec 31, 2026?",
+            question_b="Will Bitcoin hit $100k before 2027?",
+            rules_a="YES if index X reaches 100000 during 2026 UTC, otherwise NO.",
+            rules_b="YES if index X reaches 100000 during 2026 UTC, otherwise NO.",
         )
 
         judgment = judge.judge_pair(pair)
@@ -114,8 +116,8 @@ class TestMarketDiscoveryJev(unittest.TestCase):
         }
 
         equiv, conf, reason = verify_cross_platform_equivalence_jev(
-            {"question": "Will Fed cut rates in Dec 2026?"},
-            {"title": "Fed rate cut at December 2026 meeting?"},
+            {"question": "Will Fed cut rates in Dec 2026?", "rules": "YES if the announced December meeting target range is lower than the prior range."},
+            {"title": "Fed rate cut at December 2026 meeting?", "rules": "YES if the announced December meeting target range is lower than the prior range."},
             "polymarket",
             "kalshi",
             client=mock_client,
@@ -129,8 +131,8 @@ class TestMarketDiscoveryJev(unittest.TestCase):
         mock_client.is_available.return_value = False
 
         equiv, conf, reason = verify_cross_platform_equivalence_jev(
-            {"question": "Will Fed cut rates in Dec 2026?"},
-            {"title": "Fed rate cut at December 2026 meeting?"},
+            {"question": "Will Fed cut rates in Dec 2026?", "rules": "YES if the announced December meeting target range is lower than the prior range."},
+            {"title": "Fed rate cut at December 2026 meeting?", "rules": "YES if the announced December meeting target range is lower than the prior range."},
             "polymarket",
             "kalshi",
             client=mock_client,

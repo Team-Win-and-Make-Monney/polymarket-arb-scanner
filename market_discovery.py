@@ -140,6 +140,7 @@ class MarketRef:
     venue: str
     external_id: str
     question: str
+    rules: str = ""
 
 
 @dataclass(frozen=True)
@@ -149,6 +150,8 @@ class CandidatePair:
     question_a: str
     venue_b: str
     question_b: str
+    rules_a: str = ""
+    rules_b: str = ""
 
 
 @dataclass(frozen=True)
@@ -284,30 +287,14 @@ class JevJudge:
 
     def judge_pair(self, pair: CandidatePair) -> Judgment:
         """Evaluate whether a candidate pair is resolution-equivalent."""
+        from jev_semantics import equivalence_questions
+        if not pair.rules_a.strip() or not pair.rules_b.strip():
+            return Judgment(pair.pair_id, False, 0.0, "Review required: missing settlement rules")
         state = {
-            "venue_a": pair.venue_a,
-            "question_a": pair.question_a,
-            "venue_b": pair.venue_b,
-            "question_b": pair.question_b,
+            "venue_a": pair.venue_a, "question_a": pair.question_a, "rules_a": pair.rules_a,
+            "venue_b": pair.venue_b, "question_b": pair.question_b, "rules_b": pair.rules_b,
         }
-        questions = {
-            "resolution_equivalence": {
-                "type": "choice",
-                "instructions": (
-                    "Do the questions from `venue_a` ('question_a') and `venue_b` ('question_b') "
-                    "refer to the exact same underlying event and resolve to identical outcomes across all edge cases?"
-                ),
-                "criteria": {
-                    "identical": "Guaranteed identical settlement in all scenarios",
-                    "divergent": "Subtly different definitions, dates, or criteria with potential divergence",
-                    "different_events": "Completely different events or entities",
-                },
-            },
-            "equivalence_probability": {
-                "type": "noul",
-                "instructions": "Is `question_a` strictly equivalent in resolution outcome to `question_b`?",
-            },
-        }
+        questions = equivalence_questions("resolution_equivalence", "equivalence_probability")
 
         try:
             resp = self.client.query_decisions(state, questions)
@@ -319,7 +306,7 @@ class JevJudge:
             conf = float(choice_ans.get("confidence", 0.0))
             noul_p = float(noul_ans.get("noul", 0.0))
 
-            is_equivalent = (choice == "identical") and (noul_p >= 0.85)
+            is_equivalent = (choice == "identical") and (0.85 <= noul_p <= 1.0) and (0.90 <= conf <= 1.0)
             reasoning = f"Jev: choice={choice}, P(equiv)={noul_p:.2f}, conf={conf:.2f}"
 
             return Judgment(
@@ -379,6 +366,16 @@ class DiscoveryPipeline:
         self.accept_confidence = accept_confidence
         self.max_candidates = max_candidates
 
+    def _cache_key(self, cand: CandidatePair) -> str:
+        key = pair_key(cand.venue_a, cand.question_a, cand.venue_b, cand.question_b)
+        if isinstance(self.judge, JevJudge):
+            from jev_semantics import PROMPT_VERSION
+            provenance = [cand.pair_id, cand.rules_a, cand.rules_b,
+                          self.judge.client.model, PROMPT_VERSION]
+            digest = hashlib.sha256(json.dumps(provenance).encode()).hexdigest()
+            return f"jev:{key}:{digest}"
+        return key
+
     async def run(self, markets_by_venue: dict[str, list[MarketRef]]) -> DiscoveryResult:
         candidates = self._prefilter(markets_by_venue)
         logger.info("Discovery: %d candidate pairs after pre-filter", len(candidates))
@@ -396,7 +393,7 @@ class DiscoveryPipeline:
         to_judge: list[CandidatePair] = []
 
         for cand in candidates:
-            key = pair_key(cand.venue_a, cand.question_a, cand.venue_b, cand.question_b)
+            key = self._cache_key(cand)
             cached = self.cache.get(key)
             if cached is not None:
                 cached_hits += 1
@@ -433,7 +430,7 @@ class DiscoveryPipeline:
                     "market_b_id": ids[1] if len(ids) > 1 else "",
                     "question_b": cand.question_b,
                 }
-                key = pair_key(cand.venue_a, cand.question_a, cand.venue_b, cand.question_b)
+                key = self._cache_key(cand)
                 self.cache.put(key, record)
                 new_judgments += 1
                 if j.equivalent and j.confidence >= self.accept_confidence:
@@ -479,6 +476,7 @@ class DiscoveryPipeline:
                                     question_a=ma.question,
                                     venue_b=venue_b,
                                     question_b=mb.question,
+                                    rules_a=ma.rules, rules_b=mb.rules,
                                 ),
                             )
                         )
@@ -498,23 +496,25 @@ def _chunks(seq: list, n: int):
 
 def polymarket_refs(markets: list[dict]) -> list[MarketRef]:
     """Extract MarketRefs from Polymarket Gamma market dicts."""
+    from jev_semantics import settlement_rules
     refs: list[MarketRef] = []
     for m in markets:
         external_id = str(m.get("id") or m.get("condition_id") or m.get("questionID") or "")
         question = (m.get("question") or m.get("title") or "").strip()
         if external_id and question:
-            refs.append(MarketRef("polymarket", external_id, question))
+            refs.append(MarketRef("polymarket", external_id, question, settlement_rules(m)))
     return refs
 
 
 def kalshi_refs(events: list[dict]) -> list[MarketRef]:
     """Extract MarketRefs from Kalshi event dicts (event-level granularity)."""
+    from jev_semantics import settlement_rules
     refs: list[MarketRef] = []
     for e in events:
         external_id = str(e.get("event_ticker") or e.get("ticker") or "")
         question = (e.get("title") or e.get("sub_title") or "").strip()
         if external_id and question:
-            refs.append(MarketRef("kalshi", external_id, question))
+            refs.append(MarketRef("kalshi", external_id, question, settlement_rules(e)))
     return refs
 
 

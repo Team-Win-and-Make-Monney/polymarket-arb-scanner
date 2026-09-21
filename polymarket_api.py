@@ -327,30 +327,20 @@ def get_best_bid_ask(order_book: dict) -> dict:
     Returns dict with keys: bid, bid_size, ask, ask_size (all float or None).
     """
     result = {"bid": None, "bid_size": None, "ask": None, "ask_size": None}
-    bids = order_book.get("bids", [])
-    asks = order_book.get("asks", [])
-    if bids:
-        best_bid = bids[0]  # Highest bid first
+    for side, field, choose in (("bids", "bid", max), ("asks", "ask", min)):
+        levels = order_book.get(side, [])
+        if not isinstance(levels, list) or not levels:
+            continue
         try:
-            price = float(best_bid.get("price"))
-            size = float(best_bid.get("size"))
-        except (TypeError, ValueError):
-            price = size = None
-        if price is not None and size is not None and math.isfinite(price) and math.isfinite(size):
-            if 0.0 < price < 1.0 and size > 0.0:
-                result["bid"] = price
-                result["bid_size"] = size
-    if asks:
-        best_ask = asks[0]  # Lowest ask first
-        try:
-            price = float(best_ask.get("price"))
-            size = float(best_ask.get("size"))
-        except (TypeError, ValueError):
-            price = size = None
-        if price is not None and size is not None and math.isfinite(price) and math.isfinite(size):
-            if 0.0 < price < 1.0 and size > 0.0:
-                result["ask"] = price
-                result["ask_size"] = size
+            parsed = [(float(level["price"]), float(level["size"])) for level in levels]
+            if any(not math.isfinite(price) or not math.isfinite(size)
+                   or not 0 < price < 1 or size <= 0 for price, size in parsed):
+                continue
+        except (KeyError, TypeError, ValueError):
+            continue
+        price = choose(price for price, size in parsed)
+        result[field] = price
+        result[f"{field}_size"] = sum(size for level_price, size in parsed if level_price == price)
     return result
 
 

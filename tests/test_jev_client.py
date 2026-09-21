@@ -18,7 +18,7 @@ class TestJevClient(unittest.TestCase):
     """Test suite for JevClient methods and error handling."""
 
     def setUp(self):
-        self.client = JevClient(api_key="test-key", model="typesafe/jev-1.13")
+        self.client = JevClient(api_key="test-key", model="jev-1.13.0")
 
     def test_availability(self):
         """Test is_available checks api_key properly."""
@@ -26,12 +26,12 @@ class TestJevClient(unittest.TestCase):
         empty_client = JevClient(api_key="")
         self.assertFalse(empty_client.is_available())
 
-    @patch("urllib.request.urlopen")
+    @patch("jev_client._urlopen")
     def test_query_decisions_success(self, mock_urlopen):
         """Test successful decision query and JSON decoding."""
         mock_resp = MagicMock()
         mock_resp.read.return_value = json.dumps({
-            "model": "typesafe/jev-1.13",
+            "model": "jev-1.13.0",
             "answers": {
                 "is_urgent": {"type": "noul", "noul": 0.85},
             },
@@ -46,7 +46,7 @@ class TestJevClient(unittest.TestCase):
         self.assertIn("answers", res)
         self.assertEqual(res["answers"]["is_urgent"]["noul"], 0.85)
 
-    @patch("urllib.request.urlopen")
+    @patch("jev_client._urlopen")
     def test_evaluate_noul(self, mock_urlopen):
         """Test evaluate_noul helper returns a float probability."""
         mock_resp = MagicMock()
@@ -58,7 +58,7 @@ class TestJevClient(unittest.TestCase):
         prob = self.client.evaluate_noul("State", "Is it true?")
         self.assertAlmostEqual(prob, 0.72)
 
-    @patch("urllib.request.urlopen")
+    @patch("jev_client._urlopen")
     def test_evaluate_choice(self, mock_urlopen):
         """Test evaluate_choice helper returns choice, confidence, and distribution."""
         mock_resp = MagicMock()
@@ -81,7 +81,7 @@ class TestJevClient(unittest.TestCase):
         self.assertAlmostEqual(conf, 0.88)
         self.assertEqual(len(probs), 3)
 
-    @patch("urllib.request.urlopen")
+    @patch("jev_client._urlopen")
     def test_evaluate_score(self, mock_urlopen):
         """Test evaluate_score helper returns score and confidence."""
         mock_resp = MagicMock()

@@ -102,6 +102,8 @@ from scans import (
     _refine_frechet_with_clob,
     scan_temporal_arb,
     _refine_temporal_with_clob,
+    scan_ctf,
+    _refine_ctf_with_clob,
 )
 import config
 from config import (
@@ -923,6 +925,29 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
             except Exception as e:
                 logger.error("Temporal arbitrage scan failed: %s", e)
 
+    # Plan 04: CTF Primitives (Merge / Split Arbitrage)
+    if args.mode in ("all", "ctf"):
+        from config import CTF_ENABLED, CTF_MERGE_ENABLED, CTF_MINT_SELL_ENABLED
+        is_dry_run = getattr(args, "dry_run", None)
+        if is_dry_run is None:
+            is_dry_run = getattr(executor, "dry_run", True)
+        if args.mode == "ctf" and not (CTF_ENABLED or CTF_MERGE_ENABLED or CTF_MINT_SELL_ENABLED) and not is_dry_run:
+            logger.error(
+                "CTF mode requested but CTF_ENABLED=false in non-dry-run execution. "
+                "Refusing to scan without explicit enablement."
+            )
+        elif (CTF_ENABLED or CTF_MERGE_ENABLED or CTF_MINT_SELL_ENABLED) or (args.mode == "ctf" and is_dry_run):
+            logger.info("--- CTF Primitives Scan (Polymarket Merge / Split) ---")
+            try:
+                ctf_opps = scan_ctf(
+                    poly_markets or [],
+                    min_profit=min_profit,
+                )
+                all_opportunities.extend(ctf_opps)
+                logger.info("Found %d CTF primitive opportunities.", len(ctf_opps))
+            except Exception as e:
+                logger.error("CTF primitives scan failed: %s", e)
+
     # STRAT-07: Time Decay Convergence
     if args.mode in ("all", "time-decay"):
         from config import TIME_DECAY_ENABLED
@@ -1314,9 +1339,9 @@ def main():
                  "imbalance", "news-snipe", "correlated", "time-decay",
                  "logical-arb", "whale-copy",
                  "fee-promo", "cross-mm",
-                 "lead-lag-mm", "toxic-flow", "vol-mm", "mm-pilot", "jev-crypto", "frechet", "temporal"],
+                 "lead-lag-mm", "toxic-flow", "vol-mm", "mm-pilot", "jev-crypto", "frechet", "temporal", "ctf"],
         default="all",
-        help="Scan mode: all, binary, negrisk, negrisk-no, cross, kalshi, cross-all, spread, betfair, smarkets, sxbet, matchbook, gemini, ibkr, event, triangular, stale, resolution, convergence, mm, mm-pilot, rewards, imbalance, news-snipe, correlated, time-decay, fee-promo, cross-mm, jev-crypto, frechet, temporal",
+        help="Scan mode: all, binary, negrisk, negrisk-no, cross, kalshi, cross-all, spread, betfair, smarkets, sxbet, matchbook, gemini, ibkr, event, triangular, stale, resolution, convergence, mm, mm-pilot, rewards, imbalance, news-snipe, correlated, time-decay, fee-promo, cross-mm, jev-crypto, frechet, temporal, ctf",
     )
     parser.add_argument(
         "--min-profit",
@@ -1624,6 +1649,13 @@ def main():
     except Exception as exc:
         logger.debug("Position sizer not available: %s", exc)
 
+    ctf_client = None
+    try:
+        from ctf_api import CTFClient
+        ctf_client = CTFClient(dry_run=dry_run)
+    except Exception as exc:
+        logger.debug("CTFClient not initialized: %s", exc)
+
     executor = ArbitrageExecutor(
         pm_trader=pm_trader,
         kalshi_client=kalshi_client,
@@ -1646,6 +1678,7 @@ def main():
         sizing_aggressiveness=CONFIG_SIZING_AGGRESSIVENESS,
         concurrent_execution=CONFIG_CONCURRENT_EXECUTION,
         position_sizer=pos_sizer,
+        ctf_client=ctf_client,
     )
 
     extra_clients = {

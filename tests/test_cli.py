@@ -969,3 +969,47 @@ class TestDisputeGateCLI:
             _cli_mod._run_oneshot(args, min_profit=0.01, kalshi_client=None, executor=executor, db=mock_db)
 
         assert executor.risk_manager.uma_state_unavailable is True
+
+
+class TestCTFModeCLI:
+    """Tests for CTF mode CLI parsing and oneshot dispatch."""
+
+    def test_cli_parser_accepts_ctf_mode(self):
+        from cli import main
+        # Verify parser handles --mode ctf
+        with patch.object(sys, "argv", ["scanner.py", "--mode", "ctf", "--dry-run"]):
+            with patch("cli._run_oneshot") as mock_oneshot, \
+                 patch("cli.build_client_from_env", return_value=None), \
+                 patch("cli.TradeDB"):
+                try:
+                    main()
+                except SystemExit:
+                    pass
+                assert mock_oneshot.called
+                args = mock_oneshot.call_args[0][0]
+                assert args.mode == "ctf"
+
+    def test_run_oneshot_dispatches_ctf(self, monkeypatch):
+        monkeypatch.setattr(config, "CTF_ENABLED", True)
+        args = _make_args(mode="ctf")
+        mock_db = MagicMock()
+        poly_markets = [{"conditionId": "0xctf_cid", "question": "Test?"}]
+        mock_ctf_opp = {
+            "type": "CTFMerge",
+            "market": "Test?",
+            "net_profit": 0.05,
+            "prices": "Y=0.45 N=0.48",
+            "total_cost": "$0.93",
+        }
+
+        with patch.object(_cli_mod, "fetch_all_markets", return_value=poly_markets), \
+             patch.object(_cli_mod, "scan_ctf", return_value=[mock_ctf_opp]) as mock_scan, \
+             patch.object(_cli_mod, "display_results") as mock_display, \
+             patch.object(_cli_mod, "dashboard_state"):
+            _cli_mod._run_oneshot(args, min_profit=0.01, kalshi_client=None, executor=_make_executor(), db=mock_db)
+
+        mock_scan.assert_called_once()
+        mock_display.assert_called_once()
+        opps = mock_display.call_args[0][0]
+        assert len(opps) == 1
+        assert opps[0]["type"] == "CTFMerge"

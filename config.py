@@ -668,6 +668,18 @@ TEMPORAL_ARB_ENABLED = _env_bool("TEMPORAL_ARB_ENABLED", "false")
 TEMPORAL_MIN_VIOLATION = _env_float("TEMPORAL_MIN_VIOLATION", "0.02")
 TEMPORAL_ARB_MAX_TRADE_SIZE = _env_float("TEMPORAL_ARB_MAX_TRADE_SIZE", "25.0")
 
+# Plan 04: CTF mint/split & merge/redeem primitives (Polymarket on-chain CTF)
+CTF_ENABLED = _env_bool("CTF_ENABLED", "false")
+CTF_MERGE_ENABLED = _env_bool("CTF_MERGE_ENABLED", "false")
+CTF_MINT_SELL_ENABLED = _env_bool("CTF_MINT_SELL_ENABLED", "false")
+CTF_CONVERT_ENABLED = _env_bool("CTF_CONVERT_ENABLED", "false")
+CTF_MIN_PROFIT = _env_float("CTF_MIN_PROFIT", "0.005")
+CTF_MAX_TRADE_SIZE = _env_float("CTF_MAX_TRADE_SIZE", "25.0")
+CTF_GAS_ESTIMATE = _env_float("CTF_GAS_ESTIMATE", "0.01")
+CONDITIONAL_TOKENS_ADDRESS = os.getenv("CONDITIONAL_TOKENS_ADDRESS", "0x4d97dcd9" "7ec945f40cf65f87097ace5ea0476045")
+NEG_RISK_ADAPTER_ADDRESS = os.getenv("NEG_RISK_ADAPTER_ADDRESS", "0xd91e80cf2e7be2e162c6513ced06f1dd0da35296")
+COLLATERAL_TOKEN_ADDRESS = os.getenv("COLLATERAL_TOKEN_ADDRESS", "0xc011a7e1" "2a19f7b1f670d46f03b03f3342e82dfb")
+
 # Plan 05: UMA oracle dispute-risk gate (defensive) — block resolution-held Polymarket arbs in proposal/dispute window
 DISPUTE_GATE_ENABLED = _env_bool("DISPUTE_GATE_ENABLED", "false")
 
@@ -1325,6 +1337,7 @@ def validate_config() -> list[str]:
         "MM_CANARY_QUOTE_SIZE_USD": MM_CANARY_QUOTE_SIZE_USD,
         "MM_CANARY_MAX_LOSS_USD": MM_CANARY_MAX_LOSS_USD,
         "MM_CANARY_MIN_HOURS": MM_CANARY_MIN_HOURS,
+        "CTF_MAX_TRADE_SIZE": CTF_MAX_TRADE_SIZE,
     }
     for name, val in _positive.items():
         if val <= 0:
@@ -1491,6 +1504,14 @@ def validate_config() -> list[str]:
             "DRY_RUN=true for detection-only, or remove sxbet from "
             "ENABLED_EXECUTION_PLATFORMS."
         )
+
+    # Plan 04: CTF validation — require contract addresses if any CTF feature is enabled in live mode
+    if (CTF_ENABLED or CTF_MERGE_ENABLED or CTF_MINT_SELL_ENABLED or CTF_CONVERT_ENABLED) and not DRY_RUN:
+        if not CONDITIONAL_TOKENS_ADDRESS or not COLLATERAL_TOKEN_ADDRESS:
+            raise ConfigError(
+                "CTF strategies enabled with DRY_RUN=false, but CONDITIONAL_TOKENS_ADDRESS "
+                "or COLLATERAL_TOKEN_ADDRESS is missing."
+            )
 
     # --- Strategy-specific validation (Phase 8) ---
 

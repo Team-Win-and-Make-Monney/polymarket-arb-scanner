@@ -1515,6 +1515,44 @@ class TestTemporalContinuousScan:
 
 
 # ---------------------------------------------------------------------------
+# CTF Primitives Continuous Integration (Plan 04)
+# ---------------------------------------------------------------------------
+
+class TestCTFContinuousScan:
+    """Plan 04: CTF Primitives continuous scan layer 1 tests."""
+
+    def test_ctf_disabled_returns_empty(self, monkeypatch):
+        import config
+        from continuous import _scan_ctf_layer1
+        monkeypatch.setattr(config, "CTF_ENABLED", False)
+        monkeypatch.setattr(config, "CTF_MERGE_ENABLED", False)
+        monkeypatch.setattr(config, "CTF_MINT_SELL_ENABLED", False)
+        res = _scan_ctf_layer1([{"conditionId": "0x123"}], mode="all", min_profit=0.01)
+        assert res == []
+
+    def test_ctf_unmatched_mode_returns_empty(self, monkeypatch):
+        import config
+        from continuous import _scan_ctf_layer1
+        monkeypatch.setattr(config, "CTF_ENABLED", True)
+        res = _scan_ctf_layer1([{"conditionId": "0x123"}], mode="binary", min_profit=0.01)
+        assert res == []
+
+    def test_ctf_enabled_dispatches_scan(self, monkeypatch):
+        from unittest.mock import patch
+        import config
+        from continuous import _scan_ctf_layer1
+        monkeypatch.setattr(config, "CTF_ENABLED", True)
+        markets = [{"conditionId": "0x123"}]
+        mock_opps = [{"type": "CTFMerge", "net_profit": 0.05}]
+
+        with patch("scans.ctf.scan_ctf", return_value=mock_opps) as p_scan:
+            res = _scan_ctf_layer1(markets, mode="ctf", min_profit=0.01)
+
+        assert res == mock_opps
+        p_scan.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # UMA Dispute Gate Continuous Integration (Plan 05)
 # ---------------------------------------------------------------------------
 

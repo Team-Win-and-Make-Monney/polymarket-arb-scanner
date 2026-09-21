@@ -1,0 +1,57 @@
+{
+  "as_of": "2026-09-20T12:00:00Z",
+  "program_id": "example-rewards",
+  "previous": {
+    "id": "program-old",
+    "text": "Qualifying activity earns a 100 USD reward.",
+    "url": "https://example.org/program-old",
+    "published_at": "2026-09-19T10:00:00Z",
+    "available_at": "2026-09-19T10:01:00Z",
+    "captured_at": "2026-09-19T10:02:00Z",
+    "entity_ids": [
+      "example-rewards"
+    ],
+    "kind": "official"
+  },
+  "current": {
+    "id": "program-new",
+    "text": "",
+    "url": "https://example.org/program-new",
+    "published_at": "2026-09-20T10:00:00Z",
+    "available_at": "2026-09-20T10:01:00Z",
+    "captured_at": "2026-09-20T10:02:00Z",
+    "entity_ids": [
+      "example-rewards"
+    ],
+    "kind": "official"
+  },
+  "previous_conditions": {
+    "start_at": "2026-09-01T00:00:00Z",
+    "end_at": "2026-10-01T00:00:00Z",
+    "reward_amount": "100",
+    "reward_unit": "USD",
+    "minimum_volume": "1000",
+    "eligible_regions": [
+      "US"
+    ]
+  },
+  "current_conditions": {
+    "start_at": "2026-09-01T00:00:00Z",
+    "end_at": "2026-10-01T00:00:00Z",
+    "reward_amount": "150",
+    "reward_unit": "USD",
+    "minimum_volume": "1000",
+    "eligible_regions": [
+      "US"
+    ]
+  },
+  "workflows": [
+    {
+      "id": "rewards-monitor",
+      "description": "Monitor changes to reward amounts and qualification rules."
+    }
+  ],
+  "trusted_hosts": [
+    "example.org"
+  ]
+}

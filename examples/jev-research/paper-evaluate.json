@@ -1,0 +1,92 @@
+{
+  "evaluation_at": "2026-09-25T12:00:00Z",
+  "split_at": "2026-09-20T00:00:00Z",
+  "train_event_groups": [
+    "fed-july-2026"
+  ],
+  "feature_records": [
+    {
+      "workflow": "paper_features",
+      "rubric_version": "1.0.0",
+      "schema_version": 1,
+      "input_hash": "f049c8d67a1d8c4bca2dd20d4c916ad8d20aee2339d8a8d22927853a446b7ef9",
+      "as_of": "2026-09-20T12:00:00Z",
+      "status": "ok",
+      "reason": null,
+      "evidence": [
+        {
+          "source_id": "fed-news",
+          "text": "Fed officials discuss a rate cut at the September 2026 meeting.",
+          "url": "https://example.org/fed-news",
+          "sha256": "7e02ef1ec2f7255f51a040be7469d81051b7f86415a074df8c9e4d590099e2b8",
+          "published_at": "2026-09-20T10:00:00Z",
+          "available_at": "2026-09-20T10:01:00Z",
+          "captured_at": "2026-09-20T10:02:00Z"
+        }
+      ],
+      "execution_enabled": false,
+      "equivalence_approved": false,
+      "retain_candidate": true,
+      "evaluation": {
+        "status": "ok",
+        "mode": "advisory",
+        "model": "jev-1.13.0",
+        "usage": null,
+        "elapsed_ms": 1.0,
+        "state_hash": "32c3b7aee20120ffdc62263e3dd45ea1d796a0744b9628f49ce9d94da992fdf3",
+        "question_hash": "31397a157792f7d5d3e8df55bb63cedb95bc3a0fb4047981cc64b97675aaef3b",
+        "error_code": null
+      },
+      "record_id": "paper-001",
+      "event_group": "fed-september-2026",
+      "target": {
+        "id": "fed-cut",
+        "proposition": "The Fed cuts its target range at its September meeting.",
+        "entity_ids": [
+          "FED"
+        ],
+        "horizon_end": "2026-09-24T00:00:00Z"
+      },
+      "features": {
+        "supporting_claim_present": 0.95,
+        "opposing_claim_present": 0.95,
+        "uncertainty_present": 0.95
+      },
+      "paper_only": true,
+      "probabilities_are_market_forecasts": false,
+      "judgments": {
+        "supporting_claim_present": {
+          "type": "noul",
+          "noul": 0.95
+        },
+        "opposing_claim_present": {
+          "type": "noul",
+          "noul": 0.95
+        },
+        "uncertainty_present": {
+          "type": "noul",
+          "noul": 0.95
+        }
+      }
+    }
+  ],
+  "forecasts": [
+    {
+      "record_id": "paper-001",
+      "model_id": "external-frozen-model-v1",
+      "predicted_at": "2026-09-20T12:00:01Z",
+      "training_end": "2026-09-19T23:00:00Z",
+      "probability": 0.8,
+      "baseline_probability": 0.5
+    }
+  ],
+  "outcomes": [
+    {
+      "target_id": "fed-cut",
+      "value": 1,
+      "occurred_at": "2026-09-24T00:00:00Z",
+      "known_at": "2026-09-24T00:01:00Z",
+      "source_url": "https://example.org/outcome"
+    }
+  ]
+}

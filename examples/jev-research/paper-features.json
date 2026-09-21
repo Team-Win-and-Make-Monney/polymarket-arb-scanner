@@ -1,0 +1,27 @@
+{
+  "as_of": "2026-09-20T12:00:00Z",
+  "record_id": "paper-001",
+  "event_group": "fed-september-2026",
+  "target": {
+    "id": "fed-cut",
+    "proposition": "The Fed cuts its target range at its September meeting.",
+    "entity_ids": [
+      "FED"
+    ],
+    "horizon_end": "2026-09-24T00:00:00Z"
+  },
+  "sources": [
+    {
+      "id": "fed-news",
+      "text": "Fed officials discuss a rate cut at the September 2026 meeting.",
+      "url": "https://example.org/fed-news",
+      "published_at": "2026-09-20T10:00:00Z",
+      "available_at": "2026-09-20T10:01:00Z",
+      "captured_at": "2026-09-20T10:02:00Z",
+      "entity_ids": [
+        "FED"
+      ],
+      "kind": "news"
+    }
+  ]
+}

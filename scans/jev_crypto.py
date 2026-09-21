@@ -448,36 +448,16 @@ def _refine_jev_crypto_with_clob(
             except Exception as dbe:
                 logger.debug("Failed to record Jev decision in DB: %s", dbe)
 
-        # Apply deterministic gating rules
-        if conf < JEV_CONFIDENCE_THRESHOLD or risk > 1.8:
-            logger.debug("Rejected by risk/confidence guardrails: conf=%.2f, risk=%.2f", conf, risk)
-            continue
-
         if action == "pass_fair":
             continue
 
-        # Calculate edge and net profit
-        trade_size = 50.0
         if action == "buy_yes":
             exec_price = best_yes_ask
-            prob_target = model_prob
             clob_depth = float(clob_data.get("yes_ask_size") or clob_data.get("best_ask_size", 0) or 0)
-        else:  # buy_no
+        else:
             exec_price = best_no_ask
-            prob_target = 1.0 - model_prob
             clob_depth = float(clob_data.get("no_ask_size", 0) or 0)
-
-        if raw_edge < JEV_MIN_EDGE:
-            continue
-
-        net_calc = net_profit_jev_crypto(
-            price=exec_price,
-            model_prob=prob_target,
-            size=trade_size,
-        )
-
-        if net_calc["net_profit"] <= 0 or net_calc["net_roi"] < min_profit:
-            continue
+        net_calc = selected_calc
 
         opportunities.append({
             "type": "JevCrypto",

@@ -583,7 +583,8 @@ class TestOrderbookOrdering:
     def test_best_prices_do_not_depend_on_array_order(self):
         result = _real_get_best_bid_ask({
             "asks": [{"price": "0.999", "size": "9"}, {"price": "0.41", "size": "12"},
-                     {"price": "0.60", "size": "5"}, {"price": "0.41", "size": "3"}],
+                     {"price": "0.60", "size": "5"}, {"price": "0.41", "size": "3"},
+                     {"price": "0.01", "size": "0"}, {"price": "bad", "size": "10"}, None],
             "bids": [{"price": "0.01", "size": "9"}, {"price": "0.39", "size": "7"}],
         })
         assert result == {"ask": 0.41, "ask_size": 15, "bid": 0.39, "bid_size": 7}

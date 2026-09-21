@@ -331,12 +331,15 @@ def get_best_bid_ask(order_book: dict) -> dict:
         levels = order_book.get(side, [])
         if not isinstance(levels, list) or not levels:
             continue
-        try:
-            parsed = [(float(level["price"]), float(level["size"])) for level in levels]
-            if any(not math.isfinite(price) or not math.isfinite(size)
-                   or not 0 < price < 1 or size <= 0 for price, size in parsed):
+        parsed = []
+        for level in levels:
+            try:
+                price, size = float(level["price"]), float(level["size"])
+            except (KeyError, TypeError, ValueError):
                 continue
-        except (KeyError, TypeError, ValueError):
+            if math.isfinite(price) and math.isfinite(size) and 0 < price < 1 and size > 0:
+                parsed.append((price, size))
+        if not parsed:
             continue
         price = choose(price for price, size in parsed)
         result[field] = price

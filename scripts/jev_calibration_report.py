@@ -163,7 +163,7 @@ def format_markdown_report(report: dict) -> str:
         lines.append("")
         wr = edge.get("win_rate", 0.0) * 100
         roi = edge.get("roi", 0.0) * 100
-        lines.append(f"- **Actionable Trades**: {edge.get('total_recommended')} (`{edge.get('wins')}W - {edge.get('losses')}L`)")
+        lines.append(f"- **Evaluated Trades**: {edge.get('evaluated_trades')} (`{edge.get('wins')}W - {edge.get('losses')}L`)")
         lines.append(f"- **Win Rate**: `{wr:.1f}%`")
         lines.append(rf"- **Simulated PnL**: `\${edge.get('total_pnl'):+.2f}` (`{roi:+.2f}%` ROI)")
         lines.append("")

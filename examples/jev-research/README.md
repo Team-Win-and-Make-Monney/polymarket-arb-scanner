@@ -17,6 +17,8 @@ python -m research_jev paper-evaluate --input examples/jev-research/paper-evalua
 ```
 
 The first two commands default to off and do not call TypeSafe.
-`paper-evaluate` always runs offline. Missing-evidence commands return exit code
-2 and an explicit status. Input and output semantics are described in
+`paper-evaluate` always runs offline. Commands return exit code 2 when the
+top-level result has status `insufficient_evidence` or processing raises an exception,
+while nested insufficient-evidence diagnostics preserve top-level status `ok` and exit code 0.
+Input and output semantics are described in
 [the research runbook](../../docs/JEV-RESEARCH.md).

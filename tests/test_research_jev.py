@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from research_jev.__main__ import WORKFLOWS
 from research_jev.adapters import screen_discovery_candidates, screen_signal_candidates
 from research_jev.paper import evaluate_paper_forecasts
+from research_jev import rubrics as r
 from research_jev.runtime import content_hash
 from research_jev.workflows import (
     analyze_transcript, classify_event, compare_settlement_language, detect_incentive_changes,
@@ -33,15 +34,23 @@ def fixture(name):
 
 
 class FakeJev:
-    def __init__(self, answers=None, mode="advisory", failure=False, mutate=None):
+    def __init__(self, answers=None, mode="advisory", failure=False, mutate=None, status="ok", error_code=None):
         self.answers = answers or {}
         self.mode, self.failure, self.mutate = mode, failure, mutate
+        self.status, self.error_code = status, error_code
         self.calls = []
 
     def evaluate(self, state, questions):
         self.calls.append((copy.deepcopy(state), copy.deepcopy(questions)))
         if self.failure:
             raise RuntimeError("SECRET must never reach logs or output")
+        if self.status != "ok":
+            result = {"status": self.status, "mode": self.mode, "model": "jev-1.13.0", "answers": {},
+                      "usage": None, "elapsed_ms": None, "state_hash": content_hash(state),
+                      "question_hash": content_hash(questions), "error_code": self.error_code}
+            if self.mutate:
+                self.mutate(result)
+            return result
         answers = {}
         for key, question in questions.items():
             if question["type"] == "noul":
@@ -96,6 +105,68 @@ class TestWorkflowCoverage:
         assert result["evidence"]
         assert result["evaluation"]["usage"] is None
         assert result["evaluation"]["question_hash"]
+        assert result["input_hash"]
+        assert result["evaluation"]["state_hash"]
+
+    @pytest.mark.parametrize("name", ["event", "novelty", "relevance", "settlement", "attention",
+                                      "incentives", "transcript", "paper-features"])
+    def test_deterministic_identifier_contracts_and_hash_stability(self, name):
+        fix1 = fixture(name)
+        fix2 = fixture(name)
+        res1 = WORKFLOWS[name](fix1, FakeJev())
+        res2 = WORKFLOWS[name](fix2, FakeJev())
+        assert res1["status"] == res2["status"] == "ok"
+        assert res1["input_hash"] == res2["input_hash"]
+        assert res1["evaluation"]["state_hash"] == res2["evaluation"]["state_hash"]
+        assert res1["evaluation"]["question_hash"] == res2["evaluation"]["question_hash"]
+        assert len(res1["input_hash"]) == 64
+        assert len(res1["evaluation"]["state_hash"]) == 64
+        assert len(res1["evaluation"]["question_hash"]) == 64
+
+        # Changing an input field changes input_hash and state_hash, but not question_hash
+        mutated = copy.deepcopy(fix1)
+        mutated["as_of"] = "2026-09-20T12:05:00Z"
+        res_mut = WORKFLOWS[name](mutated, FakeJev())
+        assert res_mut["status"] == "ok"
+        assert res_mut["input_hash"] != res1["input_hash"]
+        assert res_mut["evaluation"]["state_hash"] != res1["evaluation"]["state_hash"]
+        assert res_mut["evaluation"]["question_hash"] == res1["evaluation"]["question_hash"]
+
+    def test_question_hash_diverges_across_different_question_definitions(self):
+        res_event = WORKFLOWS["event"](fixture("event"), FakeJev())
+        res_novelty = WORKFLOWS["novelty"](fixture("novelty"), FakeJev())
+        assert res_event["evaluation"]["question_hash"] != res_novelty["evaluation"]["question_hash"]
+
+    def test_rubric_version_updates_on_rubric_changes(self, monkeypatch):
+        rubric_key = "event"
+        monkeypatch.setitem(r.VERSIONS, rubric_key, "2.0.0")
+        res = WORKFLOWS["event"](fixture("event"), FakeJev())
+        assert res["rubric_version"] == "2.0.0"
+
+        # Changing schema_version on a result does not alter state or question hashes
+        assert res["schema_version"] == 1
+        res_original = WORKFLOWS["event"](fixture("event"), FakeJev())
+        assert res["input_hash"] == res_original["input_hash"]
+        assert res["evaluation"]["state_hash"] == res_original["evaluation"]["state_hash"]
+
+    def test_client_error_code_propagation(self):
+        client = FakeJev(status="error", error_code="quota_exceeded")
+        res = WORKFLOWS["event"](fixture("event"), client)
+        assert res["status"] == "unavailable"
+        assert res["evaluation"]["status"] == "unavailable"
+        assert res["evaluation"]["error_code"] == "quota_exceeded"
+
+        # When error_code exceeds 64 characters, metadata error_code is None
+        client_long = FakeJev(status="error", error_code="e" * 65)
+        res_long = WORKFLOWS["event"](fixture("event"), client_long)
+        assert res_long["status"] == "unavailable"
+        assert res_long["evaluation"]["error_code"] is None
+
+        # When error_code is not a string, metadata error_code is None
+        client_num = FakeJev(status="error", error_code=500)
+        res_num = WORKFLOWS["event"](fixture("event"), client_num)
+        assert res_num["status"] == "unavailable"
+        assert res_num["evaluation"]["error_code"] is None
 
     @pytest.mark.parametrize("name", ["event", "novelty", "relevance", "settlement", "attention",
                                       "incentives", "transcript", "paper-features"])
@@ -405,6 +476,11 @@ class TestPaperEvaluation:
         lambda row: row["forecasts"][0].update(baseline_probability=1.5),
         lambda row: row["feature_records"][0]["evidence"][0].update(captured_at="2026-09-24T00:00:00Z"),
         lambda row: row["feature_records"][0].update(features=None),
+        lambda row: row["feature_records"][0].update(evidence=row["feature_records"][0]["evidence"] * 25),
+        lambda row: row["feature_records"][0]["evidence"][0].update(sha256="0" * 64),
+        lambda row: row["feature_records"][0]["evidence"][0].update(url="http://insecure.org/news"),
+        lambda row: row["feature_records"][0]["evidence"][0].update(source_id="invalid source id"),
+        lambda row: row["feature_records"][0]["evidence"][0].update(text=""),
         lambda row: row["train_event_groups"].append("fed-september-2026"),
         lambda row: row["outcomes"][0].update(known_at="2026-09-26T00:00:00Z"),
         lambda row: row.update(outcomes=[]),
@@ -413,6 +489,21 @@ class TestPaperEvaluation:
         payload = paper_dataset()
         mutation(payload)
         assert evaluate_paper_forecasts(payload)["status"] == "insufficient_evidence"
+
+    def test_paper_evaluation_input_hash_contract(self):
+        payload1 = paper_dataset()
+        payload2 = paper_dataset()
+        res1 = evaluate_paper_forecasts(payload1)
+        res2 = evaluate_paper_forecasts(payload2)
+        assert res1["status"] == "ok"
+        assert res1["input_hash"] == res2["input_hash"]
+        assert len(res1["input_hash"]) == 64
+
+        payload3 = paper_dataset()
+        payload3["evaluation_at"] = "2026-09-26T12:00:00Z"
+        res3 = evaluate_paper_forecasts(payload3)
+        assert res3["status"] == "ok"
+        assert res3["input_hash"] != res1["input_hash"]
 
 
 class TestExistingDataAdapters:
@@ -436,6 +527,26 @@ class TestExistingDataAdapters:
         assert result["proposed_candidates"] == payload["candidates"]
         assert result["diagnostics"][0]["screen"]["status"] == "insufficient_evidence"
 
+    def test_discovery_mixed_batch_preserves_candidates(self):
+        payload = fixture("discovery-screen")
+        valid = payload["candidates"][0]
+        invalid = {"venue_a": "polymarket"}
+        payload["candidates"] = [valid, invalid]
+        result = screen_discovery_candidates(payload, FakeJev())
+        assert result["status"] == "insufficient_evidence"
+        assert result["retain_candidates"] is True
+        assert result["candidates"] == payload["candidates"]
+        assert result["incumbent_candidates"] == payload["candidates"]
+
+    def test_discovery_failure_before_candidates_usable(self):
+        payload = fixture("discovery-screen")
+        payload["candidates"] = "not_a_list"
+        result = screen_discovery_candidates(payload, FakeJev())
+        assert result["status"] == "insufficient_evidence"
+        assert result["retain_candidates"] is True
+        assert "candidates" not in result
+        assert "incumbent_candidates" not in result
+
     def test_signal_adapter_preserves_observed_probability(self):
         result = screen_signal_candidates(fixture("signal-screen"), FakeJev())
         assert result["incumbent"] == result["selected"] == result["proposed"] == {"id": "signal-1", "probability": 0.62}
@@ -449,6 +560,24 @@ class TestExistingDataAdapters:
     def test_missing_signal_snapshot_preserves_incumbent(self):
         result = screen_signal_candidates(fixture("signal-screen-insufficient"), FakeJev())
         assert result["selected"] == result["proposed"] == result["incumbent"]
+
+    def test_signal_mixed_batch_preserves_incumbent(self):
+        payload = fixture("signal-screen")
+        valid = payload["candidates"][0]
+        invalid = {"id": "signal-2", "question": "invalid prob", "probability": 999.0, "isResolved": False}
+        payload["candidates"] = [valid, invalid]
+        result = screen_signal_candidates(payload, FakeJev())
+        assert result["status"] == "insufficient_evidence"
+        assert result["retain_incumbent"] is True
+        assert result["incumbent"] == {"id": "signal-1", "probability": 0.62}
+
+    def test_signal_failure_before_candidates_usable(self):
+        payload = fixture("signal-screen")
+        payload["provider"] = "invalid_provider"
+        result = screen_signal_candidates(payload, FakeJev())
+        assert result["status"] == "insufficient_evidence"
+        assert result["retain_incumbent"] is True
+        assert "incumbent" not in result
 
     def test_opposite_direction_does_not_invert_signal_probability(self):
         result = screen_signal_candidates(fixture("signal-screen"), FakeJev({"same_direction": 0.01}))

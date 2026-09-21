@@ -57,6 +57,8 @@ def _evaluate(result: dict, state: dict, questions: dict, client) -> dict | None
         if not isinstance(got, dict) or got.get("mode") != mode or mode not in {"shadow", "advisory"}:
             raise ValueError("invalid_evaluation")
         if got.get("status") != "ok":
+            code = got.get("error_code")
+            metadata["error_code"] = code if isinstance(code, str) and len(code) <= 64 else None
             result.update(status="unavailable", reason="model_unavailable")
             return None
         answers, usage = validate_response({"model": got.get("model"), "answers": got.get("answers"),

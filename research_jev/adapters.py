@@ -12,11 +12,13 @@ from research_jev.workflows import compare_settlement_language, source_to_market
 
 def screen_discovery_candidates(payload: dict, client=None) -> dict:
     """Accept discovery-cache records plus full contract snapshots keyed by venue/id."""
+    candidates = None
     try:
         row = v.bounded(payload, {"as_of", "candidates", "contracts", "trusted_hosts"})
-        candidates = row["candidates"]
-        if not isinstance(candidates, list) or len(candidates) > 20 or not isinstance(row["contracts"], dict):
+        raw_candidates = row["candidates"]
+        if not isinstance(raw_candidates, list) or len(raw_candidates) > 20 or not isinstance(row["contracts"], dict):
             raise ValueError("invalid_candidates")
+        candidates = raw_candidates
         diagnostics = []
         for index, candidate in enumerate(candidates):
             if not isinstance(candidate, dict):
@@ -41,13 +43,19 @@ def screen_discovery_candidates(payload: dict, client=None) -> dict:
                 "proposed_candidates": proposed, "diagnostics": diagnostics,
                 "equivalence_approved": False, "live_state_changed": False}
     except (ValueError, TypeError, KeyError, AttributeError):
-        return {"workflow": "discovery_screen", "status": "insufficient_evidence",
-                "reason": "invalid_or_missing_input", "retain_candidates": True,
-                "equivalence_approved": False, "execution_enabled": False}
+        result = {"workflow": "discovery_screen", "status": "insufficient_evidence",
+                  "reason": "invalid_or_missing_input", "retain_candidates": True,
+                  "equivalence_approved": False, "execution_enabled": False}
+        if candidates is not None:
+            result["candidates"] = candidates
+            result["incumbent_candidates"] = candidates
+        return result
 
 
 def screen_signal_candidates(payload: dict, client=None) -> dict:
     """Evaluate Manifold/Metaculus candidate responses without changing their probabilities."""
+    candidates = []
+    candidates_list_started = False
     try:
         row = v.bounded(payload, {"as_of", "provider", "candidates", "snapshots", "contract", "trusted_hosts"})
         provider = row["provider"]
@@ -55,6 +63,7 @@ def screen_signal_candidates(payload: dict, client=None) -> dict:
             raise ValueError("invalid_provider")
         if not isinstance(row["candidates"], list) or len(row["candidates"]) > 20:
             raise ValueError("invalid_candidates")
+        candidates_list_started = True
         candidates, diagnostics = [], []
         for candidate in row["candidates"]:
             if not isinstance(candidate, dict):
@@ -90,5 +99,8 @@ def screen_signal_candidates(payload: dict, client=None) -> dict:
                 "proposed": eligible[0] if eligible else None, "diagnostics": diagnostics,
                 "probabilities_modified": False, "execution_enabled": False, "live_state_changed": False}
     except (ValueError, TypeError, KeyError, AttributeError):
-        return {"workflow": "signal_screen", "status": "insufficient_evidence",
-                "reason": "invalid_or_missing_input", "retain_incumbent": True, "execution_enabled": False}
+        result = {"workflow": "signal_screen", "status": "insufficient_evidence",
+                  "reason": "invalid_or_missing_input", "retain_incumbent": True, "execution_enabled": False}
+        if candidates_list_started and candidates:
+            result["incumbent"] = candidates[0]
+        return result

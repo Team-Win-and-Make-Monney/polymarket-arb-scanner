@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 from urllib.parse import urlsplit
 
@@ -77,7 +78,19 @@ def _evaluate(payload: dict) -> dict:
         evidence = record.get("evidence")
         if not isinstance(evidence, list) or not evidence:
             raise ValueError("missing_feature_evidence")
+        if len(evidence) > v.MAX_SOURCES:
+            raise ValueError("too_many_feature_evidence")
         for source in evidence:
+            if not isinstance(source, dict):
+                raise ValueError("invalid_source")
+            v.identifier(source.get("source_id"))
+            text = v.text(source.get("text"))
+            url = urlsplit(v.text(source.get("url"), 2000))
+            if url.scheme != "https" or not url.hostname or url.username or url.password:
+                raise ValueError("invalid_source_url")
+            expected_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            if source.get("sha256") != expected_sha:
+                raise ValueError("invalid_source_digest")
             if not (v.instant(source["published_at"]) <= v.instant(source["available_at"])
                     <= v.instant(source["captured_at"]) <= as_of):
                 raise ValueError("feature_time_leakage")

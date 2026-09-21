@@ -117,7 +117,8 @@ class PartialFillHedger:
 
         try:
             if platform == "polymarket":
-                return self._hedge_polymarket(token_id, fill_price, size, max_loss)
+                success, _ = self._hedge_polymarket(token_id, fill_price, size, max_loss)
+                return success
             elif platform == "kalshi":
                 return self._hedge_kalshi(token_id, fill_price, size, max_loss,
                                           pf.get("side", "yes"),
@@ -141,57 +142,68 @@ class PartialFillHedger:
 
         return False
 
-    def _hedge_polymarket(self, token_id: str, fill_price: float, size: float, max_loss: float, side: str = "SELL") -> bool:
+    def _hedge_polymarket(
+        self, token_id: str, fill_price: float, size: float, max_loss: float, side: str = "SELL"
+    ) -> tuple[bool, str]:
         """Hedge a Polymarket position at current touch (bid for SELL, ask for BUY).
 
         ``size`` is the filled share quantity (not dollars).
+
+        Returns:
+            Tuple of (success: bool, state: str) where state is 'filled', 'rejected', or 'unknown'.
         """
         if not self.pm_trader:
-            return False
+            return False, "rejected"
         from polymarket_api import fetch_order_book, get_best_bid_ask
         book = fetch_order_book(token_id)
         if not book:
-            return False
+            return False, "rejected"
         ba = get_best_bid_ask(book)
         side_upper = side.upper()
         if side_upper == "BUY":
             price = ba.get("ask")
             if price is None or price <= 0:
-                return False
+                return False, "rejected"
             loss = price - fill_price
         else:
             price = ba.get("bid")
             if price is None or price <= 0:
-                return False
+                return False, "rejected"
             loss = fill_price - price
 
         if loss > max_loss:
             logger.info("Polymarket hedge: %s price $%.3f too far from fill $%.3f (loss $%.3f > max $%.3f)",
                         side_upper, price, fill_price, loss, max_loss)
-            return False
+            return False, "rejected"
         if size <= 0:
-            return False
+            return False, "rejected"
         resp = self.pm_trader.place_order(
             token_id=token_id, side=side_upper, price=price, size=float(size),
             order_type="FOK",
         )
         if not resp or not resp.get("success"):
-            return False
+            return False, "rejected"
         order_id = resp.get("orderID") or resp.get("order_id")
         if not order_id:
             logger.warning("Polymarket hedge order placed without order_id: %s", resp)
-            return False
+            return False, "unknown"
         if hasattr(self.pm_trader, "get_order_status"):
             try:
                 status = self.pm_trader.get_order_status(order_id)
                 if isinstance(status, dict):
-                    return str(status.get("status", "")).lower() in ("matched", "filled")
+                    status_str = str(status.get("status", "")).lower()
+                    if status_str in ("matched", "filled"):
+                        return True, "filled"
+                    elif status_str in ("canceled", "cancelled", "expired", "rejected"):
+                        return False, "rejected"
+                    else:
+                        return False, "unknown"
                 logger.warning("Polymarket hedge order %s status non-dict or unavailable: %s", order_id, status)
-                return False
+                return False, "unknown"
             except Exception as e:
                 logger.warning("Failed to check Polymarket hedge order status %s: %s", order_id, e)
-                return False
-        return True
+                return False, "unknown"
+        return True, "filled"
 
     def _hedge_kalshi(self, ticker: str, fill_price: float, size: float, max_loss: float,
                       side: str, action: str = "sell",
@@ -394,9 +406,20 @@ class PartialFillHedger:
                 touch_price = ba.get("ask") if pm_side == "BUY" else ba.get("bid")
                 if touch_price and touch_price > 0:
                     pm_shares = max(1.0, float(round(size / touch_price)))
-                    if self._hedge_polymarket(matched_pm_token, fill_price, pm_shares, max_loss, side=pm_side):
+                    pm_success, pm_state = self._hedge_polymarket(
+                        matched_pm_token, fill_price, pm_shares, max_loss, side=pm_side
+                    )
+                    if pm_success:
                         return True
-                    logger.warning("Cross-venue Polymarket hedge failed; attempting native Limitless flatten")
+                    if pm_state == "unknown":
+                        logger.warning(
+                            "Polymarket cross-hedge order status unknown; keeping position pending reconciliation"
+                        )
+                        return False
+                    logger.warning(
+                        "Cross-venue Polymarket hedge rejected (%s); attempting native Limitless flatten",
+                        pm_state,
+                    )
 
         # Native Limitless flatten hedge
         if not self.limitless_client or not getattr(self.limitless_client, "authenticated", False):

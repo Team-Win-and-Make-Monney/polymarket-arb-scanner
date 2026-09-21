@@ -1044,3 +1044,31 @@ class TestLimitlessHedge:
                 mock_pm.place_order.assert_called_once()
                 mock_limitless.get_order_book.assert_not_called()
                 mock_limitless.place_order.assert_not_called()
+
+    def test_limitless_cross_hedge_status_unknown_does_not_flatten_limitless(self, PartialFillHedger, db):
+        mock_pm = MagicMock()
+        mock_pm.place_order.return_value = {"success": True, "orderID": "pm_ord_unknown"}
+        mock_pm.get_order_status.side_effect = Exception("Network timeout checking order status")
+        mock_limitless = MagicMock()
+        mock_limitless.authenticated = True
+        hedger = PartialFillHedger(pm_trader=mock_pm, limitless_client=mock_limitless, db=db)
+
+        with patch("polymarket_api.fetch_order_book") as mock_fetch:
+            with patch("polymarket_api.get_best_bid_ask") as mock_best:
+                mock_fetch.return_value = {"bids": [0.49], "asks": [0.51]}
+                mock_best.return_value = {"bid": 0.49, "ask": 0.51}
+
+                pf = {
+                    "id": 109, "platform": "limitless",
+                    "token_id": "0xpm_token_789",
+                    "_market_id": "limitless-mkt-1",
+                    "hedge_platform": "polymarket",
+                    "fill_price": 0.50,
+                    "size": 10.0,
+                    "side": "yes",
+                    "hedge_attempts": 0,
+                }
+                assert hedger._attempt_hedge(pf) is False
+                mock_pm.place_order.assert_called_once()
+                mock_limitless.get_order_book.assert_not_called()
+                mock_limitless.place_order.assert_not_called()

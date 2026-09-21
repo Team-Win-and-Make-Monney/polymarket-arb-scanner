@@ -197,6 +197,43 @@ class TestCredentialHealthChecker(unittest.TestCase):
         finally:
             loop.close()
 
+    def test_limitless_auth_failure_none_fires_critical_alert(self):
+        """Test that get_balance returning None (auth failure) escalates to CRITICAL after 3 attempts."""
+        unauthed_mock = mock.MagicMock(return_value=None)
+        setattr(
+            self.mock_clients["limitless"],
+            HEALTH_ENDPOINTS["limitless"]["method"],
+            unauthed_mock,
+        )
+
+        for platform in self.mock_clients:
+            if platform != "limitless":
+                method_name = HEALTH_ENDPOINTS[platform]["method"]
+                setattr(self.mock_clients[platform], method_name, mock.MagicMock(return_value=[{"id": 1}]))
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            # Attempt 1
+            loop.run_until_complete(self.health_checker.check_all_platforms())
+            self.assertEqual(1, self.health_checker._consecutive_failures.get("limitless", 0))
+
+            # Attempt 2
+            loop.run_until_complete(self.health_checker.check_all_platforms())
+            self.assertEqual(2, self.health_checker._consecutive_failures.get("limitless", 0))
+
+            # Attempt 3: threshold reached -> CRITICAL alert
+            self.mock_alert_manager.reset_mock()
+            loop.run_until_complete(self.health_checker.check_all_platforms())
+            self.assertEqual(3, self.health_checker._consecutive_failures.get("limitless", 0))
+
+            self.mock_alert_manager.alert.assert_called()
+            call_args = self.mock_alert_manager.alert.call_args
+            self.assertIn("CRITICAL", call_args[0])
+            self.assertIn("limitless", str(call_args[0]).lower())
+        finally:
+            loop.close()
+
     def test_timeout_is_info_severity(self):
         """Test that timeout exceptions fire INFO severity alerts."""
         # Mock the _async_call method to raise TimeoutError

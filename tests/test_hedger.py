@@ -872,6 +872,7 @@ class TestLimitlessHedge:
                 call_args = mock_pm.place_order.call_args
                 assert call_args[1]["side"] == "SELL"
                 assert call_args[1]["token_id"] == "0xpm_token_123"
+                assert call_args[1]["size"] == 21.0
 
     def test_limitless_cross_hedge_refuses_when_loss_exceeds_max(self, PartialFillHedger, db):
         mock_pm = MagicMock()
@@ -960,3 +961,4 @@ class TestLimitlessHedge:
                 call_args = mock_pm.place_order.call_args[1]
                 assert call_args["side"] == "BUY"
                 assert call_args["price"] == 0.51
+                assert call_args["size"] == 20.0

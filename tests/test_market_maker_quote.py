@@ -8,7 +8,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from market_maker import QuoteManager
+from market_maker import MarketMaker, QuoteManager
 
 
 class TestQuoteManagerPlacement:
@@ -122,3 +122,57 @@ class TestQuoteManagerPlacement:
         assert res is True
         mock_trader.cancel_order.assert_called_once_with("ord-live-777")
         assert len(qm_live.get_active_orders("mkt-1")) == 0
+
+
+class TestMarketMakerRefreshCancelGuard:
+    def test_refresh_quotes_skips_when_cancel_fails(self):
+        qm = QuoteManager(dry_run=False)
+        mock_trader = MagicMock()
+        # Seed an active order in qm
+        qm._active_orders["ord-existing"] = {
+            "platform": "limitless",
+            "market_key": "mkt-1",
+            "side": "bid",
+            "price": 0.50,
+            "size": 10.0,
+            "status": "resting",
+            "placed_at": 1000.0,
+        }
+        # mock_trader fails cancel
+        mock_trader.cancel_order.return_value = False
+
+        mm = MarketMaker(quote_manager=qm, dry_run=False)
+        mm.add_market("mkt-1", "limitless", mid_price=0.50)
+
+        with patch("config.ENABLED_EXECUTION_PLATFORMS", frozenset(["limitless"])):
+            new_quotes = mm.refresh_quotes(trader=mock_trader)
+
+        assert len(new_quotes) == 0
+        # Existing order must remain in active orders, and no new order placed
+        assert len(qm.get_active_orders("mkt-1")) == 1
+        mock_trader.place_order.assert_not_called()
+
+    def test_refresh_quotes_proceeds_when_cancel_succeeds(self):
+        qm = QuoteManager(dry_run=False)
+        mock_trader = MagicMock()
+        qm._active_orders["ord-existing"] = {
+            "platform": "limitless",
+            "market_key": "mkt-1",
+            "side": "bid",
+            "price": 0.50,
+            "size": 10.0,
+            "status": "resting",
+            "placed_at": 1000.0,
+        }
+        mock_trader.cancel_order.return_value = True
+        mock_trader.place_order.return_value = {"order_id": "ord-new-1"}
+
+        mm = MarketMaker(quote_manager=qm, dry_run=False)
+        mm.add_market("mkt-1", "limitless", mid_price=0.50)
+
+        with patch("config.ENABLED_EXECUTION_PLATFORMS", frozenset(["limitless"])):
+            new_quotes = mm.refresh_quotes(trader=mock_trader)
+
+        assert len(new_quotes) > 0
+        mock_trader.cancel_order.assert_called_once_with("ord-existing")
+        mock_trader.place_order.assert_called()

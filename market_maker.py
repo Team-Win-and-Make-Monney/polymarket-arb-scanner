@@ -566,7 +566,16 @@ class MarketMaker:
             )
 
             # Cancel existing quotes for this market
-            self.quote_manager.cancel_all(mkey, trader=trader if not self.dry_run else None)
+            live_trader = trader if not self.dry_run else None
+            outstanding = len(self.quote_manager.get_active_orders(mkey))
+            cancelled = self.quote_manager.cancel_all(mkey, trader=live_trader)
+            if cancelled < outstanding:
+                logger.error(
+                    "MM: %d of %d resting orders on %s were not cancelled — "
+                    "skipping requote to avoid stacking live quotes",
+                    outstanding - cancelled, outstanding, mkey,
+                )
+                continue
 
             # Place new bid
             if self.inventory.can_trade(mkey, self.quote_size):

@@ -383,7 +383,16 @@ class PartialFillHedger:
         )
 
         if matched_pm_token and self.pm_trader:
-            return self._hedge_polymarket(matched_pm_token, fill_price, size, max_loss, side=pm_side)
+            from polymarket_api import fetch_order_book, get_best_bid_ask
+            pm_book = fetch_order_book(matched_pm_token)
+            if not pm_book:
+                return False
+            ba = get_best_bid_ask(pm_book)
+            touch_price = ba.get("ask") if pm_side == "BUY" else ba.get("bid")
+            if not touch_price or touch_price <= 0:
+                return False
+            pm_shares = max(1.0, float(round(size / touch_price)))
+            return self._hedge_polymarket(matched_pm_token, fill_price, pm_shares, max_loss, side=pm_side)
 
         # Native Limitless flatten hedge
         if not self.limitless_client or not getattr(self.limitless_client, "authenticated", False):
@@ -426,7 +435,7 @@ class PartialFillHedger:
         if outcome not in ("yes", "no"):
             outcome = "yes"
 
-        quantity = max(1, int(round(size / best_price))) if best_price > 0 else 1
+        quantity = max(1, int(round(size / best_price)))
         resp = self.limitless_client.place_order(
             market_id=market_id,
             side=hedge_action,

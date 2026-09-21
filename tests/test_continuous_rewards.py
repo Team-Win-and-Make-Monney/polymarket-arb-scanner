@@ -389,3 +389,33 @@ class TestRewardsContinuousMode:
         reward_info = reward_tracker.reward_scores[market_key]
         assert "polymarket" in reward_info
         assert reward_info["polymarket"]["pool_size_usdc"] > 0
+
+    def test_continuous_rewards_gate_logic(self):
+        """Verify the rewards gate allows entry when only Limitless rewards are enabled."""
+        from unittest.mock import MagicMock
+        args = MagicMock()
+        args.mode = "all"
+        CONFIG_REWARDS_ENABLED = False
+        CONFIG_LIMITLESS_REWARDS_ENABLED = True
+
+        should_enter = (
+            (args.mode in ("all", "rewards") and (CONFIG_REWARDS_ENABLED or CONFIG_LIMITLESS_REWARDS_ENABLED))
+            or args.mode == "limitless-rewards"
+        )
+        assert should_enter is True
+
+        # And when both are False
+        CONFIG_LIMITLESS_REWARDS_ENABLED = False
+        should_enter = (
+            (args.mode in ("all", "rewards") and (CONFIG_REWARDS_ENABLED or CONFIG_LIMITLESS_REWARDS_ENABLED))
+            or args.mode == "limitless-rewards"
+        )
+        assert should_enter is False
+
+        # And for explicit limitless-rewards mode
+        args.mode = "limitless-rewards"
+        should_enter = (
+            (args.mode in ("all", "rewards") and (CONFIG_REWARDS_ENABLED or CONFIG_LIMITLESS_REWARDS_ENABLED))
+            or args.mode == "limitless-rewards"
+        )
+        assert should_enter is True

@@ -36,6 +36,7 @@ class TestCredentialHealthChecker(unittest.TestCase):
             "matchbook": mock.MagicMock(),
             "gemini": mock.MagicMock(),
             "ibkr": mock.MagicMock(),
+            "limitless": mock.MagicMock(),
         }
 
         # Create mock alert manager
@@ -53,10 +54,10 @@ class TestCredentialHealthChecker(unittest.TestCase):
         return await test_coro
 
     def test_health_endpoints_defined_for_all_platforms(self):
-        """Test that health check endpoints exist for all 8 platforms."""
+        """Test that health check endpoints exist for all 9 platforms."""
         expected_platforms = {
             "polymarket", "kalshi", "betfair", "smarkets",
-            "sxbet", "matchbook", "gemini", "ibkr"
+            "sxbet", "matchbook", "gemini", "ibkr", "limitless",
         }
         actual_platforms = set(HEALTH_ENDPOINTS.keys())
         self.assertEqual(expected_platforms, actual_platforms)

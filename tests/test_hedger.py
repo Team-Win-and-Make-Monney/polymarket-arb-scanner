@@ -874,6 +874,31 @@ class TestLimitlessHedge:
                 assert call_args[1]["token_id"] == "0xpm_token_123"
                 assert call_args[1]["size"] == 21.0
 
+    def test_limitless_cross_hedge_reads_underscore_hedge_platform(self, PartialFillHedger, db):
+        mock_pm = MagicMock()
+        mock_pm.place_order.return_value = {"success": True, "order_id": "pm_h_underscore"}
+        mock_pm.get_order_status.return_value = {"status": "matched"}
+        hedger = PartialFillHedger(pm_trader=mock_pm, db=db)
+
+        with patch("polymarket_api.fetch_order_book") as mock_fetch:
+            with patch("polymarket_api.get_best_bid_ask") as mock_best:
+                mock_fetch.return_value = {"bids": [0.48], "asks": [0.52]}
+                mock_best.return_value = {"bid": 0.48, "ask": 0.52}
+
+                pf = {
+                    "id": 1021, "platform": "limitless",
+                    "token_id": "0xpm_token_underscore",
+                    "_hedge_platform": "polymarket",
+                    "fill_price": 0.50,
+                    "size": 10.0,
+                    "side": "yes",
+                    "hedge_attempts": 0,
+                }
+                assert hedger._attempt_hedge(pf) is True
+                mock_pm.place_order.assert_called_once()
+                call_args = mock_pm.place_order.call_args
+                assert call_args[1]["token_id"] == "0xpm_token_underscore"
+
     def test_limitless_cross_hedge_refuses_when_loss_exceeds_max(self, PartialFillHedger, db):
         mock_pm = MagicMock()
         hedger = PartialFillHedger(pm_trader=mock_pm, db=db)

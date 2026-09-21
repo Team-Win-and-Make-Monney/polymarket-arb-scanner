@@ -2413,7 +2413,10 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                     all_opportunities.extend(mc_opps)
 
                 # Layer 3: Liquidity Rewards
-                if (args.mode in ("all", "rewards") and CONFIG_REWARDS_ENABLED) or args.mode == "limitless-rewards":
+                if (
+                    (args.mode in ("all", "rewards") and (CONFIG_REWARDS_ENABLED or CONFIG_LIMITLESS_REWARDS_ENABLED))
+                    or args.mode == "limitless-rewards"
+                ):
                     try:
                         pm_reward_opps = []
                         k_reward_opps = []

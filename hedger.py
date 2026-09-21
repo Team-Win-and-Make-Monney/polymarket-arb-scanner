@@ -379,7 +379,11 @@ class PartialFillHedger:
             pf.get("_pm_token_id")
             or pf.get("hedge_token_id")
             or pf.get("matched_token_id")
-            or (pf.get("token_id") if pf.get("hedge_platform") == "polymarket" else None)
+            or (
+                pf.get("token_id")
+                if (pf.get("_hedge_platform") or pf.get("hedge_platform")) == "polymarket"
+                else None
+            )
         )
 
         if matched_pm_token and self.pm_trader:

@@ -21,6 +21,7 @@ HEALTH_ENDPOINTS = {
     "matchbook": {"method": "fetch_all_events", "args": {}},
     "gemini": {"method": "fetch_all_markets", "args": {"status": "active"}},
     "ibkr": {"method": "fetch_all_markets", "args": {}},
+    "limitless": {"method": "fetch_all_markets", "args": {"limit": 1}},
 }
 
 

@@ -237,3 +237,53 @@ class TestExecutorCTF:
              patch.object(executor_mod, "ENABLED_EXECUTION_PLATFORMS", frozenset({"polymarket", "polymarket_ctf", "kalshi"})):
             with pytest.raises(NotImplementedError):
                 executor._execute_single_leg(leg, 10.0, opp)
+
+    def test_execute_legs_preflight_missing_ctf_client_fails_closed(self) -> None:
+        """Verify _execute_legs preflight fails closed with 0 CLOB submissions if ctf_client is None."""
+        import executor as curr_exec
+        executor = self._setup_executor(dry_run=True)
+        executor.ctf_client = None
+        opp = {"type": "CTFMerge", "market": "Test market", "total_cost": "$0.90", "net_roi": "5%"}
+        legs = [
+            {"platform": "polymarket", "side": "BUY", "token": "yes", "price": 0.45},
+            {"platform": "polymarket", "side": "BUY", "token": "no", "price": 0.45},
+            {"platform": "polymarket_ctf", "action": "merge", "price": 1.0},
+        ]
+        with patch.object(executor, "_execute_single_leg") as mock_exec_single:
+            result = executor._execute_legs(opp, legs, 10.0)
+            assert result is False
+            assert not mock_exec_single.called
+
+    def test_execute_legs_preflight_not_whitelisted_fails_closed(self) -> None:
+        """Verify _execute_legs preflight fails closed if polymarket_ctf is not in whitelist."""
+        import executor as curr_exec
+        executor = self._setup_executor(dry_run=True)
+        opp = {"type": "CTFMerge", "market": "Test market", "total_cost": "$0.90", "net_roi": "5%"}
+        legs = [
+            {"platform": "polymarket", "side": "BUY", "token": "yes", "price": 0.45},
+            {"platform": "polymarket", "side": "BUY", "token": "no", "price": 0.45},
+            {"platform": "polymarket_ctf", "action": "merge", "price": 1.0},
+        ]
+        with patch.object(curr_exec, "ENABLED_EXECUTION_PLATFORMS", frozenset({"polymarket", "kalshi"})), \
+             patch.object(executor_mod, "ENABLED_EXECUTION_PLATFORMS", frozenset({"polymarket", "kalshi"})), \
+             patch.object(executor, "_execute_single_leg") as mock_exec_single:
+            result = executor._execute_legs(opp, legs, 10.0)
+            assert result is False
+            assert not mock_exec_single.called
+
+    def test_execute_legs_preflight_live_fails_closed_in_phase_4a(self) -> None:
+        """Verify _execute_legs preflight fails closed in live mode without submitting CLOB orders."""
+        import executor as curr_exec
+        executor = self._setup_executor(dry_run=False)
+        opp = {"type": "CTFMerge", "market": "Test market", "total_cost": "$0.90", "net_roi": "5%"}
+        legs = [
+            {"platform": "polymarket", "side": "BUY", "token": "yes", "price": 0.45},
+            {"platform": "polymarket", "side": "BUY", "token": "no", "price": 0.45},
+            {"platform": "polymarket_ctf", "action": "merge", "price": 1.0},
+        ]
+        with patch.object(curr_exec, "ENABLED_EXECUTION_PLATFORMS", frozenset({"polymarket", "polymarket_ctf", "kalshi"})), \
+             patch.object(executor_mod, "ENABLED_EXECUTION_PLATFORMS", frozenset({"polymarket", "polymarket_ctf", "kalshi"})), \
+             patch.object(executor, "_execute_single_leg") as mock_exec_single:
+            result = executor._execute_legs(opp, legs, 10.0)
+            assert result is False
+            assert not mock_exec_single.called

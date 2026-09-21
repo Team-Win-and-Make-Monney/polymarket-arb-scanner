@@ -16,49 +16,6 @@ import scans.ctf as ctf_mod
 class TestCTFScan:
     """Test suite for two-stage CTFMerge and CTFMint scan."""
 
-    @pytest.fixture(autouse=True)
-    def _ensure_polymarket_funcs(self):
-        """Ensure scans.ctf has valid binary parsing functions even if stubbed by prior tests."""
-        orig_gbm = getattr(ctf_mod, "get_binary_markets", None)
-        orig_pop = getattr(ctf_mod, "parse_outcome_prices", None)
-
-        def _real_pop(market):
-            raw = market.get("outcomePrices")
-            if not raw:
-                return None
-            try:
-                import json
-                prices = json.loads(raw) if isinstance(raw, str) else raw
-                return [float(p) for p in prices]
-            except Exception:
-                return None
-
-        def _real_gbm(markets):
-            binary = []
-            for m in markets:
-                if m.get("negRisk"):
-                    continue
-                outcomes = m.get("outcomes")
-                if isinstance(outcomes, str):
-                    try:
-                        import json
-                        outcomes = json.loads(outcomes)
-                    except Exception:
-                        continue
-                if outcomes and len(outcomes) == 2:
-                    prices = _real_pop(m)
-                    if prices and len(prices) == 2:
-                        binary.append(m)
-            return binary
-
-        ctf_mod.get_binary_markets = _real_gbm
-        ctf_mod.parse_outcome_prices = _real_pop
-        yield
-        if orig_gbm is not None:
-            ctf_mod.get_binary_markets = orig_gbm
-        if orig_pop is not None:
-            ctf_mod.parse_outcome_prices = orig_pop
-
     def _sample_markets(self) -> list[dict]:
         from datetime import datetime, timezone, timedelta
         future_date = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()

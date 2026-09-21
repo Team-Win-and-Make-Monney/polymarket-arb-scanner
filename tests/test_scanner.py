@@ -17,18 +17,22 @@ _SOON = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
 @pytest.fixture(autouse=True)
 def mock_external_modules():
     """Mock external API modules that may not be installed."""
+    saved_modules = {}
     mock_modules = {}
     for mod_name in [
         "polymarket_api", "kalshi_api",
         "betfair_api", "smarkets_api", "sxbet_api",
         "ws_feeds", "db", "risk_manager", "executor",
     ]:
-        if mod_name not in sys.modules:
-            mock_modules[mod_name] = MagicMock()
-            sys.modules[mod_name] = mock_modules[mod_name]
+        if mod_name in sys.modules:
+            saved_modules[mod_name] = sys.modules[mod_name]
+        mock_modules[mod_name] = MagicMock()
+        sys.modules[mod_name] = mock_modules[mod_name]
     yield
     for mod_name in mock_modules:
-        if mod_name in sys.modules:
+        if mod_name in saved_modules:
+            sys.modules[mod_name] = saved_modules[mod_name]
+        elif mod_name in sys.modules:
             del sys.modules[mod_name]
     # Also clear scanner and decomposed sub-modules so they reimport with fresh mocks
     for mod in list(sys.modules):

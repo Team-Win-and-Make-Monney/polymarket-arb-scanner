@@ -56,6 +56,7 @@ class TestCTFABIs:
 
     def test_split_position_encoding(self) -> None:
         """Verify parameter encoding and decoding for splitPosition."""
+        assert SPLIT_POSITION_TYPES == ["address", "bytes32", "bytes32", "uint256[]", "uint256"]
         collateral = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
         parent_collection_id = b"\x00" * 32
         condition_id = b"\x12" * 32
@@ -75,6 +76,7 @@ class TestCTFABIs:
 
     def test_merge_positions_encoding(self) -> None:
         """Verify parameter encoding and decoding for mergePositions."""
+        assert MERGE_POSITIONS_TYPES == ["address", "bytes32", "bytes32", "uint256[]", "uint256"]
         collateral = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
         parent_collection_id = b"\x00" * 32
         condition_id = b"\xab" * 32
@@ -94,6 +96,7 @@ class TestCTFABIs:
 
     def test_redeem_positions_encoding(self) -> None:
         """Verify parameter encoding and decoding for redeemPositions."""
+        assert REDEEM_POSITIONS_TYPES == ["address", "bytes32", "bytes32", "uint256[]"]
         collateral = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
         parent_collection_id = b"\x00" * 32
         condition_id = b"\xcd" * 32
@@ -111,6 +114,7 @@ class TestCTFABIs:
 
     def test_convert_positions_encoding(self) -> None:
         """Verify parameter encoding and decoding for convertPositions."""
+        assert CONVERT_POSITIONS_TYPES == ["bytes32", "uint256", "uint256"]
         market_id = b"\x42" * 32
         index_set = 1
         amount = 25_000_000
@@ -126,6 +130,9 @@ class TestCTFABIs:
 
     def test_erc20_and_erc1155_types(self) -> None:
         """Verify ERC20 and ERC1155 balance/allowance types round-trip."""
+        assert ERC20_ALLOWANCE_TYPES == ["address", "address"]
+        assert ERC20_APPROVE_TYPES == ["address", "uint256"]
+        assert ERC20_BALANCE_OF_TYPES == ["address"]
         owner = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
         spender = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
 

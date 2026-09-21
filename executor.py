@@ -3188,9 +3188,22 @@ class ArbitrageExecutor:
             action="traded",
         )
 
+        # Pre-flight: CTF capability check before logging or submitting any legs
+        if any(leg.get("platform") == "polymarket_ctf" for leg in legs):
+            if self.ctf_client is None:
+                logger.warning("Pre-flight: CTF client unavailable for CTF opportunity. Skipping.")
+                return False
+            if "polymarket_ctf" not in ENABLED_EXECUTION_PLATFORMS:
+                logger.warning("Pre-flight: polymarket_ctf not in ENABLED_EXECUTION_PLATFORMS. Skipping.")
+                return False
+            if not self.dry_run:
+                logger.warning("Pre-flight: Live on-chain CTF execution is not supported in Phase 4a. Skipping.")
+                return False
+
         # Determine if legs span multiple platforms (cross-platform arbs)
+        # Note: polymarket_ctf legs must never run concurrently with CLOB legs
         platforms = set(leg["platform"] for leg in legs)
-        cross_platform = len(platforms) > 1
+        cross_platform = len(platforms) > 1 and "polymarket_ctf" not in platforms
 
         # Log all trades as pending
         for i, leg in enumerate(legs):

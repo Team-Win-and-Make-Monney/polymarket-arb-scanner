@@ -89,7 +89,14 @@ from fees import (
     net_profit_multi_cross,
     net_profit_logical_arb,
     find_lowest_fee_path,
+    net_profit_ctf_merge,
+    net_profit_ctf_mint,
 )
+try:
+    from ctf_api import CTFClient
+except ImportError:
+    class CTFClient:  # type: ignore[no-redef]
+        pass
 
 logger = logging.getLogger(__name__)
 
@@ -229,6 +236,7 @@ class ArbitrageExecutor:
         concurrent_execution: bool = False,
         notifier=None,
         position_sizer=None,
+        ctf_client: CTFClient | None = None,
     ):
         self.pm_trader = pm_trader
         self.kalshi_client = kalshi_client
@@ -240,6 +248,7 @@ class ArbitrageExecutor:
         self.ibkr_client = ibkr_client
         self.gas_monitor = gas_monitor
         self.notifier = notifier
+        self.ctf_client = ctf_client
         self.db = db
         self.risk = risk_manager
         self.dry_run = dry_run
@@ -721,6 +730,9 @@ class ArbitrageExecutor:
                     opportunity, original_profit, price_cache)
             elif opp_type == "TemporalArb":
                 passed, reval_profit, reason = self._revalidate_temporal(
+                    opportunity, original_profit, price_cache)
+            elif opp_type in ("CTFMerge", "CTFMint"):
+                passed, reval_profit, reason = self._revalidate_ctf(
                     opportunity, original_profit, price_cache)
             elif opp_type == "TriangularCross":
                 passed, reval_profit, reason = self._revalidate_triangular(
@@ -1224,6 +1236,108 @@ class ArbitrageExecutor:
         opp["prices"] = f"Ask(Late)={late_yes_ask:.3f} + Ask(Early NO)={early_no_ask:.3f}"
         opp["net_profit"] = reval_profit
         return True, reval_profit, "passed"
+
+    def _revalidate_ctf(
+        self, opp: dict, original_profit: float, price_cache: dict | None
+    ) -> tuple[bool, float, str]:
+        """Revalidate a Polymarket CTF opportunity (CTFMerge or CTFMint).
+
+        Returns:
+            (passed, reval_profit, reason)
+        """
+        token_ids = opp.get("_token_ids", [])
+        if len(token_ids) < 2:
+            logger.warning("Revalidation: missing token IDs for CTF")
+            raise _RevalidationAPIError("missing token IDs for CTF")
+
+        cached_yes = self._check_ws_cache(price_cache, "polymarket", token_ids[0])
+        cached_no = self._check_ws_cache(price_cache, "polymarket", token_ids[1])
+
+        if cached_yes and cached_yes.get("_stale", False):
+            logger.info("Skipping revalidation: polymarket YES stale for >30s")
+            return False, 0.0, "feed_stale"
+        if cached_no and cached_no.get("_stale", False):
+            logger.info("Skipping revalidation: polymarket NO stale for >30s")
+            return False, 0.0, "feed_stale"
+
+        opp_type = opp.get("type", "")
+        category = opp.get("category")
+
+        if opp_type == "CTFMerge":
+            yes_ask = no_ask = None
+            if cached_yes and cached_no:
+                yes_ask = _cached_probability(cached_yes, "best_ask", "ask", "price")
+                no_ask = _cached_probability(cached_no, "best_ask", "ask", "price")
+
+            if yes_ask is None or no_ask is None:
+                yes_book = fetch_order_book(token_ids[0])
+                no_book = fetch_order_book(token_ids[1])
+                if not yes_book or not no_book:
+                    raise _RevalidationAPIError("failed to fetch order book for CTFMerge")
+                yes_data = get_best_bid_ask(yes_book)
+                no_data = get_best_bid_ask(no_book)
+                yes_ask = yes_data.get("ask")
+                no_ask = no_data.get("ask")
+
+            if yes_ask is None or no_ask is None:
+                raise _RevalidationAPIError("no ask price in order book for CTFMerge")
+
+            result = net_profit_ctf_merge(yes_ask, no_ask, category=category)
+            reval_profit = result["net_profit"]
+            threshold = self._get_revalidation_threshold(original_profit, opp)
+            if reval_profit < threshold:
+                logger.info(
+                    "Revalidation: CTFMerge profit degraded %.4f -> %.4f (threshold=%.4f)",
+                    original_profit, reval_profit, threshold,
+                )
+                return False, reval_profit, "profit_below_floor"
+
+            opp["prices"] = f"Y={yes_ask:.3f} N={no_ask:.3f}"
+            opp["total_cost"] = f"${yes_ask + no_ask:.4f}"
+            opp["gross_spread"] = f"{result['gross_spread']:.4f}"
+            opp["fees"] = f"${result['fees']:.4f}"
+            opp["net_profit"] = reval_profit
+            opp["net_roi"] = f"{result['net_profit'] / (yes_ask + no_ask) * 100:.2f}%"
+            return True, reval_profit, "passed"
+
+        elif opp_type == "CTFMint":
+            yes_bid = no_bid = None
+            if cached_yes and cached_no:
+                yes_bid = _cached_probability(cached_yes, "best_bid", "bid")
+                no_bid = _cached_probability(cached_no, "best_bid", "bid")
+
+            if yes_bid is None or no_bid is None:
+                yes_book = fetch_order_book(token_ids[0])
+                no_book = fetch_order_book(token_ids[1])
+                if not yes_book or not no_book:
+                    raise _RevalidationAPIError("failed to fetch order book for CTFMint")
+                yes_data = get_best_bid_ask(yes_book)
+                no_data = get_best_bid_ask(no_book)
+                yes_bid = yes_data.get("bid")
+                no_bid = no_data.get("bid")
+
+            if yes_bid is None or no_bid is None:
+                raise _RevalidationAPIError("no bid price in order book for CTFMint")
+
+            result = net_profit_ctf_mint(yes_bid, no_bid, category=category)
+            reval_profit = result["net_profit"]
+            threshold = self._get_revalidation_threshold(original_profit, opp)
+            if reval_profit < threshold:
+                logger.info(
+                    "Revalidation: CTFMint profit degraded %.4f -> %.4f (threshold=%.4f)",
+                    original_profit, reval_profit, threshold,
+                )
+                return False, reval_profit, "profit_below_floor"
+
+            opp["prices"] = f"Y={yes_bid:.3f} N={no_bid:.3f}"
+            opp["total_cost"] = "$1.0000"
+            opp["gross_spread"] = f"{result['gross_spread']:.4f}"
+            opp["fees"] = f"${result['fees']:.4f}"
+            opp["net_profit"] = reval_profit
+            opp["net_roi"] = f"{result['net_profit'] / 1.0 * 100:.2f}%"
+            return True, reval_profit, "passed"
+
+        return False, 0.0, "unknown_ctf_type"
 
     def _revalidate_negrisk(
         self, opp: dict, original_profit: float, price_cache: dict | None
@@ -2008,6 +2122,53 @@ class ArbitrageExecutor:
                  "price": yes_price, "_token_id": yes_token},
                 {"platform": "polymarket", "side": "BUY", "token": "no",
                  "price": no_price, "_token_id": no_token},
+            ]
+        elif opp_type == "CTFMerge":
+            # Buy YES + NO on Polymarket CLOB, then merge into $1.00 collateral on-chain
+            yes_token = token_ids[0] if len(token_ids) > 0 else ""
+            no_token = token_ids[1] if len(token_ids) > 1 else ""
+            yes_price = self._parse_price(opportunity, "Y=")
+            no_price = self._parse_price(opportunity, "N=")
+            if yes_price is None or no_price is None:
+                return []
+            unit_cost = yes_price + no_price
+            contracts = int(size / unit_cost) if unit_cost > 0 else 0
+            if contracts < 1:
+                return []
+            condition_id = opportunity.get("_condition_id", "")
+            legs = [
+                {"platform": "polymarket", "side": "BUY", "token": "yes",
+                 "price": yes_price, "size": round(contracts * yes_price, 4),
+                 "_contracts": contracts, "_token_id": yes_token},
+                {"platform": "polymarket", "side": "BUY", "token": "no",
+                 "price": no_price, "size": round(contracts * no_price, 4),
+                 "_contracts": contracts, "_token_id": no_token},
+                {"platform": "polymarket_ctf", "action": "merge", "side": "MERGE",
+                 "condition_id": condition_id, "amount": float(contracts),
+                 "price": 1.0, "size": float(contracts), "_contracts": contracts},
+            ]
+        elif opp_type == "CTFMint":
+            # Split collateral into YES + NO on-chain, then sell YES + NO on Polymarket CLOB
+            yes_token = token_ids[0] if len(token_ids) > 0 else ""
+            no_token = token_ids[1] if len(token_ids) > 1 else ""
+            yes_price = self._parse_price(opportunity, "Y=")
+            no_price = self._parse_price(opportunity, "N=")
+            if yes_price is None or no_price is None:
+                return []
+            contracts = int(size / 1.0)
+            if contracts < 1:
+                return []
+            condition_id = opportunity.get("_condition_id", "")
+            legs = [
+                {"platform": "polymarket_ctf", "action": "split", "side": "SPLIT",
+                 "condition_id": condition_id, "amount": float(contracts),
+                 "price": 1.0, "size": float(contracts), "_contracts": contracts},
+                {"platform": "polymarket", "side": "SELL", "token": "yes",
+                 "price": yes_price, "size": round(contracts * yes_price, 4),
+                 "_contracts": contracts, "_token_id": yes_token},
+                {"platform": "polymarket", "side": "SELL", "token": "no",
+                 "price": no_price, "size": round(contracts * no_price, 4),
+                 "_contracts": contracts, "_token_id": no_token},
             ]
         elif opp_type.startswith("NegRiskNO"):
             # Buy NO on each outcome — Σ NO < (N-1) arbitrage.
@@ -3033,9 +3194,22 @@ class ArbitrageExecutor:
             action="traded",
         )
 
+        # Pre-flight: CTF capability check before logging or submitting any legs
+        if any(leg.get("platform") == "polymarket_ctf" for leg in legs):
+            if self.ctf_client is None:
+                logger.warning("Pre-flight: CTF client unavailable for CTF opportunity. Skipping.")
+                return False
+            if "polymarket_ctf" not in ENABLED_EXECUTION_PLATFORMS:
+                logger.warning("Pre-flight: polymarket_ctf not in ENABLED_EXECUTION_PLATFORMS. Skipping.")
+                return False
+            if not self.dry_run:
+                logger.warning("Pre-flight: Live on-chain CTF execution is not supported in Phase 4a. Skipping.")
+                return False
+
         # Determine if legs span multiple platforms (cross-platform arbs)
+        # Note: polymarket_ctf legs must never run concurrently with CLOB legs
         platforms = set(leg["platform"] for leg in legs)
-        cross_platform = len(platforms) > 1
+        cross_platform = len(platforms) > 1 and "polymarket_ctf" not in platforms
 
         # Log all trades as pending
         for i, leg in enumerate(legs):
@@ -3236,7 +3410,7 @@ class ArbitrageExecutor:
         return all_filled
 
     # Platforms that cannot sell/cancel — concurrent execution is not safe
-    _NO_CANCEL_PLATFORMS = frozenset({"ibkr"})
+    _NO_CANCEL_PLATFORMS = frozenset({"ibkr", "polymarket_ctf"})
 
     def _supports_concurrent(self, legs: list[dict]) -> bool:
         """Check whether all legs are on platforms that support cancellation.
@@ -3798,6 +3972,40 @@ class ArbitrageExecutor:
             if resp and resp.get("error"):
                 logger.warning("IBKR place_order returned error: %s", resp.get("error"))
             return False, None, None
+
+        elif platform == "polymarket_ctf":
+            action = leg.get("action", "").lower()
+            condition_id = leg.get("condition_id", "")
+            contracts = leg.get("_contracts", 0) or leg.get("amount", 0)
+            if self.dry_run:
+                built = None
+                if self.ctf_client:
+                    try:
+                        if action == "merge":
+                            built = self.ctf_client.build_merge(condition_id, float(contracts))
+                        elif action == "split":
+                            built = self.ctf_client.build_split(condition_id, float(contracts))
+                    except Exception as be:
+                        logger.warning("CTF calldata build simulation error: %s", be)
+                mock_tx = "0x" + "c7f0" * 16
+                logger.info(
+                    "[DRY RUN] Simulated CTF %s for condition %s (%d contracts, calldata=%s)",
+                    action, condition_id, contracts, built.get("data") if built else "n/a",
+                )
+                leg["_fill_price"] = 1.0
+                leg["_fill_qty"] = contracts
+                return True, mock_tx, 1.0
+            else:
+                if self.ctf_client:
+                    built = None
+                    if action == "merge":
+                        built = self.ctf_client.build_merge(condition_id, float(contracts))
+                    elif action == "split":
+                        built = self.ctf_client.build_split(condition_id, float(contracts))
+                    self.ctf_client.send(built)
+                else:
+                    raise NotImplementedError("CTFClient required for live CTF execution")
+                return False, None, None
 
         return False, None, None
 

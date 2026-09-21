@@ -635,6 +635,111 @@ class TestWhaleCopyConfig:
 
 
 # ---------------------------------------------------------------------------
+# Plan 04: CTF Primitives Config
+# ---------------------------------------------------------------------------
+
+class TestCTFConfig:
+    def test_polymarket_ctf_in_valid_platforms(self):
+        from config import _VALID_PLATFORMS
+        assert "polymarket_ctf" in _VALID_PLATFORMS
+
+    @pytest.mark.parametrize("bad_val", ["-0.01", "-1.0", "nan", "inf", "-inf"])
+    def test_ctf_gas_estimate_rejects_negative_and_non_finite(self, monkeypatch, bad_val):
+        monkeypatch.setenv("CTF_GAS_ESTIMATE", bad_val)
+        with pytest.raises(ValueError, match="must be finite and >= 0"):
+            _reload_config()
+
+    def test_ctf_gas_estimate_accepts_valid(self, monkeypatch):
+        monkeypatch.setenv("CTF_GAS_ESTIMATE", "0.025")
+        cfg = _reload_config()
+        assert cfg.CTF_GAS_ESTIMATE == 0.025
+
+    @pytest.mark.parametrize("dry_run", [True, False])
+    @pytest.mark.parametrize("bad_addr", ["", "invalid_hex", "0x1234", "0x" + "0" * 40])
+    def test_ctf_address_validation_rejects_invalid_addresses(self, monkeypatch, tmp_path, dry_run, bad_addr):
+        from live_envelope_fixtures import write_test_envelope
+        monkeypatch.setenv("LIVE_ENVELOPE_PATH", str(write_test_envelope(tmp_path)))
+        cfg = _reload_config()
+        monkeypatch.setattr(cfg, "DRY_RUN", dry_run)
+        monkeypatch.setattr(cfg, "CTF_ENABLED", True)
+        monkeypatch.setattr(cfg, "ENABLED_EXECUTION_PLATFORMS", frozenset(["kalshi"]))
+
+        # Bad CONDITIONAL_TOKENS_ADDRESS
+        monkeypatch.setattr(cfg, "CONDITIONAL_TOKENS_ADDRESS", bad_addr)
+        monkeypatch.setattr(cfg, "COLLATERAL_TOKEN_ADDRESS", "0x" + "1" * 40)
+        with pytest.raises(cfg.ConfigError, match="CONDITIONAL_TOKENS_ADDRESS must be a valid non-zero 20-byte"):
+            cfg.validate_config()
+
+        # Bad COLLATERAL_TOKEN_ADDRESS
+        monkeypatch.setattr(cfg, "CONDITIONAL_TOKENS_ADDRESS", "0x" + "1" * 40)
+        monkeypatch.setattr(cfg, "COLLATERAL_TOKEN_ADDRESS", bad_addr)
+        with pytest.raises(cfg.ConfigError, match="COLLATERAL_TOKEN_ADDRESS must be a valid non-zero 20-byte"):
+            cfg.validate_config()
+
+    @pytest.mark.parametrize("dry_run", [True, False])
+    def test_ctf_convert_requires_valid_adapter(self, monkeypatch, tmp_path, dry_run):
+        from live_envelope_fixtures import write_test_envelope
+        monkeypatch.setenv("LIVE_ENVELOPE_PATH", str(write_test_envelope(tmp_path)))
+        cfg = _reload_config()
+        monkeypatch.setattr(cfg, "DRY_RUN", dry_run)
+        monkeypatch.setattr(cfg, "CTF_ENABLED", True)
+        monkeypatch.setattr(cfg, "CTF_CONVERT_ENABLED", True)
+        monkeypatch.setattr(cfg, "CONDITIONAL_TOKENS_ADDRESS", "0x" + "1" * 40)
+        monkeypatch.setattr(cfg, "COLLATERAL_TOKEN_ADDRESS", "0x" + "2" * 40)
+        monkeypatch.setattr(cfg, "ENABLED_EXECUTION_PLATFORMS", frozenset(["kalshi"]))
+
+        # Invalid adapter
+        monkeypatch.setattr(cfg, "NEG_RISK_ADAPTER_ADDRESS", "0x" + "0" * 40)
+        with pytest.raises(cfg.ConfigError, match="NEG_RISK_ADAPTER_ADDRESS must be a valid non-zero 20-byte"):
+            cfg.validate_config()
+
+        # Valid adapter passes
+        monkeypatch.setattr(cfg, "NEG_RISK_ADAPTER_ADDRESS", "0x" + "3" * 40)
+        cfg.validate_config()
+
+    def test_limitless_rewards_validation(self, monkeypatch, tmp_path):
+        from live_envelope_fixtures import write_test_envelope
+        monkeypatch.setenv("LIVE_ENVELOPE_PATH", str(write_test_envelope(tmp_path)))
+        cfg = _reload_config()
+        monkeypatch.setattr(cfg, "DRY_RUN", False)
+        monkeypatch.setattr(cfg, "LIMITLESS_REWARDS_ENABLED", True)
+        monkeypatch.setattr(cfg, "LIMITLESS_API_KEY", "")
+        monkeypatch.setattr(cfg, "LIMITLESS_PRIVATE_KEY", "")
+        monkeypatch.setattr(cfg, "LIMITLESS_EXCHANGE_CONTRACT", "")
+        monkeypatch.setattr(cfg, "ENABLED_EXECUTION_PLATFORMS", frozenset(["kalshi"]))
+
+        # Missing API key in live mode fails
+        with pytest.raises(cfg.ConfigError, match="requires LIMITLESS_API_KEY"):
+            cfg.validate_config()
+
+        # Missing private key in live mode fails
+        monkeypatch.setattr(cfg, "LIMITLESS_API_KEY", "valid-key")
+        with pytest.raises(cfg.ConfigError, match="requires LIMITLESS_PRIVATE_KEY"):
+            cfg.validate_config()
+
+        # Missing exchange contract in live mode fails
+        monkeypatch.setattr(cfg, "LIMITLESS_PRIVATE_KEY", "valid-pk")
+        with pytest.raises(cfg.ConfigError, match="requires valid non-zero LIMITLESS_EXCHANGE_CONTRACT address"):
+            cfg.validate_config()
+
+        # Missing limitless in execution whitelist fails
+        monkeypatch.setattr(cfg, "LIMITLESS_EXCHANGE_CONTRACT", "0x" + "2" * 40)
+        with pytest.raises(cfg.ConfigError, match="requires 'limitless' in ENABLED_EXECUTION_PLATFORMS"):
+            cfg.validate_config()
+
+        # Valid live configuration passes
+        monkeypatch.setattr(cfg, "ENABLED_EXECUTION_PLATFORMS", frozenset(["kalshi", "limitless"]))
+        cfg.validate_config()
+
+        # Dry run passes even without credentials
+        monkeypatch.setattr(cfg, "DRY_RUN", True)
+        monkeypatch.setattr(cfg, "LIMITLESS_API_KEY", "")
+        monkeypatch.setattr(cfg, "LIMITLESS_PRIVATE_KEY", "")
+        monkeypatch.setattr(cfg, "LIMITLESS_EXCHANGE_CONTRACT", "")
+        cfg.validate_config()
+
+
+# ---------------------------------------------------------------------------
 # Env hygiene — no personal/global env files merged into the bot environment
 # ---------------------------------------------------------------------------
 

@@ -60,6 +60,7 @@ class TestNewsSnipeJev(unittest.TestCase):
             "Full approval granted",
             "Will FDA approve new vaccine?",
             client=mock_client,
+            settlement_rules="The official final decision determines the YES or NO outcome.",
         )
         self.assertEqual(res["sentiment"], "YES")
         self.assertEqual(res["source"], "keyword")
@@ -83,6 +84,7 @@ class TestNewsSnipeJev(unittest.TestCase):
             "SEC confirms registration effective immediately",
             "Will SEC approve spot ETF?",
             client=mock_client,
+            settlement_rules="The official final decision determines the YES or NO outcome.",
         )
         self.assertEqual(res["sentiment"], "YES")
         self.assertAlmostEqual(res["confidence"], 0.92)
@@ -97,7 +99,7 @@ class TestNewsSnipeJev(unittest.TestCase):
                 "outcome_resolution": {
                     "type": "choice",
                     "choice": "resolves_no",
-                    "confidence": 0.88,
+                    "confidence": 0.98,
                 }
             }
         }
@@ -107,9 +109,10 @@ class TestNewsSnipeJev(unittest.TestCase):
             "Appeal denied by unanimous panel",
             "Will merger close before year end?",
             client=mock_client,
+            settlement_rules="The official final decision determines the YES or NO outcome.",
         )
         self.assertEqual(res["sentiment"], "NO")
-        self.assertAlmostEqual(res["confidence"], 0.88)
+        self.assertAlmostEqual(res["confidence"], 0.98)
         self.assertEqual(res["source"], "jev")
 
     def test_jev_filters_neutral_speculation(self):
@@ -131,6 +134,7 @@ class TestNewsSnipeJev(unittest.TestCase):
             "Market waits for official confirmation",
             "Will ETF be approved by Friday?",
             client=mock_client,
+            settlement_rules="The official final decision determines the YES or NO outcome.",
         )
         self.assertIsNone(res["sentiment"])
         self.assertEqual(res["confidence"], 0.0)

@@ -5,6 +5,7 @@ import math
 import os
 
 from config import (
+    CTF_GAS_ESTIMATE,
     FEE_MODEL,
     KALSHI_FEE_CAP_CENTS,
     POLYGON_GAS_ESTIMATE,
@@ -2320,4 +2321,82 @@ def net_profit_jev_crypto(
         "gross_profit": gross_profit,
         "net_profit": net_profit,
         "net_roi": net_roi,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Plan 04: CTF Primitives Fee Calculators
+# ---------------------------------------------------------------------------
+
+def net_profit_ctf_merge(
+    yes_ask: float,
+    no_ask: float,
+    category: str | None = None,
+    gas_cost: float | None = None,
+) -> dict[str, float]:
+    """Net profit calculator for buy-and-merge CTF arbitrage (YES_ask + NO_ask < $1.00).
+
+    Buys both YES and NO on the order book and merges them into $1.00 collateral
+    via ConditionalTokens.mergePositions(), avoiding resolution holding period.
+
+    Args:
+        yes_ask: Best ask price for YES token.
+        no_ask: Best ask price for NO token.
+        category: Market category for Polymarket taker fee rate lookup.
+        gas_cost: Optional gas cost override in USD. If None, uses
+            CTF_GAS_ESTIMATE + 2 * POLYGON_GAS_ESTIMATE.
+
+    Returns:
+        Dict with gross_spread, fees, net_profit.
+    """
+    gross = 1.0 - (yes_ask + no_ask)
+    if gross <= 0.0:
+        return {"gross_spread": gross, "fees": 0.0, "net_profit": gross}
+
+    fee_yes = polymarket_taker_fee(yes_ask, category=category)
+    fee_no = polymarket_taker_fee(no_ask, category=category)
+    gas = gas_cost if gas_cost is not None else (CTF_GAS_ESTIMATE + POLYGON_GAS_ESTIMATE * 2)
+    total_fees = fee_yes + fee_no + gas
+
+    return {
+        "gross_spread": gross,
+        "fees": total_fees,
+        "net_profit": gross - total_fees,
+    }
+
+
+def net_profit_ctf_mint(
+    yes_bid: float,
+    no_bid: float,
+    category: str | None = None,
+    gas_cost: float | None = None,
+) -> dict[str, float]:
+    """Net profit calculator for mint-and-sell CTF arbitrage (YES_bid + NO_bid > $1.00).
+
+    Mints 1 YES + 1 NO from $1.00 collateral via ConditionalTokens.splitPosition(),
+    then sells both legs into resting bids for > $1.00.
+
+    Args:
+        yes_bid: Best bid price for YES token.
+        no_bid: Best bid price for NO token.
+        category: Market category for Polymarket taker fee rate lookup.
+        gas_cost: Optional gas cost override in USD. If None, uses
+            CTF_GAS_ESTIMATE + 2 * POLYGON_GAS_ESTIMATE.
+
+    Returns:
+        Dict with gross_spread, fees, net_profit.
+    """
+    gross = (yes_bid + no_bid) - 1.0
+    if gross <= 0.0:
+        return {"gross_spread": gross, "fees": 0.0, "net_profit": gross}
+
+    fee_yes = polymarket_taker_fee(yes_bid, category=category)
+    fee_no = polymarket_taker_fee(no_bid, category=category)
+    gas = gas_cost if gas_cost is not None else (CTF_GAS_ESTIMATE + POLYGON_GAS_ESTIMATE * 2)
+    total_fees = fee_yes + fee_no + gas
+
+    return {
+        "gross_spread": gross,
+        "fees": total_fees,
+        "net_profit": gross - total_fees,
     }

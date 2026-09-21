@@ -53,6 +53,7 @@ from config import (
     NEWS_SNIPE_ENABLED as CONFIG_NEWS_SNIPE_ENABLED,
     CORRELATED_ENABLED as CONFIG_CORRELATED_ENABLED,
     TIME_DECAY_ENABLED as CONFIG_TIME_DECAY_ENABLED,
+    LIMITLESS_REWARDS_ENABLED as CONFIG_LIMITLESS_REWARDS_ENABLED,
     polymarket_scan_enabled,
     polymarket_reward_fetch_enabled,
 )
@@ -94,6 +95,7 @@ from scans import (
     scan_multi_cross,
     scan_polymarket_rewards,
     scan_kalshi_rewards,
+    scan_limitless_rewards,
     scan_lead_lag_mm,
     scan_toxic_flow_pause,
     scan_volatility_adjusted_mm,
@@ -1248,6 +1250,35 @@ def _scan_temporal_layer1(kalshi_markets, mode, min_profit, kalshi_client=None, 
         return []
 
 
+def _scan_ctf_layer1(poly_markets, mode, min_profit, price_cache=None, funnel=None) -> list[dict]:
+    """Plan 04 CTF Primitives arbitrage. Returns [] when disabled or no markets."""
+    if mode not in ("all", "ctf"):
+        return []
+    is_explicit = (mode == "ctf")
+    is_dry_run = getattr(config, "DRY_RUN", True)
+    enabled = (
+        getattr(config, "CTF_ENABLED", False)
+        or getattr(config, "CTF_MERGE_ENABLED", False)
+        or getattr(config, "CTF_MINT_SELL_ENABLED", False)
+    )
+    if not enabled and not (is_explicit and is_dry_run):
+        return []
+    if not poly_markets:
+        return []
+    try:
+        from scans.ctf import scan_ctf
+        return scan_ctf(
+            poly_markets,
+            min_profit=min_profit,
+            price_cache=price_cache,
+            funnel=funnel,
+        )
+    except Exception as exc:
+        logger.warning("CTF primitives scan failed: %s", exc)
+        return []
+
+
+
 def _scan_jev_crypto_continuous(
     poly_markets,
     mode: str,
@@ -1279,6 +1310,67 @@ def _scan_jev_crypto_continuous(
         db=db,
         force=is_explicit,
     )
+
+
+def _scan_rewards_continuous(
+    mode: str,
+    poly_reward_markets: list[dict] | None = None,
+    reward_tracker=None,
+    kalshi_client=None,
+    kalshi_reward_tracker=None,
+    kalshi_data=None,
+    limitless_client=None,
+    price_cache: dict | None = None,
+) -> list[dict]:
+    """Execute Layer 3 liquidity rewards scanning across configured platforms."""
+    rewards_enabled = getattr(config, "REWARDS_ENABLED", CONFIG_REWARDS_ENABLED)
+    limitless_rewards_enabled = getattr(config, "LIMITLESS_REWARDS_ENABLED", CONFIG_LIMITLESS_REWARDS_ENABLED)
+
+    if not (
+        (mode in ("all", "rewards") and (rewards_enabled or limitless_rewards_enabled))
+        or mode == "limitless-rewards"
+    ):
+        return []
+
+    opps: list[dict] = []
+    try:
+        pm_reward_opps: list[dict] = []
+        k_reward_opps: list[dict] = []
+        lim_reward_opps: list[dict] = []
+        if mode in ("all", "rewards") and rewards_enabled:
+            if poly_reward_markets and reward_tracker:
+                pm_reward_opps = scan_polymarket_rewards(
+                    markets=poly_reward_markets,
+                    reward_tracker=reward_tracker,
+                    price_cache=price_cache or {},
+                )
+                opps.extend(pm_reward_opps)
+
+            if kalshi_client and kalshi_reward_tracker:
+                k_reward_opps = scan_kalshi_rewards(
+                    kalshi_client=kalshi_client,
+                    reward_tracker=kalshi_reward_tracker,
+                    kalshi_data=kalshi_data,
+                )
+                opps.extend(k_reward_opps)
+
+        if (mode in ("all", "rewards", "limitless-rewards")) and (limitless_rewards_enabled or mode == "limitless-rewards") and limitless_client:
+            lim_reward_opps = scan_limitless_rewards(
+                limitless_client=limitless_client,
+                price_cache=price_cache or {},
+            )
+            opps.extend(lim_reward_opps)
+
+        logger.debug(
+            "Rewards scan complete: %d Polymarket + %d Kalshi + %d Limitless opps",
+            len(pm_reward_opps),
+            len(k_reward_opps),
+            len(lim_reward_opps),
+        )
+    except Exception as exc:
+        logger.debug("Rewards scanning error: %s", exc)
+
+    return opps
 
 
 def heal_kalshi_client(executor, platform_clients, hedger, notifier):
@@ -1762,6 +1854,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
             sxbet_client=extra_clients.get("sxbet"),
             matchbook_client=extra_clients.get("matchbook"),
             gemini_client=extra_clients.get("gemini"),
+            limitless_client=extra_clients.get("limitless"),
             db=db,
         )
 
@@ -1837,6 +1930,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
         "matchbook": extra_clients.get("matchbook"),
         "gemini": extra_clients.get("gemini"),
         "ibkr": extra_clients.get("ibkr"),
+        "limitless": extra_clients.get("limitless"),
     }
     # Remove None clients
     platform_clients = {k: v for k, v in platform_clients.items() if v is not None}
@@ -2380,33 +2474,17 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                     all_opportunities.extend(mc_opps)
 
                 # Layer 3: Liquidity Rewards
-                if args.mode in ("all", "rewards") and CONFIG_REWARDS_ENABLED:
-                    try:
-                        pm_reward_opps = []
-                        k_reward_opps = []
-                        if poly_reward_markets and _reward_tracker:
-                            pm_reward_opps = scan_polymarket_rewards(
-                                markets=poly_reward_markets,
-                                reward_tracker=_reward_tracker,
-                                price_cache=price_cache,
-                            )
-                            all_opportunities.extend(pm_reward_opps)
-
-                        if kalshi_client and _kalshi_reward_tracker:
-                            k_reward_opps = scan_kalshi_rewards(
-                                kalshi_client=kalshi_client,
-                                reward_tracker=_kalshi_reward_tracker,
-                                kalshi_data=kalshi_data,
-                            )
-                            all_opportunities.extend(k_reward_opps)
-
-                        logger.debug(
-                            "Rewards scan complete: %d Polymarket + %d Kalshi opps",
-                            len(pm_reward_opps),
-                            len(k_reward_opps),
-                        )
-                    except Exception as exc:
-                        logger.debug("Rewards scanning error: %s", exc)
+                reward_opps = _scan_rewards_continuous(
+                    mode=args.mode,
+                    poly_reward_markets=poly_reward_markets,
+                    reward_tracker=_reward_tracker,
+                    kalshi_client=kalshi_client,
+                    kalshi_reward_tracker=_kalshi_reward_tracker,
+                    kalshi_data=kalshi_data,
+                    limitless_client=extra_clients.get("limitless"),
+                    price_cache=price_cache,
+                )
+                all_opportunities.extend(reward_opps)
 
                 # Kalshi VIP: passive volume-rebate tracking (no execution path).
                 if _kalshi_vip_tracker is not None:
@@ -2498,6 +2576,19 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                     )
                 except Exception as exc:
                     logger.warning("Temporal scan failed: %s", exc)
+
+                try:
+                    all_opportunities.extend(
+                        _scan_ctf_layer1(
+                            poly_markets,
+                            args.mode,
+                            min_profit,
+                            price_cache=price_cache,
+                            funnel=_funnel,
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning("CTF primitives scan failed: %s", exc)
 
                 # Structural alpha: Combinatorial logical arbitrage (Phase 9)
                 if args.mode in ("all", "logical-arb"):

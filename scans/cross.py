@@ -168,8 +168,8 @@ def _refine_cross_with_clob(opportunities: list[dict], markets_by_key: dict, min
                 conf_thresh = JEV_CONFIDENCE_THRESHOLD
                 try:
                     from matcher import verify_cross_platform_equivalence_jev
-                    ma = {"question": opp.get("market", "")}
-                    mb = {"title": opp.get("kalshi", "")}
+                    ma = {"question": opp.get("market", ""), "rules": opp.get("_rules_a", "")}
+                    mb = {"title": opp.get("kalshi", ""), "rules": opp.get("_rules_b", "")}
                     is_eq, _, reason = verify_cross_platform_equivalence_jev(
                         ma, mb, "polymarket", "kalshi", min_confidence=conf_thresh
                     )
@@ -372,6 +372,8 @@ def scan_cross_platform(
                         "_kalshi_ticker": km.get("ticker", ""),
                         "_token_ids": pm_token_ids,
                         "_inverted": bool(inverted),
+                        "_rules_a": pm.get("description", "") or pm.get("rules", ""),
+                        "_rules_b": km.get("rules_primary", "") or km.get("rules_secondary", "") or km.get("description", "") or km.get("rules", ""),
                         "confidence": match.get("confidence", "LOW"),
                         "_days_to_resolution": _days_to_resolution(pm, "polymarket"),
                     }

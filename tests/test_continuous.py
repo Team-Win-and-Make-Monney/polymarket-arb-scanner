@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 # Save any real modules already loaded so we can restore them after import
 _saved_modules = {}
 _modules_to_mock = [
-    "kalshi_api", "polymarket_api", "dashboard", "display", "recovery",
+    "kalshi_api", "dashboard", "display", "recovery",
 ]
 for _mod_name in _modules_to_mock:
     if _mod_name in sys.modules:
@@ -27,8 +27,6 @@ mock_kalshi.KALSHI_BASE_URL = "https://api.elections.kalshi.com"
 mock_kalshi.KALSHI_API_PATH = "/trade-api/v2"
 sys.modules["kalshi_api"] = mock_kalshi
 
-mock_pm = MagicMock()
-sys.modules["polymarket_api"] = mock_pm
 
 mock_dashboard = MagicMock()
 mock_dashboard.state = MagicMock()
@@ -1512,6 +1510,55 @@ class TestTemporalContinuousScan:
         assert res == mock_refined
         p_scan.assert_called_once()
         p_ref.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# CTF Primitives Continuous Integration (Plan 04)
+# ---------------------------------------------------------------------------
+
+class TestCTFContinuousScan:
+    """Plan 04: CTF Primitives continuous scan layer 1 tests."""
+
+    def test_ctf_disabled_returns_empty(self, monkeypatch):
+        import config
+        from continuous import _scan_ctf_layer1
+        monkeypatch.setattr(config, "CTF_ENABLED", False)
+        monkeypatch.setattr(config, "CTF_MERGE_ENABLED", False)
+        monkeypatch.setattr(config, "CTF_MINT_SELL_ENABLED", False)
+        res = _scan_ctf_layer1([{"conditionId": "0x123"}], mode="all", min_profit=0.01)
+        assert res == []
+
+    def test_ctf_unmatched_mode_returns_empty(self, monkeypatch):
+        import config
+        from continuous import _scan_ctf_layer1
+        monkeypatch.setattr(config, "CTF_ENABLED", True)
+        res = _scan_ctf_layer1([{"conditionId": "0x123"}], mode="binary", min_profit=0.01)
+        assert res == []
+
+    def test_ctf_enabled_dispatches_scan(self, monkeypatch):
+        from unittest.mock import patch
+        import config
+        from continuous import _scan_ctf_layer1
+        monkeypatch.setattr(config, "CTF_ENABLED", True)
+        markets = [{"conditionId": "0x123"}]
+        mock_opps = [{"type": "CTFMerge", "net_profit": 0.05}]
+
+        with patch("scans.ctf.scan_ctf", return_value=mock_opps) as p_scan:
+            res = _scan_ctf_layer1(markets, mode="ctf", min_profit=0.01)
+
+        assert res == mock_opps
+        p_scan.assert_called_once()
+
+    def test_ctf_explicit_mode_in_live_disabled_returns_empty(self, monkeypatch):
+        import config
+        from continuous import _scan_ctf_layer1
+        monkeypatch.setattr(config, "CTF_ENABLED", False)
+        monkeypatch.setattr(config, "CTF_MERGE_ENABLED", False)
+        monkeypatch.setattr(config, "CTF_MINT_SELL_ENABLED", False)
+        monkeypatch.setattr(config, "DRY_RUN", False)
+        markets = [{"conditionId": "0x123"}]
+        res = _scan_ctf_layer1(markets, mode="ctf", min_profit=0.01)
+        assert res == []
 
 
 # ---------------------------------------------------------------------------

@@ -1,17 +1,19 @@
 """Empirical Brier score and probability calibration analytics for TypeSafe Jev System One.
 
 Calculates:
-- Brier Score (BS): Mean squared error of calibrated model predictions vs ground truth outcomes.
+- Brier Score (BS): Mean squared error of experimental model predictions vs ground truth outcomes.
 - Brier Skill Score (BSS): Relative improvement of Jev over market-implied pricing baseline.
 - Calibration Bins (Reliability Curve): Predicted probability vs observed empirical frequencies.
 - Expected Calibration Error (ECE): Sample-weighted absolute calibration error across bins.
-- Edge Realization & PnL: Win rate and realized returns for Jev-recommended trades.
+- Edge Realization & PnL: Hypothetical returns for complete research observations; never actual P&L.
 - ASCII Reliability Diagram: Visual terminal representation of empirical calibration.
 """
 
 from __future__ import annotations
 
 import logging
+import json
+from datetime import datetime
 import math
 from typing import Any
 
@@ -25,7 +27,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def calculate_brier_score(forecasts: list[float], outcomes: list[float]) -> float:
+def calculate_brier_score(forecasts: list[float], outcomes: list[float]) -> float | None:
     """Calculate the Brier Score for a set of binary probabilistic forecasts.
 
     BS = (1 / N) * sum((f_i - o_i)^2)
@@ -37,19 +39,20 @@ def calculate_brier_score(forecasts: list[float], outcomes: list[float]) -> floa
 
     Returns:
         Brier score between 0.0 (perfect prediction) and 1.0 (total divergence).
-        Returns 0.0 if lists are empty.
+        Returns None when no observations exist; empty data is not perfect accuracy.
 
     Raises:
         ValueError: If non-empty lists have mismatched lengths.
     """
-    if not forecasts or not outcomes:
-        return 0.0
-
     if len(forecasts) != len(outcomes):
         raise ValueError(
             f"Mismatched input lengths: forecasts({len(forecasts)}) != outcomes({len(outcomes)})"
         )
 
+    if not forecasts:
+        return None
+    if not all(_probability(p) for p in forecasts) or not all(o in (0.0, 1.0) for o in outcomes):
+        raise ValueError("Invalid forecast or binary outcome")
     total_sq_err = sum((f - o) ** 2 for f, o in zip(forecasts, outcomes))
     return total_sq_err / len(forecasts)
 
@@ -81,7 +84,7 @@ def calculate_brier_skill_score(
     bs_ref = calculate_brier_score(reference_forecasts, outcomes)
 
     if bs_ref == 0.0:
-        return 1.0 if bs_model == 0.0 else -math.inf
+        return None  # Skill relative to a perfect baseline is undefined.
 
     return 1.0 - (bs_model / bs_ref)
 
@@ -164,76 +167,96 @@ def calculate_expected_calibration_error(
     return round(ece, 4)
 
 
-def calculate_edge_realization(decisions: list[dict[str, Any]], standard_stake: float = 50.0) -> dict[str, Any]:
-    """Evaluate realized trading performance for decisions with recommended actions.
+def _probability(value) -> bool:
+    return isinstance(value, (float, int)) and not isinstance(value, bool) and math.isfinite(value) and 0 <= value <= 1
 
-    Simulates returns on decisions where Jev recommended 'buy_yes' or 'buy_no'.
 
-    Args:
-        decisions: List of decision dicts from DB with resolved_outcome.
-        standard_stake: Notional dollar stake per opportunity.
+def _details(record: dict) -> dict:
+    details = record.get("details", {})
+    if isinstance(details, str):
+        try:
+            details = json.loads(details)
+        except (ValueError, TypeError):
+            return {}
+    return details if isinstance(details, dict) else {}
 
-    Returns:
-        Dict with total_recommended, wins, losses, win_rate, total_pnl, roi.
+
+def select_independent_records(records: list[dict]) -> tuple[list[dict], dict]:
+    """One earliest valid pre-expiry observation per market; legacy/invalid rows stay excluded."""
+    valid, seen = [], set()
+    excluded = {"invalid_or_missing_provenance": 0, "repeated_market": 0}
+    for record in sorted(records, key=lambda r: (r.get("timestamp", ""), r.get("id", 0))):
+        details = _details(record)
+        market_id = details.get("market_id")
+        try:
+            observed = datetime.fromisoformat(details["observed_at"].replace("Z", "+00:00"))
+            expiry = datetime.fromisoformat(details["expires_at"].replace("Z", "+00:00"))
+            resolved_at = datetime.fromisoformat(record["resolved_at"].replace("Z", "+00:00"))
+            provenance_ok = (resolved_at.tzinfo is not None and observed < resolved_at
+                             and details.get("quote_method") == "orderbook-extrema-v1"
+                             and details.get("resolution_source") == "gamma_final_uma"
+                             and details.get("resolution_status") == "resolved"
+                             and observed.tzinfo is not None and expiry.tzinfo is not None and observed < expiry
+                             and details.get("contract_hash") and details.get("model") and details.get("prompt_version"))
+        except (KeyError, TypeError, ValueError, AttributeError):
+            provenance_ok = False
+        if (not isinstance(market_id, str) or not market_id or not provenance_ok
+                or not _probability(record.get("jev_prob")) or not _probability(record.get("market_prob"))
+                or record.get("resolved_outcome") not in (0.0, 1.0)):
+            excluded["invalid_or_missing_provenance"] += 1
+            continue
+        if market_id in seen:
+            excluded["repeated_market"] += 1
+            continue
+        seen.add(market_id)
+        valid.append(record)
+    return valid, excluded
+
+
+def calculate_edge_realization(decisions: list[dict], standard_stake: float = 50.0) -> dict[str, Any]:
+    """Simulated hold-to-settlement returns using actual side asks and explicit cost assumptions.
+
+    standard_stake is a USD purchase budget, not a contract count. These are hypothetical
+    fills, never actual realized trading P&L. Missing NO quotes or costs exclude the row.
     """
-    recommended = [d for d in decisions if d.get("action") in ("buy_yes", "buy_no") and d.get("resolved_outcome") is not None]
-
-    if not recommended:
-        return {
-            "total_recommended": 0,
-            "wins": 0,
-            "losses": 0,
-            "win_rate": 0.0,
-            "total_pnl": 0.0,
-            "total_cost": 0.0,
-            "roi": 0.0,
-        }
-
-    wins = 0
-    losses = 0
-    total_pnl = 0.0
-    total_cost = 0.0
-
-    for d in recommended:
-        action = d["action"]
-        outcome = float(d["resolved_outcome"])
-        # Market price at entry
-        mkt_p = float(d.get("market_prob") or 0.5)
-
-        if action == "buy_yes":
-            cost = standard_stake * mkt_p
-            # Payout: $1 per share if YES won (outcome == 1.0), else 0
-            payout = standard_stake if outcome == 1.0 else 0.0
-            pnl = payout - cost
-            if outcome == 1.0:
-                wins += 1
-            else:
-                losses += 1
-        else:  # buy_no
-            no_p = 1.0 - mkt_p
-            cost = standard_stake * no_p
-            # Payout: $1 per share if NO won (outcome == 0.0), else 0
-            payout = standard_stake if outcome == 0.0 else 0.0
-            pnl = payout - cost
-            if outcome == 0.0:
-                wins += 1
-            else:
-                losses += 1
-
+    if not math.isfinite(standard_stake) or standard_stake <= 0:
+        raise ValueError("standard_stake must be a positive USD budget")
+    recommended = [d for d in decisions if d.get("action") in ("buy_yes", "buy_no")]
+    wins = losses = excluded = 0
+    total_pnl = total_cost = total_fees = total_slippage = 0.0
+    for record in recommended:
+        details = _details(record)
+        try:
+            yes_ask, no_ask = float(details["yes_ask"]), float(details["no_ask"])
+            stake = float(details.get("stake_usd", standard_stake))
+            fees, slippage = float(details["fees_usd"]), float(details["slippage_usd"])
+            outcome = float(record["resolved_outcome"])
+            if (not all(math.isfinite(v) for v in (yes_ask, no_ask, stake, fees, slippage, outcome))
+                    or not (0 < yes_ask < 1 and 0 < no_ask < 1 and stake > 0)
+                    or fees < 0 or slippage < 0 or outcome not in (0, 1)):
+                raise ValueError("Invalid execution inputs")
+        except (KeyError, TypeError, ValueError):
+            excluded += 1
+            continue
+        price = yes_ask if record["action"] == "buy_yes" else no_ask
+        contracts = stake / price
+        won = outcome == (1.0 if record["action"] == "buy_yes" else 0.0)
+        cost = stake + fees + slippage
+        total_pnl += (contracts if won else 0.0) - cost
         total_cost += cost
-        total_pnl += pnl
-
-    win_rate = (wins / len(recommended)) if recommended else 0.0
-    roi = (total_pnl / total_cost) if total_cost > 0 else 0.0
-
+        total_fees += fees
+        total_slippage += slippage
+        wins += int(won)
+        losses += int(not won)
+    evaluated = wins + losses
     return {
-        "total_recommended": len(recommended),
-        "wins": wins,
-        "losses": losses,
-        "win_rate": round(win_rate, 4),
-        "total_pnl": round(total_pnl, 2),
-        "total_cost": round(total_cost, 2),
-        "roi": round(roi, 4),
+        "basis": "hypothetical hold-to-settlement fills; explicit cost assumptions; not realized P&L",
+        "total_recommended": len(recommended), "evaluated_trades": evaluated, "excluded_records": excluded,
+        "wins": wins, "losses": losses, "win_rate": wins / evaluated if evaluated else None,
+        "total_pnl": round(total_pnl, 4) if evaluated else None,
+        "total_cost": round(total_cost, 4) if evaluated else None,
+        "total_fees": round(total_fees, 4), "total_slippage": round(total_slippage, 4),
+        "roi": round(total_pnl / total_cost, 6) if evaluated else None,
     }
 
 
@@ -260,7 +283,8 @@ def generate_calibration_report(
     target_asset = None if (not asset or asset.lower() == "all") else asset.upper()
 
     all_decisions = db.get_jev_decisions(asset=target_asset, limit=2000)
-    resolved_decisions = db.get_jev_calibration_data(asset=target_asset, only_resolved=True, limit=2000)
+    raw_resolved = db.get_jev_calibration_data(asset=target_asset, only_resolved=True, limit=2000)
+    resolved_decisions, exclusions = select_independent_records(raw_resolved)
 
     total_logged = len(all_decisions)
     total_resolved = len(resolved_decisions)
@@ -271,14 +295,17 @@ def generate_calibration_report(
             "asset_filter": asset or "all",
             "total_logged": total_logged,
             "total_resolved": 0,
-            "message": "No resolved decisions found in database. Run sync_jev_resolutions.py to populate ground truth outcomes.",
+            "raw_resolved_rows": len(raw_resolved), "exclusions": exclusions,
+            "sample_window": "most recent 2000 resolved rows; not lifetime totals",
+            "live_ready": False,
+            "message": "No eligible independent resolved observations. Inspect resolution state, provenance and exclusions.",
             "per_asset": {},
             "bins": [],
             "ascii_diagram": "",
         }
 
     jev_forecasts = [float(d["jev_prob"]) for d in resolved_decisions]
-    mkt_forecasts = [float(d["market_prob"] or 0.5) for d in resolved_decisions]
+    mkt_forecasts = [float(d["market_prob"]) for d in resolved_decisions]
     outcomes = [float(d["resolved_outcome"]) for d in resolved_decisions]
 
     jev_bs = calculate_brier_score(jev_forecasts, outcomes)
@@ -309,7 +336,7 @@ def generate_calibration_report(
             continue
 
         s_jev = [float(d["jev_prob"]) for d in sym_resolved]
-        s_mkt = [float(d["market_prob"] or 0.5) for d in sym_resolved]
+        s_mkt = [float(d["market_prob"]) for d in sym_resolved]
         s_out = [float(d["resolved_outcome"]) for d in sym_resolved]
 
         s_jbs = calculate_brier_score(s_jev, s_out)
@@ -331,6 +358,13 @@ def generate_calibration_report(
 
     return {
         "status": "success",
+        "live_ready": False,
+        "raw_resolved_rows": len(raw_resolved), "exclusions": exclusions,
+        "sample_window": "most recent 2000 resolved rows; not lifetime totals",
+        "baseline": "recorded YES ask; descriptive reference, not an unbiased probability estimate",
+        "distinct_markets": total_resolved,
+        "minimum_sample_gate_met": total_resolved >= 300,
+        "evidence_limit": "descriptive research; no confidence interval or prospective profitability proof",
         "asset_filter": asset or "all",
         "total_logged": total_logged,
         "total_resolved": total_resolved,

@@ -1,4 +1,4 @@
-"""Client for TypeSafe's Jev System One decision model via OpenRouter.
+"""Client for TypeSafe's Jev System One decision model via the direct TypeSafe API.
 
 Provides low-latency, typed evaluations over structured states using
 calibrated probabilities (noul), discrete selections (choice), and
@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+from pathlib import Path
+import stat
 import os
 import urllib.error
 import urllib.request
@@ -25,8 +28,8 @@ logger = logging.getLogger(__name__)
 # Constants & Defaults
 # ---------------------------------------------------------------------------
 
-OPENROUTER_DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions"
-DEFAULT_JEV_MODEL = "typesafe/jev-1.13"
+TYPESAFE_DECISIONS_URL = "https://api.typesafe.ai/v1/systemone"
+DEFAULT_JEV_MODEL = "jev-1.13.0"
 DEFAULT_TIMEOUT_SEC = 15
 
 
@@ -43,6 +46,70 @@ class JevRateLimitError(JevError):
     """Raised when Jev API returns HTTP 429."""
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise JevError("TypeSafe API redirects are not allowed")
+
+
+def _urlopen(request, timeout):
+    return urllib.request.build_opener(_NoRedirect()).open(request, timeout=timeout)
+
+
+def load_api_key() -> str:
+    """Load only explicitly configured TypeSafe secrets; never use OpenRouter keys."""
+    key = os.getenv("TYPESAFE_API_KEY", "").strip()
+    if key:
+        return key
+    filename = os.getenv("TYPESAFE_API_KEY_FILE", "")
+    if not filename:
+        return ""
+    try:
+        fd = os.open(Path(filename).expanduser(), os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd) as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_uid != os.getuid():
+                raise JevError("TypeSafe key file must be owned by this user with mode 600")
+            key = stream.read(4097).strip()
+            if not key or len(key) > 4096:
+                raise JevError("Invalid TypeSafe key file")
+            return key
+    except JevError:
+        raise
+    except OSError:
+        raise JevError("Cannot read configured TypeSafe key file") from None
+
+
+def _number(value, low=0.0, high=1.0):
+    return (isinstance(value, (float, int)) and not isinstance(value, bool)
+            and math.isfinite(value) and low <= value <= high)
+
+
+def validate_answers(result: dict, questions: dict) -> None:
+    """Fail closed on missing, invalid, or out-of-schema provider answers."""
+    if not isinstance(result, dict) or not isinstance(result.get("answers"), dict):
+        raise JevError("TypeSafe response is missing typed answers")
+    for name, question in questions.items():
+        answer = result["answers"].get(name)
+        kind = question.get("type")
+        if not isinstance(answer, dict) or answer.get("type") != kind:
+            raise JevError("TypeSafe response has a missing or mismatched answer type")
+        if kind == "noul":
+            if not _number(answer.get("noul")):
+                raise JevError("TypeSafe returned an invalid probability")
+            continue
+        criteria = question.get("criteria", {})
+        options = set(criteria) if kind == "choice" else {str(i) for i in range(len(criteria))}
+        probs = answer.get("probabilities")
+        if (not _number(answer.get("confidence")) or not isinstance(probs, dict)
+                or set(probs) != options or not all(_number(p) for p in probs.values())
+                or not math.isclose(sum(probs.values()), 1.0, abs_tol=0.001)):
+            raise JevError("TypeSafe returned an invalid decision distribution")
+        if kind == "choice" and answer.get("choice") not in options:
+            raise JevError("TypeSafe returned an unknown choice")
+        if kind == "score" and not _number(answer.get("score"), 0, len(criteria) - 1):
+            raise JevError("TypeSafe returned an invalid rubric score")
+
+
 class JevClient:
     """Client for querying TypeSafe's Jev-1.13 decision model."""
 
@@ -50,19 +117,23 @@ class JevClient:
         self,
         api_key: str | None = None,
         model: str | None = None,
-        base_url: str = OPENROUTER_DECISIONS_URL,
+        base_url: str = TYPESAFE_DECISIONS_URL,
         timeout: int = DEFAULT_TIMEOUT_SEC,
     ):
         """Initialize Jev client.
 
         Args:
-            api_key: OpenRouter API key. If None, reads from OPENROUTER_API_KEY env.
-            model: Model identifier. Defaults to typesafe/jev-1.13.
+            api_key: TypeSafe key. Otherwise use TYPESAFE_API_KEY or TYPESAFE_API_KEY_FILE.
+            model: Direct TypeSafe model identifier, pinned to jev-1.13.0 by default.
             base_url: Decisions API endpoint URL.
             timeout: Request timeout in seconds.
         """
-        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY", "")
-        self.model = model or os.getenv("JEV_MODEL", DEFAULT_JEV_MODEL)
+        if base_url != TYPESAFE_DECISIONS_URL:
+            raise JevError("TypeSafe keys may only be sent to the official decision endpoint")
+        self.api_key = load_api_key() if api_key is None else api_key
+        self.model = model or os.getenv("TYPESAFE_MODEL", DEFAULT_JEV_MODEL)
+        if self.model.startswith("typesafe/"):
+            raise JevError("Use a direct TypeSafe model ID such as jev-1.13.0")
         self.base_url = base_url
         self.timeout = timeout
 
@@ -90,7 +161,7 @@ class JevClient:
             JevError: On API or network failures.
         """
         if not self.api_key:
-            raise JevError("OPENROUTER_API_KEY is not configured")
+            raise JevError("TYPESAFE_API_KEY or TYPESAFE_API_KEY_FILE is not configured")
 
         selected_model = model or self.model
         payload = {
@@ -106,25 +177,24 @@ class JevClient:
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
-                "HTTP-Referer": "https://github.com/johnsnow92/polymarket-arb-scanner",
-                "X-OpenRouter-Title": "Polymarket-Arb-Scanner / Jev",
             },
             method="POST",
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                body = resp.read().decode("utf-8")
-                return json.loads(body)
-        except urllib.error.HTTPError as e:
-            err_body = e.read().decode("utf-8", errors="replace")
-            logger.error("Jev API HTTP %d error: %s", e.code, err_body)
-            if e.code == 429:
-                raise JevRateLimitError(f"Rate limited by Jev API: {err_body}") from e
-            raise JevError(f"Jev API HTTP {e.code}: {err_body}") from e
-        except Exception as e:
-            logger.error("Jev network or parsing error: %s", e)
-            raise JevError(f"Jev request failed: {e}") from e
+            with _urlopen(req, timeout=self.timeout) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            # A response can echo sensitive request data. Do not log or retain its body.
+            code = exc.code
+            exc.close()
+            if code in (429, 529):
+                raise JevRateLimitError(f"TypeSafe temporarily unavailable (HTTP {code})") from None
+            raise JevError(f"TypeSafe API HTTP {code}") from None
+        except Exception:
+            raise JevError("TypeSafe transport or JSON decoding failed") from None
+        validate_answers(result, questions)
+        return result
 
     def evaluate_noul(
         self,
@@ -152,7 +222,7 @@ class JevClient:
         resp = self.query_decisions(state, {"q": question_def})
         answers = resp.get("answers", {})
         q_ans = answers.get("q", {})
-        return float(q_ans.get("noul", 0.5))
+        return float(q_ans["noul"])
 
     def evaluate_choice(
         self,

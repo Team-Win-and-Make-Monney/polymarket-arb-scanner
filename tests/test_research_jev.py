@@ -172,6 +172,43 @@ class TestNoveltyAndSettlement:
         assert len(result["evidence"]) == 2
         assert not client.calls
 
+    @pytest.mark.parametrize("same_text", [True, False])
+    def test_different_known_events_cannot_be_marked_duplicate(self, same_text):
+        payload, client = fixture("novelty"), FakeJev({"relationship": "duplicate"})
+        payload["current"]["constraints"] = {"event_id": "acme-q3-2026"}
+        payload["previous"][0]["constraints"] = {"event_id": "acme-q2-2026"}
+        if same_text:
+            payload["current"]["text"] = payload["previous"][0]["text"]
+        result = screen_novelty(payload, client)
+        assert result["status"] == "abstain"
+        assert result["relationship"] is None
+        assert result["requires_review"] is True
+        assert result["retain_originals"] is True
+        assert len(result["evidence"]) == 2
+        assert not client.calls
+
+    def test_exact_duplicate_with_matching_known_event_still_avoids_model(self):
+        payload, client = fixture("novelty"), FakeJev()
+        payload["current"]["constraints"] = {"event_id": "acme-q3-2026"}
+        payload["previous"][0]["constraints"] = {"event_id": "acme-q3-2026"}
+        payload["current"]["text"] = payload["previous"][0]["text"]
+        result = screen_novelty(payload, client)
+        assert result["relationship"] == "duplicate"
+        assert result["requires_review"] is False
+        assert not client.calls
+
+    @pytest.mark.parametrize("side", ["current", "previous"])
+    def test_known_event_on_only_one_side_cannot_be_an_exact_duplicate(self, side):
+        payload, client = fixture("novelty"), FakeJev({"relationship": "duplicate"})
+        item = payload["current"] if side == "current" else payload["previous"][0]
+        item["constraints"] = {"event_id": "acme-q3-2026"}
+        payload["current"]["text"] = payload["previous"][0]["text"]
+        result = screen_novelty(payload, client)
+        assert result["status"] == "abstain"
+        assert result["relationship"] is None
+        assert result["requires_review"] is True
+        assert not client.calls
+
     def test_contradiction_is_routed_for_review(self):
         result = screen_novelty(fixture("novelty"), FakeJev({"relationship": "contradiction"}))
         assert result["relationship"] == "contradiction"
@@ -266,6 +303,27 @@ class TestRelevanceAndQueue:
 
 
 class TestProgramsAndTranscript:
+    @pytest.mark.parametrize("mode,failure", [("off", False), ("advisory", True), ("advisory", False)])
+    def test_prose_only_program_change_requires_review_even_when_model_is_off_or_fails(self, mode, failure):
+        payload = fixture("incentives")
+        payload["current_conditions"] = copy.deepcopy(payload["previous_conditions"])
+        payload["previous"]["text"] = "All qualifying accounts may earn a reward."
+        payload["current"]["text"] = "Employee accounts are now excluded from earning a reward."
+        result = detect_incentive_changes(payload, FakeJev({"change": "cosmetic"}, mode=mode, failure=failure))
+        assert result["deterministic_changes"] == {}
+        assert result["requires_review"] is True
+        assert result["account_eligibility"] == "not_evaluated"
+
+    def test_identical_program_prose_and_conditions_do_not_require_review(self):
+        payload, client = fixture("incentives"), FakeJev(failure=True)
+        payload["current_conditions"] = copy.deepcopy(payload["previous_conditions"])
+        payload["current"]["text"] = payload["previous"]["text"]
+        result = detect_incentive_changes(payload, client)
+        assert result["change"] == "unchanged"
+        assert result["requires_review"] is False
+        assert result["unresolved_workflows"] == []
+        assert not client.calls
+
     def test_model_cannot_hide_a_numeric_program_change(self):
         result = detect_incentive_changes(fixture("incentives"), FakeJev({"change": "cosmetic"}))
         assert result["deterministic_changes"]["reward_amount"] == {"previous": "100", "current": "150"}

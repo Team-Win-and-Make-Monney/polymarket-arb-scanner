@@ -120,12 +120,21 @@ def screen_novelty(payload: dict, client=None) -> dict:
         v.chronological_pair(item, current)
     state = {**row, "current": current, "previous": previous}
     result = _base("novelty", state, previous + [current])
-    result.update(relationship=None, retain_originals=True)
+    result.update(relationship=None, retain_originals=True, requires_review=True)
+    current_event = current.get("constraints", {}).get("event_id")
+    event_conflicts = [item["id"] for item in previous
+                       if set(current["entity_ids"]) & set(item["entity_ids"])
+                       and current_event != item.get("constraints", {}).get("event_id")]
+    if event_conflicts:
+        # Repeated wording can describe different event periods. A missing ID on
+        # one side also cannot establish equality with the other side's known ID.
+        result.update(status="abstain", reason="event_identity_not_proven", event_conflicts=event_conflicts)
+        return result
     if any(current["text"] == item["text"] and current["entity_ids"] == item["entity_ids"] for item in previous):
-        result.update(relationship="duplicate", reason="exact_text_and_entity_match")
+        result.update(relationship="duplicate", reason="exact_text_and_entity_match", requires_review=False)
         return result
     if not any(set(current["entity_ids"]) & set(item["entity_ids"]) for item in previous):
-        result.update(relationship="unrelated", reason="disjoint_entity_ids")
+        result.update(relationship="unrelated", reason="disjoint_entity_ids", requires_review=False)
         return result
     answers = _evaluate(result, state, r.novelty_questions(), client)
     result["relationship"] = _selected(result, answers, "relationship")
@@ -277,10 +286,11 @@ def detect_incentive_changes(payload: dict, client=None) -> dict:
     state = {**row, "previous": previous, "current": current, "previous_conditions": old, "current_conditions": new}
     result = _base("incentives", state, [previous, current])
     changes = {key: {"previous": old[key], "current": new[key]} for key in v.mismatches(old, new)}
+    prose_changed = previous["text"] != current["text"]
     result.update(deterministic_changes=changes, change=None, affected_workflows=[],
                   unresolved_workflows=[workflow["id"] for workflow in workflows],
-                  account_eligibility="not_evaluated", requires_review=bool(changes))
-    if previous["text"] == current["text"] and not changes:
+                  account_eligibility="not_evaluated", requires_review=bool(changes) or prose_changed)
+    if not prose_changed and not changes:
         result.update(change="unchanged", reason="exact_text_and_conditions_match", unresolved_workflows=[])
         return result
     answers = _evaluate(result, state, r.incentive_questions(workflows), client)
@@ -291,7 +301,8 @@ def detect_incentive_changes(payload: dict, client=None) -> dict:
                                     if _strong(answers[f"w{index}_affected"]["noul"]) is True]
     result["unresolved_workflows"] = [workflow["id"] for index, workflow in enumerate(workflows)
                                       if _strong(answers[f"w{index}_affected"]["noul"]) is None]
-    result["requires_review"] = bool(changes) or result["change"] != "cosmetic" or bool(result["unresolved_workflows"])
+    result["requires_review"] = (bool(changes) or prose_changed or result["change"] != "cosmetic"
+                                 or bool(result["unresolved_workflows"]))
     return result
 
 

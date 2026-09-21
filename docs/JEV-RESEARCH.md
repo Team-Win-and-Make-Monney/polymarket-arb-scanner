@@ -90,6 +90,12 @@ The model never performs that arithmetic or rewrites a market probability.
 Source and rule hosts must appear exactly in the caller's trusted-host list;
 subdomains are not implicitly trusted.
 
+Novelty screening checks optional event IDs before exact-text deduplication or
+semantic comparison. Shared entities with differing event IDs, or an event ID
+supplied on only one side, require review. Repeated wording across different
+reporting periods cannot be treated as a duplicate. Original sources remain in
+the result even when their scopes conflict.
+
 Two concrete adapters consume the existing pipeline formats:
 
 - `screen_discovery_candidates` / `discovery-screen` accepts discovery-cache
@@ -115,8 +121,10 @@ Existing Firecrawl evidence ingestion (PR #142) is a separate scope.
 Program comparison requires two official snapshots bound to the same program
 ID and trusted hosts. Caller-supplied exact conditions include start/end times,
 reward amount/unit, minimum volume and eligible regions. Negative numeric values
-are rejected. A semantic "cosmetic" judgment cannot suppress a numeric/date
-change. Outputs identify research workflows potentially affected; account
+are rejected. Any exact prose change or structured condition change requires
+review, including when the model is off, unavailable, or labels it "cosmetic."
+Only identical prose and conditions take the deterministic unchanged path.
+Outputs identify research workflows potentially affected; account
 eligibility is always `not_evaluated`.
 
 Transcript input must identify the same speaker and have caller-reviewed

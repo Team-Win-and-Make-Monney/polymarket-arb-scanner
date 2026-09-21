@@ -470,3 +470,209 @@ def scan_kalshi_rewards(kalshi_client, reward_tracker, min_pool_usdc: float = 10
 
     logger.info("Found %d Kalshi reward opportunities.", len(opportunities))
     return opportunities
+
+
+# ---------------------------------------------------------------------------
+# Limitless Rewards Scan
+# ---------------------------------------------------------------------------
+
+
+def _refine_limitless_rewards_with_clob(
+    opportunities: list[dict],
+    limitless_client,
+    price_cache: dict | None = None,
+) -> list[dict]:
+    """Stage 2: Verify Limitless optimal quotes against live CLOB.
+
+    Checks that optimal bids/asks don't cross the market and depth is sufficient.
+    """
+    if not opportunities:
+        return opportunities
+
+    logger.info("Refining %d Limitless reward candidates with CLOB depth check...", len(opportunities))
+
+    refined = []
+    for opp in opportunities:
+        market_key = opp.get("_market_key")
+        if not market_key:
+            refined.append(opp)
+            continue
+
+        book = None
+        if price_cache and market_key in price_cache:
+            cached = price_cache[market_key]
+            if isinstance(cached, dict) and "bids" in cached and "asks" in cached:
+                book = cached
+
+        if book is None and limitless_client:
+            try:
+                book = limitless_client.get_order_book(market_key)
+            except Exception as e:
+                logger.debug("Limitless order book fetch failed for %s: %s", market_key, e)
+
+        if not book or not book.get("bids") or not book.get("asks"):
+            # CLOB unavailable: keep opportunity (graceful degradation)
+            opp["_clob_refined"] = False
+            refined.append(opp)
+            continue
+
+        best_bid = max(float(b["price"]) for b in book["bids"])
+        best_ask = min(float(a["price"]) for a in book["asks"])
+        bid_depth = sum(float(b.get("amount", 0)) for b in book["bids"])
+        ask_depth = sum(float(a.get("amount", 0)) for a in book["asks"])
+
+        min_depth = 5.0
+        if bid_depth < min_depth or ask_depth < min_depth:
+            logger.debug("Dropping Limitless reward on %s: insufficient depth", market_key)
+            continue
+
+        optimal_bid = opp.get("optimal_bid", 0)
+        optimal_ask = opp.get("optimal_ask", 0)
+
+        if optimal_bid > best_ask or optimal_ask < best_bid:
+            logger.debug("Dropping Limitless reward on %s: quotes cross market", market_key)
+            continue
+
+        opp["_clob_refined"] = True
+        opp["_clob_depth"] = min(bid_depth, ask_depth)
+        refined.append(opp)
+
+    dropped = len(opportunities) - len(refined)
+    if dropped:
+        logger.info("Dropped %d Limitless reward candidates at CLOB validation.", dropped)
+    return refined
+
+
+def scan_limitless_rewards(
+    limitless_client,
+    min_pool_usdc: float = 10.0,
+    price_cache: dict | None = None,
+    max_candidates: int | None = None,
+) -> list[dict]:
+    """Scan for Limitless reward-eligible markets and generate resting order opportunities.
+
+    Two-stage scan:
+    1. Filter markets with active reward programs and sufficient pool size.
+    2. Refine with CLOB depth check.
+
+    Args:
+        limitless_client: LimitlessClient instance.
+        min_pool_usdc: Minimum daily reward pool in USDC.
+        price_cache: Optional WS price cache for faster lookup.
+        max_candidates: Maximum reward markets to refine against the CLOB.
+
+    Returns:
+        List of Limitless reward opportunity dicts.
+    """
+    opportunities = []
+
+    if not limitless_client:
+        return opportunities
+
+    logger.info("Scanning Limitless markets for reward programs...")
+
+    try:
+        markets = limitless_client.fetch_all_markets()
+    except Exception as e:
+        logger.error("Limitless fetch_all_markets failed in rewards scan: %s", e)
+        return []
+
+    filtered_no_incentives = 0
+    filtered_small_pool = 0
+    filtered_invalid_metadata = 0
+
+    for market in markets:
+        market_key = market.get("id") or market.get("market_id")
+        if not market_key:
+            continue
+
+        # Get reward info (from market dict or query client)
+        reward_info = market.get("reward_program")
+        if not reward_info or not isinstance(reward_info, dict):
+            try:
+                reward_info = limitless_client.get_reward_program(market_key)
+            except Exception as exc:
+                logger.debug("Failed to query Limitless reward program for %s: %s", market_key, exc)
+                reward_info = None
+
+        if not reward_info:
+            filtered_no_incentives += 1
+            continue
+
+        if not _validate_reward_metadata(reward_info):
+            filtered_invalid_metadata += 1
+            continue
+
+        pool_size = float(reward_info.get("pool_size_usdc", 0) or reward_info.get("daily_rate_usdc", 0))
+        if pool_size < min_pool_usdc:
+            filtered_small_pool += 1
+            continue
+
+        min_size = float(reward_info.get("min_incentive_size", 5.0))
+
+        # Mid-price from cache or market
+        mid_price = None
+        if price_cache and market_key in price_cache:
+            cached = price_cache[market_key]
+            if isinstance(cached, dict):
+                yes_bid = cached.get("yes_bid")
+                yes_ask = cached.get("yes_ask")
+                if yes_bid is not None and yes_ask is not None:
+                    mid_price = (yes_bid + yes_ask) / 2
+
+        if mid_price is None:
+            yp = market.get("yes_price")
+            np = market.get("no_price")
+            if yp is not None and np is not None:
+                mid_price = (yp + (1.0 - np)) / 2
+            elif yp is not None:
+                mid_price = yp
+
+        if mid_price is None or not (0.01 <= mid_price <= 0.99):
+            continue
+
+        optimal = _calculate_optimal_quotes(reward_info, mid_price, inventory=0.0)
+        min_size_cost = optimal["bid"] * min_size
+        reward_daily_rate = float(reward_info.get("daily_rate_usdc", pool_size))
+        reward_density = reward_daily_rate / max(min_size_cost, 1.0)
+
+        opportunities.append({
+            "type": "LimitlessRewards",
+            "_layer": 3,
+            "market": (market.get("title") or market.get("question") or market_key)[:60],
+            "platform": "limitless",
+            "reward_pool_usdc": pool_size,
+            "min_size": min_size,
+            "optimal_bid": optimal["bid"],
+            "optimal_ask": optimal["ask"],
+            "optimal_spread": optimal["spread"],
+            "single_sided_ok": 0.10 <= mid_price <= 0.90,
+            "total_cost": f"${min_size_cost:.4f}",
+            "net_profit": 0.0,
+            "net_roi": 0.0,
+            "reward_daily_rate_usdc": reward_daily_rate,
+            "reward_density_score": reward_density,
+            "_execution_eligible": False,
+            "_market_key": market_key,
+            "_market_volume": float(market.get("volume", 0) or 0),
+        })
+
+    if filtered_no_incentives:
+        logger.info("Filtered %d Limitless markets without reward programs.", filtered_no_incentives)
+    if filtered_small_pool:
+        logger.info("Filtered %d Limitless markets with reward pool < $%.2f.", filtered_small_pool, min_pool_usdc)
+    if filtered_invalid_metadata:
+        logger.info("Filtered %d Limitless markets with invalid reward metadata.", filtered_invalid_metadata)
+
+    candidate_limit = REWARDS_MAX_MARKETS if max_candidates is None else max_candidates
+    opportunities.sort(key=lambda opp: opp.get("reward_density_score", 0), reverse=True)
+    if candidate_limit > 0 and len(opportunities) > candidate_limit:
+        opportunities = opportunities[:candidate_limit]
+
+    # Stage 2: Refine against live CLOB
+    opportunities = _refine_limitless_rewards_with_clob(
+        opportunities, limitless_client, price_cache=price_cache,
+    )
+
+    logger.info("Found %d Limitless reward opportunities.", len(opportunities))
+    return opportunities

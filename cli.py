@@ -98,6 +98,7 @@ from scans import (
     scan_convergence,
     scan_polymarket_rewards,
     scan_kalshi_rewards,
+    scan_limitless_rewards,
     scan_frechet,
     _refine_frechet_with_clob,
     scan_temporal_arb,
@@ -1008,34 +1009,51 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
             )
 
     # Rewards scanning (Layer 3: liquidity rewards)
-    if args.mode in ("all", "rewards") and CONFIG_REWARDS_ENABLED:
+    limitless_rewards_active = getattr(config, "LIMITLESS_REWARDS_ENABLED", False) or args.mode == "limitless-rewards"
+    if args.mode in ("all", "rewards", "limitless-rewards") and (CONFIG_REWARDS_ENABLED or limitless_rewards_active):
         logger.info("--- Rewards Scan ---")
-        try:
-            # Polymarket rewards scan
-            if poly_reward_markets:
-                from market_maker import RewardTracker
-                reward_tracker = RewardTracker()
-                pm_reward_opps = scan_polymarket_rewards(
-                    poly_reward_markets, reward_tracker, min_pool_usdc=10.0
-                )
-                all_opportunities.extend(pm_reward_opps)
-                logger.info("Found %d Polymarket reward opportunities.", len(pm_reward_opps))
-        except Exception as e:
-            logger.error("Polymarket rewards scan failed: %s", e)
+        if args.mode in ("all", "rewards") and CONFIG_REWARDS_ENABLED:
+            try:
+                # Polymarket rewards scan
+                if poly_reward_markets:
+                    from market_maker import RewardTracker
+                    reward_tracker = RewardTracker()
+                    pm_reward_opps = scan_polymarket_rewards(
+                        poly_reward_markets, reward_tracker, min_pool_usdc=10.0
+                    )
+                    all_opportunities.extend(pm_reward_opps)
+                    logger.info("Found %d Polymarket reward opportunities.", len(pm_reward_opps))
+            except Exception as e:
+                logger.error("Polymarket rewards scan failed: %s", e)
 
-        try:
-            # Kalshi rewards scan
-            if kalshi_client:
-                from market_maker import KalshiRewardTracker
-                kalshi_reward_tracker = KalshiRewardTracker()
-                k_reward_opps = scan_kalshi_rewards(
-                    kalshi_client, kalshi_reward_tracker, min_pool_usdc=10.0,
-                    kalshi_data=kalshi_data,
-                )
-                all_opportunities.extend(k_reward_opps)
-                logger.info("Found %d Kalshi reward opportunities.", len(k_reward_opps))
-        except Exception as e:
-            logger.error("Kalshi rewards scan failed: %s", e)
+            try:
+                # Kalshi rewards scan
+                if kalshi_client:
+                    from market_maker import KalshiRewardTracker
+                    kalshi_reward_tracker = KalshiRewardTracker()
+                    k_reward_opps = scan_kalshi_rewards(
+                        kalshi_client, kalshi_reward_tracker, min_pool_usdc=10.0,
+                        kalshi_data=kalshi_data,
+                    )
+                    all_opportunities.extend(k_reward_opps)
+                    logger.info("Found %d Kalshi reward opportunities.", len(k_reward_opps))
+            except Exception as e:
+                logger.error("Kalshi rewards scan failed: %s", e)
+
+        if limitless_rewards_active:
+            try:
+                # Limitless rewards scan
+                from limitless_api import LimitlessClient
+                limitless_client = LimitlessClient()
+                api_key = getattr(config, "LIMITLESS_API_KEY", "")
+                pk = getattr(config, "LIMITLESS_PRIVATE_KEY", "")
+                if api_key:
+                    limitless_client.login(api_key=api_key, private_key=pk)
+                l_reward_opps = scan_limitless_rewards(limitless_client, min_pool_usdc=10.0)
+                all_opportunities.extend(l_reward_opps)
+                logger.info("Found %d Limitless reward opportunities.", len(l_reward_opps))
+            except Exception as e:
+                logger.error("Limitless rewards scan failed: %s", e)
 
     # Jev System One Crypto Decision Scan
     if args.mode in ("all", "jev-crypto"):
@@ -1336,13 +1354,13 @@ def main():
                  "spread", "betfair", "smarkets", "sxbet", "matchbook",
                  "gemini", "ibkr", "event", "triangular", "nway",
                  "multi-cross",
-                 "stale", "resolution", "convergence", "mm", "rewards",
+                 "stale", "resolution", "convergence", "mm", "rewards", "limitless-rewards",
                  "imbalance", "news-snipe", "correlated", "time-decay",
                  "logical-arb", "whale-copy",
                  "fee-promo", "cross-mm",
                  "lead-lag-mm", "toxic-flow", "vol-mm", "mm-pilot", "jev-crypto", "frechet", "temporal", "ctf"],
         default="all",
-        help="Scan mode: all, binary, negrisk, negrisk-no, cross, kalshi, cross-all, spread, betfair, smarkets, sxbet, matchbook, gemini, ibkr, event, triangular, stale, resolution, convergence, mm, mm-pilot, rewards, imbalance, news-snipe, correlated, time-decay, fee-promo, cross-mm, jev-crypto, frechet, temporal, ctf",
+        help="Scan mode: all, binary, negrisk, negrisk-no, cross, kalshi, cross-all, spread, betfair, smarkets, sxbet, matchbook, gemini, ibkr, event, triangular, stale, resolution, convergence, mm, mm-pilot, rewards, limitless-rewards, imbalance, news-snipe, correlated, time-decay, fee-promo, cross-mm, jev-crypto, frechet, temporal, ctf",
     )
     parser.add_argument(
         "--min-profit",

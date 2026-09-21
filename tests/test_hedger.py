@@ -17,7 +17,7 @@ def mock_external_modules():
     for mod_name in [
         "polymarket_api", "kalshi_api",
         "betfair_api", "smarkets_api", "sxbet_api", "matchbook_api",
-        "gemini_api", "ibkr_api",
+        "gemini_api", "ibkr_api", "limitless_api",
     ]:
         if mod_name in sys.modules:
             continue
@@ -817,3 +817,98 @@ class TestKalshiBuyToReduce:
         )
         assert result is True
         assert mock_kalshi.place_order.call_args[1]["action"] == "buy"
+
+
+# ---------------------------------------------------------------------------
+# Limitless Hedging (Delta-neutral cross-hedge to Polymarket & native Limitless)
+# ---------------------------------------------------------------------------
+
+
+class TestLimitlessHedge:
+    """Test delta-neutral hedging for Limitless positions."""
+
+    def test_routes_to_limitless(self, PartialFillHedger, db):
+        mock_limitless = MagicMock()
+        mock_limitless.authenticated = True
+        mock_limitless.get_order_book.return_value = {
+            "bids": [{"price": 0.49, "amount": 20.0}],
+            "asks": [{"price": 0.51, "amount": 20.0}],
+        }
+        mock_limitless.place_order.return_value = {"order_id": "lim_h1"}
+        hedger = PartialFillHedger(limitless_client=mock_limitless, db=db)
+
+        pf = {
+            "id": 101, "platform": "limitless",
+            "token_id": "mkt_lim_1", "fill_price": 0.50,
+            "size": 10.0, "side": "yes",
+            "hedge_attempts": 0,
+        }
+        assert hedger._attempt_hedge(pf) is True
+        mock_limitless.place_order.assert_called_once()
+        assert mock_limitless.place_order.call_args[1]["side"] == "sell"
+
+    def test_limitless_cross_hedge_polymarket_places_opposing_order(self, PartialFillHedger, db):
+        mock_pm = MagicMock()
+        mock_pm.place_order.return_value = {"success": True, "order_id": "pm_h_lim"}
+        mock_pm.get_order_status.return_value = {"status": "matched"}
+        hedger = PartialFillHedger(pm_trader=mock_pm, db=db)
+
+        with patch("polymarket_api.fetch_order_book") as mock_fetch:
+            with patch("polymarket_api.get_best_bid_ask") as mock_best:
+                mock_fetch.return_value = {"bids": [0.48], "asks": [0.52]}
+                mock_best.return_value = {"bid": 0.48, "ask": 0.52}
+
+                pf = {
+                    "id": 102, "platform": "limitless",
+                    "token_id": "0xpm_token_123",
+                    "hedge_platform": "polymarket",
+                    "fill_price": 0.50,
+                    "size": 10.0,
+                    "side": "yes",
+                    "hedge_attempts": 0,
+                }
+                assert hedger._attempt_hedge(pf) is True
+                mock_pm.place_order.assert_called_once()
+                call_args = mock_pm.place_order.call_args
+                assert call_args[1]["side"] == "SELL"
+                assert call_args[1]["token_id"] == "0xpm_token_123"
+
+    def test_limitless_cross_hedge_refuses_when_loss_exceeds_max(self, PartialFillHedger, db):
+        mock_pm = MagicMock()
+        hedger = PartialFillHedger(pm_trader=mock_pm, db=db)
+
+        with patch("polymarket_api.fetch_order_book") as mock_fetch:
+            with patch("polymarket_api.get_best_bid_ask") as mock_best:
+                # Big spread drop: fill at 0.50, best bid only 0.35 (loss 0.15 > max_loss ~0.025)
+                mock_fetch.return_value = {"bids": [0.35], "asks": [0.55]}
+                mock_best.return_value = {"bid": 0.35, "ask": 0.55}
+
+                pf = {
+                    "id": 103, "platform": "limitless",
+                    "token_id": "0xpm_token_123",
+                    "hedge_platform": "polymarket",
+                    "fill_price": 0.50,
+                    "size": 10.0,
+                    "side": "yes",
+                    "hedge_attempts": 0,
+                }
+                assert hedger._attempt_hedge(pf) is False
+                mock_pm.place_order.assert_not_called()
+
+    def test_limitless_native_hedge_refuses_when_loss_exceeds_max(self, PartialFillHedger, db):
+        mock_limitless = MagicMock()
+        mock_limitless.authenticated = True
+        mock_limitless.get_order_book.return_value = {
+            "bids": [{"price": 0.30, "amount": 20.0}],
+            "asks": [{"price": 0.50, "amount": 20.0}],
+        }
+        hedger = PartialFillHedger(limitless_client=mock_limitless, db=db)
+
+        pf = {
+            "id": 104, "platform": "limitless",
+            "token_id": "mkt_lim_1", "fill_price": 0.50,
+            "size": 10.0, "side": "yes",
+            "hedge_attempts": 0,
+        }
+        assert hedger._attempt_hedge(pf) is False
+        mock_limitless.place_order.assert_not_called()

@@ -24,7 +24,7 @@ from scans.multi_cross import scan_multi_cross
 from scans.stale import scan_stale_prices
 from scans.resolution import scan_resolution_snipes
 from scans.convergence import scan_convergence
-from scans.rewards import scan_polymarket_rewards, scan_kalshi_rewards
+from scans.rewards import scan_polymarket_rewards, scan_kalshi_rewards, scan_limitless_rewards
 from scans.fee_promo import scan_fee_promo
 from scans.cross_mm import scan_cross_mm
 from scans.lead_lag_mm import scan_lead_lag_mm
@@ -111,4 +111,5 @@ __all__ = [
     "_refine_temporal_with_clob",
     "scan_ctf",
     "_refine_ctf_with_clob",
+    "scan_limitless_rewards",
 ]

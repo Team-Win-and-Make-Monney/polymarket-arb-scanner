@@ -245,11 +245,85 @@ class QuoteManager:
                 }
             return order_id
 
-        # Live order placement would go here, dispatching to platform API
-        # For now, log the intended action
-        logger.info("MM quote: %s %s %s @ %.4f ($%.2f)",
-                     platform, side, market_key, price, size)
-        return None
+        norm_platform = platform.lower()
+        order_side = "buy" if side.lower() in ("bid", "buy") else "sell"
+        quantity = max(1, int(round(size / price))) if price > 0 else 1
+
+        resp = None
+        try:
+            if norm_platform == "limitless":
+                resp = trader.place_order(
+                    market_id=market_key,
+                    side=order_side,
+                    outcome="yes",
+                    quantity=quantity,
+                    price=price,
+                    time_in_force="gtc",
+                )
+            elif norm_platform == "kalshi":
+                resp = trader.place_order(
+                    ticker=market_key,
+                    side="yes",
+                    action=order_side,
+                    count=quantity,
+                    price_dollars=price,
+                    time_in_force="gtc",
+                )
+            elif norm_platform == "polymarket":
+                resp = trader.place_order(
+                    token_id=market_key,
+                    side=order_side.upper(),
+                    price=price,
+                    size=float(quantity),
+                    order_type="GTC",
+                )
+            elif hasattr(trader, "place_order"):
+                try:
+                    resp = trader.place_order(
+                        market_id=market_key,
+                        side=order_side,
+                        price=price,
+                        size=size,
+                    )
+                except TypeError:
+                    resp = trader.place_order(market_key, order_side, price, size)
+        except Exception as exc:
+            logger.error("Failed to place live MM quote on %s for %s: %s", platform, market_key, exc)
+            return None
+
+        if resp is None:
+            logger.warning("Live MM quote returned None for %s %s", platform, market_key)
+            return None
+
+        order_id = None
+        if isinstance(resp, str):
+            order_id = resp
+        elif isinstance(resp, dict):
+            order_id = (
+                resp.get("order_id")
+                or resp.get("orderID")
+                or resp.get("id")
+                or (resp.get("order", {}).get("order_id") if isinstance(resp.get("order"), dict) else None)
+            )
+
+        if not order_id:
+            logger.warning("Live MM quote on %s returned response without order ID: %s", platform, resp)
+            return None
+
+        order_id = str(order_id)
+        with self._lock:
+            self._active_orders[order_id] = {
+                "platform": platform,
+                "market_key": market_key,
+                "side": side,
+                "price": price,
+                "size": size,
+                "status": "resting",
+                "placed_at": time.time(),
+            }
+        logger.info("MM quote placed: %s %s %s @ %.4f ($%.2f) -> order_id=%s",
+                    platform, side, market_key, price, size, order_id)
+        return order_id
 
     @staticmethod
     def _cancel_on_exchange(order_id: str, trader) -> bool:
@@ -463,7 +537,7 @@ class MarketMaker:
             )
 
             # Cancel existing quotes for this market
-            self.quote_manager.cancel_all(mkey)
+            self.quote_manager.cancel_all(mkey, trader=trader if not self.dry_run else None)
 
             # Place new bid
             if self.inventory.can_trade(mkey, self.quote_size):

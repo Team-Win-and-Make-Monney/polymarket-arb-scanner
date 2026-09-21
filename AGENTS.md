@@ -2,6 +2,8 @@
 
 Instructions for AI coding agents operating in this repository.
 
+This repository supports autonomous trading services, but execution remains governed by current runtime configuration, venue eligibility, operator-owned risk limits, and kill-switch controls. Repository documentation is not transaction authority.
+
 ## Project Overview
 
 Python CLI tool that scans for arbitrage opportunities across prediction markets. Supports one-shot scans, continuous mode with WebSocket feeds, and automated trade execution. 
@@ -158,3 +160,17 @@ Add entries to `_CROSS_FEE_FUNCS` in `scans/cross.py` using `functools.partial(n
 ## CI / CD & Deployment
 - `.github/workflows/test.yml` — correctness lint plus pytest on PRs to `master` (Python 3.12); any failure or collection crash fails CI.
 - Railway auto-deploys on push to `master` via GitHub integration. Dockerfile-based build (`python:3.12-slim`).
+
+## Local Firecrawl KBs
+
+Sticky venue/docs mirrors: `~/Financial Markets with AI/.firecrawl/_kb/` (Kalshi API,
+Polymarket public docs — shadow/data only). Registry:
+`~/.claude/references/firecrawl-kb-registry.md`. Read the corpus `index.md`, then only
+the pages you need. Do not preload whole trees. Polymarket international remains
+non-executable per portfolio allowlist.
+
+## Mem0 (cross-tool)
+
+Mem0 `app_id=johnsnow92-polymarket-arb-scanner`. Search this app_id plus `personal-prefs` at session start before rediscovering durable decisions.
+Personal prefs → `personal-prefs`. Open items → Linear. Human notes → Obsidian. Claude Code session learnings → native MEMORY.md.
+Policy: `~/Dev/mem0-knowledge-base/FULL-LEVERAGE.md`.

@@ -219,6 +219,92 @@ class TestTokenIdPropagation:
         # Price count (3) != token ID count (1) → returns empty legs
         assert legs == []
 
+    def test_build_legs_jev_crypto_buy_yes(self, executor):
+        opp = {
+            "type": "JevCrypto",
+            "_action": "buy_yes",
+            "_token_ids": ["tok_yes", "tok_no"],
+            "_exec_price": 0.45,
+        }
+        legs = executor._build_legs(opp, 10.0)
+        assert len(legs) == 1
+        assert legs[0]["platform"] == "polymarket"
+        assert legs[0]["side"] == "BUY"
+        assert legs[0]["token"] == "yes"
+        assert legs[0]["price"] == 0.45
+        assert legs[0]["_token_id"] == "tok_yes"
+
+    def test_build_legs_jev_crypto_buy_no(self, executor):
+        opp = {
+            "type": "JevCrypto",
+            "_action": "buy_no",
+            "_token_ids": ["tok_yes", "tok_no"],
+            "_exec_price": 0.55,
+        }
+        legs = executor._build_legs(opp, 10.0)
+        assert len(legs) == 1
+        assert legs[0]["platform"] == "polymarket"
+        assert legs[0]["side"] == "BUY"
+        assert legs[0]["token"] == "no"
+        assert legs[0]["price"] == 0.55
+        assert legs[0]["_token_id"] == "tok_no"
+
+    def test_revalidate_jev_crypto(self, executor):
+        now = time.time()
+        price_cache = {("polymarket", "tok_yes"): {"best_ask": 0.40, "_ts": now}}
+        opp_pass = {
+            "type": "JevCrypto", "net_profit": 0.10, "total_cost": "$1.00",
+            "_confidence": 0.75, "_token_ids": ["tok_yes", "tok_no"],
+            "_model_prob": 0.65, "_action": "buy_yes",
+        }
+        assert executor._revalidate(opp_pass, price_cache) is True
+
+        opp_fail = {
+            "type": "JevCrypto", "net_profit": 0.10, "total_cost": "$1.00",
+            "_confidence": 0.30, "_token_ids": ["tok_yes", "tok_no"],
+            "_model_prob": 0.65, "_action": "buy_yes",
+        }
+        assert executor._revalidate(opp_fail, price_cache) is False
+
+    def test_revalidate_jev_crypto_price_and_edge(self, executor):
+        # Opportunity with target token and model probability 0.65 (raw edge = 0.65 - 0.40 = 0.25 >= JEV_MIN_EDGE)
+        opp = {
+            "type": "JevCrypto",
+            "net_profit": 0.10,
+            "total_cost": 50.0,
+            "_confidence": 0.85,
+            "_action": "buy_yes",
+            "_token_ids": ["tok_yes", "tok_no"],
+            "_model_prob": 0.65,
+        }
+        now = time.time()
+        price_cache = {("polymarket", "tok_yes"): {"best_ask": 0.40, "_ts": now}}
+        assert executor._revalidate(opp, price_cache) is True
+        assert opp["_exec_price"] == 0.40
+
+        # Now suppose price moved up to 0.64 (edge = 0.65 - 0.64 = 0.01 < JEV_MIN_EDGE 0.04)
+        price_cache_collapsed = {("polymarket", "tok_yes"): {"best_ask": 0.64, "_ts": now}}
+        assert executor._revalidate(opp, price_cache_collapsed) is False
+
+    def test_revalidate_jev_crypto_fails_closed_when_price_unavailable(self, executor):
+        opp = {
+            "type": "JevCrypto", "net_profit": 0.10, "total_cost": 50.0,
+            "_confidence": 0.85, "_action": "buy_yes",
+            "_token_ids": ["tok_yes", "tok_no"], "_model_prob": 0.65,
+        }
+        with patch("executor.fetch_order_book", return_value=None):
+            assert executor._revalidate(opp, None) is False
+
+    def test_revalidate_jev_crypto_size_clamping(self, executor):
+        opp = {
+            "type": "JevCrypto", "net_profit": 0.10, "total_cost": 1000.0,
+            "_clob_depth": 50.0, "_confidence": 0.85, "_action": "buy_yes",
+            "_token_ids": ["tok_yes", "tok_no"], "_model_prob": 0.65,
+        }
+        now = time.time()
+        price_cache = {("polymarket", "tok_yes"): {"best_ask": 0.40, "_ts": now}}
+        assert executor._revalidate(opp, price_cache) is True
+
 
 # ---------------------------------------------------------------------------
 # _parse_price
@@ -2098,6 +2184,43 @@ class TestPlatformWhitelist:
         assert success is True
         assert order_id == "ord1"
 
+    def test_persist_order_id_before_fill_poll(self, executor):
+        """Order ID must be written to DB before fill confirmation completes."""
+        leg = {
+            "platform": "polymarket",
+            "side": "BUY",
+            "price": 0.50,
+            "_token_id": "tok123",
+            "_trade_id": 42,
+            "_idempotency_key": "idem-xyz",
+        }
+        opp = {"type": "Binary"}
+        executor.pm_trader.place_order.return_value = {
+            "success": True, "orderID": "ord-persist-1",
+        }
+        call_order: list[str] = []
+        update_mock = MagicMock()
+
+        def _track_update(*a, **kw):
+            call_order.append("update")
+            update_mock(*a, **kw)
+
+        def _track_confirm(*a, **kw):
+            call_order.append("confirm")
+            return 0.50
+
+        with patch("executor.ENABLED_EXECUTION_PLATFORMS", frozenset(["polymarket", "kalshi"])), \
+             patch.object(executor.db, "update_trade_status", side_effect=_track_update), \
+             patch.object(executor, "_confirm_fill_pm", side_effect=_track_confirm):
+            success, order_id, fill_price = executor._execute_single_leg(leg, 5.0, opp)
+        assert success is True
+        assert order_id == "ord-persist-1"
+        assert "update" in call_order and "confirm" in call_order
+        assert call_order.index("update") < call_order.index("confirm")
+        # First update must carry the order_id while still pending
+        first_kw = update_mock.call_args_list[0].kwargs
+        assert first_kw.get("order_id") == "ord-persist-1"
+
     def test_cross_all_legs_rejected_when_platform_not_whitelisted(self, executor):
         """Cross-all with a non-whitelisted platform returns empty legs."""
         opp = {
@@ -2394,13 +2517,13 @@ class TestMakerRouting:
              mpatch.object(executor, "_confirm_fill_pm", return_value=0.45):
             executor.dry_run = False
             success, order_id, fill_price = executor._execute_single_leg(leg, 5.0, opp)
-        # Verify place_order was called with order_type="GTC"
+        # Verify place_order was called with order_type="GTC" and share qty
         assert executor.pm_trader.place_order.called
         call_kwargs = executor.pm_trader.place_order.call_args
-        order_type = (call_kwargs.kwargs or {}).get("order_type") or (
-            call_kwargs.args[4] if len(call_kwargs.args) > 4 else None
-        )
-        # The important assertion: it was called (GTC routing invoked), and fill succeeded
+        order_type = (call_kwargs.kwargs or {}).get("order_type")
+        assert order_type == "GTC"
+        # $5 @ $0.45 → floor(5/0.45) = 11 shares (not dollar size)
+        assert call_kwargs.kwargs.get("size") == 11.0
         assert success is True
         assert order_id == "order_gtc_123"
 
@@ -2769,3 +2892,323 @@ class TestMmPilotBlocksLegacyKalshiRewards:
         assert result is True
         opps = db.get_recent_opportunities()
         assert opps[-1]["action"] != "skipped:mm_pilot_owns_kalshi"
+
+
+# ---------------------------------------------------------------------------
+# TestExecutorFrechet
+# ---------------------------------------------------------------------------
+
+class TestExecutorFrechet:
+    def test_build_legs_frechet_polymarket(self, executor):
+        opp = {
+            "type": "FrechetArb",
+            "_platform": "polymarket",
+            "_buy_yes_token": "tok_sup_yes",
+            "_buy_no_token": "tok_sub_no",
+            "_p_b": 0.45,
+            "_p_a": 0.70,
+        }
+        legs = executor._build_legs(opp, 5.0)
+        assert len(legs) == 2
+        assert legs[0]["platform"] == "polymarket"
+        assert legs[0]["side"] == "BUY"
+        assert legs[0]["token"] == "yes"
+        assert legs[0]["price"] == pytest.approx(0.45)
+        assert legs[0]["_token_id"] == "tok_sup_yes"
+        assert legs[0]["_contracts"] == 6
+        assert legs[0]["size"] == pytest.approx(2.70)
+
+        assert legs[1]["platform"] == "polymarket"
+        assert legs[1]["side"] == "BUY"
+        assert legs[1]["token"] == "no"
+        assert legs[1]["price"] == pytest.approx(0.30)
+        assert legs[1]["_token_id"] == "tok_sub_no"
+        assert legs[1]["_contracts"] == 6
+        assert legs[1]["size"] == pytest.approx(1.80)
+
+    def test_build_legs_frechet_kalshi(self, executor):
+        opp = {
+            "type": "FrechetArb",
+            "_platform": "kalshi",
+            "_buy_yes_ticker": "KXBTC-T90k",
+            "_buy_no_ticker": "KXBTC-T100k",
+            "_p_b": 0.45,
+            "_p_a": 0.70,
+        }
+        legs = executor._build_legs(opp, 5.0)
+        assert len(legs) == 2
+        assert legs[0]["platform"] == "kalshi"
+        assert legs[0]["side"] == "yes"
+        assert legs[0]["action"] == "buy"
+        assert legs[0]["price"] == pytest.approx(0.45)
+        assert legs[0]["_ticker"] == "KXBTC-T90k"
+        assert legs[0]["_contracts"] == 6
+        assert legs[0]["size"] == pytest.approx(2.70)
+
+        assert legs[1]["platform"] == "kalshi"
+        assert legs[1]["side"] == "no"
+        assert legs[1]["action"] == "buy"
+        assert legs[1]["price"] == pytest.approx(0.30)
+        assert legs[1]["_ticker"] == "KXBTC-T100k"
+        assert legs[1]["_contracts"] == 6
+        assert legs[1]["size"] == pytest.approx(1.80)
+
+    def test_revalidate_frechet_kalshi_passed(self, executor):
+        opp = {
+            "type": "FrechetArb",
+            "_platform": "kalshi",
+            "_buy_yes_ticker": "KXBTC-T90k",
+            "_buy_no_ticker": "KXBTC-T100k",
+            "net_profit": 0.20,
+        }
+        mock_book_b = {"orderbook": {"yes": [[40, 100]], "no": [[55, 100]]}}
+        mock_book_a = {"orderbook": {"yes": [[70, 100]], "no": [[25, 100]]}}
+
+        def mock_fetch(ticker):
+            return mock_book_b if ticker == "KXBTC-T90k" else mock_book_a
+
+        executor.kalshi_client.fetch_order_book.side_effect = mock_fetch
+        passed = executor._revalidate(opp)
+        assert passed is True
+        assert opp["_p_b"] == pytest.approx(0.45)
+        assert opp["_p_a"] == pytest.approx(0.70)
+        assert opp["net_profit"] > 0
+
+    def test_revalidate_frechet_kalshi_degraded(self, executor):
+        opp = {
+            "type": "FrechetArb",
+            "_platform": "kalshi",
+            "_buy_yes_ticker": "KXBTC-T90k",
+            "_buy_no_ticker": "KXBTC-T100k",
+            "net_profit": 0.20,
+        }
+        # Books moved so total cost >= 1.0 (no edge)
+        mock_book_b = {"orderbook": {"yes": [[40, 100]], "no": [[45, 100]]}}  # yes_ask = 0.55
+        mock_book_a = {"orderbook": {"yes": [[45, 100]], "no": [[50, 100]]}}  # no_ask = 0.55
+
+        def mock_fetch(ticker):
+            return mock_book_b if ticker == "KXBTC-T90k" else mock_book_a
+
+        executor.kalshi_client.fetch_order_book.side_effect = mock_fetch
+        passed = executor._revalidate(opp)
+        assert passed is False
+
+    def test_revalidate_frechet_kalshi_missing_book(self, executor):
+        opp = {
+            "type": "FrechetArb",
+            "_platform": "kalshi",
+            "_buy_yes_ticker": "KXBTC-T90k",
+            "_buy_no_ticker": "KXBTC-T100k",
+            "net_profit": 0.20,
+        }
+        executor.kalshi_client.fetch_order_book.return_value = None
+        passed = executor._revalidate(opp)
+        assert passed is False
+
+    def test_revalidate_frechet_polymarket_passed(self, executor):
+        from unittest.mock import patch
+        opp = {
+            "type": "FrechetArb",
+            "_platform": "polymarket",
+            "_buy_yes_token": "tok_b",
+            "_buy_no_token": "tok_a",
+            "net_profit": 0.20,
+        }
+        # Mock order books:
+        # tok_b (YES on B): ask 0.45
+        # tok_a (NO on A): ask 0.30 (implied P(A) = 0.70)
+        def mock_fetch(tok):
+            return {"book": tok}
+
+        def mock_bba(book):
+            if book["book"] == "tok_b":
+                return {"ask": 0.45, "bid": 0.43}
+            else:
+                return {"ask": 0.30, "bid": 0.28}
+
+        with patch("executor.fetch_order_book", side_effect=mock_fetch), \
+             patch("executor.get_best_bid_ask", side_effect=mock_bba):
+            passed = executor._revalidate(opp)
+
+        assert passed is True
+        assert opp["_p_b"] == 0.45
+        assert opp["_p_a"] == pytest.approx(0.70)
+
+    def test_revalidate_frechet_polymarket_degraded(self, executor):
+        from unittest.mock import patch
+        opp = {
+            "type": "FrechetArb",
+            "_platform": "polymarket",
+            "_buy_yes_token": "tok_b",
+            "_buy_no_token": "tok_a",
+            "net_profit": 0.20,
+        }
+        # Prices moved so cost is 0.50 + 0.50 = 1.00 -> profit is negative
+        def mock_fetch(tok):
+            return {"book": tok}
+
+        def mock_bba(book):
+            return {"ask": 0.50, "bid": 0.48}
+
+        with patch("executor.fetch_order_book", side_effect=mock_fetch), \
+             patch("executor.get_best_bid_ask", side_effect=mock_bba):
+            passed = executor._revalidate(opp)
+
+        assert passed is False
+
+    def test_execute_frechet_max_trade_size_clamped(self, executor):
+        from unittest.mock import patch
+        opp = {
+            "type": "FrechetArb",
+            "market": "BTC 100k subset of 90k",
+            "_platform": "polymarket",
+            "_buy_yes_token": "tok_b",
+            "_buy_no_token": "tok_a",
+            "_p_b": 0.45,
+            "_p_a": 0.70,
+            "total_cost": "$0.75",
+            "net_profit": 0.20,
+            "net_roi": "26.7%",
+            "_clob_depth": 500.0,
+        }
+        executor.max_trade_size = 100.0
+        # FRECHET_ARB_MAX_TRADE_SIZE is 20.0
+        with patch("config.FRECHET_ARB_MAX_TRADE_SIZE", 20.0), \
+             patch.object(executor, "_revalidate", return_value=True):
+            legs = executor._build_legs(opp, 20.0)
+            assert len(legs) == 2
+            # 20.0 / 0.75 = 26 contracts
+            assert legs[0]["_contracts"] == 26
+            assert legs[1]["_contracts"] == 26
+
+
+class TestExecutorTemporal:
+    """Test executor leg building, contract quantity matching, and revalidation for TemporalArb."""
+
+    def test_build_legs_temporal_equal_contract_quantities(self, executor) -> None:
+        opp = {
+            "type": "TemporalArb",
+            "_platform": "kalshi",
+            "_late_ticker": "KXBTC-26JUN30-T100000",
+            "_early_ticker": "KXBTC-26MAR31-T100000",
+            "_p_late": 0.45,
+            "_p_early": 0.70,
+            "_kalshi_late_yes": 0.45,
+            "_kalshi_early_no": 0.30,
+        }
+        # unit cost = 0.45 + 0.30 = 0.75
+        # size = 15.0 -> contracts = 20
+        legs = executor._build_legs(opp, 15.0)
+        assert len(legs) == 2
+        assert legs[0]["platform"] == "kalshi"
+        assert legs[0]["side"] == "yes"
+        assert legs[0]["action"] == "buy"
+        assert legs[0]["price"] == 0.45
+        assert legs[0]["_ticker"] == "KXBTC-26JUN30-T100000"
+        assert legs[0]["_contracts"] == 20
+        assert legs[0]["size"] == 9.0  # 20 * 0.45
+
+        assert legs[1]["platform"] == "kalshi"
+        assert legs[1]["side"] == "no"
+        assert legs[1]["action"] == "buy"
+        assert legs[1]["price"] == 0.30
+        assert legs[1]["_ticker"] == "KXBTC-26MAR31-T100000"
+        assert legs[1]["_contracts"] == 20
+        assert legs[1]["size"] == 6.0  # 20 * 0.30
+
+    def test_build_legs_temporal_contracts_zero(self, executor) -> None:
+        opp = {
+            "type": "TemporalArb",
+            "_platform": "kalshi",
+            "_late_ticker": "KXBTC-26JUN30-T100000",
+            "_early_ticker": "KXBTC-26MAR31-T100000",
+            "_p_late": 0.45,
+            "_p_early": 0.70,
+            "_kalshi_late_yes": 0.50,
+            "_kalshi_early_no": 0.50,
+        }
+        # unit cost = 1.00, size = 0.50 -> contracts = 0
+        legs = executor._build_legs(opp, 0.50)
+        assert legs == []
+
+    def test_revalidate_temporal_success(self, executor) -> None:
+        from unittest.mock import MagicMock
+        opp = {
+            "type": "TemporalArb",
+            "_late_ticker": "KXBTC-26JUN30-T100000",
+            "_early_ticker": "KXBTC-26MAR31-T100000",
+            "net_profit": 0.15,
+        }
+        mock_kalshi = MagicMock()
+        mock_kalshi.fetch_order_book.side_effect = [
+            # late ticker book: NO bid 0.52 -> YES ask = 0.48
+            {"orderbook_fp": {"yes_dollars": [["0.45", "100"]], "no_dollars": [["0.52", "100"]]}},
+            # early ticker book: YES bid 0.68 -> NO ask = 0.32
+            {"orderbook_fp": {"yes_dollars": [["0.68", "100"]], "no_dollars": [["0.28", "100"]]}},
+        ]
+        executor.kalshi_client = mock_kalshi
+
+        passed = executor._revalidate(opp)
+        assert passed is True
+        assert opp["_kalshi_late_yes"] == 0.48
+        assert opp["_kalshi_early_no"] == 0.32
+        assert opp["_p_late"] == 0.48
+        assert opp["_p_early"] == 0.68
+
+    def test_revalidate_temporal_spread_degradation_fails(self, executor) -> None:
+        from unittest.mock import MagicMock
+        opp = {
+            "type": "TemporalArb",
+            "_late_ticker": "KXBTC-26JUN30-T100000",
+            "_early_ticker": "KXBTC-26MAR31-T100000",
+            "net_profit": 0.20,
+        }
+        mock_kalshi = MagicMock()
+        # Spread moved so cost = 0.50 + 0.50 = 1.00 -> profit is negative
+        mock_kalshi.fetch_order_book.side_effect = [
+            {"orderbook_fp": {"yes_dollars": [["0.45", "100"]], "no_dollars": [["0.50", "100"]]}},
+            {"orderbook_fp": {"yes_dollars": [["0.50", "100"]], "no_dollars": [["0.45", "100"]]}},
+        ]
+        executor.kalshi_client = mock_kalshi
+
+        passed = executor._revalidate(opp)
+        assert passed is False
+
+    def test_revalidate_temporal_missing_client_raises(self, executor) -> None:
+        from executor import _RevalidationAPIError
+        import pytest
+        opp = {
+            "type": "TemporalArb",
+            "_late_ticker": "KXBTC-26JUN30-T100000",
+            "_early_ticker": "KXBTC-26MAR31-T100000",
+            "net_profit": 0.10,
+        }
+        executor.kalshi_client = None
+        with pytest.raises(_RevalidationAPIError):
+            executor._revalidate_temporal(opp, 0.10)
+
+    def test_execute_temporal_max_trade_size_clamped(self, executor) -> None:
+        from unittest.mock import patch
+        opp = {
+            "type": "TemporalArb",
+            "market": "KXBTC-26MAR31 subset of KXBTC-26JUN30",
+            "_platform": "kalshi",
+            "_late_ticker": "KXBTC-26JUN30-T100000",
+            "_early_ticker": "KXBTC-26MAR31-T100000",
+            "_p_late": 0.45,
+            "_p_early": 0.70,
+            "_kalshi_late_yes": 0.45,
+            "_kalshi_early_no": 0.30,
+            "total_cost": "$0.75",
+            "net_profit": 0.20,
+            "net_roi": "26.7%",
+            "_clob_depth": 500.0,
+        }
+        executor.max_trade_size = 100.0
+        with patch("config.TEMPORAL_ARB_MAX_TRADE_SIZE", 15.0), \
+             patch.object(executor, "_revalidate", return_value=(True, 0.20, "passed")):
+            legs = executor._build_legs(opp, 15.0)
+            assert len(legs) == 2
+            # 15.0 / 0.75 = 20 contracts
+            assert legs[0]["_contracts"] == 20
+            assert legs[1]["_contracts"] == 20

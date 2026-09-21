@@ -6,6 +6,7 @@ __pycache__/
 *.pem
 nul
 trades.db
+canary_trades.db
 snapshots.db
 data/discovery/pmarb.db
 decisions.jsonl
@@ -25,3 +26,5 @@ arbgrid-roadmap.docx
 ~$*.docx
 PLAN.md
 .claude/claudex/
+data/dryrun-*/
+/backtest_recommendations.json

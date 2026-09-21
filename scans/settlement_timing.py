@@ -184,7 +184,16 @@ def scan_settlement_timing(
             "net_profit": result["net_profit"],
             "net_roi": result.get("net_roi", 0),
             "confidence": 0.95,
-            "_market_key": slow_market.get("condition_id") or slow_market.get("id", ""),
+            "_market_key": (
+                slow_market.get("conditionId")
+                or slow_market.get("condition_id")
+                or slow_market.get("id", "")
+            ),
+            "_condition_id": (
+                slow_market.get("conditionId")
+                or slow_market.get("condition_id")
+                or slow_market.get("id", "")
+            ),
             "_platform": slow_platform,
             "_slow_market": slow_market,
             "_winning_side": winning_side,
@@ -231,7 +240,11 @@ def _refine_settlement_with_clob(
     for opp in opportunities:
         market = opp.get("_slow_market")
         if market:
-            market_key = market.get("condition_id") or market.get("id", "")
+            market_key = (
+                market.get("conditionId")
+                or market.get("condition_id")
+                or market.get("id", "")
+            )
             if market_key and market_key not in fetch_tasks:
                 fetch_tasks[market_key] = market
 
@@ -252,12 +265,16 @@ def _refine_settlement_with_clob(
 
     for opp in opportunities:
         market = opp.get("_slow_market")
-        market_key = market.get("condition_id") or market.get("id", "")
+        market_key = (
+            market.get("conditionId")
+            or market.get("condition_id")
+            or market.get("id", "")
+        )
         winning_side = opp.get("_winning_side", "yes")
         platform = opp.get("_platform", "polymarket")
 
         clob = clob_results.get(market_key)
-        if clob:
+        if clob and isinstance(clob, dict):
             if winning_side == "yes":
                 current_price = clob.get("yes_ask", opp["_current_price"])
                 depth = clob.get("yes_ask_size", 0)
@@ -267,6 +284,9 @@ def _refine_settlement_with_clob(
         else:
             current_price = opp["_current_price"]
             depth = 0
+
+        if not isinstance(current_price, (int, float)):
+            current_price = opp["_current_price"]
 
         discount = 1.0 - current_price
         if discount < min_discount:

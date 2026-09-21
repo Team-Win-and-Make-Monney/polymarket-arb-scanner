@@ -72,6 +72,14 @@ def paper_dataset():
 
 
 class TestWorkflowCoverage:
+    def test_injected_client_without_explicit_mode_stays_off(self):
+        client = FakeJev()
+        del client.mode
+        result = classify_event(fixture("event"), client)
+        assert result["status"] == "off"
+        assert result["evaluation"]["mode"] == "off"
+        assert not client.calls
+
     @pytest.mark.parametrize("name", ["event", "novelty", "relevance", "settlement", "attention",
                                       "incentives", "transcript", "paper-features"])
     def test_every_workflow_has_reachable_semantic_behavior(self, name):

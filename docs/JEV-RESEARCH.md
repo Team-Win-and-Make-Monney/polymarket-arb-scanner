@@ -39,6 +39,7 @@ Functions are exported from `research_jev`. An integration can inject any
 synchronous client implementing `evaluate(state, questions) -> dict` and the
 portable runtime result contract. All complete ordered requests are hashed;
 replayed or injected responses must match those hashes and the pinned model.
+An injected client must declare its mode explicitly; a missing mode stays off.
 
 ## Snapshot contract
 

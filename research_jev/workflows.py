@@ -44,7 +44,7 @@ def _base(name: str, state: dict, items: list[dict]) -> dict:
 
 def _evaluate(result: dict, state: dict, questions: dict, client) -> dict | None:
     evaluator = client if client is not None else JevClient()
-    mode = getattr(evaluator, "mode", "advisory")
+    mode = getattr(evaluator, "mode", "off")
     metadata = {"status": "off" if mode == "off" else "unavailable", "mode": mode,
                 "model": r.MODEL, "usage": None, "elapsed_ms": None,
                 "state_hash": content_hash(state), "question_hash": content_hash(questions), "error_code": None}

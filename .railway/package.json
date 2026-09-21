@@ -1,5 +1,5 @@
 {
-  "name": "polymarket-railway-iac",
+  "name": "arb-railway-iac",
   "private": true,
   "type": "module",
   "engines": {

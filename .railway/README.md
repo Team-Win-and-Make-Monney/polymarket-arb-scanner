@@ -1,68 +1,25 @@
-# Railway configuration
+# Railway infrastructure migration
 
-This project defines its Railway infrastructure in code.
+This configuration preserves the live environment inventory imported on 21 September 2026. Secrets remain in Railway through `preserve()`. The entrypoint refuses unknown project/environment names. Verify the linked project ID and environment ID before every command; names are the authoring guard, not a substitute for account identity.
 
-```txt
-.railway/railway.ts
-```
+Prerequisites: Node.js 22 or newer, Railway CLI 5.58.0, and the pinned Railway SDK. The SDK does not install the CLI. Run commands from the repository root:
 
-Use this file to describe the Railway project you want: services, databases, buckets, custom domains, replicas, groups, and environment variables.
-
-The TypeScript file imports `railway/iac`. Install the pinned SDK into the isolated `.railway` package (Node.js 22 or newer):
-
-```bash
+```sh
 npm ci --prefix .railway
+railway status
+railway config plan --json
 ```
 
-Install Railway CLI 5.45.7 or newer separately from Railway's official distribution, then verify it before planning:
+`railway config init` and `railway config pull` also run from the repository root. Pull into a separate scratch directory when comparing remote state; do not overwrite the environment router. For programmatic subprocess callers, remove an inherited `_` executable hint before invoking Railway: SDK 3.11.0 otherwise may inspect the caller's version instead of Railway's.
 
-```bash
-railway --version
-```
+No automatic apply runs on merge. Plan each listed environment separately, review the exact changes, and preserve the plan outside `.railway/` with `railway config plan --out <private-plan-file>`. Only an operator-approved exact plan may be applied with `railway config apply --plan <private-plan-file> --yes`. Any destruction requires separate explicit approval and `--confirm-destructive`. Saved plans can contain sensitive values and must not be committed.
 
-## Common commands
+## Scope and migration gates
 
-Create the configuration files:
+- `polymarket-arb-scanner` / `production`: `environments/arb-production.ts`.
 
-```bash
-railway config init
-```
+Railway imports describe dashboard state; they can omit settings currently supplied by legacy repository manifests. Effective legacy build, start, health check, and restart settings have been carried into the affected service definitions. The legacy root manifest is removed only in this proposed branch. Before deployment, use the supported migration workflow to clear any explicit remote Config File setting, then regenerate the plan and verify all health/build settings. Do not apply a partial inventory or deploy a branch with a missing legacy manifest before that transition is ready.
 
-Import an existing Railway project into code:
+Service sources, current provider controls, queue ownership, public TCP endpoints, and secret values are preserved. Source changes are outside this migration. There is no new EDI production worker. Rank staging has its isolated Postgres and fixture-only dispatch; production Redis retains its pinned image and authenticated ACL startup. The arb proxy remains until its external consumer inventory is known.
 
-```bash
-railway config pull
-```
-
-Preview what Railway would change:
-
-```bash
-railway config plan
-```
-
-Apply the planned changes:
-
-```bash
-railway config apply
-```
-
-## Repository safety gate
-
-This is a named `arb-scanner` partial restricted to the audited Polymarket production project and environment. It deliberately excludes `polymarket-egress-proxy`: the live proxy has no recorded source, and Railway CLI 5.45.7 plus SDK 3.11.0 cannot round-trip its TCP proxy networking without planning a deletion.
-
-The checked-in root `railway.toml` remains the authoritative service manifest. `.railway/railway.ts` fails closed while any root `railway.json` or `railway.toml` remains, so `railway config plan` and `railway config apply` cannot create a second configuration source. Migrate the legacy manifest in a separate reviewed change, verify the resulting diff and redacted plan, and remove the legacy manifest in that same migration before using this IaC definition.
-
-Merging this file does not apply Railway changes. Do not run `railway config migrate --apply` or `railway config apply` without the repository-required action-time approval for the exact redacted plan and a fresh dry-run/quiescence readback.
-
-## Notes
-
-- `railway config plan` is read-only, but the repository guard refuses it until the legacy root manifest has been migrated and removed.
-- `railway config apply` previews changes and asks before applying unless you pass `--yes`.
-- Destructive changes in non-interactive or agent sessions require `railway config apply --confirm-destructive` after reviewing the plan.
-- A future protected deployment workflow may pin a plan (`railway config plan --out railway-plan.json`) and apply only that reviewed plan after an explicit environment approval. Do not auto-apply on merge. On GitHub Actions, use https://github.com/railwayapp/config.
-- Services already managed by `railway.json` or `railway.toml` must be migrated before `.railway/railway.ts` can manage them.
-- Keep one `.railway` file for the whole project. A named `export const partial` (or `PARTIAL` / `const Partial`) is a last resort for separate repos that cannot share that file. Do not add it unless omit=delete across repos is a blocker.
-- Use `replicas` for scaling; advanced placement can still specify region names.
-- Use `group("Name", [resources])` to keep large projects organized on the Railway canvas.
-- Secrets imported from Railway are rendered as `preserve()` so existing values are retained without writing secret values to source. Use `railway config pull --omit-preserved-variables` for a smaller import. `railway config pull --include-variables` decrypts and inlines non-sealed values (including secrets that were never sealed).
-- `railway config migrate` finds every `railway.json` / `railway.toml` in the repository and writes them into this one file.
+Template databases have provider-managed volume relationships that the CLI currently omits from the imported graph. Verify their live attachments and a backup before apply; a no-change import alone does not prove volume recovery or full resource ownership.

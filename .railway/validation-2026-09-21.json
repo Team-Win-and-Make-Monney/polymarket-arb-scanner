@@ -1,0 +1,46 @@
+[
+  {
+    "environment": "arb-production",
+    "valid": true,
+    "diff": "~ Update arb-scanner build.builder\n~ Update arb-scanner deploy.healthcheckPath, deploy.healthcheckTimeout, deploy.restartPolicyMaxRetries and 1 more\n~ Update polymarket-egress-proxy build.builder\n~ Update polymarket-egress-proxy deploy.restartPolicyMaxRetries, deploy.restartPolicyType",
+    "diagnostics": [],
+    "changes": [
+      {
+        "summary": "Update arb-scanner build.builder",
+        "severity": "safe",
+        "kind": "resource.update",
+        "details": [
+          "build.builder (null \u2192 \"DOCKERFILE\")"
+        ]
+      },
+      {
+        "summary": "Update arb-scanner deploy.healthcheckPath, deploy.healthcheckTimeout, deploy.restartPolicyMaxRetries and 1 more",
+        "severity": "safe",
+        "kind": "resource.update",
+        "details": [
+          "deploy.healthcheckPath (null \u2192 \"/healthz\")",
+          "deploy.healthcheckTimeout (null \u2192 300)",
+          "deploy.restartPolicyMaxRetries (null \u2192 10)",
+          "deploy.restartPolicyType (null \u2192 \"ON_FAILURE\")"
+        ]
+      },
+      {
+        "summary": "Update polymarket-egress-proxy build.builder",
+        "severity": "safe",
+        "kind": "resource.update",
+        "details": [
+          "build.builder (null \u2192 \"DOCKERFILE\")"
+        ]
+      },
+      {
+        "summary": "Update polymarket-egress-proxy deploy.restartPolicyMaxRetries, deploy.restartPolicyType",
+        "severity": "safe",
+        "kind": "resource.update",
+        "details": [
+          "deploy.restartPolicyMaxRetries (null \u2192 5)",
+          "deploy.restartPolicyType (null \u2192 \"ON_FAILURE\")"
+        ]
+      }
+    ]
+  }
+]

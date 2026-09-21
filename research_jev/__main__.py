@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import stat
 import sys
 from pathlib import Path
 
@@ -24,6 +26,27 @@ WORKFLOWS = {
 }
 
 
+def read_snapshot(path: Path) -> bytes:
+    """Bound reads to regular files, without blocking on a writerless FIFO."""
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 80000:
+            raise ValueError("invalid_input_file")
+        raw = bytearray()
+        while len(raw) <= 80000:
+            chunk = os.read(descriptor, 80001 - len(raw))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        if len(raw) > 80000:
+            raise ValueError("input_too_large")
+        return bytes(raw)
+    finally:
+        os.close(descriptor)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("workflow", choices=WORKFLOWS)
@@ -32,10 +55,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mode", choices=("off", "shadow", "advisory"), default="off")
     args = parser.parse_args(argv)
     try:
-        with args.input.open("rb") as stream:
-            raw = stream.read(80001)
-        if len(raw) > 80000:
-            raise ValueError("input_too_large")
+        raw = read_snapshot(args.input)
         payload = parse_json(raw)
         result = WORKFLOWS[args.workflow](payload, JevClient(mode=args.mode))
         rendered = json.dumps(result, ensure_ascii=False, allow_nan=False, indent=2) + "\n"

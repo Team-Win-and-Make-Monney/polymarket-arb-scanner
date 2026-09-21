@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -392,6 +393,14 @@ class TestExistingDataAdapters:
 
 
 class TestCli:
+    def test_writerless_fifo_is_rejected_without_blocking(self, tmp_path):
+        fifo = tmp_path / "input.json"
+        os.mkfifo(fifo)
+        result = subprocess.run([sys.executable, "-m", "research_jev", "event", "--input", str(fifo)],
+                                cwd=ROOT, text=True, capture_output=True, timeout=3)
+        assert result.returncode == 2
+        assert json.loads(result.stderr)["status"] == "invalid"
+
     def test_cli_default_off_has_no_key_requirement(self):
         result = subprocess.run([sys.executable, "-m", "research_jev", "event", "--input", str(FIXTURES / "event.json")],
                                 cwd=ROOT, text=True, capture_output=True, check=True)

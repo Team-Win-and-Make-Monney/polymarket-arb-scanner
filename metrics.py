@@ -153,6 +153,15 @@ class MetricsCollector:
             # Number of indexed Cross pairs available for WS-driven evaluation.
             # Updated after every CrossPairIndex.rebuild call.
             "cross_pair_index_size",
+            # Detection funnel gauges (Phase 1)
+            "funnel_screened",
+            "funnel_mid_candidates",
+            "funnel_clob_evaluated",
+            "funnel_clob_dropped",
+            "funnel_fee_dropped",
+            "funnel_roi_dropped",
+            "funnel_depth_dropped",
+            "funnel_surfaced",
         }
         self._histogram_names = {
             "scan_duration_seconds",

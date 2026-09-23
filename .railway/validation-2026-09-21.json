@@ -1,0 +1,11 @@
+{
+  "guards": "All exact IDs accepted; wrong projectId and wrong environmentId rejected with names unchanged.",
+  "plans": [
+    {
+      "target": "arb-production",
+      "exit": 0,
+      "diff": "~ Update arb-scanner build.builder\n~ Update arb-scanner deploy.healthcheckPath, deploy.healthcheckTimeout, deploy.restartPolicyMaxRetries and 1 more\n~ Update polymarket-egress-proxy build.builder\n~ Update polymarket-egress-proxy deploy.restartPolicyMaxRetries, deploy.restartPolicyType",
+      "diagnostics": []
+    }
+  ]
+}

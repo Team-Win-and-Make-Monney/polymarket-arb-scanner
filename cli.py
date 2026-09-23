@@ -98,6 +98,13 @@ from scans import (
     scan_convergence,
     scan_polymarket_rewards,
     scan_kalshi_rewards,
+    scan_limitless_rewards,
+    scan_frechet,
+    _refine_frechet_with_clob,
+    scan_temporal_arb,
+    _refine_temporal_with_clob,
+    scan_ctf,
+    _refine_ctf_with_clob,
 )
 import config
 from config import (
@@ -212,7 +219,7 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
             fetch_futures["poly_events"] = pool.submit(fetch_events)
         if polymarket_reward_fetch_enabled(args.mode) and CONFIG_REWARDS_ENABLED:
             fetch_futures["poly_reward_markets"] = pool.submit(fetch_reward_markets)
-        if args.mode in ("all", "kalshi", "cross", "spread", "rewards") and kalshi_client:
+        if args.mode in ("all", "kalshi", "cross", "spread", "rewards", "temporal") and kalshi_client:
             fetch_futures["kalshi_data"] = pool.submit(_fetch_kalshi_data, kalshi_client)
 
         for key, future in fetch_futures.items():
@@ -234,6 +241,18 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
                     kalshi_data = result
             except Exception as e:
                 logger.error("Failed to fetch %s: %s", key, e)
+
+        if config.DISPUTE_GATE_ENABLED and db and (poly_markets or poly_events):
+            from uma_monitor import fetch_dispute_states
+            try:
+                items = list(poly_markets or []) + list(poly_events or [])
+                db.upsert_dispute_state(fetch_dispute_states(items))
+                if executor and hasattr(executor, "risk_manager"):
+                    executor.risk_manager.uma_state_unavailable = False
+            except Exception as e:
+                logger.error("Failed to update UMA dispute states (failing closed): %s", e)
+                if executor and hasattr(executor, "risk_manager"):
+                    executor.risk_manager.uma_state_unavailable = True
 
     # Stage 2: Run scans in parallel (binary, negrisk, kalshi_binary, kalshi_multi)
     scan_futures = {}
@@ -752,22 +771,45 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
             except Exception as e:
                 logger.error("Imbalance scan failed: %s", e)
 
-    # STRAT-02: News-Driven Resolution Sniping
+    # STRAT-02: News-Driven Resolution Sniping (Finnhub and/or Firecrawl sources)
     if args.mode in ("all", "news-snipe"):
-        from config import NEWS_SNIPE_ENABLED, FINNHUB_API_KEY
-        if NEWS_SNIPE_ENABLED and FINNHUB_API_KEY:
+        from config import (
+            NEWS_SNIPE_ENABLED,
+            FINNHUB_API_KEY,
+            FIRECRAWL_NEWS_ENABLED,
+            FIRECRAWL_API_KEY,
+        )
+        finnhub_on = NEWS_SNIPE_ENABLED and FINNHUB_API_KEY
+        firecrawl_on = FIRECRAWL_NEWS_ENABLED and FIRECRAWL_API_KEY
+        if finnhub_on or firecrawl_on:
             logger.info("--- News-Driven Sniping Scan ---")
             try:
                 from scans.news_snipe import scan_news_snipe
-                from finnhub_api import FinnhubNewsClient
-                finnhub = FinnhubNewsClient(FINNHUB_API_KEY)
                 markets_by_key = {}
                 if poly_markets:
                     for mkt in poly_markets:
                         cid = mkt.get("condition_id", "")
                         if cid:
                             markets_by_key[cid] = mkt
-                news_opps = scan_news_snipe(markets_by_key, finnhub, cooldown_cache={})
+                news_clients = []
+                if finnhub_on:
+                    from finnhub_api import FinnhubNewsClient
+                    news_clients.append(FinnhubNewsClient(FINNHUB_API_KEY))
+                if firecrawl_on:
+                    from firecrawl_news_client import FirecrawlNewsClient
+                    news_clients.append(FirecrawlNewsClient(FIRECRAWL_API_KEY))
+                news_opps = []
+                for client in news_clients:
+                    try:
+                        news_opps.extend(
+                            scan_news_snipe(markets_by_key, client, cooldown_cache={})
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "News snipe scan failed for %s: %s",
+                            type(client).__name__,
+                            e,
+                        )
                 all_opportunities.extend(news_opps)
                 logger.info("Found %d news snipe opportunities.", len(news_opps))
             except Exception as e:
@@ -822,6 +864,91 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
                 logger.info("Found %d correlated opportunities.", len(corr_opps))
             except Exception as e:
                 logger.error("Correlated pairs scan failed: %s", e)
+
+    # Plan 02: Fréchet-Bound Logical Arbitrage
+    if args.mode in ("all", "frechet"):
+        from config import FRECHET_ARB_ENABLED, FRECHET_MIN_VIOLATION
+        is_dry_run = getattr(args, "dry_run", None)
+        if is_dry_run is None:
+            is_dry_run = getattr(executor, "dry_run", True)
+        if args.mode == "frechet" and not FRECHET_ARB_ENABLED and not is_dry_run:
+            logger.error(
+                "Fréchet arbitrage mode requested but FRECHET_ARB_ENABLED=false in non-dry-run execution. "
+                "Refusing to scan without explicit enablement."
+            )
+        elif FRECHET_ARB_ENABLED or (args.mode == "frechet" and is_dry_run):
+            logger.info("--- Fréchet-Bound Logical Arbitrage Scan ---")
+            try:
+                frechet_opps = scan_frechet(
+                    poly_markets or [],
+                    min_profit=min_profit,
+                    min_violation=FRECHET_MIN_VIOLATION,
+                    platform="polymarket",
+                )
+                frechet_opps = _refine_frechet_with_clob(frechet_opps, min_profit=min_profit)
+                all_opportunities.extend(frechet_opps)
+                logger.info("Found %d Fréchet arbitrage opportunities.", len(frechet_opps))
+            except Exception as e:
+                logger.error("Fréchet arbitrage scan failed: %s", e)
+
+    # Plan 03: Cross-Date / Nested Temporal Arbitrage
+    if args.mode in ("all", "temporal"):
+        from config import TEMPORAL_ARB_ENABLED, TEMPORAL_MIN_VIOLATION
+        is_dry_run = getattr(args, "dry_run", None)
+        if is_dry_run is None:
+            is_dry_run = getattr(executor, "dry_run", True)
+        if args.mode == "temporal" and not TEMPORAL_ARB_ENABLED and not is_dry_run:
+            logger.error(
+                "Temporal arbitrage mode requested but TEMPORAL_ARB_ENABLED=false in non-dry-run execution. "
+                "Refusing to scan without explicit enablement."
+            )
+        elif TEMPORAL_ARB_ENABLED or (args.mode == "temporal" and is_dry_run):
+            logger.info("--- Cross-Date / Nested Temporal Arbitrage Scan ---")
+            try:
+                kalshi_markets_flat = []
+                if kalshi_data and kalshi_data[0]:
+                    for evt in kalshi_data[0]:
+                        for mkt in evt.get("markets", [evt]):
+                            kalshi_markets_flat.append(mkt)
+                if kalshi_markets_flat:
+                    temporal_opps = scan_temporal_arb(
+                        kalshi_markets_flat,
+                        min_profit=min_profit,
+                        min_violation=TEMPORAL_MIN_VIOLATION,
+                    )
+                    temporal_opps = _refine_temporal_with_clob(
+                        temporal_opps,
+                        min_profit=min_profit,
+                        kalshi_client=kalshi_client,
+                    )
+                    all_opportunities.extend(temporal_opps)
+                    logger.info("Found %d temporal arbitrage opportunities.", len(temporal_opps))
+            except Exception as e:
+                logger.error("Temporal arbitrage scan failed: %s", e)
+
+    # Plan 04: CTF Primitives (Merge / Split Arbitrage)
+    if args.mode in ("all", "ctf"):
+        from config import CTF_ENABLED, CTF_MERGE_ENABLED, CTF_MINT_SELL_ENABLED
+        is_dry_run = getattr(args, "dry_run", None)
+        if is_dry_run is None:
+            is_dry_run = getattr(executor, "dry_run", True)
+        if args.mode == "ctf" and not (CTF_ENABLED or CTF_MERGE_ENABLED or CTF_MINT_SELL_ENABLED) and not is_dry_run:
+            logger.error(
+                "CTF mode requested but CTF_ENABLED=false in non-dry-run execution. "
+                "Refusing to scan without explicit enablement."
+            )
+            sys.exit(1)
+        elif (CTF_ENABLED or CTF_MERGE_ENABLED or CTF_MINT_SELL_ENABLED) or (args.mode == "ctf" and is_dry_run):
+            logger.info("--- CTF Primitives Scan (Polymarket Merge / Split) ---")
+            try:
+                ctf_opps = scan_ctf(
+                    poly_markets or [],
+                    min_profit=min_profit,
+                )
+                all_opportunities.extend(ctf_opps)
+                logger.info("Found %d CTF primitive opportunities.", len(ctf_opps))
+            except Exception as e:
+                logger.error("CTF primitives scan failed: %s", e)
 
     # STRAT-07: Time Decay Convergence
     if args.mode in ("all", "time-decay"):
@@ -882,34 +1009,73 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
             )
 
     # Rewards scanning (Layer 3: liquidity rewards)
-    if args.mode in ("all", "rewards") and CONFIG_REWARDS_ENABLED:
+    limitless_rewards_active = getattr(config, "LIMITLESS_REWARDS_ENABLED", False) or args.mode == "limitless-rewards"
+    if args.mode in ("all", "rewards", "limitless-rewards") and (CONFIG_REWARDS_ENABLED or limitless_rewards_active):
         logger.info("--- Rewards Scan ---")
-        try:
-            # Polymarket rewards scan
-            if poly_reward_markets:
-                from market_maker import RewardTracker
-                reward_tracker = RewardTracker()
-                pm_reward_opps = scan_polymarket_rewards(
-                    poly_reward_markets, reward_tracker, min_pool_usdc=10.0
-                )
-                all_opportunities.extend(pm_reward_opps)
-                logger.info("Found %d Polymarket reward opportunities.", len(pm_reward_opps))
-        except Exception as e:
-            logger.error("Polymarket rewards scan failed: %s", e)
+        if args.mode in ("all", "rewards") and CONFIG_REWARDS_ENABLED:
+            try:
+                # Polymarket rewards scan
+                if poly_reward_markets:
+                    from market_maker import RewardTracker
+                    reward_tracker = RewardTracker()
+                    pm_reward_opps = scan_polymarket_rewards(
+                        poly_reward_markets, reward_tracker, min_pool_usdc=10.0
+                    )
+                    all_opportunities.extend(pm_reward_opps)
+                    logger.info("Found %d Polymarket reward opportunities.", len(pm_reward_opps))
+            except Exception as e:
+                logger.error("Polymarket rewards scan failed: %s", e)
 
-        try:
-            # Kalshi rewards scan
-            if kalshi_client:
-                from market_maker import KalshiRewardTracker
-                kalshi_reward_tracker = KalshiRewardTracker()
-                k_reward_opps = scan_kalshi_rewards(
-                    kalshi_client, kalshi_reward_tracker, min_pool_usdc=10.0,
-                    kalshi_data=kalshi_data,
-                )
-                all_opportunities.extend(k_reward_opps)
-                logger.info("Found %d Kalshi reward opportunities.", len(k_reward_opps))
-        except Exception as e:
-            logger.error("Kalshi rewards scan failed: %s", e)
+            try:
+                # Kalshi rewards scan
+                if kalshi_client:
+                    from market_maker import KalshiRewardTracker
+                    kalshi_reward_tracker = KalshiRewardTracker()
+                    k_reward_opps = scan_kalshi_rewards(
+                        kalshi_client, kalshi_reward_tracker, min_pool_usdc=10.0,
+                        kalshi_data=kalshi_data,
+                    )
+                    all_opportunities.extend(k_reward_opps)
+                    logger.info("Found %d Kalshi reward opportunities.", len(k_reward_opps))
+            except Exception as e:
+                logger.error("Kalshi rewards scan failed: %s", e)
+
+        if limitless_rewards_active:
+            try:
+                # Limitless rewards scan
+                limitless_client = extra_clients.get("limitless") if extra_clients else None
+                if not limitless_client:
+                    from limitless_api import LimitlessClient
+                    limitless_client = LimitlessClient()
+                    api_key = getattr(config, "LIMITLESS_API_KEY", "")
+                    pk = getattr(config, "LIMITLESS_PRIVATE_KEY", "")
+                    if api_key:
+                        limitless_client.login(api_key=api_key, private_key=pk)
+                l_reward_opps = scan_limitless_rewards(limitless_client, min_pool_usdc=10.0)
+                all_opportunities.extend(l_reward_opps)
+                logger.info("Found %d Limitless reward opportunities.", len(l_reward_opps))
+            except Exception as e:
+                logger.error("Limitless rewards scan failed: %s", e)
+
+    # Jev System One Crypto Decision Scan
+    if args.mode in ("all", "jev-crypto"):
+        from config import JEV_CRYPTO_ENABLED, OPENROUTER_API_KEY
+        if (args.mode == "jev-crypto") or (JEV_CRYPTO_ENABLED and OPENROUTER_API_KEY):
+            logger.info("--- Jev System One Crypto Scan ---")
+            try:
+                from scans.jev_crypto import scan_jev_crypto
+                markets_by_key = {}
+                if poly_markets:
+                    for mkt in poly_markets:
+                        cid = mkt.get("condition_id", "") or mkt.get("conditionId", "") or mkt.get("question", "")
+                        if cid:
+                            markets_by_key[cid] = mkt
+                is_forced = (args.mode == "jev-crypto")
+                jev_opps = scan_jev_crypto(markets_by_key, min_profit=min_profit, db=db, force=is_forced)
+                all_opportunities.extend(jev_opps)
+                logger.info("Found %d Jev crypto opportunities.", len(jev_opps))
+            except Exception as e:
+                logger.error("Jev crypto scan failed: %s", e)
 
     # Filter by minimum depth if specified
     if args.min_depth > 0:
@@ -1190,13 +1356,13 @@ def main():
                  "spread", "betfair", "smarkets", "sxbet", "matchbook",
                  "gemini", "ibkr", "event", "triangular", "nway",
                  "multi-cross",
-                 "stale", "resolution", "convergence", "mm", "rewards",
+                 "stale", "resolution", "convergence", "mm", "rewards", "limitless-rewards",
                  "imbalance", "news-snipe", "correlated", "time-decay",
                  "logical-arb", "whale-copy",
                  "fee-promo", "cross-mm",
-                 "lead-lag-mm", "toxic-flow", "vol-mm", "mm-pilot"],
+                 "lead-lag-mm", "toxic-flow", "vol-mm", "mm-pilot", "jev-crypto", "frechet", "temporal", "ctf"],
         default="all",
-        help="Scan mode; mm-pilot isolates the continuous Kalshi reward-MM pilot from unrelated scans",
+        help="Scan mode: all, binary, negrisk, negrisk-no, cross, kalshi, cross-all, spread, betfair, smarkets, sxbet, matchbook, gemini, ibkr, event, triangular, stale, resolution, convergence, mm, mm-pilot, rewards, limitless-rewards, imbalance, news-snipe, correlated, time-decay, fee-promo, cross-mm, jev-crypto, frechet, temporal, ctf",
     )
     parser.add_argument(
         "--min-profit",
@@ -1331,6 +1497,7 @@ def main():
         "min_net_roi": CONFIG_MIN_NET_ROI,
         "allow_better_reentry": CONFIG_ALLOW_BETTER_REENTRY,
         "reentry_improvement_threshold": CONFIG_REENTRY_IMPROVEMENT_THRESHOLD,
+        "dispute_gate_enabled": config.DISPUTE_GATE_ENABLED,
     }
     risk_manager = RiskManager(risk_config)
 
@@ -1503,6 +1670,29 @@ def main():
     except Exception as exc:
         logger.debug("Position sizer not available: %s", exc)
 
+    ctf_client = None
+    try:
+        from ctf_api import CTFClient
+        ctf_client = CTFClient(dry_run=dry_run)
+    except Exception as exc:
+        logger.debug("CTFClient not initialized: %s", exc)
+
+    limitless_client = None
+    try:
+        from config import (
+            LIMITLESS_API_KEY as CONFIG_LIMITLESS_API_KEY,
+            LIMITLESS_PRIVATE_KEY as CONFIG_LIMITLESS_PRIVATE_KEY,
+            LIMITLESS_REWARDS_ENABLED as CONFIG_LIMITLESS_REWARDS_ENABLED,
+        )
+        if CONFIG_LIMITLESS_REWARDS_ENABLED or args.mode in ("all", "rewards", "limitless-rewards"):
+            from limitless_api import LimitlessClient
+            limitless_client = LimitlessClient()
+            limitless_client.dry_run = dry_run
+            if CONFIG_LIMITLESS_API_KEY:
+                limitless_client.login(api_key=CONFIG_LIMITLESS_API_KEY, private_key=CONFIG_LIMITLESS_PRIVATE_KEY)
+    except Exception as exc:
+        logger.debug("LimitlessClient not initialized: %s", exc)
+
     executor = ArbitrageExecutor(
         pm_trader=pm_trader,
         kalshi_client=kalshi_client,
@@ -1525,6 +1715,7 @@ def main():
         sizing_aggressiveness=CONFIG_SIZING_AGGRESSIVENESS,
         concurrent_execution=CONFIG_CONCURRENT_EXECUTION,
         position_sizer=pos_sizer,
+        ctf_client=ctf_client,
     )
 
     extra_clients = {
@@ -1534,6 +1725,7 @@ def main():
         "matchbook": matchbook_client,
         "gemini": gemini_client,
         "ibkr": ibkr_client,
+        "limitless": limitless_client,
     }
 
     # Initialize webhook notifier

@@ -29,6 +29,7 @@ from fees import (
     net_profit_ibkr_binary,
     net_profit_cross_ibkr,
     net_profit_cross_generic,
+    net_profit_frechet_implication,
     _platform_win_fee,
     _platform_entry_fee,
     PLATFORM_FEE_SCHEDULE,
@@ -1036,3 +1037,49 @@ class TestDirectionalStrategyFeesScaleWithContracts:
         # Net should scale roughly linearly with size.
         ratio = result_50 / result_1
         assert 40 < ratio < 60, f"Time decay net should scale ~50x with size, got {ratio}x"
+
+
+# ---------------------------------------------------------------------------
+# Fréchet Implication Fee Tests
+# ---------------------------------------------------------------------------
+
+class TestFrechetFee:
+    def test_profitable_implication_violation_polymarket(self):
+        res = net_profit_frechet_implication(0.70, 0.50, platform="polymarket")
+        assert res["gross_spread"] == pytest.approx(0.20)
+        assert res["total_cost"] == pytest.approx(0.80)
+        assert res["fees"] > 0
+        assert res["net_profit"] > 0
+        assert res["net_profit"] < 0.20
+        assert res["net_roi"] == pytest.approx(res["net_profit"] / res["total_cost"])
+
+    def test_no_violation_returns_zero_fees_and_negative_profit(self):
+        res = net_profit_frechet_implication(0.40, 0.60, platform="polymarket")
+        assert res["gross_spread"] == pytest.approx(-0.20)
+        assert res["fees"] == 0.0
+        assert res["net_profit"] == pytest.approx(-0.20)
+        assert res["net_roi"] == 0.0
+        assert res["total_cost"] == pytest.approx(1.20)
+
+    def test_exact_equality_zero_violation(self):
+        res = net_profit_frechet_implication(0.50, 0.50, platform="polymarket")
+        assert res["gross_spread"] == pytest.approx(0.0)
+        assert res["fees"] == 0.0
+        assert res["net_profit"] == pytest.approx(0.0)
+        assert res["net_roi"] == 0.0
+        assert res["total_cost"] == pytest.approx(1.0)
+
+    def test_kalshi_platform_fees(self):
+        res = net_profit_frechet_implication(0.75, 0.55, platform="kalshi")
+        assert res["gross_spread"] == pytest.approx(0.20)
+        assert res["total_cost"] == pytest.approx(0.80)
+        assert res["fees"] > 0
+        assert res["net_profit"] > 0
+        assert res["net_roi"] == pytest.approx(res["net_profit"] / res["total_cost"])
+
+    def test_category_fee_scaling(self):
+        res_default = net_profit_frechet_implication(0.70, 0.50, platform="polymarket")
+        res_category = net_profit_frechet_implication(0.70, 0.50, platform="polymarket", category="crypto")
+        # Fee calculation functions may vary by category
+        assert res_default["gross_spread"] == res_category["gross_spread"]
+        assert res_default["total_cost"] == res_category["total_cost"]

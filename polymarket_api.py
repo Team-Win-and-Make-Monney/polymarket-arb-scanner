@@ -72,6 +72,9 @@ if _proxy_url:
     # missing SDK internal aborts only when the authenticated write path is
     # actually constructed, not any dry-run/read-only import of this module.
     _session.proxies = {"http": _proxy_url, "https": _proxy_url}
+    # py-clob-client-v2 uses a module-level httpx client that otherwise bypasses
+    # POLYMARKET_PROXY_URL (critical for US/MI geoblock on CLOB writes).
+    _clob_http._http_client = httpx.Client(http2=True, proxy=_proxy_url)
 _session.mount("https://", HTTPAdapter(pool_connections=2, pool_maxsize=10))
 
 _ORDER_TYPE_MAP = {
@@ -324,30 +327,23 @@ def get_best_bid_ask(order_book: dict) -> dict:
     Returns dict with keys: bid, bid_size, ask, ask_size (all float or None).
     """
     result = {"bid": None, "bid_size": None, "ask": None, "ask_size": None}
-    bids = order_book.get("bids", [])
-    asks = order_book.get("asks", [])
-    if bids:
-        best_bid = bids[0]  # Highest bid first
-        try:
-            price = float(best_bid.get("price"))
-            size = float(best_bid.get("size"))
-        except (TypeError, ValueError):
-            price = size = None
-        if price is not None and size is not None and math.isfinite(price) and math.isfinite(size):
-            if 0.0 < price < 1.0 and size > 0.0:
-                result["bid"] = price
-                result["bid_size"] = size
-    if asks:
-        best_ask = asks[0]  # Lowest ask first
-        try:
-            price = float(best_ask.get("price"))
-            size = float(best_ask.get("size"))
-        except (TypeError, ValueError):
-            price = size = None
-        if price is not None and size is not None and math.isfinite(price) and math.isfinite(size):
-            if 0.0 < price < 1.0 and size > 0.0:
-                result["ask"] = price
-                result["ask_size"] = size
+    for side, field, choose in (("bids", "bid", max), ("asks", "ask", min)):
+        levels = order_book.get(side, [])
+        if not isinstance(levels, list) or not levels:
+            continue
+        parsed = []
+        for level in levels:
+            try:
+                price, size = float(level["price"]), float(level["size"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(price) and math.isfinite(size) and 0 < price < 1 and size > 0:
+                parsed.append((price, size))
+        if not parsed:
+            continue
+        price = choose(price for price, size in parsed)
+        result[field] = price
+        result[f"{field}_size"] = sum(size for level_price, size in parsed if level_price == price)
     return result
 
 
@@ -615,7 +611,7 @@ class PolymarketTrader:
                     order_id, resp)
                 return False
             canceled = resp.get("canceled") or resp.get("cancelled")
-            if not isinstance(canceled, list) or order_id not in canceled:
+            if not isinstance(canceled, list) or (order_id not in canceled and not any(order_id == str(item) for item in canceled)):
                 logger.warning(
                     "Polymarket cancel_order: %s not confirmed in canceled list %r",
                     order_id, canceled)

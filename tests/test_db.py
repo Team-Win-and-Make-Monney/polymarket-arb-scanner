@@ -95,6 +95,36 @@ class TestLogTrade:
         assert trades[0]["status"] == "failed"
         assert trades[0]["fill_price"] is None
 
+    def test_persist_order_id_before_fill(self, db):
+        """Crash-recovery path: order_id must be writable while still pending."""
+        opp_id = db.log_opportunity("Cross", "M", "", 0.9, 0.1, 0.1, 50, "traded")
+        trade_id = db.log_trade(opp_id, "polymarket", "BUY", 0.45, 5.0, "pending")
+        db.update_trade_status(
+            trade_id,
+            "pending",
+            order_id="0xabc",
+            client_order_id="idem-1",
+        )
+        trades = db.get_trades_for_opportunity(opp_id)
+        assert trades[0]["order_id"] == "0xabc"
+        assert trades[0]["client_order_id"] == "idem-1"
+        assert trades[0]["status"] == "pending"
+
+    def test_persist_fill_qty_on_fill(self, db):
+        opp_id = db.log_opportunity("Cross", "M", "", 0.9, 0.1, 0.1, 50, "traded")
+        trade_id = db.log_trade(opp_id, "kalshi", "yes", 0.40, 5.0, "pending")
+        db.update_trade_status(
+            trade_id,
+            "filled",
+            fill_price=0.40,
+            order_id="k-order-1",
+            fill_qty=12.0,
+        )
+        trades = db.get_trades_for_opportunity(opp_id)
+        assert trades[0]["order_id"] == "k-order-1"
+        assert trades[0]["fill_qty"] == pytest.approx(12.0)
+        assert trades[0]["status"] == "filled"
+
 
 # ---------------------------------------------------------------------------
 # Position lifecycle
@@ -260,6 +290,47 @@ class TestSlippage:
 
 
 # ---------------------------------------------------------------------------
+# Jev Decision Logging
+# ---------------------------------------------------------------------------
+
+class TestJevDecisions:
+    def test_record_and_get_decision(self, db):
+        dec_id = db.record_jev_decision(
+            asset="BTC",
+            strike=95000.0,
+            spot=81089.0,
+            action="pass_fair",
+            market_prob=0.38,
+            jev_prob=0.40,
+            edge=0.02,
+            confidence=0.88,
+            details={"risk": 1.2, "conviction": 0.5},
+        )
+        assert dec_id >= 1
+
+        records = db.get_jev_decisions(asset="BTC", limit=10)
+        assert len(records) == 1
+        r = records[0]
+        assert r["asset"] == "BTC"
+        assert r["strike"] == 95000.0
+        assert r["spot"] == 81089.0
+        assert r["action"] == "pass_fair"
+        assert "risk" in r["details"]
+
+    def test_get_jev_decisions_asset_filter(self, db):
+        db.record_jev_decision("BTC", 90000.0, 81000.0, "buy_yes")
+        db.record_jev_decision("ETH", 3000.0, 2100.0, "pass_fair")
+        db.record_jev_decision("SOL", 180.0, 125.0, "buy_no")
+
+        btc_recs = db.get_jev_decisions(asset="BTC")
+        assert len(btc_recs) == 1
+        assert btc_recs[0]["asset"] == "BTC"
+
+        all_recs = db.get_jev_decisions()
+        assert len(all_recs) == 3
+
+
+# ---------------------------------------------------------------------------
 # Strategy P&L — no double-count across trade legs (audit M-1/B28)
 # ---------------------------------------------------------------------------
 
@@ -278,3 +349,69 @@ class TestStrategyPnl:
         assert cross["total_pnl"] == pytest.approx(0.05)   # once, not 0.10
         assert cross["win_count"] == 1                     # one opportunity, not two legs
         assert cross["trade_count"] == 2                   # two legs counted
+
+
+# ---------------------------------------------------------------------------
+# UMA Dispute State Cache (Plan 05)
+# ---------------------------------------------------------------------------
+
+class TestDisputeStateDB:
+    def test_upsert_and_get_dispute_state(self, db):
+        states = {
+            "0xcond1": {
+                "condition_id": "0xcond1",
+                "state": "disputed",
+                "blocked": True,
+                "reason": "uma_disputed",
+            },
+            "0xcond2": {
+                "condition_id": "0xcond2",
+                "state": "open",
+                "blocked": False,
+                "reason": "clear",
+            },
+        }
+        count = db.upsert_dispute_state(states)
+        assert count == 2
+
+        res1 = db.get_dispute_state("0xcond1")
+        assert res1 is not None
+        assert res1["condition_id"] == "0xcond1"
+        assert res1["state"] == "disputed"
+        assert res1["blocked"] is True
+        assert res1["reason"] == "uma_disputed"
+        assert res1["updated_at"] is not None
+
+        res2 = db.get_dispute_state("0xcond2")
+        assert res2 is not None
+        assert res2["condition_id"] == "0xcond2"
+        assert res2["blocked"] is False
+        assert res2["reason"] == "clear"
+
+    def test_upsert_updates_existing_record(self, db):
+        db.upsert_dispute_state({
+            "0xcond3": {
+                "condition_id": "0xcond3",
+                "state": "proposed",
+                "blocked": True,
+                "reason": "uma_proposed",
+            }
+        })
+        res = db.get_dispute_state("0xcond3")
+        assert res["blocked"] is True
+        assert res["reason"] == "uma_proposed"
+
+        # Now market resolves -> clear
+        db.upsert_dispute_state([{
+            "condition_id": "0xcond3",
+            "state": "resolved",
+            "blocked": False,
+            "reason": "clear",
+        }])
+        updated = db.get_dispute_state("0xcond3")
+        assert updated["blocked"] is False
+        assert updated["reason"] == "clear"
+
+    def test_get_unknown_condition_returns_none(self, db):
+        assert db.get_dispute_state("0xnonexistent") is None
+        assert db.get_dispute_state("") is None

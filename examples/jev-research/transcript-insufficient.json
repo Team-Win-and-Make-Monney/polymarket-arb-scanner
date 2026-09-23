@@ -1,0 +1,32 @@
+{
+  "as_of": "2026-09-20T12:00:00Z",
+  "speaker_id": "governor-example",
+  "current": {
+    "id": "speech-new",
+    "text": "",
+    "url": "https://example.org/speech-new",
+    "published_at": "2026-09-20T10:00:00Z",
+    "available_at": "2026-09-20T10:01:00Z",
+    "captured_at": "2026-09-20T10:02:00Z",
+    "entity_ids": [
+      "FED"
+    ],
+    "kind": "transcript",
+    "speaker_id": "governor-example",
+    "quality": "reviewed"
+  },
+  "previous": {
+    "id": "speech-old",
+    "text": "Inflation is easing and the policy path is clear.",
+    "url": "https://example.org/speech-old",
+    "published_at": "2026-09-19T10:00:00Z",
+    "available_at": "2026-09-19T10:01:00Z",
+    "captured_at": "2026-09-19T10:02:00Z",
+    "entity_ids": [
+      "FED"
+    ],
+    "kind": "transcript",
+    "speaker_id": "governor-example",
+    "quality": "reviewed"
+  }
+}

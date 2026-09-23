@@ -1,0 +1,1048 @@
+{
+  "fixture_kind": "SYNTHETIC INPUTS AND MOCKED JUDGMENTS; NOT PROVIDER RESULTS OR ACCURACY EVIDENCE",
+  "records": {
+    "event": {
+      "input": "event.json",
+      "result": {
+        "workflow": "event",
+        "rubric_version": "1.0.0",
+        "schema_version": 1,
+        "input_hash": "5db67341a961a1ba81af10e2b033ff5cecead6506bcf2d1154349ef81a627515",
+        "as_of": "2026-09-20T12:00:00Z",
+        "status": "ok",
+        "reason": null,
+        "evidence": [
+          {
+            "source_id": "acme-new",
+            "text": "ACME reduced its full-year revenue guidance after a production disruption.",
+            "url": "https://example.org/acme-new",
+            "sha256": "6d67c13d219574f986e491c774cabc1874850112edc745587faa4b733c166895",
+            "published_at": "2026-09-20T10:00:00Z",
+            "available_at": "2026-09-20T10:01:00Z",
+            "captured_at": "2026-09-20T10:02:00Z"
+          }
+        ],
+        "execution_enabled": false,
+        "equivalence_approved": false,
+        "retain_candidate": true,
+        "evaluation": {
+          "status": "ok",
+          "mode": "advisory",
+          "model": "jev-1.13.0",
+          "usage": null,
+          "elapsed_ms": 1.0,
+          "state_hash": "a0adff7eb5e5cd2b8776f38eca7b8562a90b1dd4d6b86b14f0c47f6282dee2df",
+          "question_hash": "3ef6d848fe160ee4463146afe13281c98f71cbdf79510558c9b313c4b2ee6ce0",
+          "error_code": null
+        },
+        "judgments": {
+          "event_type": {
+            "type": "choice",
+            "choice": "guidance_revision",
+            "confidence": 1.0,
+            "probabilities": {
+              "buyback": 0.0,
+              "guidance_revision": 1.0,
+              "financing": 0.0,
+              "regulatory": 0.0,
+              "operational_disruption": 0.0,
+              "multiple": 0.0,
+              "none": 0.0,
+              "uncertain": 0.0
+            }
+          }
+        },
+        "event_type": "guidance_revision",
+        "requires_review": false
+      }
+    },
+    "event-insufficient": {
+      "input": "event-insufficient.json",
+      "result": {
+        "workflow": "event",
+        "rubric_version": "1.0.0",
+        "schema_version": 1,
+        "status": "insufficient_evidence",
+        "reason": "invalid_or_missing_input",
+        "retain_candidate": true,
+        "equivalence_approved": false,
+        "execution_enabled": false,
+        "evidence": [],
+        "evaluation": null
+      }
+    },
+    "novelty": {
+      "input": "novelty.json",
+      "result": {
+        "workflow": "novelty",
+        "rubric_version": "1.0.0",
+        "schema_version": 1,
+        "input_hash": "aeb4b8e96dc7edc82dc86ea4b657a993ada6201f91fec420a7d11fc78799cd30",
+        "as_of": "2026-09-20T12:00:00Z",
+        "status": "ok",
+        "reason": null,
+        "evidence": [
+          {
+            "source_id": "acme-old",
+            "text": "ACME reaffirmed its full-year revenue guidance.",
+            "url": "https://example.org/acme-old",
+            "sha256": "f22445c60214a0e6f875bb6501fa0eadc4435d1622aa5525a464621c2113690e",
+            "published_at": "2026-09-19T10:00:00Z",
+            "available_at": "2026-09-19T10:01:00Z",
+            "captured_at": "2026-09-19T10:02:00Z"
+          },
+          {
+            "source_id": "acme-new",
+            "text": "ACME reduced its full-year revenue guidance after a production disruption.",
+            "url": "https://example.org/acme-new",
+            "sha256": "6d67c13d219574f986e491c774cabc1874850112edc745587faa4b733c166895",
+            "published_at": "2026-09-20T10:00:00Z",
+            "available_at": "2026-09-20T10:01:00Z",
+            "captured_at": "2026-09-20T10:02:00Z"
+          }
+        ],
+        "execution_enabled": false,
+        "equivalence_approved": false,
+        "retain_candidate": true,
+        "evaluation": {
+          "status": "ok",
+          "mode": "advisory",
+          "model": "jev-1.13.0",
+          "usage": null,
+          "elapsed_ms": 1.0,
+          "state_hash": "9cf75092b22676f66f35128dd6abbc825055e0308f92f953f53ae83361f4a01e",
+          "question_hash": "837ef7af99918fbc4aa2cba2a4eb937915bed92902cdfec9a0b7a34beb8d769d",
+          "error_code": null
+        },
+        "relationship": "update",
+        "retain_originals": true,
+        "judgments": {
+          "relationship": {
+            "type": "choice",
+            "choice": "update",
+            "confidence": 1.0,
+            "probabilities": {
+              "duplicate": 0.0,
+              "update": 1.0,
+              "contradiction": 0.0,
+              "unrelated": 0.0,
+              "uncertain": 0.0
+            }
+          }
+        },
+        "requires_review": true
+      }
+    },
+    "novelty-insufficient": {
+      "input": "novelty-insufficient.json",
+      "result": {
+        "workflow": "novelty",
+        "rubric_version": "1.0.0",
+        "schema_version": 1,
+        "status": "insufficient_evidence",
+        "reason": "invalid_or_missing_input",
+        "retain_candidate": true,
+        "equivalence_approved": false,
+        "execution_enabled": false,
+        "evidence": [],
+        "evaluation": null
+      }
+    },
+    "relevance": {
+      "input": "relevance.json",
+      "result": {
+        "workflow": "relevance",
+        "rubric_version": "1.0.0",
+        "schema_version": 1,
+        "input_hash": "143a05443f1024d8c68133ebfeb4610dc6fbbfba1d4e6b00bea98c4e9e0682d0",
+        "as_of": "2026-09-20T12:00:00Z",
+        "status": "ok",
+        "reason": null,
+        "evidence": [
+          {
+            "source_id": "fed-news",
+            "text": "Fed officials discuss a rate cut at the September 2026 meeting.",
+            "url": "https://example.org/fed-news",
+            "sha256": "7e02ef1ec2f7255f51a040be7469d81051b7f86415a074df8c9e4d590099e2b8",
+            "published_at": "2026-09-20T10:00:00Z",
+            "available_at": "2026-09-20T10:01:00Z",
+            "captured_at": "2026-09-20T10:02:00Z"
+          },
+          {
+            "source_id": "mkt-a-rules",
+            "text": "Resolves YES if the Federal Reserve lowers its target range by at least 25 basis points at the September 2026 meeting, according to its official decision.",
+            "url": "https://example.org/mkt-a-rules",
+            "sha256": "46646a279bb136b179a7de36693e0330be5db76e61d5a5a8b26438505130beb9",
+            "published_at": "2026-09-19T10:00:00Z",
+            "available_at": "2026-09-19T10:01:00Z",
+            "captured_at": "2026-09-19T10:02:00Z"
+          }
+        ],
+        "execution_enabled": false,
+        "equivalence_approved": false,
+        "retain_candidate": true,
+        "evaluation": {
+          "status": "ok",
+          "mode": "advisory",
+          "model": "jev-1.13.0",
+          "usage": null,
+          "elapsed_ms": 1.0,
+          "state_hash": "7be661d4a4119fb19eae80fa0f31d10d4954c99491f6efe1e4c93ff16de595b0",
+          "question_hash": "8be86e9dafa8f487ef3f59016bb9b94ea449eed3136842e66ae2b9405e3decdd",
+          "error_code": null
+        },
+        "contract_id": "mkt-a",
+        "deterministic_mismatches": [],
+        "would_remove": false,
+        "relevance": "relevant",
+        "semantic_direction": true,
+        "judgments": {
+          "same_event": {
+            "type": "noul",
+            "noul": 0.95
+          },
+          "same_direction": {
+            "type": "noul",
+            "noul": 0.95
+          }
+        }
+      }
+    },
+    "relevance-insufficient": {
+      "input": "relevance-insufficient.json",
+      "result": {
+        "workflow": "relevance",
+        "rubric_version": "1.0.0",
+        "schema_version": 1,
+        "status": "insufficient_evidence",
+        "reason": "invalid_or_missing_input",
+        "retain_candidate": true,
+        "equivalence_approved": false,
+        "execution_enabled": false,
+        "evidence": [],
+        "evaluation": null
+      }
+    },
+    "settlement": {
+      "input": "settlement.json",
+      "result": {
+        "workflow": "settlement",
+        "rubric_version": "1.0.0",
+        "schema_version": 1,
+        "input_hash": "9e3764ef0732909d6f6a3cb1393d29f513a9148c78100a61f18244eebcc9afbb",
+        "as_of": "2026-09-20T12:00:00Z",
+        "status": "ok",
+        "reason": null,
+        "evidence": [
+          {
+            "source_id": "mkt-a-rules",
+            "text": "Resolves YES if the Federal Reserve lowers its target range by at least 25 basis points at the September 2026 meeting, according to its official decision.",
+            "url": "https://example.org/mkt-a-rules",
+            "sha256": "46646a279bb136b179a7de36693e0330be5db76e61d5a5a8b26438505130beb9",
+            "published_at": "2026-09-19T10:00:00Z",
+            "available_at": "2026-09-19T10:01:00Z",
+            "captured_at": "2026-09-19T10:02:00Z"
+          },
+          {
+            "source_id": "mkt-b-rules",
+            "text": "Resolves YES if the Federal Reserve lowers its target range by at least 25 basis points at the September 2026 meeting, according to its official decision.",
+            "url": "https://example.org/mkt-b-rules",
+            "sha256": "46646a279bb136b179a7de36693e0330be5db76e61d5a5a8b26438505130beb9",
+            "published_at": "2026-09-19T10:00:00Z",
+            "available_at": "2026-09-19T10:01:00Z",
+            "captured_at": "2026-09-19T10:02:00Z"
+          }
+        ],
+        "execution_enabled": false,
+        "equivalence_approved": false,
+        "retain_candidate": true,
+        "evaluation": {
+          "status": "ok",
+          "mode": "advisory",
+          "model": "jev-1.13.0",
+          "usage": null,
+          "elapsed_ms": 1.0,
+          "state_hash": "99deb88531fcb27c03285ef06d3a8512fe23b8268249a20e5a72d8285e686eb4",
+          "question_hash": "9f1e1173dda6add7ed3348091735e77edfaa9c1eade527dca03f5ed602298518",
+          "error_code": null
+        },
+        "deterministic_mismatches": [],
+        "language": "apparent_agreement",
+        "would_remove": false,
+        "requires_review": true,
+        "judgments": {
+          "language": {
+            "type": "choice",
+            "choice": "apparent_agreement",
+            "confidence": 1.0,
+            "probabilities": {
+              "apparent_agreement": 1.0,
+              "disagreement": 0.0,
+              "uncertain": 0.0
+            }
+          }
+        }
+      }
+    },
+    "settlement-insufficient": {
+      "input": "settlement-insufficient.json",
+      "result": {
+        "workflow": "settlement",
+        "rubric_version": "1.0.0",
+        "schema_version": 1,
+        "status": "insufficient_evidence",
+        "reason": "invalid_or_missing_input",
+        "retain_candidate": true,
+        "equivalence_approved": false,
+        "execution_enabled": false,
+        "evidence": [],
+        "evaluation": null
+      }
+    },
+    "attention": {
+      "input": "attention.json",
+      "result": {
+        "workflow": "attention",
+        "rubric_version": "1.0.0",
+        "schema_version": 1,
+        "input_hash": "fffa709f9f840760204d62b1a64c4841be13f7ab6828826f90972e31ee3be970",
+        "as_of": "2026-09-20T12:00:00Z",
+        "status": "ok",
+        "reason": null,
+        "evidence": [
+          {
+            "source_id": "acme-old",
+            "text": "ACME reaffirmed its full-year revenue guidance.",
+            "url": "https://example.org/acme-old",
+            "sha256": "f22445c60214a0e6f875bb6501fa0eadc4435d1622aa5525a464621c2113690e",
+            "published_at": "2026-09-19T10:00:00Z",
+            "available_at": "2026-09-19T10:01:00Z",
+            "captured_at": "2026-09-19T10:02:00Z"
+          },
+          {
+            "source_id": "acme-required",
+            "text": "ACME is holding a scheduled shareholder meeting.",
+            "url": "https://example.org/acme-required",
+            "sha256": "be5a5e59002dd36e3a29bb22ed8d9e02ec0f3893480bb497c425d343d0f74d9f",
+            "published_at": "2026-09-20T10:00:00Z",
+            "available_at": "2026-09-20T10:01:00Z",
+            "captured_at": "2026-09-20T10:02:00Z"
+          },
+          {
+            "source_id": "acme-new",
+            "text": "ACME reduced its full-year revenue guidance after a production disruption.",
+            "url": "https://example.org/acme-new",
+            "sha256": "6d67c13d219574f986e491c774cabc1874850112edc745587faa4b733c166895",
+            "published_at": "2026-09-20T10:00:00Z",
+            "available_at": "2026-09-20T10:01:00Z",
+            "captured_at": "2026-09-20T10:02:00Z"
+          }
+        ],
+        "execution_enabled": false,
+        "equivalence_approved": false,
+        "retain_candidate": true,
+        "evaluation": {
+          "status": "ok",
+          "mode": "advisory",
+          "model": "jev-1.13.0",
+          "usage": null,
+          "elapsed_ms": 1.0,
+          "state_hash": "033045d3f186cc90e543a1307d7e165ccc825416cf82b60aa8ac7d56ea769186",
+          "question_hash": "29734f6e7ae25daaa4d7297063231721b86b16376ac57eedb6de6fa39047d3c6",
+          "error_code": null
+        },
+        "baseline_order": [
+          "acme-old",
+          "acme-required",
+          "acme-new"
+        ],
+        "order": [
+          "acme-required",
+          "acme-new",
+          "acme-old"
+        ],
+        "proposed_order": [
+          "acme-required",
+          "acme-new",
+          "acme-old"
+        ],
+        "attention": [
+          {
+            "source_id": "acme-old",
+            "attention_judgment": 0.1,
+            "required_attention": false,
+            "uncertain": false,
+            "baseline_index": 0
+          },
+          {
+            "source_id": "acme-required",
+            "attention_judgment": 0.1,
+            "required_attention": true,
+            "uncertain": false,
+            "baseline_index": 1
+          },
+          {
+            "source_id": "acme-new",
+            "attention_judgment": 0.95,
+            "required_attention": false,
+            "uncertain": false,
+            "baseline_index": 2
+          }
+        ],
+        "judgments": {
+          "s0_attention": {
+            "type": "noul",
+            "noul": 0.1
+          },
+          "s1_attention": {
+            "type": "noul",
+            "noul": 0.1
+          },
+          "s2_attention": {
+            "type": "noul",
+            "noul": 0.95
+          }
+        },
+        "probabilities_are_market_forecasts": false
+      }
+    },
+    "attention-insufficient": {
+      "input": "attention-insufficient.json",
+      "result": {
+        "workflow": "attention",
+        "rubric_version": "1.0.0",
+        "schema_version": 1,
+        "status": "insufficient_evidence",
+        "reason": "invalid_or_missing_input",
+        "retain_candidate": true,
+        "equivalence_approved": false,
+        "execution_enabled": false,
+        "evidence": [],
+        "evaluation": null
+      }
+    },
+    "incentives": {
+      "input": "incentives.json",
+      "result": {
+        "workflow": "incentives",
+        "rubric_version": "1.0.0",
+        "schema_version": 1,
+        "input_hash": "45880058772778b54ee189619da12b908cc9412a535dea1a607fb10da5f1cea9",
+        "as_of": "2026-09-20T12:00:00Z",
+        "status": "ok",
+        "reason": null,
+        "evidence": [
+          {
+            "source_id": "program-old",
+            "text": "Qualifying activity earns a 100 USD reward.",
+            "url": "https://example.org/program-old",
+            "sha256": "8894a89600d450a7cc1a77f90f972195d44ded0d68f1a81e4ff8af4cc0591e11",
+            "published_at": "2026-09-19T10:00:00Z",
+            "available_at": "2026-09-19T10:01:00Z",
+            "captured_at": "2026-09-19T10:02:00Z"
+          },
+          {
+            "source_id": "program-new",
+            "text": "Qualifying activity now earns a 150 USD reward.",
+            "url": "https://example.org/program-new",
+            "sha256": "976cd2777a55b469808e38cac0f520889c3abc0bbf60cdb7d35ea84589572c8b",
+            "published_at": "2026-09-20T10:00:00Z",
+            "available_at": "2026-09-20T10:01:00Z",
+            "captured_at": "2026-09-20T10:02:00Z"
+          }
+        ],
+        "execution_enabled": false,
+        "equivalence_approved": false,
+        "retain_candidate": true,
+        "evaluation": {
+          "status": "ok",
+          "mode": "advisory",
+          "model": "jev-1.13.0",
+          "usage": null,
+          "elapsed_ms": 1.0,
+          "state_hash": "61b546510c60cf284b19cb192b916f92d7aedb96d2bc02bcb2f05e9371c60fae",
+          "question_hash": "d92dae242b90ca8a581db035e2421bf3ab6cd74a2f5fda0971b353d4404c719e",
+          "error_code": null
+        },
+        "deterministic_changes": {
+          "reward_amount": {
+            "previous": "100",
+            "current": "150"
+          }
+        },
+        "change": "reward",
+        "affected_workflows": [
+          "rewards-monitor"
+        ],
+        "unresolved_workflows": [],
+        "account_eligibility": "not_evaluated",
+        "requires_review": true,
+        "judgments": {
+          "change": {
+            "type": "choice",
+            "choice": "reward",
+            "confidence": 1.0,
+            "probabilities": {
+              "eligibility": 0.0,
+              "reward": 1.0,
+              "duration": 0.0,
+              "multiple": 0.0,
+              "cosmetic": 0.0,
+              "uncertain": 0.0
+            }
+          },
+          "w0_affected": {
+            "type": "noul",
+            "noul": 0.95
+          }
+        }
+      }
+    },
+    "incentives-insufficient": {
+      "input": "incentives-insufficient.json",
+      "result": {
+        "workflow": "incentives",
+        "rubric_version": "1.0.0",
+        "schema_version": 1,
+        "status": "insufficient_evidence",
+        "reason": "invalid_or_missing_input",
+        "retain_candidate": true,
+        "equivalence_approved": false,
+        "execution_enabled": false,
+        "evidence": [],
+        "evaluation": null
+      }
+    },
+    "transcript": {
+      "input": "transcript.json",
+      "result": {
+        "workflow": "transcript",
+        "rubric_version": "1.0.0",
+        "schema_version": 1,
+        "input_hash": "17f48aa01e58931d090a9589f8e0f094bd24fcfa030ddc3c214b38630156917d",
+        "as_of": "2026-09-20T12:00:00Z",
+        "status": "ok",
+        "reason": null,
+        "evidence": [
+          {
+            "source_id": "speech-old",
+            "text": "Inflation is easing and the policy path is clear.",
+            "url": "https://example.org/speech-old",
+            "sha256": "fc9f38d2d840be01b3fb6346ef50e204b09caffe64d5a688ca325ec52e0a010c",
+            "published_at": "2026-09-19T10:00:00Z",
+            "available_at": "2026-09-19T10:01:00Z",
+            "captured_at": "2026-09-19T10:02:00Z"
+          },
+          {
+            "source_id": "speech-new",
+            "text": "Inflation remains elevated. We are uncertain about the policy path.",
+            "url": "https://example.org/speech-new",
+            "sha256": "77ec80da2774b03ccfc8b0e5e66e066d55bd79edc29b780ba73b3815e5ccfa82",
+            "published_at": "2026-09-20T10:00:00Z",
+            "available_at": "2026-09-20T10:01:00Z",
+            "captured_at": "2026-09-20T10:02:00Z"
+          }
+        ],
+        "execution_enabled": false,
+        "equivalence_approved": false,
+        "retain_candidate": true,
+        "evaluation": {
+          "status": "ok",
+          "mode": "advisory",
+          "model": "jev-1.13.0",
+          "usage": null,
+          "elapsed_ms": 1.0,
+          "state_hash": "cfcfa2fc8bb4d599478fc1a7eecc61131ea54528ffb88714785f86272f5eca4c",
+          "question_hash": "661d8303f74c9b48a96c9ac9af8616a72293b0ba87867390c2ead0d1a58dfd80",
+          "error_code": null
+        },
+        "themes": [
+          "inflation",
+          "policy_path",
+          "uncertainty"
+        ],
+        "unresolved_themes": [],
+        "language_change": "contradiction",
+        "comparison_status": "ok",
+        "judgments": {
+          "inflation": {
+            "type": "noul",
+            "noul": 0.99
+          },
+          "employment": {
+            "type": "noul",
+            "noul": 0.01
+          },
+          "growth": {
+            "type": "noul",
+            "noul": 0.01
+          },
+          "financial_stability": {
+            "type": "noul",
+            "noul": 0.01
+          },
+          "policy_path": {
+            "type": "noul",
+            "noul": 0.95
+          },
+          "uncertainty": {
+            "type": "noul",
+            "noul": 0.99
+          },
+          "language_change": {
+            "type": "choice",
+            "choice": "contradiction",
+            "confidence": 1.0,
+            "probabilities": {
+              "new_emphasis": 0.0,
+              "repeated": 0.0,
+              "contradiction": 1.0,
+              "uncertain": 0.0
+            }
+          }
+        }
+      }
+    },
+    "transcript-insufficient": {
+      "input": "transcript-insufficient.json",
+      "result": {
+        "workflow": "transcript",
+        "rubric_version": "1.0.0",
+        "schema_version": 1,
+        "status": "insufficient_evidence",
+        "reason": "invalid_or_missing_input",
+        "retain_candidate": true,
+        "equivalence_approved": false,
+        "execution_enabled": false,
+        "evidence": [],
+        "evaluation": null
+      }
+    },
+    "paper-features": {
+      "input": "paper-features.json",
+      "result": {
+        "workflow": "paper_features",
+        "rubric_version": "1.0.0",
+        "schema_version": 1,
+        "input_hash": "f049c8d67a1d8c4bca2dd20d4c916ad8d20aee2339d8a8d22927853a446b7ef9",
+        "as_of": "2026-09-20T12:00:00Z",
+        "status": "ok",
+        "reason": null,
+        "evidence": [
+          {
+            "source_id": "fed-news",
+            "text": "Fed officials discuss a rate cut at the September 2026 meeting.",
+            "url": "https://example.org/fed-news",
+            "sha256": "7e02ef1ec2f7255f51a040be7469d81051b7f86415a074df8c9e4d590099e2b8",
+            "published_at": "2026-09-20T10:00:00Z",
+            "available_at": "2026-09-20T10:01:00Z",
+            "captured_at": "2026-09-20T10:02:00Z"
+          }
+        ],
+        "execution_enabled": false,
+        "equivalence_approved": false,
+        "retain_candidate": true,
+        "evaluation": {
+          "status": "ok",
+          "mode": "advisory",
+          "model": "jev-1.13.0",
+          "usage": null,
+          "elapsed_ms": 1.0,
+          "state_hash": "32c3b7aee20120ffdc62263e3dd45ea1d796a0744b9628f49ce9d94da992fdf3",
+          "question_hash": "31397a157792f7d5d3e8df55bb63cedb95bc3a0fb4047981cc64b97675aaef3b",
+          "error_code": null
+        },
+        "record_id": "paper-001",
+        "event_group": "fed-september-2026",
+        "target": {
+          "id": "fed-cut",
+          "proposition": "The Fed cuts its target range at its September meeting.",
+          "entity_ids": [
+            "FED"
+          ],
+          "horizon_end": "2026-09-24T00:00:00Z"
+        },
+        "features": {
+          "supporting_claim_present": 0.5,
+          "opposing_claim_present": 0.05,
+          "uncertainty_present": 0.5
+        },
+        "paper_only": true,
+        "probabilities_are_market_forecasts": false,
+        "judgments": {
+          "supporting_claim_present": {
+            "type": "noul",
+            "noul": 0.5
+          },
+          "opposing_claim_present": {
+            "type": "noul",
+            "noul": 0.05
+          },
+          "uncertainty_present": {
+            "type": "noul",
+            "noul": 0.5
+          }
+        }
+      }
+    },
+    "paper-features-insufficient": {
+      "input": "paper-features-insufficient.json",
+      "result": {
+        "workflow": "paper_features",
+        "rubric_version": "1.0.0",
+        "schema_version": 1,
+        "status": "insufficient_evidence",
+        "reason": "invalid_or_missing_input",
+        "retain_candidate": true,
+        "equivalence_approved": false,
+        "execution_enabled": false,
+        "evidence": [],
+        "evaluation": null
+      }
+    },
+    "discovery-screen": {
+      "input": "discovery-screen.json",
+      "result": {
+        "workflow": "discovery_screen",
+        "status": "ok",
+        "execution_enabled": false,
+        "incumbent_candidates": [
+          {
+            "venue_a": "kalshi",
+            "market_a_id": "mkt-a",
+            "question_a": "Will the Fed cut rates by at least 25 basis points at its September 2026 meeting?",
+            "venue_b": "polymarket",
+            "market_b_id": "mkt-b",
+            "question_b": "Will the Fed cut rates by at least 25 basis points at its September 2026 meeting?",
+            "equivalent": false,
+            "confidence": 0.0,
+            "reasoning": "Synthetic unresolved example"
+          }
+        ],
+        "candidates": [
+          {
+            "venue_a": "kalshi",
+            "market_a_id": "mkt-a",
+            "question_a": "Will the Fed cut rates by at least 25 basis points at its September 2026 meeting?",
+            "venue_b": "polymarket",
+            "market_b_id": "mkt-b",
+            "question_b": "Will the Fed cut rates by at least 25 basis points at its September 2026 meeting?",
+            "equivalent": false,
+            "confidence": 0.0,
+            "reasoning": "Synthetic unresolved example"
+          }
+        ],
+        "proposed_candidates": [
+          {
+            "venue_a": "kalshi",
+            "market_a_id": "mkt-a",
+            "question_a": "Will the Fed cut rates by at least 25 basis points at its September 2026 meeting?",
+            "venue_b": "polymarket",
+            "market_b_id": "mkt-b",
+            "question_b": "Will the Fed cut rates by at least 25 basis points at its September 2026 meeting?",
+            "equivalent": false,
+            "confidence": 0.0,
+            "reasoning": "Synthetic unresolved example"
+          }
+        ],
+        "diagnostics": [
+          {
+            "index": 0,
+            "screen": {
+              "workflow": "settlement",
+              "rubric_version": "1.0.0",
+              "schema_version": 1,
+              "input_hash": "9e3764ef0732909d6f6a3cb1393d29f513a9148c78100a61f18244eebcc9afbb",
+              "as_of": "2026-09-20T12:00:00Z",
+              "status": "ok",
+              "reason": null,
+              "evidence": [
+                {
+                  "source_id": "mkt-a-rules",
+                  "text": "Resolves YES if the Federal Reserve lowers its target range by at least 25 basis points at the September 2026 meeting, according to its official decision.",
+                  "url": "https://example.org/mkt-a-rules",
+                  "sha256": "46646a279bb136b179a7de36693e0330be5db76e61d5a5a8b26438505130beb9",
+                  "published_at": "2026-09-19T10:00:00Z",
+                  "available_at": "2026-09-19T10:01:00Z",
+                  "captured_at": "2026-09-19T10:02:00Z"
+                },
+                {
+                  "source_id": "mkt-b-rules",
+                  "text": "Resolves YES if the Federal Reserve lowers its target range by at least 25 basis points at the September 2026 meeting, according to its official decision.",
+                  "url": "https://example.org/mkt-b-rules",
+                  "sha256": "46646a279bb136b179a7de36693e0330be5db76e61d5a5a8b26438505130beb9",
+                  "published_at": "2026-09-19T10:00:00Z",
+                  "available_at": "2026-09-19T10:01:00Z",
+                  "captured_at": "2026-09-19T10:02:00Z"
+                }
+              ],
+              "execution_enabled": false,
+              "equivalence_approved": false,
+              "retain_candidate": true,
+              "evaluation": {
+                "status": "ok",
+                "mode": "advisory",
+                "model": "jev-1.13.0",
+                "usage": null,
+                "elapsed_ms": 1.0,
+                "state_hash": "99deb88531fcb27c03285ef06d3a8512fe23b8268249a20e5a72d8285e686eb4",
+                "question_hash": "9f1e1173dda6add7ed3348091735e77edfaa9c1eade527dca03f5ed602298518",
+                "error_code": null
+              },
+              "deterministic_mismatches": [],
+              "language": "apparent_agreement",
+              "would_remove": false,
+              "requires_review": true,
+              "judgments": {
+                "language": {
+                  "type": "choice",
+                  "choice": "apparent_agreement",
+                  "confidence": 1.0,
+                  "probabilities": {
+                    "apparent_agreement": 1.0,
+                    "disagreement": 0.0,
+                    "uncertain": 0.0
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "equivalence_approved": false,
+        "live_state_changed": false
+      }
+    },
+    "discovery-screen-insufficient": {
+      "input": "discovery-screen-insufficient.json",
+      "result": {
+        "workflow": "discovery_screen",
+        "status": "ok",
+        "execution_enabled": false,
+        "incumbent_candidates": [
+          {
+            "venue_a": "kalshi",
+            "market_a_id": "mkt-a",
+            "question_a": "Will the Fed cut rates by at least 25 basis points at its September 2026 meeting?",
+            "venue_b": "polymarket",
+            "market_b_id": "mkt-b",
+            "question_b": "Will the Fed cut rates by at least 25 basis points at its September 2026 meeting?",
+            "equivalent": false,
+            "confidence": 0.0,
+            "reasoning": "Synthetic unresolved example"
+          }
+        ],
+        "candidates": [
+          {
+            "venue_a": "kalshi",
+            "market_a_id": "mkt-a",
+            "question_a": "Will the Fed cut rates by at least 25 basis points at its September 2026 meeting?",
+            "venue_b": "polymarket",
+            "market_b_id": "mkt-b",
+            "question_b": "Will the Fed cut rates by at least 25 basis points at its September 2026 meeting?",
+            "equivalent": false,
+            "confidence": 0.0,
+            "reasoning": "Synthetic unresolved example"
+          }
+        ],
+        "proposed_candidates": [
+          {
+            "venue_a": "kalshi",
+            "market_a_id": "mkt-a",
+            "question_a": "Will the Fed cut rates by at least 25 basis points at its September 2026 meeting?",
+            "venue_b": "polymarket",
+            "market_b_id": "mkt-b",
+            "question_b": "Will the Fed cut rates by at least 25 basis points at its September 2026 meeting?",
+            "equivalent": false,
+            "confidence": 0.0,
+            "reasoning": "Synthetic unresolved example"
+          }
+        ],
+        "diagnostics": [
+          {
+            "index": 0,
+            "screen": {
+              "workflow": "settlement",
+              "rubric_version": "1.0.0",
+              "schema_version": 1,
+              "status": "insufficient_evidence",
+              "reason": "invalid_or_missing_input",
+              "retain_candidate": true,
+              "equivalence_approved": false,
+              "execution_enabled": false,
+              "evidence": [],
+              "evaluation": null
+            }
+          }
+        ],
+        "equivalence_approved": false,
+        "live_state_changed": false
+      }
+    },
+    "signal-screen": {
+      "input": "signal-screen.json",
+      "result": {
+        "workflow": "signal_screen",
+        "status": "ok",
+        "provider": "manifold",
+        "incumbent": {
+          "id": "signal-1",
+          "probability": 0.62
+        },
+        "selected": {
+          "id": "signal-1",
+          "probability": 0.62
+        },
+        "proposed": {
+          "id": "signal-1",
+          "probability": 0.62
+        },
+        "diagnostics": [
+          {
+            "id": "signal-1",
+            "screen": {
+              "workflow": "relevance",
+              "rubric_version": "1.0.0",
+              "schema_version": 1,
+              "input_hash": "3b4375d1629084db57c402fdae0311c9c493b9998bb6d27efbf7c6c0f04fd6c8",
+              "as_of": "2026-09-20T12:00:00Z",
+              "status": "ok",
+              "reason": null,
+              "evidence": [
+                {
+                  "source_id": "signal-1",
+                  "text": "Fed cut at September 2026 meeting?",
+                  "url": "https://example.org/signal-1",
+                  "sha256": "b923673a1b0d47f29fe75b28dc62605a6d8ba31d450eadf9f509858edea6a477",
+                  "published_at": "2026-09-20T10:00:00Z",
+                  "available_at": "2026-09-20T10:01:00Z",
+                  "captured_at": "2026-09-20T10:02:00Z"
+                },
+                {
+                  "source_id": "mkt-a-rules",
+                  "text": "Resolves YES if the Federal Reserve lowers its target range by at least 25 basis points at the September 2026 meeting, according to its official decision.",
+                  "url": "https://example.org/mkt-a-rules",
+                  "sha256": "46646a279bb136b179a7de36693e0330be5db76e61d5a5a8b26438505130beb9",
+                  "published_at": "2026-09-19T10:00:00Z",
+                  "available_at": "2026-09-19T10:01:00Z",
+                  "captured_at": "2026-09-19T10:02:00Z"
+                }
+              ],
+              "execution_enabled": false,
+              "equivalence_approved": false,
+              "retain_candidate": true,
+              "evaluation": {
+                "status": "ok",
+                "mode": "advisory",
+                "model": "jev-1.13.0",
+                "usage": null,
+                "elapsed_ms": 1.0,
+                "state_hash": "9f5b4dbe0ab6bb92f3cc0e454519d7f74d47f516155dd881dd5e2419b4f56b36",
+                "question_hash": "8be86e9dafa8f487ef3f59016bb9b94ea449eed3136842e66ae2b9405e3decdd",
+                "error_code": null
+              },
+              "contract_id": "mkt-a",
+              "deterministic_mismatches": [],
+              "would_remove": false,
+              "relevance": "relevant",
+              "semantic_direction": true,
+              "judgments": {
+                "same_event": {
+                  "type": "noul",
+                  "noul": 0.95
+                },
+                "same_direction": {
+                  "type": "noul",
+                  "noul": 0.95
+                }
+              }
+            }
+          }
+        ],
+        "probabilities_modified": false,
+        "execution_enabled": false,
+        "live_state_changed": false
+      }
+    },
+    "signal-screen-insufficient": {
+      "input": "signal-screen-insufficient.json",
+      "result": {
+        "workflow": "signal_screen",
+        "status": "ok",
+        "provider": "manifold",
+        "incumbent": {
+          "id": "signal-1",
+          "probability": 0.62
+        },
+        "selected": {
+          "id": "signal-1",
+          "probability": 0.62
+        },
+        "proposed": {
+          "id": "signal-1",
+          "probability": 0.62
+        },
+        "diagnostics": [
+          {
+            "id": "signal-1",
+            "screen": {
+              "workflow": "relevance",
+              "rubric_version": "1.0.0",
+              "schema_version": 1,
+              "status": "insufficient_evidence",
+              "reason": "invalid_or_missing_input",
+              "retain_candidate": true,
+              "equivalence_approved": false,
+              "execution_enabled": false,
+              "evidence": [],
+              "evaluation": null
+            }
+          }
+        ],
+        "probabilities_modified": false,
+        "execution_enabled": false,
+        "live_state_changed": false
+      }
+    },
+    "paper-evaluate": {
+      "input": "paper-evaluate.json",
+      "result": {
+        "workflow": "paper_evaluation",
+        "schema_version": 1,
+        "status": "ok",
+        "input_hash": "56ad39f2cb9fd13e9d5f3231f4803f10f7afd6b92c13085efacd5f7ecdb12705",
+        "paper_only": true,
+        "execution_enabled": false,
+        "evaluation_at": "2026-09-25T12:00:00Z",
+        "heldout_cases": 1,
+        "heldout_event_groups": 1,
+        "metrics": {
+          "brier": 0.03999999999999998,
+          "baseline_brier": 0.25,
+          "log_loss": 0.2231435513142097,
+          "baseline_log_loss": 0.6931471805599453
+        },
+        "brier_change_vs_baseline": -0.21000000000000002,
+        "cases": [
+          {
+            "record_id": "paper-001",
+            "event_group": "fed-september-2026",
+            "target_id": "fed-cut",
+            "model_id": "external-frozen-model-v1",
+            "predicted_at": "2026-09-20T12:00:01Z",
+            "probability": 0.8,
+            "baseline_probability": 0.5,
+            "outcome": 1,
+            "brier": 0.03999999999999998,
+            "baseline_brier": 0.25,
+            "log_loss": 0.2231435513142097,
+            "baseline_log_loss": 0.6931471805599453
+          }
+        ],
+        "market_probability_source": "independently_supplied_forecasts",
+        "calibration_established": false,
+        "profitability_established": false,
+        "log_loss_clip_epsilon": 1e-15
+      }
+    }
+  }
+}

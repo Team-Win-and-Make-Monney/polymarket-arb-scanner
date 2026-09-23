@@ -33,6 +33,60 @@ def fixture(name):
     return json.loads((FIXTURES / f"{name}.json").read_text())
 
 
+CANONICAL_HASHES = {
+    "event": {
+        "rubric_version": "1.0.0",
+        "input_hash": "5db67341a961a1ba81af10e2b033ff5cecead6506bcf2d1154349ef81a627515",
+        "state_hash": "a0adff7eb5e5cd2b8776f38eca7b8562a90b1dd4d6b86b14f0c47f6282dee2df",
+        "question_hash": "3ef6d848fe160ee4463146afe13281c98f71cbdf79510558c9b313c4b2ee6ce0",
+    },
+    "novelty": {
+        "rubric_version": "1.0.0",
+        "input_hash": "aeb4b8e96dc7edc82dc86ea4b657a993ada6201f91fec420a7d11fc78799cd30",
+        "state_hash": "9cf75092b22676f66f35128dd6abbc825055e0308f92f953f53ae83361f4a01e",
+        "question_hash": "837ef7af99918fbc4aa2cba2a4eb937915bed92902cdfec9a0b7a34beb8d769d",
+    },
+    "relevance": {
+        "rubric_version": "1.0.0",
+        "input_hash": "143a05443f1024d8c68133ebfeb4610dc6fbbfba1d4e6b00bea98c4e9e0682d0",
+        "state_hash": "7be661d4a4119fb19eae80fa0f31d10d4954c99491f6efe1e4c93ff16de595b0",
+        "question_hash": "8be86e9dafa8f487ef3f59016bb9b94ea449eed3136842e66ae2b9405e3decdd",
+    },
+    "settlement": {
+        "rubric_version": "1.0.0",
+        "input_hash": "9e3764ef0732909d6f6a3cb1393d29f513a9148c78100a61f18244eebcc9afbb",
+        "state_hash": "99deb88531fcb27c03285ef06d3a8512fe23b8268249a20e5a72d8285e686eb4",
+        "question_hash": "9f1e1173dda6add7ed3348091735e77edfaa9c1eade527dca03f5ed602298518",
+    },
+    "attention": {
+        "rubric_version": "1.0.0",
+        "input_hash": "fffa709f9f840760204d62b1a64c4841be13f7ab6828826f90972e31ee3be970",
+        "state_hash": "033045d3f186cc90e543a1307d7e165ccc825416cf82b60aa8ac7d56ea769186",
+        "question_hash": "29734f6e7ae25daaa4d7297063231721b86b16376ac57eedb6de6fa39047d3c6",
+    },
+    "incentives": {
+        "rubric_version": "1.0.0",
+        "input_hash": "45880058772778b54ee189619da12b908cc9412a535dea1a607fb10da5f1cea9",
+        "state_hash": "61b546510c60cf284b19cb192b916f92d7aedb96d2bc02bcb2f05e9371c60fae",
+        "question_hash": "d92dae242b90ca8a581db035e2421bf3ab6cd74a2f5fda0971b353d4404c719e",
+    },
+    "transcript": {
+        "rubric_version": "1.0.0",
+        "input_hash": "17f48aa01e58931d090a9589f8e0f094bd24fcfa030ddc3c214b38630156917d",
+        "state_hash": "cfcfa2fc8bb4d599478fc1a7eecc61131ea54528ffb88714785f86272f5eca4c",
+        "question_hash": "661d8303f74c9b48a96c9ac9af8616a72293b0ba87867390c2ead0d1a58dfd80",
+    },
+    "paper-features": {
+        "rubric_version": "1.0.0",
+        "input_hash": "f049c8d67a1d8c4bca2dd20d4c916ad8d20aee2339d8a8d22927853a446b7ef9",
+        "state_hash": "32c3b7aee20120ffdc62263e3dd45ea1d796a0744b9628f49ce9d94da992fdf3",
+        "question_hash": "31397a157792f7d5d3e8df55bb63cedb95bc3a0fb4047981cc64b97675aaef3b",
+    },
+}
+
+CANONICAL_PAPER_EVALUATION_INPUT_HASH = "56ad39f2cb9fd13e9d5f3231f4803f10f7afd6b92c13085efacd5f7ecdb12705"
+
+
 class FakeJev:
     def __init__(self, answers=None, mode="advisory", failure=False, mutate=None, status="ok", error_code=None):
         self.answers = answers or {}
@@ -111,14 +165,16 @@ class TestWorkflowCoverage:
     @pytest.mark.parametrize("name", ["event", "novelty", "relevance", "settlement", "attention",
                                       "incentives", "transcript", "paper-features"])
     def test_deterministic_identifier_contracts_and_hash_stability(self, name):
+        expected = CANONICAL_HASHES[name]
         fix1 = fixture(name)
         fix2 = fixture(name)
         res1 = WORKFLOWS[name](fix1, FakeJev())
         res2 = WORKFLOWS[name](fix2, FakeJev())
         assert res1["status"] == res2["status"] == "ok"
-        assert res1["input_hash"] == res2["input_hash"]
-        assert res1["evaluation"]["state_hash"] == res2["evaluation"]["state_hash"]
-        assert res1["evaluation"]["question_hash"] == res2["evaluation"]["question_hash"]
+        assert res1["rubric_version"] == expected["rubric_version"]
+        assert res1["input_hash"] == res2["input_hash"] == expected["input_hash"]
+        assert res1["evaluation"]["state_hash"] == res2["evaluation"]["state_hash"] == expected["state_hash"]
+        assert res1["evaluation"]["question_hash"] == res2["evaluation"]["question_hash"] == expected["question_hash"]
         assert len(res1["input_hash"]) == 64
         assert len(res1["evaluation"]["state_hash"]) == 64
         assert len(res1["evaluation"]["question_hash"]) == 64
@@ -137,6 +193,16 @@ class TestWorkflowCoverage:
         res_novelty = WORKFLOWS["novelty"](fixture("novelty"), FakeJev())
         assert res_event["evaluation"]["question_hash"] != res_novelty["evaluation"]["question_hash"]
 
+    def test_canonical_rubric_versions_and_question_fingerprints_are_pinned(self):
+        # Every rubric in r.VERSIONS is bound to a canonical version and question_hash fingerprint
+        for workflow, expected in CANONICAL_HASHES.items():
+            rubric_name = workflow.replace("-", "_")
+            assert r.VERSIONS[rubric_name] == expected["rubric_version"]
+            res = WORKFLOWS[workflow](fixture(workflow), FakeJev())
+            assert res["evaluation"]["question_hash"] == expected["question_hash"]
+            assert res["input_hash"] == expected["input_hash"]
+            assert res["evaluation"]["state_hash"] == expected["state_hash"]
+
     def test_rubric_version_updates_on_rubric_changes(self, monkeypatch):
         rubric_key = "event"
         monkeypatch.setitem(r.VERSIONS, rubric_key, "2.0.0")
@@ -148,6 +214,7 @@ class TestWorkflowCoverage:
         res_original = WORKFLOWS["event"](fixture("event"), FakeJev())
         assert res["input_hash"] == res_original["input_hash"]
         assert res["evaluation"]["state_hash"] == res_original["evaluation"]["state_hash"]
+        assert res["evaluation"]["question_hash"] == res_original["evaluation"]["question_hash"]
 
     def test_client_error_code_propagation(self):
         client = FakeJev(status="error", error_code="quota_exceeded")
@@ -496,7 +563,7 @@ class TestPaperEvaluation:
         res1 = evaluate_paper_forecasts(payload1)
         res2 = evaluate_paper_forecasts(payload2)
         assert res1["status"] == "ok"
-        assert res1["input_hash"] == res2["input_hash"]
+        assert res1["input_hash"] == res2["input_hash"] == CANONICAL_PAPER_EVALUATION_INPUT_HASH
         assert len(res1["input_hash"]) == 64
 
         payload3 = paper_dataset()

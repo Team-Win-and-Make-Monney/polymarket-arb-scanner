@@ -119,15 +119,17 @@ class FirecrawlEvidenceClient:
 
                 final_poll = False
                 while True:
-                    if not final_poll and time.monotonic() >= deadline:
+                    remaining = deadline - time.monotonic()
+                    if not final_poll and remaining <= 0:
                         final_poll = True
+                    # Permit one bounded readback after the discovery deadline. A
+                    # paid job may finish during the final sleep or status request.
+                    request_timeout = 5.0 if final_poll else min(30.0, remaining)
                     try:
                         status_response = client.get(
                             f"https://api.firecrawl.dev/v2/agent/{job_id}",
                             headers=headers,
-                            # Permit one bounded readback after the discovery deadline. A
-                            # paid job may finish during the final sleep or status request.
-                            timeout=5.0 if final_poll else _remaining_seconds(deadline),
+                            timeout=request_timeout,
                         )
                     except httpx.TimeoutException:
                         if final_poll or time.monotonic() < deadline:

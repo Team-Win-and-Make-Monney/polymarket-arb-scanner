@@ -282,6 +282,52 @@ class TestFirecrawlEvidence:
             ("GET", "/v2/agent/job-status-timeout"),
         ]
 
+    def test_deadline_passing_between_clock_reads_still_allows_final_poll(self, monkeypatch):
+        requests: list[httpx.Request] = []
+        clock_values = iter([
+            100.0,  # discover: deadline = 100.0 + 2.0 = 102.0
+            100.0,  # POST: _remaining_seconds(deadline)
+            101.999,  # Polling loop: remaining = deadline - time.monotonic() (0.001s left)
+            102.001,  # If a second read occurs before GET, this would be past deadline!
+            102.001,  # Remainder / subsequent reads
+            102.001,
+        ])
+
+        def mock_monotonic() -> float:
+            try:
+                return next(clock_values)
+            except StopIteration:
+                return 102.001
+
+        monkeypatch.setattr("firecrawl_evidence.time.monotonic", mock_monotonic)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.method == "POST":
+                return httpx.Response(200, json={"success": True, "id": "job-clock-split"})
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "status": "completed",
+                    "creditsUsed": 1,
+                    "data": {"evidence": []},
+                },
+            )
+
+        client = FirecrawlEvidenceClient(
+            "fixture-key",
+            timeout_seconds=2,
+            poll_interval_seconds=0,
+            transport=httpx.MockTransport(handler),
+        )
+
+        assert client.discover("Did the official result publish?")["evidence"] == []
+        assert [(request.method, request.url.path) for request in requests] == [
+            ("POST", "/v2/agent"),
+            ("GET", "/v2/agent/job-clock-split"),
+        ]
+
     def test_cancel_conflict_does_not_replace_original_failure(self):
         requests: list[httpx.Request] = []
 

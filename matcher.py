@@ -9,6 +9,8 @@ embedding-based matcher provides higher-recall cross-platform matching
 using all-MiniLM-L6-v2 cosine similarity.
 """
 
+from __future__ import annotations
+
 import logging
 import re
 
@@ -244,6 +246,56 @@ def _get_market_id(market: dict) -> str:
     )
 
 
+def verify_cross_platform_equivalence_jev(
+    market_a: dict,
+    market_b: dict,
+    platform_a: str,
+    platform_b: str,
+    client=None,
+    min_confidence: float = 0.60,
+) -> tuple[bool, float, str]:
+    """Verify semantic and resolution equivalence of two cross-platform markets using Jev.
+
+    Args:
+        market_a: Market dict from platform A.
+        market_b: Market dict from platform B.
+        platform_a: Platform name (e.g. 'polymarket').
+        platform_b: Platform name (e.g. 'kalshi').
+        client: Optional JevClient instance.
+        min_confidence: Minimum confidence required to accept equivalence.
+
+    Returns:
+        Tuple of (is_equivalent: bool, confidence: float, reasoning: str).
+    """
+    try:
+        from jev_client import get_jev_client
+        j_client = client or get_jev_client()
+        if not j_client.is_available():
+            return False, 0.0, "Jev unavailable; fail-closed safety gate"
+
+        from jev_semantics import equivalence_questions, settlement_rules
+        rules_a, rules_b = settlement_rules(market_a), settlement_rules(market_b)
+        if not rules_a or not rules_b:
+            return False, 0.0, "Review required: missing settlement rules; fail-closed"
+        state = {
+            "platform_a": platform_a, "question_a": _get_title(market_a), "rules_a": rules_a,
+            "platform_b": platform_b, "question_b": _get_title(market_b), "rules_b": rules_b,
+        }
+        questions = equivalence_questions()
+
+        resp = j_client.query_decisions(state, questions)
+        answers = resp.get("answers", {})
+        choice = answers.get("is_equivalent", {}).get("choice", "different_events")
+        conf = float(answers.get("is_equivalent", {}).get("confidence", 0.0))
+        noul_p = float(answers.get("probability", {}).get("noul", 0.0))
+
+        equiv = (choice == "identical") and (0.85 <= noul_p <= 1.0) and (max(0.90, min_confidence) <= conf <= 1.0)
+        return equiv, conf, f"Jev: choice={choice}, P={noul_p:.2f}, conf={conf:.2f}"
+    except Exception as e:
+        logger.debug("Jev equivalence check failed: %s", e)
+        return False, 0.0, f"Error: {e}"
+
+
 def match_cross_platform(
     markets_a: list[dict],
     markets_b: list[dict],
@@ -251,6 +303,8 @@ def match_cross_platform(
     platform_b: str,
     threshold: int = 80,
     min_confidence: str = "LOW",
+    verify_with_jev: bool = False,
+    jev_client=None,
 ) -> list[dict]:
     """Platform-agnostic cross-platform matching between any two market lists.
 
@@ -329,6 +383,13 @@ def match_cross_platform(
             )
             if CONFIDENCE_ORDER.get(confidence, 0) < min_conf_level:
                 continue
+            if verify_with_jev:
+                is_eq, _, reason = verify_cross_platform_equivalence_jev(
+                    ma, best_match, platform_a, platform_b, client=jev_client
+                )
+                if not is_eq:
+                    logger.debug("Jev rejected equivalence: %s", reason)
+                    continue
             matches.append({
                 "market_a": ma,
                 "market_b": best_match,

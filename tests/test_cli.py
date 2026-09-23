@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import sys
 import os
 import argparse
+import config
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -41,6 +42,8 @@ for _mod in _EXTERNAL_MODS:
     elif _mod in sys.modules and isinstance(sys.modules[_mod], MagicMock):
         del sys.modules[_mod]
 _stashed.clear()
+sys.modules.pop("scans.frechet", None)
+sys.modules.pop("scans.temporal", None)
 
 
 # ---------------------------------------------------------------------------
@@ -204,9 +207,8 @@ class TestConfigPrecedence:
         env.pop("MIN_PROFIT_THRESHOLD", None)
         with patch.dict(os.environ, env, clear=True):
             args = argparse.Namespace(min_profit=None)
-            from config import DEFAULT_MIN_PROFIT
-            min_profit = args.min_profit or float(os.getenv("MIN_PROFIT_THRESHOLD", str(DEFAULT_MIN_PROFIT)))
-            assert min_profit == pytest.approx(DEFAULT_MIN_PROFIT)
+            min_profit = args.min_profit or float(os.getenv("MIN_PROFIT_THRESHOLD", str(config.DEFAULT_MIN_PROFIT)))
+            assert min_profit == pytest.approx(config.DEFAULT_MIN_PROFIT)
 
     def test_dry_run_cli_true_overrides_env(self):
         """--dry-run flag overrides DRY_RUN env."""
@@ -346,6 +348,65 @@ class TestRunOneshotModeRouting:
         _cli_mod._run_oneshot(args, 0.01, None, _make_executor(), _make_db(),
                               extra_clients={"ibkr": ibkr_client})
         mock_ibkr.assert_called_once()
+
+    @patch.object(_cli_mod, "display_results")
+    @patch.object(_cli_mod, "dashboard_state")
+    @patch.object(_cli_mod, "_refine_frechet_with_clob", return_value=[])
+    @patch.object(_cli_mod, "scan_frechet", return_value=[])
+    @patch.object(_cli_mod, "fetch_all_markets", return_value=[{"title": "M1"}])
+    def test_frechet_mode_runs_frechet_scan(
+        self, mock_fetch, mock_scan, mock_refine, mock_dash, mock_display
+    ):
+        args = _make_args(mode="frechet")
+        _cli_mod._run_oneshot(args, 0.01, None, _make_executor(), _make_db())
+        mock_scan.assert_called_once()
+        mock_refine.assert_called_once()
+
+    @patch.object(_cli_mod, "display_results")
+    @patch.object(_cli_mod, "dashboard_state")
+    @patch.object(_cli_mod, "_refine_frechet_with_clob", return_value=[])
+    @patch.object(_cli_mod, "scan_frechet", return_value=[])
+    @patch.object(_cli_mod, "fetch_all_markets", return_value=[{"title": "M1"}])
+    def test_frechet_mode_refuses_non_dry_run_without_flag(
+        self, mock_fetch, mock_scan, mock_refine, mock_dash, mock_display
+    ):
+        args = _make_args(mode="frechet", dry_run=False)
+        executor = _make_executor()
+        executor.dry_run = False
+        with patch("config.FRECHET_ARB_ENABLED", False):
+            _cli_mod._run_oneshot(args, 0.01, None, executor, _make_db())
+        mock_scan.assert_not_called()
+        mock_refine.assert_not_called()
+
+    @patch.object(_cli_mod, "display_results")
+    @patch.object(_cli_mod, "dashboard_state")
+    @patch.object(_cli_mod, "_fetch_kalshi_data", return_value=([{"markets": [{"ticker": "KXBTC-26MAR31-T100000"}]}], {}))
+    @patch.object(_cli_mod, "_refine_temporal_with_clob", return_value=[])
+    @patch.object(_cli_mod, "scan_temporal_arb", return_value=[])
+    def test_temporal_mode_runs_temporal_scan(
+        self, mock_scan, mock_refine, mock_fetch_kalshi, mock_dash, mock_display
+    ):
+        args = _make_args(mode="temporal")
+        _cli_mod._run_oneshot(args, 0.01, MagicMock(), _make_executor(), _make_db())
+        mock_scan.assert_called_once()
+        mock_refine.assert_called_once()
+
+    @patch.object(_cli_mod, "display_results")
+    @patch.object(_cli_mod, "dashboard_state")
+    @patch.object(_cli_mod, "_fetch_kalshi_data", return_value=([{"markets": [{"ticker": "KXBTC-26MAR31-T100000"}]}], {}))
+    @patch.object(_cli_mod, "_refine_temporal_with_clob", return_value=[])
+    @patch.object(_cli_mod, "scan_temporal_arb", return_value=[])
+    def test_temporal_mode_refuses_non_dry_run_without_flag(
+        self, mock_scan, mock_refine, mock_fetch_kalshi, mock_dash, mock_display
+    ):
+        args = _make_args(mode="temporal", dry_run=False)
+        executor = _make_executor()
+        executor.dry_run = False
+        with patch("config.TEMPORAL_ARB_ENABLED", False):
+            _cli_mod._run_oneshot(args, 0.01, MagicMock(), executor, _make_db())
+        mock_scan.assert_not_called()
+        mock_refine.assert_not_called()
+
 
     @patch.object(_cli_mod, "display_results")
     @patch.object(_cli_mod, "dashboard_state")
@@ -831,3 +892,183 @@ class TestOptionalClientStartup:
 
         assert result is client
         client.login.assert_called_once_with(api_key="token")
+
+
+# ---------------------------------------------------------------------------
+# UMA Dispute Gate CLI Wiring (Plan 05)
+# ---------------------------------------------------------------------------
+
+class TestDisputeGateCLI:
+    """Verify UMA dispute cache population in _run_oneshot."""
+
+    def test_dispute_gate_populates_cache_when_enabled(self, monkeypatch):
+        monkeypatch.setattr(config, "DISPUTE_GATE_ENABLED", True)
+
+        args = _make_args(mode="binary")
+        mock_db = MagicMock()
+        poly_markets = [{"conditionId": "0xabc", "umaResolutionStatus": "disputed"}]
+
+        with patch.object(_cli_mod, "fetch_all_markets", return_value=poly_markets), \
+             patch.object(_cli_mod, "scan_binary_internal", return_value=[]), \
+             patch.object(_cli_mod, "display_results"), \
+             patch.object(_cli_mod, "dashboard_state"):
+            _cli_mod._run_oneshot(args, min_profit=0.01, kalshi_client=None, executor=_make_executor(), db=mock_db)
+
+        mock_db.upsert_dispute_state.assert_called_once()
+        states = mock_db.upsert_dispute_state.call_args[0][0]
+        assert "0xabc" in states
+        assert states["0xabc"]["blocked"] is True
+
+    def test_dispute_gate_skips_cache_when_disabled(self, monkeypatch):
+        monkeypatch.setattr(config, "DISPUTE_GATE_ENABLED", False)
+
+        args = _make_args(mode="binary")
+        mock_db = MagicMock()
+        poly_markets = [{"conditionId": "0xabc", "umaResolutionStatus": "disputed"}]
+
+        with patch.object(_cli_mod, "fetch_all_markets", return_value=poly_markets), \
+             patch.object(_cli_mod, "scan_binary_internal", return_value=[]), \
+             patch.object(_cli_mod, "display_results"), \
+             patch.object(_cli_mod, "dashboard_state"):
+            _cli_mod._run_oneshot(args, min_profit=0.01, kalshi_client=None, executor=_make_executor(), db=mock_db)
+
+        mock_db.upsert_dispute_state.assert_not_called()
+
+    def test_dispute_gate_includes_events_cache_when_enabled(self, monkeypatch):
+        monkeypatch.setattr(config, "DISPUTE_GATE_ENABLED", True)
+
+        args = _make_args(mode="negrisk")
+        mock_db = MagicMock()
+        poly_events = [{"id": "evt1", "markets": [{"conditionId": "0xevent_cid", "umaResolutionStatus": "disputed"}]}]
+
+        with patch.object(_cli_mod, "fetch_all_markets", return_value=[]), \
+             patch.object(_cli_mod, "fetch_events", return_value=poly_events), \
+             patch.object(_cli_mod, "scan_negrisk_internal", return_value=[]), \
+             patch.object(_cli_mod, "display_results"), \
+             patch.object(_cli_mod, "dashboard_state"):
+            _cli_mod._run_oneshot(args, min_profit=0.01, kalshi_client=None, executor=_make_executor(), db=mock_db)
+
+        mock_db.upsert_dispute_state.assert_called_once()
+        states = mock_db.upsert_dispute_state.call_args[0][0]
+        assert "0xevent_cid" in states
+        assert states["0xevent_cid"]["blocked"] is True
+
+    def test_dispute_gate_refresh_failure_fails_closed(self, monkeypatch):
+        monkeypatch.setattr(config, "DISPUTE_GATE_ENABLED", True)
+
+        args = _make_args(mode="binary")
+        mock_db = MagicMock()
+        mock_db.upsert_dispute_state.side_effect = RuntimeError("Database locked")
+        poly_markets = [{"conditionId": "0xabc", "umaResolutionStatus": "disputed"}]
+        executor = _make_executor()
+
+        with patch.object(_cli_mod, "fetch_all_markets", return_value=poly_markets), \
+             patch.object(_cli_mod, "scan_binary_internal", return_value=[]), \
+             patch.object(_cli_mod, "display_results"), \
+             patch.object(_cli_mod, "dashboard_state"):
+            _cli_mod._run_oneshot(args, min_profit=0.01, kalshi_client=None, executor=executor, db=mock_db)
+
+        assert executor.risk_manager.uma_state_unavailable is True
+
+
+class TestCTFModeCLI:
+    """Tests for CTF mode CLI parsing and oneshot dispatch."""
+
+    def test_cli_parser_accepts_ctf_mode(self):
+        from cli import main
+        # Verify parser handles --mode ctf
+        with patch.object(sys, "argv", ["scanner.py", "--mode", "ctf", "--dry-run"]):
+            with patch("cli._run_oneshot") as mock_oneshot, \
+                 patch("cli.build_client_from_env", return_value=None), \
+                 patch("cli.TradeDB"):
+                try:
+                    main()
+                except SystemExit as exc:
+                    assert exc.code in (0, None)
+                assert mock_oneshot.called
+                args = mock_oneshot.call_args[0][0]
+                assert args.mode == "ctf"
+
+    def test_run_oneshot_dispatches_ctf(self, monkeypatch):
+        monkeypatch.setattr(config, "CTF_ENABLED", True)
+        args = _make_args(mode="ctf")
+        mock_db = MagicMock()
+        poly_markets = [{"conditionId": "0xctf_cid", "question": "Test?"}]
+        mock_ctf_opp = {
+            "type": "CTFMerge",
+            "market": "Test?",
+            "net_profit": 0.05,
+            "prices": "Y=0.45 N=0.48",
+            "total_cost": "$0.93",
+        }
+
+        with patch.object(_cli_mod, "fetch_all_markets", return_value=poly_markets), \
+             patch.object(_cli_mod, "scan_ctf", return_value=[mock_ctf_opp]) as mock_scan, \
+             patch.object(_cli_mod, "display_results") as mock_display, \
+             patch.object(_cli_mod, "dashboard_state"):
+            _cli_mod._run_oneshot(args, min_profit=0.01, kalshi_client=None, executor=_make_executor(), db=mock_db)
+
+        mock_scan.assert_called_once()
+        mock_display.assert_called_once()
+        opps = mock_display.call_args[0][0]
+        assert len(opps) == 1
+        assert opps[0]["type"] == "CTFMerge"
+
+    def test_run_oneshot_ctf_live_disabled_exits_fast(self, monkeypatch):
+        monkeypatch.setattr(config, "CTF_ENABLED", False)
+        monkeypatch.setattr(config, "CTF_MERGE_ENABLED", False)
+        monkeypatch.setattr(config, "CTF_MINT_SELL_ENABLED", False)
+        args = _make_args(mode="ctf")
+        args.dry_run = False
+        executor = _make_executor(dry_run=False)
+
+        with patch.object(_cli_mod, "fetch_all_markets", return_value=[]), \
+             patch.object(_cli_mod, "scan_ctf") as mock_scan, \
+             pytest.raises(SystemExit) as exc_info:
+            _cli_mod._run_oneshot(args, min_profit=0.01, kalshi_client=None, executor=executor, db=MagicMock())
+
+        assert exc_info.value.code == 1
+        mock_scan.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Limitless Rewards Mode CLI Tests
+# ---------------------------------------------------------------------------
+
+
+class TestLimitlessRewardsModeCLI:
+    def test_cli_parser_accepts_limitless_rewards_mode(self):
+        from cli import main
+        with patch.object(sys, "argv", ["scanner.py", "--mode", "limitless-rewards", "--dry-run"]):
+            with patch("cli._run_oneshot") as mock_oneshot, \
+                 patch("cli.build_client_from_env", return_value=None), \
+                 patch("cli.TradeDB"):
+                try:
+                    main()
+                except SystemExit as exc:
+                    assert exc.code in (0, None)
+                assert mock_oneshot.called
+                args = mock_oneshot.call_args[0][0]
+                assert args.mode == "limitless-rewards"
+
+    def test_run_oneshot_dispatches_limitless_rewards(self):
+        args = _make_args(mode="limitless-rewards")
+        mock_opp = {
+            "type": "LimitlessRewards",
+            "market": "Test Limitless Market",
+            "net_profit": 0.0,
+            "net_roi": 0.0,
+            "reward_pool_usdc": 100.0,
+            "total_cost": "$5.00",
+        }
+
+        with patch.object(_cli_mod, "scan_limitless_rewards", return_value=[mock_opp]) as mock_scan, \
+             patch.object(_cli_mod, "display_results") as mock_display, \
+             patch.object(_cli_mod, "dashboard_state"):
+            _cli_mod._run_oneshot(args, min_profit=0.0, kalshi_client=None, executor=_make_executor(), db=_make_db())
+
+        mock_scan.assert_called_once()
+        mock_display.assert_called_once()
+        opps = mock_display.call_args[0][0]
+        assert len(opps) == 1
+        assert opps[0]["type"] == "LimitlessRewards"

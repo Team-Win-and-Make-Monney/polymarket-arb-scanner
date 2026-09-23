@@ -44,7 +44,11 @@ def scan_resolution_snipes(
 
     for market in markets:
         title = market.get("question") or market.get("title", "")
-        market_key = market.get("condition_id") or market.get("id", "")
+        market_key = (
+            market.get("conditionId")
+            or market.get("condition_id")
+            or market.get("id", "")
+        )
 
         # Check if market is approaching resolution
         if not _is_near_resolution(market):
@@ -94,6 +98,7 @@ def scan_resolution_snipes(
                 "_price": price,
                 "_consensus": consensus,
                 "_market_key": market_key,
+                "_condition_id": market_key,
                 "_direction": "BUY_YES" if outcome_name == "yes" else "BUY_NO",
             }
             opportunity["_efficiency"] = capital_efficiency_score(opportunity)

@@ -11,16 +11,18 @@ import types
 import pytest
 from unittest.mock import MagicMock, patch
 
-# Mock tenacity before importing polymarket_api — the module uses decorators
-# at import time, so we need a mock that passes through the decorated function.
-if "tenacity" not in sys.modules:
-    _tenacity_mock = types.ModuleType("tenacity")
-    # retry() must be a decorator factory that returns the original function unchanged
-    _tenacity_mock.retry = lambda **kwargs: (lambda fn: fn)
-    _tenacity_mock.stop_after_attempt = lambda *a, **kw: None
-    _tenacity_mock.wait_exponential = lambda *a, **kw: None
-    _tenacity_mock.retry_if_exception_type = lambda *a, **kw: None
-    sys.modules["tenacity"] = _tenacity_mock
+# Mock tenacity before importing polymarket_api only if not already installed
+try:
+    import tenacity
+except ImportError:
+    if "tenacity" not in sys.modules:
+        _tenacity_mock = types.ModuleType("tenacity")
+        # retry() must be a decorator factory that returns the original function unchanged
+        _tenacity_mock.retry = lambda **kwargs: (lambda fn: fn)
+        _tenacity_mock.stop_after_attempt = lambda *a, **kw: None
+        _tenacity_mock.wait_exponential = lambda *a, **kw: None
+        _tenacity_mock.retry_if_exception_type = lambda *a, **kw: None
+        sys.modules["tenacity"] = _tenacity_mock
 
 # Mock py_clob_client_v2 since CI may not have the SDK installed
 for mod in [
@@ -575,3 +577,14 @@ class TestBestBidAskValidation:
             "asks": [{"price": "0.51", "size": "8"}],
         })
         assert result == {"bid": 0.49, "bid_size": 12.0, "ask": 0.51, "ask_size": 8.0}
+
+
+class TestOrderbookOrdering:
+    def test_best_prices_do_not_depend_on_array_order(self):
+        result = _real_get_best_bid_ask({
+            "asks": [{"price": "0.999", "size": "9"}, {"price": "0.41", "size": "12"},
+                     {"price": "0.60", "size": "5"}, {"price": "0.41", "size": "3"},
+                     {"price": "0.01", "size": "0"}, {"price": "bad", "size": "10"}, None],
+            "bids": [{"price": "0.01", "size": "9"}, {"price": "0.39", "size": "7"}],
+        })
+        assert result == {"ask": 0.41, "ask_size": 15, "bid": 0.39, "bid_size": 7}

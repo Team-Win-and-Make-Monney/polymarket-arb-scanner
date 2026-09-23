@@ -357,6 +357,7 @@ class TestConfigInvariants:
         cfg = live_config()
         monkeypatch.setattr(cfg, "MM_KALSHI_PILOT_ENABLED", True)
         monkeypatch.setattr(cfg, "DRY_RUN", False)
+        monkeypatch.setattr(cfg, "ENABLED_EXECUTION_PLATFORMS", frozenset({"kalshi"}))
         for flag in ("MM_AUTO_HEDGE_ENABLED", "MM_TOXIC_FLOW_ENABLED",
                      "MM_VOLATILITY_ADJUSTED_ENABLED"):
             monkeypatch.setattr(cfg, flag, flag != missing_flag)
@@ -369,6 +370,7 @@ class TestConfigInvariants:
         cfg = live_config()
         monkeypatch.setattr(cfg, "MM_KALSHI_PILOT_ENABLED", True)
         monkeypatch.setattr(cfg, "DRY_RUN", False)
+        monkeypatch.setattr(cfg, "ENABLED_EXECUTION_PLATFORMS", frozenset({"kalshi"}))
         for flag in ("MM_AUTO_HEDGE_ENABLED", "MM_TOXIC_FLOW_ENABLED",
                      "MM_VOLATILITY_ADJUSTED_ENABLED"):
             monkeypatch.setattr(cfg, flag, True)

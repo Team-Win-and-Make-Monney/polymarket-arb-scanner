@@ -1,0 +1,16 @@
+---
+description: Firecrawl usage in this repo (SDK vs raw requests)
+globs:
+  - "**/*.py"
+alwaysApply: false
+---
+
+# Firecrawl in this repo
+
+The Firecrawl Python SDK (`firecrawl-py`, v4.x) is installed in `.venv` and pinned in `requirements.txt`.
+
+- For **new scripts / pipelines / programmatic monitor management**, use the SDK: `from firecrawl import Firecrawl`.
+- **Execution hot path (news-snipe):** `firecrawl_news_client.py` intentionally uses raw `requests` against the REST API (mirroring `finnhub_api.py`) to keep the trading-loop dependency graph minimal. Do NOT convert it to the SDK without a reason.
+- `FIRECRAWL_API_KEY` via env / Infisical — never hardcode.
+- News-snipe (STRAT-02) supports two independent sources: `NEWS_SNIPE_ENABLED`+`FINNHUB_API_KEY` (Finnhub) and `FIRECRAWL_NEWS_ENABLED`+`FIRECRAWL_API_KEY` (Firecrawl). Both default off; the scan runs once per enabled source and merges results.
+- No LLM / new dependency in the execution hot path without explicit sign-off — this repo trades real capital.

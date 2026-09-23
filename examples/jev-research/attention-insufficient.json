@@ -1,0 +1,13 @@
+{
+  "as_of": "2026-09-20T12:00:00Z",
+  "sources": [],
+  "watchlist": [
+    {
+      "id": "acme-thesis",
+      "entity_ids": [
+        "ACME"
+      ],
+      "thesis": "Production interruptions may affect the issuer outlook."
+    }
+  ]
+}

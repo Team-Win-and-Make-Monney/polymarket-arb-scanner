@@ -15,6 +15,14 @@ reviews:
     enabled: true
     auto_incremental_review: true
     drafts: false
+    # Also review stacked PRs targeting these working branches.
+    base_branches:
+      - '^codex/.*$'
+      - '^feat/.*$'
+      - '^feature/.*$'
+      - '^fix/.*$'
+      - '^chore/.*$'
+      - '^jtamm/.*$'
   path_instructions:
     - path: "*.py"
       instructions: |
@@ -53,3 +61,19 @@ reviews:
         Treat Railway configuration as production-sensitive. Flag weakened health
         checks, unsafe commands, secret exposure, or any deployment behavior lacking
         explicit rollout and rollback evidence.
+
+# Public repository: keep private organization context (MCP servers, issue
+# trackers, organization-wide learnings, other issues/PRs) out of public reviews.
+knowledge_base:
+  learnings:
+    scope: local
+  issues:
+    scope: local
+  pull_requests:
+    scope: local
+  mcp:
+    usage: disabled
+  linear:
+    usage: disabled
+  jira:
+    usage: disabled

@@ -1,5 +1,5 @@
 requests==2.33.0
-python-dotenv==1.2.1
+python-dotenv==1.2.2
 tabulate==0.9.0
 thefuzz[speedup]==0.22.1
 cryptography==46.0.4
@@ -13,6 +13,10 @@ numpy>=1.24.0
 ib_insync>=0.9.70
 duckdb>=1.1.0
 finnhub-python==2.4.27
+# Firecrawl Python SDK — available for SDK-based Firecrawl work (research/monitor
+# scripts). NOTE: firecrawl_news_client.py intentionally uses raw `requests`
+# (mirroring finnhub_api.py) to keep the execution-path dependency graph minimal.
+firecrawl-py>=4.0,<5.0
 sentry-sdk>=2.60.0
 anthropic>=0.40.0
 PyYAML>=6.0

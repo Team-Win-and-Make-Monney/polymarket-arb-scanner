@@ -3,5 +3,8 @@
     "allow": [
       "Bash(python -m pytest:*)"
     ]
-  }
+  },
+  "enabledMcpjsonServers": [
+    "railway"
+  ]
 }

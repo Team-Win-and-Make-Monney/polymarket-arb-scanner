@@ -10,7 +10,14 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import kalshi_api
-from kalshi_api import KalshiClient, _rate_limit, _RateLimitError, KALSHI_BASE_URL, KALSHI_API_PATH
+from kalshi_api import (
+    KalshiClient,
+    _rate_limit,
+    _RateLimitError,
+    KALSHI_BASE_URL,
+    KALSHI_API_PATH,
+    _legacy_side_action_to_v2,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -237,29 +244,71 @@ class TestKalshiMarketPrice:
 # TestKalshiOrders
 # ---------------------------------------------------------------------------
 
+class TestKalshiV2SideMapping:
+    """Legacy yes/no + buy/sell → V2 YES-book bid/ask."""
+
+    def test_buy_yes_is_bid(self):
+        side, price = _legacy_side_action_to_v2("yes", "buy", 0.60)
+        assert side == "bid"
+        assert price == pytest.approx(0.60)
+
+    def test_buy_no_is_ask_at_complement(self):
+        side, price = _legacy_side_action_to_v2("no", "buy", 0.35)
+        assert side == "ask"
+        assert price == pytest.approx(0.65)
+
+    def test_sell_yes_is_ask(self):
+        side, price = _legacy_side_action_to_v2("yes", "sell", 0.40)
+        assert side == "ask"
+        assert price == pytest.approx(0.40)
+
+
 class TestKalshiOrders:
     """Order placement, status, cancel, balance, positions."""
 
     @patch("kalshi_api._rate_limit")
     def test_place_order_success(self, mock_rl, client):
-        """place_order returns parsed JSON on 200."""
+        """place_order posts V2 events/orders and normalizes the response."""
         client.session.request.return_value = _mock_response(
-            200, {"order": {"id": "o1", "status": "resting"}}
+            201,
+            {
+                "order_id": "o1",
+                "fill_count": "0.00",
+                "remaining_count": "5.00",
+                "ts_ms": 1,
+            },
         )
         result = client.place_order("TICK", "yes", "buy", 5, 0.60)
-        assert result == {"order": {"id": "o1", "status": "resting"}}
+        assert result["order"]["order_id"] == "o1"
+        assert result["order"]["status"] == "resting"
+        method, url = client.session.request.call_args[0][:2]
+        assert method == "POST"
+        assert url.endswith("/portfolio/events/orders")
         body = client.session.request.call_args[1]["json"]
-        assert body["yes_price"] == 60
-        assert "no_price" not in body
+        assert body["side"] == "bid"
+        assert body["count"] == "5.00"
+        assert body["price"] == "0.6000"
+        assert body["time_in_force"] == "fill_or_kill"
+        assert body["self_trade_prevention_type"] == "taker_at_cross"
+        assert "client_order_id" in body
 
     @patch("kalshi_api._rate_limit")
     def test_place_order_no_side_price(self, mock_rl, client):
-        """Placing a 'no' order sets no_price instead of yes_price."""
-        client.session.request.return_value = _mock_response(201, {"order": {"id": "o2"}})
+        """Buying NO maps to ask on the YES book at 1 - price."""
+        client.session.request.return_value = _mock_response(
+            201,
+            {
+                "order_id": "o2",
+                "fill_count": "0.00",
+                "remaining_count": "3.00",
+                "ts_ms": 1,
+            },
+        )
         result = client.place_order("TICK", "no", "buy", 3, 0.35)
         body = client.session.request.call_args[1]["json"]
-        assert body["no_price"] == 35
-        assert "yes_price" not in body
+        assert body["side"] == "ask"
+        assert body["price"] == "0.6500"  # 1 - 0.35
+        assert result["order"]["order_id"] == "o2"
 
     @patch("kalshi_api._rate_limit")
     def test_place_order_returns_none_on_400(self, mock_rl, client):
@@ -312,9 +361,12 @@ class TestKalshiOrders:
 
     @patch("kalshi_api._rate_limit")
     def test_cancel_order_success(self, mock_rl, client):
-        """cancel_order returns True on 200/204."""
+        """cancel_order hits V2 events path and returns True on 200/204."""
         client.session.request.return_value = _mock_response(204)
         assert client.cancel_order("o1") is True
+        method, url = client.session.request.call_args[0][:2]
+        assert method == "DELETE"
+        assert url.endswith("/portfolio/events/orders/o1")
 
     @patch("kalshi_api._rate_limit")
     def test_cancel_order_failure(self, mock_rl, client):

@@ -382,3 +382,123 @@ class TestRewardDatabaseSchema:
         assert columns["timestamp"] == "INTEGER"
 
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# TestLimitless (Limitless liquidity rewards scan)
+# ---------------------------------------------------------------------------
+
+
+class TestLimitless:
+    """Test scan_limitless_rewards and CLOB refinement."""
+
+    @pytest.fixture
+    def mock_limitless_client(self):
+        client = MagicMock()
+        client.fetch_all_markets.return_value = [
+            {
+                "id": "mkt-valid",
+                "title": "Will SpaceX land Starship on Mars?",
+                "category": "Space",
+                "yes_price": 0.50,
+                "no_price": 0.50,
+                "volume": 50000.0,
+                "reward_program": {
+                    "pool_size_usdc": 100.0,
+                    "daily_rate_usdc": 100.0,
+                    "min_incentive_size": 10.0,
+                    "max_incentive_spread": 0.04,
+                },
+            },
+            {
+                "id": "mkt-small-pool",
+                "title": "Small pool market",
+                "yes_price": 0.40,
+                "no_price": 0.60,
+                "reward_program": {
+                    "pool_size_usdc": 2.0,  # Below default 10.0 min_pool_usdc
+                    "min_incentive_size": 5.0,
+                    "max_incentive_spread": 0.04,
+                },
+            },
+            {
+                "id": "mkt-invalid-meta",
+                "title": "Invalid metadata market",
+                "yes_price": 0.50,
+                "reward_program": {
+                    "pool_size_usdc": 100.0,
+                    "min_incentive_size": -5.0,  # Invalid
+                    "max_incentive_spread": 0.04,
+                },
+            },
+            {
+                "id": "mkt-inactive",
+                "title": "Inactive reward market",
+                "yes_price": 0.50,
+                "reward_program": {
+                    "pool_size_usdc": 100.0,
+                    "min_incentive_size": 5.0,
+                    "max_incentive_spread": 0.04,
+                    "active": False,
+                },
+            },
+        ]
+        client.get_order_book.return_value = {
+            "bids": [{"price": 0.48, "amount": 50.0}],
+            "asks": [{"price": 0.52, "amount": 50.0}],
+        }
+        return client
+
+    def test_scan_limitless_rewards_emits_valid_opp(self, mock_limitless_client):
+        from scans.rewards import scan_limitless_rewards
+
+        opps = scan_limitless_rewards(mock_limitless_client, min_pool_usdc=10.0)
+        assert len(opps) == 1
+        opp = opps[0]
+
+        assert opp["type"] == "LimitlessRewards"
+        assert opp["_layer"] == 3
+        assert opp["platform"] == "limitless"
+        assert opp["_market_key"] == "mkt-valid"
+        assert opp["reward_pool_usdc"] == 100.0
+        assert opp["min_size"] == 10.0
+        assert opp["_clob_refined"] is True
+        assert 0.01 <= opp["optimal_bid"] < opp["optimal_ask"] <= 0.99
+
+    def test_scan_limitless_rewards_filters_small_pool(self, mock_limitless_client):
+        from scans.rewards import scan_limitless_rewards
+
+        opps = scan_limitless_rewards(mock_limitless_client, min_pool_usdc=10.0)
+        market_keys = [o["_market_key"] for o in opps]
+        assert "mkt-small-pool" not in market_keys
+        assert "mkt-invalid-meta" not in market_keys
+        assert "mkt-inactive" not in market_keys
+
+    def test_clob_refinement_drops_crossing_quotes(self, mock_limitless_client):
+        from scans.rewards import scan_limitless_rewards
+
+        # Order book where best ask (0.45) is lower than our optimal bid (0.488)
+        mock_limitless_client.get_order_book.return_value = {
+            "bids": [{"price": 0.40, "amount": 50.0}],
+            "asks": [{"price": 0.45, "amount": 50.0}],
+        }
+        opps = scan_limitless_rewards(mock_limitless_client, min_pool_usdc=10.0)
+        assert len(opps) == 0
+
+    def test_clob_refinement_drops_insufficient_depth(self, mock_limitless_client):
+        from scans.rewards import scan_limitless_rewards
+
+        mock_limitless_client.get_order_book.return_value = {
+            "bids": [{"price": 0.48, "amount": 1.0}],  # < 5.0
+            "asks": [{"price": 0.52, "amount": 50.0}],
+        }
+        opps = scan_limitless_rewards(mock_limitless_client, min_pool_usdc=10.0)
+        assert len(opps) == 0
+
+    def test_clob_refinement_graceful_degradation_on_missing_book(self, mock_limitless_client):
+        from scans.rewards import scan_limitless_rewards
+
+        mock_limitless_client.get_order_book.return_value = None
+        opps = scan_limitless_rewards(mock_limitless_client, min_pool_usdc=10.0)
+        assert len(opps) == 1
+        assert opps[0]["_clob_refined"] is False

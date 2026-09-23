@@ -7,7 +7,13 @@ from polymarket_api import get_binary_markets, get_clob_prices, parse_outcome_pr
 from kalshi_api import KalshiClient
 from matcher import (match_markets_to_events, match_markets_to_events_semantic,
                      match_cross_platform, match_cross_platform_semantic, detect_inverted)
-from config import FUZZY_MATCH_THRESHOLD, SEMANTIC_MATCHING_ENABLED, SEMANTIC_MATCH_THRESHOLD
+from config import (
+    FUZZY_MATCH_THRESHOLD,
+    SEMANTIC_MATCHING_ENABLED,
+    SEMANTIC_MATCH_THRESHOLD,
+    JEV_CROSS_EQUIVALENCE_ENABLED,
+    JEV_CONFIDENCE_THRESHOLD,
+)
 from fees import (
     net_profit_cross_platform,
     net_profit_cross_betfair,
@@ -58,7 +64,8 @@ for _i, _pa in enumerate(_ALL_PLATFORMS):
 
 
 def _refine_cross_with_clob(opportunities: list[dict], markets_by_key: dict, min_profit: float,
-                            price_cache: dict | None = None) -> list[dict]:
+                            price_cache: dict | None = None,
+                            funnel=None) -> list[dict]:
     """Stage 2: Re-check cross-platform candidates using CLOB ask prices for Polymarket side."""
     if not opportunities:
         return opportunities
@@ -95,11 +102,15 @@ def _refine_cross_with_clob(opportunities: list[dict], markets_by_key: dict, min
         market = markets_by_key.get(market_key) if market_key else None
         if not market:
             logger.debug("Cross dropped (fail-closed): no market for key %s", market_key)
+            if funnel:
+                funnel.record_clob_dropped(1)
             continue
 
         clob = clob_results.get(market_key)
         if not clob:
             logger.debug("Cross dropped (fail-closed): no CLOB book for %s", market_key)
+            if funnel:
+                funnel.record_clob_dropped(1)
             continue
 
         # Use ask price, fall back to bid + 0.01 if ask is missing. A
@@ -121,12 +132,16 @@ def _refine_cross_with_clob(opportunities: list[dict], markets_by_key: dict, min
         if (pm_yes is None or pm_no is None
                 or pm_yes_depth is None or pm_no_depth is None):
             logger.debug("Cross dropped (fail-closed): empty book sides for %s", market_key)
+            if funnel:
+                funnel.record_clob_dropped(1)
             continue
         k_yes = opp.get("_kalshi_yes")
         k_no = opp.get("_kalshi_no")
 
         if k_yes is None or k_no is None:
             logger.debug("Cross dropped (fail-closed): missing Kalshi prices for %s", market_key)
+            if funnel:
+                funnel.record_clob_dropped(1)
             continue
 
         result1 = net_profit_cross_platform(pm_yes, k_no, "yes", "no")
@@ -149,8 +164,36 @@ def _refine_cross_with_clob(opportunities: list[dict], markets_by_key: dict, min
             opp["_clob_depth"] = min(pm_yes_depth or 0, pm_no_depth or 0)
             if partial:
                 opp["_partial_clob"] = True
+            if JEV_CROSS_EQUIVALENCE_ENABLED:
+                conf_thresh = JEV_CONFIDENCE_THRESHOLD
+                try:
+                    from matcher import verify_cross_platform_equivalence_jev
+                    ma = {"question": opp.get("market", ""), "rules": opp.get("_rules_a", "")}
+                    mb = {"title": opp.get("kalshi", ""), "rules": opp.get("_rules_b", "")}
+                    is_eq, _, reason = verify_cross_platform_equivalence_jev(
+                        ma, mb, "polymarket", "kalshi", min_confidence=conf_thresh
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Cross dropped (fail-closed): Jev equivalence check error for %s: %s",
+                        opp.get("market", ""), e,
+                    )
+                    if funnel:
+                        funnel.record_clob_dropped(1)
+                    continue
+                if not is_eq:
+                    logger.info("Cross dropped by Jev equivalence gate: %s | %s", opp.get("market", ""), reason)
+                    if funnel:
+                        funnel.record_clob_dropped(1)
+                    continue
+
             refined.append(opp)
         else:
+            if funnel:
+                if best.get("gross_spread", 0) > 0:
+                    funnel.record_fee_dropped(1)
+                else:
+                    funnel.record_clob_dropped(1)
             logger.info(
                 "Cross dropped: %s | mid=$%.4f -> ask=$%.4f (min=%.4f) | "
                 "PM_Y=%.3f PM_N=%.3f K_Y=%.3f K_N=%.3f | "
@@ -201,8 +244,16 @@ def scan_cross_platform(
     min_confidence: str = "LOW",
     kalshi_events_preloaded: list[dict] | None = None,
     price_cache: dict | None = None,
+    funnel=None,
 ) -> list[dict]:
     """Scan for cross-platform arbitrage between Polymarket and Kalshi."""
+    if funnel is None:
+        try:
+            from funnel import get_funnel_tracker
+            funnel = get_funnel_tracker()
+        except ImportError:
+            funnel = None
+
     opportunities = []
     markets_by_key = {}
 
@@ -233,6 +284,8 @@ def scan_cross_platform(
             threshold=FUZZY_MATCH_THRESHOLD, min_confidence=min_confidence,
         )
     logger.info("Found %d event matches. Fetching Kalshi market prices...", len(matched))
+    if funnel:
+        funnel.record_screened(len(matched))
 
     # Pre-fetch Kalshi markets in parallel if not already done
     if kalshi_markets_by_event is None:
@@ -318,6 +371,9 @@ def scan_cross_platform(
                         "_kalshi_no": best_k_no,
                         "_kalshi_ticker": km.get("ticker", ""),
                         "_token_ids": pm_token_ids,
+                        "_inverted": bool(inverted),
+                        "_rules_a": pm.get("description", "") or pm.get("rules", ""),
+                        "_rules_b": km.get("rules_primary", "") or km.get("rules_secondary", "") or km.get("description", "") or km.get("rules", ""),
                         "confidence": match.get("confidence", "LOW"),
                         "_days_to_resolution": _days_to_resolution(pm, "polymarket"),
                     }
@@ -336,8 +392,12 @@ def scan_cross_platform(
     if filtered_resolution:
         logger.info("Filtered %d/%d cross-platform matches outside resolution window.", filtered_resolution, len(matched))
 
+    if funnel:
+        funnel.record_mid_candidates(len(opportunities))
+        funnel.record_clob_evaluated(len(opportunities))
+
     # Stage 2: Refine with CLOB ask prices
-    opportunities = _refine_cross_with_clob(opportunities, markets_by_key, min_profit, price_cache=price_cache)
+    opportunities = _refine_cross_with_clob(opportunities, markets_by_key, min_profit, price_cache=price_cache, funnel=funnel)
 
     # Attach fee path hints — scan-time metadata for executor re-validation
     for opp in opportunities:

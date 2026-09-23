@@ -1,0 +1,51 @@
+{
+  "as_of": "2026-09-20T12:00:00Z",
+  "sources": [
+    {
+      "id": "acme-old",
+      "text": "ACME reaffirmed its full-year revenue guidance.",
+      "url": "https://example.org/acme-old",
+      "published_at": "2026-09-19T10:00:00Z",
+      "available_at": "2026-09-19T10:01:00Z",
+      "captured_at": "2026-09-19T10:02:00Z",
+      "entity_ids": [
+        "ACME"
+      ],
+      "kind": "news"
+    },
+    {
+      "id": "acme-required",
+      "text": "ACME is holding a scheduled shareholder meeting.",
+      "url": "https://example.org/acme-required",
+      "published_at": "2026-09-20T10:00:00Z",
+      "available_at": "2026-09-20T10:01:00Z",
+      "captured_at": "2026-09-20T10:02:00Z",
+      "entity_ids": [
+        "ACME"
+      ],
+      "kind": "news",
+      "required_attention": true
+    },
+    {
+      "id": "acme-new",
+      "text": "ACME reduced its full-year revenue guidance after a production disruption.",
+      "url": "https://example.org/acme-new",
+      "published_at": "2026-09-20T10:00:00Z",
+      "available_at": "2026-09-20T10:01:00Z",
+      "captured_at": "2026-09-20T10:02:00Z",
+      "entity_ids": [
+        "ACME"
+      ],
+      "kind": "news"
+    }
+  ],
+  "watchlist": [
+    {
+      "id": "acme-thesis",
+      "entity_ids": [
+        "ACME"
+      ],
+      "thesis": "Production interruptions may affect the issuer outlook."
+    }
+  ]
+}

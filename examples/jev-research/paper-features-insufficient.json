@@ -1,0 +1,14 @@
+{
+  "as_of": "2026-09-20T12:00:00Z",
+  "record_id": "paper-001",
+  "event_group": "fed-september-2026",
+  "target": {
+    "id": "fed-cut",
+    "proposition": "The Fed cuts its target range at its September meeting.",
+    "entity_ids": [
+      "FED"
+    ],
+    "horizon_end": "2026-09-24T00:00:00Z"
+  },
+  "sources": []
+}

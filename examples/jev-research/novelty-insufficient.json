@@ -1,0 +1,29 @@
+{
+  "as_of": "2026-09-20T12:00:00Z",
+  "current": {
+    "id": "acme-new",
+    "text": "",
+    "url": "https://example.org/acme-new",
+    "published_at": "2026-09-20T10:00:00Z",
+    "available_at": "2026-09-20T10:01:00Z",
+    "captured_at": "2026-09-20T10:02:00Z",
+    "entity_ids": [
+      "ACME"
+    ],
+    "kind": "news"
+  },
+  "previous": [
+    {
+      "id": "acme-old",
+      "text": "ACME reaffirmed its full-year revenue guidance.",
+      "url": "https://example.org/acme-old",
+      "published_at": "2026-09-19T10:00:00Z",
+      "available_at": "2026-09-19T10:01:00Z",
+      "captured_at": "2026-09-19T10:02:00Z",
+      "entity_ids": [
+        "ACME"
+      ],
+      "kind": "news"
+    }
+  ]
+}

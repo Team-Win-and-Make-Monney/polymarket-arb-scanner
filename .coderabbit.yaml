@@ -62,9 +62,18 @@ reviews:
         checks, unsafe commands, secret exposure, or any deployment behavior lacking
         explicit rollout and rollback evidence.
 
-  pre_merge_checks:
-    custom_checks:
-      - name: Verification evidence
-        mode: warning
-        instructions: |
-          Require exact validation commands and results in the PR description. Distinguish local checks from remote CI and name unrun checks with a reason. Flag unsupported claims of deployment or live-provider success.
+# Public repository: keep private organization context (MCP servers, issue
+# trackers, organization-wide learnings, other issues/PRs) out of public reviews.
+knowledge_base:
+  learnings:
+    scope: local
+  issues:
+    scope: local
+  pull_requests:
+    scope: local
+  mcp:
+    usage: disabled
+  linear:
+    usage: disabled
+  jira:
+    usage: disabled

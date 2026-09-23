@@ -5,6 +5,7 @@ import math
 import os
 
 from config import (
+    CTF_GAS_ESTIMATE,
     FEE_MODEL,
     KALSHI_FEE_CAP_CENTS,
     POLYGON_GAS_ESTIMATE,
@@ -1587,6 +1588,74 @@ def net_profit_logical_arb(price_if_yes: float, price_then_yes: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Fréchet-Bound Logical Arbitrage fee calculator
+# ---------------------------------------------------------------------------
+
+
+def net_profit_frechet_implication(
+    p_a: float,
+    p_b: float,
+    platform: str = "polymarket",
+    category: str | None = None,
+) -> dict:
+    """Calculate net profit for an implication-violation lock on A ⊆ B.
+
+    Coherence requires P(A) <= P(B). When P(A) > P(B), buy YES on B and NO on A.
+    Payoffs across reachable states (A ⊆ B forbids A=1, B=0):
+      - A=1, B=1: YES_B pays $1, NO_A pays $0 -> payout $1.00
+      - A=0, B=1: YES_B pays $1, NO_A pays $1 -> payout $2.00
+      - A=0, B=0: YES_B pays $0, NO_A pays $1 -> payout $1.00
+    Minimum guaranteed payoff = $1.00.
+    Total cost = P(YES_B) + P(NO_A) = P(B) + (1.0 - P(A)) = 1.0 + P(B) - P(A).
+    Gross spread = 1.0 - Total cost = P(A) - P(B).
+    Profit = (P(A) - P(B)) - fees.
+
+    Args:
+        p_a: Probability/price of subset event A.
+        p_b: Probability/price of superset event B.
+        platform: Execution platform ("polymarket" or "kalshi").
+        category: Market category for Polymarket dynamic taker fee.
+
+    Returns:
+        Dict with keys: gross_spread, fees, net_profit, net_roi, total_cost.
+    """
+    gross_spread = p_a - p_b
+    total_cost = 1.0 + p_b - p_a
+    if gross_spread <= 0:
+        return {
+            "gross_spread": gross_spread,
+            "fees": 0.0,
+            "net_profit": gross_spread,
+            "net_roi": 0.0,
+            "total_cost": total_cost,
+        }
+
+    if platform == "kalshi":
+        fee = kalshi_taker_fee(p_b) + kalshi_taker_fee(1.0 - p_a)
+        gas = 0.0
+    else:
+        fee = (polymarket_taker_fee(p_b, category=category)
+               + polymarket_taker_fee(1.0 - p_a, category=category))
+        gas = POLYGON_GAS_ESTIMATE * 2
+
+    total_fees = fee + gas
+    net_profit = gross_spread - total_fees
+    net_roi = net_profit / total_cost if total_cost > 0 else 0.0
+
+    return {
+        "gross_spread": gross_spread,
+        "fees": total_fees,
+        "net_profit": net_profit,
+        "net_roi": net_roi,
+        "total_cost": total_cost,
+    }
+
+
+# Plan 03: Cross-date temporal arbitrage shares identical Dutch book implication payoff economics
+net_profit_temporal_implication = net_profit_frechet_implication
+
+
+# ---------------------------------------------------------------------------
 # Whale Copy Trading fee calculator
 # ---------------------------------------------------------------------------
 
@@ -2200,4 +2269,134 @@ def net_profit_cross_category(
         "fees": total_fees,
         "net_profit": net_profit,
         "net_roi": net_roi,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Jev System One Decision Fee Calculation
+# ---------------------------------------------------------------------------
+
+
+def net_profit_jev_crypto(
+    price: float,
+    model_prob: float,
+    size: float = 10.0,
+    category: str = "crypto",
+) -> dict:
+    """Calculate net expected profit for a Jev-directed crypto execution.
+
+    Args:
+        price: Execution price for the token in [0, 1] (buy Yes or buy No).
+        model_prob: Calibrated true probability estimated by Jev in [0, 1].
+        size: Notional trade size in USD.
+        category: Market category on Polymarket (default 'crypto' = 7% taker fee).
+
+    Returns:
+        Dict with total_cost, fees, gross_profit, net_profit, and net_roi.
+    """
+    if price <= 0.0 or price >= 1.0 or size <= 0:
+        return {
+            "total_cost": 0.0,
+            "fees": 0.0,
+            "gross_profit": 0.0,
+            "net_profit": 0.0,
+            "net_roi": 0.0,
+        }
+
+    contracts = size / price
+    # Taker fee at entry: rate * C * P * (1 - P)
+    fee = polymarket_taker_fee(price, contracts=contracts, category=category)
+    gas = POLYGON_GAS_ESTIMATE
+
+    # Expected value at expiration: model_prob * ($1.00 payout * contracts) - capital
+    expected_payout = model_prob * contracts
+    gross_profit = expected_payout - size
+    total_fees = fee + gas
+    net_profit = gross_profit - total_fees
+    net_roi = (net_profit / size) if size > 0 else 0.0
+
+    return {
+        "total_cost": size,
+        "fees": total_fees,
+        "gross_profit": gross_profit,
+        "net_profit": net_profit,
+        "net_roi": net_roi,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Plan 04: CTF Primitives Fee Calculators
+# ---------------------------------------------------------------------------
+
+def net_profit_ctf_merge(
+    yes_ask: float,
+    no_ask: float,
+    category: str | None = None,
+    gas_cost: float | None = None,
+) -> dict[str, float]:
+    """Net profit calculator for buy-and-merge CTF arbitrage (YES_ask + NO_ask < $1.00).
+
+    Buys both YES and NO on the order book and merges them into $1.00 collateral
+    via ConditionalTokens.mergePositions(), avoiding resolution holding period.
+
+    Args:
+        yes_ask: Best ask price for YES token.
+        no_ask: Best ask price for NO token.
+        category: Market category for Polymarket taker fee rate lookup.
+        gas_cost: Optional gas cost override in USD. If None, uses
+            CTF_GAS_ESTIMATE + 2 * POLYGON_GAS_ESTIMATE.
+
+    Returns:
+        Dict with gross_spread, fees, net_profit.
+    """
+    gross = 1.0 - (yes_ask + no_ask)
+    if gross <= 0.0:
+        return {"gross_spread": gross, "fees": 0.0, "net_profit": gross}
+
+    fee_yes = polymarket_taker_fee(yes_ask, category=category)
+    fee_no = polymarket_taker_fee(no_ask, category=category)
+    gas = gas_cost if gas_cost is not None else (CTF_GAS_ESTIMATE + POLYGON_GAS_ESTIMATE * 2)
+    total_fees = fee_yes + fee_no + gas
+
+    return {
+        "gross_spread": gross,
+        "fees": total_fees,
+        "net_profit": gross - total_fees,
+    }
+
+
+def net_profit_ctf_mint(
+    yes_bid: float,
+    no_bid: float,
+    category: str | None = None,
+    gas_cost: float | None = None,
+) -> dict[str, float]:
+    """Net profit calculator for mint-and-sell CTF arbitrage (YES_bid + NO_bid > $1.00).
+
+    Mints 1 YES + 1 NO from $1.00 collateral via ConditionalTokens.splitPosition(),
+    then sells both legs into resting bids for > $1.00.
+
+    Args:
+        yes_bid: Best bid price for YES token.
+        no_bid: Best bid price for NO token.
+        category: Market category for Polymarket taker fee rate lookup.
+        gas_cost: Optional gas cost override in USD. If None, uses
+            CTF_GAS_ESTIMATE + 2 * POLYGON_GAS_ESTIMATE.
+
+    Returns:
+        Dict with gross_spread, fees, net_profit.
+    """
+    gross = (yes_bid + no_bid) - 1.0
+    if gross <= 0.0:
+        return {"gross_spread": gross, "fees": 0.0, "net_profit": gross}
+
+    fee_yes = polymarket_taker_fee(yes_bid, category=category)
+    fee_no = polymarket_taker_fee(no_bid, category=category)
+    gas = gas_cost if gas_cost is not None else (CTF_GAS_ESTIMATE + POLYGON_GAS_ESTIMATE * 2)
+    total_fees = fee_yes + fee_no + gas
+
+    return {
+        "gross_spread": gross,
+        "fees": total_fees,
+        "net_profit": gross - total_fees,
     }

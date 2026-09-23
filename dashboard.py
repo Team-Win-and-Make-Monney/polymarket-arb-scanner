@@ -122,6 +122,7 @@ class _DashboardState:
         self.stale_detections = 0
         self.resolution_snipes = 0
         self.convergence_signals = 0
+        self.jev_crypto_opps = 0
         self.signal_sources_active = 0
         # Analytics (MON-01): per-strategy P&L metrics
         self.strategy_metrics: list[dict] = []
@@ -131,6 +132,8 @@ class _DashboardState:
         self.leaderboard_updated_at: float = 0
         # Rewards tracking (Layer 3)
         self.reward_tracker = None
+        # Detection funnel telemetry (Phase 1)
+        self.funnel_stats: dict[str, int] = {}
 
     def update_strategy_metrics(self, strategy_metrics: list[dict]) -> None:
         """Update dashboard with strategy leaderboard metrics.
@@ -156,12 +159,14 @@ class _DashboardState:
             "ws_connections": self.ws_connections,
             "opportunities_found": self.opportunities_found,
             "last_opportunities": self.last_opportunities[:20],
+            "funnel_stats": self.funnel_stats,
             "mm_active_markets": self.mm_active_markets,
             "mm_active_orders": self.mm_active_orders,
             "mm_total_exposure": round(self.mm_total_exposure, 2),
             "stale_detections": self.stale_detections,
             "resolution_snipes": self.resolution_snipes,
             "convergence_signals": self.convergence_signals,
+            "jev_crypto_opps": self.jev_crypto_opps,
             "signal_sources_active": self.signal_sources_active,
             "strategy_metrics": self.strategy_metrics,
             "platform_health": self.platform_health,
@@ -370,6 +375,8 @@ class _Handler(BaseHTTPRequestHandler):
             "/api/balances": self._handle_balances,
             "/api/rebalance": self._handle_rebalance,
             "/api/validation": self._handle_validation,
+            "/api/jev/calibration": self._handle_jev_calibration,
+            "/api/funnel": self._handle_funnel,
         }
 
         handler_fn = routes.get(path)
@@ -439,6 +446,16 @@ class _Handler(BaseHTTPRequestHandler):
     def _handle_status(self):
         """Scanner state JSON (existing endpoint, preserved for compatibility)."""
         _send_json(self, state.to_dict())
+
+    def _handle_funnel(self):
+        """Detection funnel telemetry endpoint (Phase 1)."""
+        from funnel import get_funnel_tracker
+        tracker = get_funnel_tracker()
+        _send_json(self, {
+            "current_cycle": tracker.current_cycle.to_dict(),
+            "cumulative": tracker.cumulative.to_dict(),
+            "history": tracker.cycle_history[-20:],
+        })
 
     def _handle_metrics(self):
         """Prometheus-compatible metrics endpoint (text exposition format).
@@ -827,6 +844,29 @@ class _Handler(BaseHTTPRequestHandler):
             "overall_pass": c1_pass and c2_pass and c3_pass,
             "milestone_status": "ACHIEVED" if (c1_pass and c2_pass and c3_pass) else "NOT ACHIEVED",
         })
+
+    def _handle_jev_calibration(self):
+        """GET /api/jev/calibration — empirical calibration report for Jev decisions."""
+        db = _get_db()
+        if not db:
+            _send_json(self, {"error": "No database available"}, 500)
+            return
+
+        try:
+            from jev_calibration import generate_calibration_report
+            asset = "all"
+            if "?" in self.path:
+                query_str = self.path.split("?", 1)[1]
+                for part in query_str.split("&"):
+                    if part.startswith("asset="):
+                        asset = part.split("=", 1)[1]
+            report = generate_calibration_report(db, asset=asset)
+            _send_json(self, report)
+        except Exception as e:
+            logger.warning("Error generating Jev calibration report: %s", e)
+            _send_json(self, {"error": str(e)}, 500)
+        finally:
+            db.close()
 
     def _handle_pause_get(self):
         """GET /api/pause — return current kill switch state."""

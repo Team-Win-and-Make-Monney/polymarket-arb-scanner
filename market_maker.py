@@ -202,7 +202,8 @@ class QuoteManager:
     Wraps platform-specific order placement APIs behind a common interface.
     """
 
-    def __init__(self):
+    def __init__(self, dry_run: bool = True):
+        self.dry_run = dry_run
         self._active_orders: dict[str, dict] = {}  # order_id -> order_info
         self._lock = threading.Lock()
 
@@ -228,8 +229,8 @@ class QuoteManager:
         Returns:
             Order ID or None on failure.
         """
-        if trader is None:
-            logger.debug("No trader for %s — dry run quote %s %s @ %.4f",
+        if trader is None or self.dry_run or (getattr(trader, "dry_run", False) is True):
+            logger.debug("No trader or dry run for %s — dry run quote %s %s @ %.4f",
                          platform, side, market_key, price)
             # Dry run: generate a fake order ID for tracking
             order_id = f"dry_{platform}_{market_key}_{side}_{time.time():.0f}"
@@ -245,11 +246,113 @@ class QuoteManager:
                 }
             return order_id
 
-        # Live order placement would go here, dispatching to platform API
-        # For now, log the intended action
-        logger.info("MM quote: %s %s %s @ %.4f ($%.2f)",
-                     platform, side, market_key, price, size)
-        return None
+        norm_platform = platform.lower()
+        from config import ENABLED_EXECUTION_PLATFORMS
+        if norm_platform not in ENABLED_EXECUTION_PLATFORMS:
+            logger.error(
+                "Platform %s not in ENABLED_EXECUTION_PLATFORMS (%s); rejecting quote",
+                norm_platform, ENABLED_EXECUTION_PLATFORMS,
+            )
+            return None
+
+        if norm_platform == "limitless":
+            from config import LIMITLESS_MAX_INVENTORY
+            with self._lock:
+                current_active = sum(
+                    o.get("size", 0) for o in self._active_orders.values()
+                    if o.get("platform") == "limitless" and o.get("market_key") == market_key
+                )
+            if current_active + size > LIMITLESS_MAX_INVENTORY:
+                logger.warning(
+                    "Limitless quote exceeds LIMITLESS_MAX_INVENTORY (active $%.2f + size $%.2f > max $%.2f); rejecting",
+                    current_active, size, LIMITLESS_MAX_INVENTORY,
+                )
+                return None
+
+        if norm_platform == "kalshi":
+            from kalshi_policy import live_kalshi_submit_allowed
+            if not live_kalshi_submit_allowed(market_key, reducing=False):
+                logger.warning("Kalshi quote rejected by policy guard for ticker %s", market_key)
+                return None
+
+        order_side = "buy" if side.lower() in ("bid", "buy") else "sell"
+        quantity = max(1, int(round(size / price))) if price > 0 else 1
+
+        resp = None
+        try:
+            if norm_platform == "limitless":
+                resp = trader.place_order(
+                    market_id=market_key,
+                    side=order_side,
+                    outcome="yes",
+                    quantity=quantity,
+                    price=price,
+                    time_in_force="gtc",
+                )
+            elif norm_platform == "kalshi":
+                resp = trader.place_order(
+                    ticker=market_key,
+                    side="yes",
+                    action=order_side,
+                    count=quantity,
+                    price_dollars=price,
+                    time_in_force="gtc",
+                )
+            elif norm_platform == "polymarket":
+                resp = trader.place_order(
+                    token_id=market_key,
+                    side=order_side.upper(),
+                    price=price,
+                    size=float(quantity),
+                    order_type="GTC",
+                )
+            elif hasattr(trader, "place_order"):
+                try:
+                    resp = trader.place_order(
+                        market_id=market_key,
+                        side=order_side,
+                        price=price,
+                        size=size,
+                    )
+                except TypeError:
+                    resp = trader.place_order(market_key, order_side, price, size)
+        except Exception as exc:
+            logger.error("Failed to place live MM quote on %s for %s: %s", platform, market_key, exc)
+            return None
+
+        if resp is None:
+            logger.warning("Live MM quote returned None for %s %s", platform, market_key)
+            return None
+
+        order_id = None
+        if isinstance(resp, str):
+            order_id = resp
+        elif isinstance(resp, dict):
+            order_id = (
+                resp.get("order_id")
+                or resp.get("orderID")
+                or resp.get("id")
+                or (resp.get("order", {}).get("order_id") if isinstance(resp.get("order"), dict) else None)
+            )
+
+        if not order_id:
+            logger.warning("Live MM quote on %s returned response without order ID: %s", platform, resp)
+            return None
+
+        order_id = str(order_id)
+        with self._lock:
+            self._active_orders[order_id] = {
+                "platform": platform,
+                "market_key": market_key,
+                "side": side,
+                "price": price,
+                "size": size,
+                "status": "resting",
+                "placed_at": time.time(),
+            }
+        logger.info("MM quote placed: %s %s %s @ %.4f ($%.2f) -> order_id=%s",
+                    platform, side, market_key, price, size, order_id)
+        return order_id
 
     @staticmethod
     def _cancel_on_exchange(order_id: str, trader) -> bool:
@@ -370,7 +473,7 @@ class MarketMaker:
     ):
         self.inventory = inventory or InventoryTracker(max_inventory, max_total_exposure)
         self.quote_engine = quote_engine or QuoteEngine(min_spread)
-        self.quote_manager = quote_manager or QuoteManager()
+        self.quote_manager = quote_manager or QuoteManager(dry_run=dry_run)
         self.quote_size = quote_size
         self.max_inventory = max_inventory
         self.refresh_interval = refresh_interval
@@ -463,7 +566,16 @@ class MarketMaker:
             )
 
             # Cancel existing quotes for this market
-            self.quote_manager.cancel_all(mkey)
+            live_trader = trader if not self.dry_run else None
+            outstanding = len(self.quote_manager.get_active_orders(mkey))
+            cancelled = self.quote_manager.cancel_all(mkey, trader=live_trader)
+            if cancelled < outstanding:
+                logger.error(
+                    "MM: %d of %d resting orders on %s were not cancelled — "
+                    "skipping requote to avoid stacking live quotes",
+                    outstanding - cancelled, outstanding, mkey,
+                )
+                continue
 
             # Place new bid
             if self.inventory.can_trade(mkey, self.quote_size):
@@ -661,7 +773,7 @@ class CrossPlatformMaker:
         self.inventory_a = inventory_a or InventoryTracker(max_inventory)
         self.inventory_b = inventory_b or InventoryTracker(max_inventory)
         self.quote_engine = quote_engine or QuoteEngine(min_spread)
-        self.quote_manager = quote_manager or QuoteManager()
+        self.quote_manager = quote_manager or QuoteManager(dry_run=dry_run)
         self.quote_size = quote_size
         self.max_inventory = max_inventory
         self.hedger = hedger
@@ -1369,6 +1481,7 @@ class ToxicFlowDetector:
         self.toxicity_threshold = toxicity_threshold
         self._fills: dict[str, list[dict]] = {}
         self._pause_until: dict[str, float] = {}
+        self._pause_reasons: dict[str, str] = {}
         self._lock = threading.Lock()
 
     def record_fill(
@@ -1451,12 +1564,14 @@ class ToxicFlowDetector:
         self,
         market_key: str,
         pause_seconds: float | None = None,
+        reason: str = "",
     ) -> None:
         """Trigger a quoting pause for a market.
 
         Args:
             market_key: Market identifier.
             pause_seconds: Duration of pause (default from config).
+            reason: Optional human/system reason for the pause.
         """
         from config import MM_TOXIC_FLOW_PAUSE_SECONDS
 
@@ -1464,15 +1579,90 @@ class ToxicFlowDetector:
         toxicity = self.get_toxicity(market_key)
         with self._lock:
             self._pause_until[market_key] = time.time() + pause_seconds
+            if reason:
+                self._pause_reasons[market_key] = reason
         logger.warning(
-            "Toxic flow detected on %s (%.1f%%), pausing for %.0fs",
-            market_key, toxicity * 100, pause_seconds,
+            "Toxic flow detected on %s (%.1f%%)%s, pausing for %.0fs",
+            market_key, toxicity * 100, f" [{reason}]" if reason else "", pause_seconds,
         )
 
     def get_pause_remaining(self, market_key: str) -> float:
         """Get remaining pause time in seconds."""
         with self._lock:
             return max(0, self._pause_until.get(market_key, 0) - time.time())
+
+    def get_pause_reason(self, market_key: str) -> str:
+        """Get pause reason if set, or empty string."""
+        with self._lock:
+            return self._pause_reasons.get(market_key, "")
+
+    def evaluate_spot_toxicity_with_jev(
+        self,
+        market_key: str,
+        asset: str,
+        spot_delta_pct: float,
+        recent_fill_skew: float = 0.0,
+        client=None,
+    ) -> tuple[bool, float, str]:
+        """Evaluate whether an external spot jump constitutes toxic flow using Jev System One.
+
+        Args:
+            market_key: Market identifier.
+            asset: Underlying asset (e.g. 'BTC').
+            spot_delta_pct: Recent spot price % change (e.g. +3.2%).
+            recent_fill_skew: Recent fill skew (-1.0 to +1.0).
+            client: Optional JevClient instance.
+
+        Returns:
+            Tuple of (should_pause: bool, toxicity_score: float, reason: str).
+        """
+        try:
+            from jev_client import get_jev_client
+            j_client = client or get_jev_client()
+            if not j_client.is_available():
+                return False, 0.0, "Jev unavailable"
+
+            state = {
+                "market_key": market_key,
+                "asset": asset,
+                "spot_delta_pct": spot_delta_pct,
+                "recent_fill_skew": recent_fill_skew,
+            }
+            questions = {
+                "adverse_selection": {
+                    "type": "noul",
+                    "instructions": (
+                        "Given an abrupt `spot_delta_pct` move in `asset` and orderbook fill skew, "
+                        "does this market-making environment present acute adverse selection / toxic flow risk?"
+                    ),
+                },
+                "toxicity_score": {
+                    "type": "score",
+                    "instructions": "Rate the adverse selection severity for market makers.",
+                    "criteria": [
+                        "0: Benign retail noise / safe to quote",
+                        "1: Moderate directional drift / widen spreads",
+                        "2: Toxic informed sweep / pull quotes immediately",
+                    ],
+                },
+            }
+
+            resp = j_client.query_decisions(state, questions)
+            answers = resp.get("answers", {})
+            noul_p = float(answers.get("adverse_selection", {}).get("noul", 0.0))
+            score = float(answers.get("toxicity_score", {}).get("score", 0.0))
+            conf = float(answers.get("toxicity_score", {}).get("confidence", 0.0))
+
+            is_toxic = (noul_p >= 0.70) or (score >= 1.4)
+            reason = f"Jev toxicity: P(toxic)={noul_p:.2f}, score={score:.2f}, conf={conf:.2f}"
+
+            if is_toxic:
+                self.trigger_pause(market_key, reason=reason)
+
+            return is_toxic, score, reason
+        except Exception as e:
+            logger.debug("Jev spot toxicity evaluation failed: %s", e)
+            return False, 0.0, f"Error: {e}"
 
 
 # Module-level instances for convenience

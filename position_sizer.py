@@ -344,15 +344,17 @@ class PositionSizer:
     def _extract_net_roi(opportunity: dict) -> float:
         """Extract net ROI as a float from the opportunity dict.
 
-        Handles both numeric values and formatted strings like ``"5.23%"``.
+        Handles numeric values, formatted percent strings (e.g. ``"5.23%"`` or ``"0.50%"``),
+        and raw decimal strings (e.g. ``"0.0523"``).
         """
         raw = opportunity.get("net_roi", 0)
         if isinstance(raw, str):
-            raw = raw.rstrip("%").strip()
+            cleaned = raw.strip()
+            is_percent = cleaned.endswith("%")
+            cleaned = cleaned.rstrip("%").strip()
             try:
-                val = float(raw)
-                # If the string was "5.23%" it means 5.23%, convert to 0.0523
-                if abs(val) > 1:
+                val = float(cleaned)
+                if is_percent or abs(val) > 1:
                     return val / 100.0
                 return val
             except (ValueError, TypeError):

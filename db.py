@@ -103,6 +103,30 @@ class TradeDB:
                 idempotency_key TEXT NOT NULL UNIQUE,
                 error TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS jev_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                asset TEXT NOT NULL,
+                strike REAL NOT NULL,
+                spot REAL NOT NULL,
+                market_prob REAL,
+                jev_prob REAL,
+                action TEXT NOT NULL,
+                edge REAL,
+                confidence REAL,
+                details TEXT,
+                resolved_outcome REAL,
+                resolved_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS dispute_state (
+                condition_id TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                blocked INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
         """)
         self.conn.commit()
 
@@ -118,6 +142,8 @@ class TradeDB:
                 ON partial_fills(hedge_status, created_at);
             CREATE INDEX IF NOT EXISTS idx_opportunities_timestamp
                 ON opportunities(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_jev_decisions_asset_timestamp
+                ON jev_decisions(asset, timestamp);
         """)
         self.conn.commit()
 
@@ -140,6 +166,35 @@ class TradeDB:
             self.conn.commit()
         except sqlite3.OperationalError:
             logger.debug("Migration: reward_yield_usdc column already exists")
+
+        # Older DBs may predate order_id on the base CREATE TABLE — ensure it exists.
+        try:
+            self.conn.execute("ALTER TABLE trades ADD COLUMN order_id TEXT")
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            logger.debug("Migration: order_id column already exists on trades")
+
+        # Filled contract/share quantity (distinct from dollar ``size``).
+        try:
+            self.conn.execute("ALTER TABLE trades ADD COLUMN fill_qty REAL")
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            logger.debug("Migration: fill_qty column already exists on trades")
+
+        # Client/idempotency key (Kalshi client_order_id, etc.)
+        try:
+            self.conn.execute("ALTER TABLE trades ADD COLUMN client_order_id TEXT")
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            logger.debug("Migration: client_order_id column already exists on trades")
+
+        try:
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_trades_order_id ON trades(order_id)"
+            )
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            logger.debug("Migration: idx_trades_order_id already exists")
 
         # Safe migration: add outcome to trades. Polymarket BUY_NO legs are
         # logged with side="BUY", so settlement cannot recover the traded
@@ -173,6 +228,14 @@ class TradeDB:
                 self.conn.commit()
             except sqlite3.OperationalError:
                 logger.debug("Migration: %s column already exists on partial_fills", col)
+
+        # Migration: Add resolved_outcome and resolved_at to jev_decisions
+        for col, col_type in [("resolved_outcome", "REAL"), ("resolved_at", "TEXT")]:
+            try:
+                self.conn.execute(f"ALTER TABLE jev_decisions ADD COLUMN {col} {col_type}")
+                self.conn.commit()
+            except sqlite3.OperationalError:
+                logger.debug("Migration: %s column already exists on jev_decisions", col)
 
     def log_opportunity(
         self,
@@ -244,9 +307,21 @@ class TradeDB:
             self.conn.commit()
             return cur.lastrowid
 
-    def update_trade_status(self, trade_id: int, status: str, fill_price: float | None = None,
-                            slippage: float | None = None):
-        """Update the status of a trade leg, optionally with fill price and slippage."""
+    def update_trade_status(
+        self,
+        trade_id: int,
+        status: str,
+        fill_price: float | None = None,
+        slippage: float | None = None,
+        order_id: str | None = None,
+        fill_qty: float | None = None,
+        client_order_id: str | None = None,
+    ):
+        """Update the status of a trade leg, optionally with fill/order fields.
+
+        ``order_id`` should be written as soon as the exchange accepts the
+        order (before fill confirmation) so crash recovery can reconcile.
+        """
         with self._lock:
             if fill_price is not None:
                 self.conn.execute(
@@ -262,6 +337,21 @@ class TradeDB:
                 self.conn.execute(
                     "UPDATE trades SET slippage = ? WHERE id = ?",
                     (slippage, trade_id),
+                )
+            if order_id is not None:
+                self.conn.execute(
+                    "UPDATE trades SET order_id = ? WHERE id = ?",
+                    (order_id, trade_id),
+                )
+            if fill_qty is not None:
+                self.conn.execute(
+                    "UPDATE trades SET fill_qty = ? WHERE id = ?",
+                    (fill_qty, trade_id),
+                )
+            if client_order_id is not None:
+                self.conn.execute(
+                    "UPDATE trades SET client_order_id = ? WHERE id = ?",
+                    (client_order_id, trade_id),
                 )
             self.conn.commit()
 
@@ -1138,6 +1228,254 @@ class TradeDB:
                 (str(int(cutoff)),),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def record_jev_decision(
+        self,
+        asset: str,
+        strike: float,
+        spot: float,
+        action: str,
+        market_prob: float | None = None,
+        jev_prob: float | None = None,
+        edge: float | None = None,
+        confidence: float | None = None,
+        details: dict | str | None = None,
+    ) -> int:
+        """Record a Jev probabilistic evaluation and decision for calibration tracking.
+
+        Args:
+            asset: Underlying crypto asset (e.g. 'BTC', 'ETH', 'SOL', 'XRP').
+            strike: Contract strike price in USD.
+            spot: Observed underlying spot price at decision time.
+            action: Evaluated action ('buy_yes', 'buy_no', 'pass_fair', etc.).
+            market_prob: Current market-implied probability (e.g. Yes ask).
+            jev_prob: Calibrated model probability from Jev noul.
+            edge: Expected edge (model_prob - market_prob or similar).
+            confidence: Jev confidence score.
+            details: Optional dict or string containing risk scores, conviction, etc.
+
+        Returns:
+            Inserted decision record ID.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        details_str = json.dumps(details) if isinstance(details, dict) else (details or "")
+        with self._lock:
+            cur = self.conn.execute(
+                """INSERT INTO jev_decisions
+                   (timestamp, asset, strike, spot, market_prob, jev_prob, action, edge, confidence, details)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    now,
+                    asset,
+                    strike,
+                    spot,
+                    market_prob,
+                    jev_prob,
+                    action,
+                    edge,
+                    confidence,
+                    details_str,
+                ),
+            )
+            self.conn.commit()
+            return cur.lastrowid
+
+    def get_jev_decisions(
+        self,
+        asset: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """Retrieve recent Jev decisions for calibration and performance analysis.
+
+        Args:
+            asset: Optional asset filter (e.g. 'BTC').
+            limit: Maximum number of records to return.
+
+        Returns:
+            List of decision dicts sorted by timestamp descending.
+        """
+        with self._lock:
+            if asset:
+                cur = self.conn.execute(
+                    """SELECT * FROM jev_decisions
+                       WHERE asset = ?
+                       ORDER BY id DESC LIMIT ?""",
+                    (asset.upper(), limit),
+                )
+            else:
+                cur = self.conn.execute(
+                    """SELECT * FROM jev_decisions
+                       ORDER BY id DESC LIMIT ?""",
+                    (limit,),
+                )
+            return [dict(row) for row in cur.fetchall()]
+
+    def update_jev_resolution(
+        self,
+        decision_id: int,
+        outcome: float,
+        resolved_at: str | None = None,
+    ) -> bool:
+        """Update a recorded Jev decision with its final ground truth resolution outcome.
+
+        Args:
+            decision_id: Database ID of the decision record.
+            outcome: Final resolved outcome (1.0 = YES won, 0.0 = NO won).
+            resolved_at: Optional ISO 8601 timestamp of resolution (defaults to now).
+
+        Returns:
+            True if a record was updated, False otherwise.
+        """
+        now = resolved_at or datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            cur = self.conn.execute(
+                """UPDATE jev_decisions
+                   SET resolved_outcome = ?, resolved_at = ?
+                   WHERE id = ?""",
+                (float(outcome), now, decision_id),
+            )
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def update_jev_resolutions_by_market(
+        self,
+        identifier: str,
+        outcome: float,
+        resolved_at: str | None = None,
+    ) -> int:
+        """Batch update unresolved decisions matching a market question or token ID.
+
+        Args:
+            identifier: Market question substring or token ID found in `details`.
+            outcome: Final resolved outcome (1.0 = YES, 0.0 = NO).
+            resolved_at: Optional ISO 8601 timestamp of resolution.
+
+        Returns:
+            Number of decision rows updated.
+        """
+        now = resolved_at or datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            cur = self.conn.execute(
+                """UPDATE jev_decisions
+                   SET resolved_outcome = ?, resolved_at = ?
+                   WHERE resolved_outcome IS NULL AND details LIKE ?""",
+                (float(outcome), now, f"%{identifier}%"),
+            )
+            self.conn.commit()
+            return cur.rowcount
+
+    def get_jev_calibration_data(
+        self,
+        asset: str | None = None,
+        only_resolved: bool = True,
+        limit: int = 1000,
+    ) -> list[dict]:
+        """Fetch decisions for statistical calibration and Brier score evaluation.
+
+        Args:
+            asset: Optional asset filter (e.g. 'BTC', 'ETH', 'SOL', 'XRP').
+            only_resolved: If True, only returns records with non-NULL resolved_outcome.
+            limit: Maximum records to return.
+
+        Returns:
+            List of decision dicts with probabilities and resolution outcomes.
+        """
+        conditions = ["jev_prob IS NOT NULL"]
+        params: list[object] = []
+
+        if only_resolved:
+            conditions.append("resolved_outcome IS NOT NULL")
+        if asset and asset.lower() != "all":
+            conditions.append("asset = ?")
+            params.append(asset.upper())
+
+        where_clause = " AND ".join(conditions)
+        sql = f"""SELECT * FROM jev_decisions
+                  WHERE {where_clause}
+                  ORDER BY id DESC LIMIT ?"""
+        params.append(limit)
+
+        with self._lock:
+            cur = self.conn.execute(sql, tuple(params))
+            return [dict(row) for row in cur.fetchall()]
+
+    # ---------------------------------------------------------------------------
+    # UMA Dispute State Cache (Plan 05)
+    # ---------------------------------------------------------------------------
+
+    def upsert_dispute_state(self, states: dict[str, dict] | list[dict]) -> int:
+        """Insert or replace dispute state rows in SQLite.
+
+        Args:
+            states: Dict mapping condition_id -> dict, or list of dispute state dicts.
+                    Each dict must contain 'condition_id', 'state', 'blocked', 'reason'.
+
+        Returns:
+            Number of rows upserted.
+        """
+        if not states:
+            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        rows = []
+        items = states.values() if isinstance(states, dict) else states
+        for s in items:
+            if not isinstance(s, dict):
+                continue
+            cid = s.get("condition_id")
+            if not cid:
+                continue
+            rows.append((
+                cid,
+                s.get("state", ""),
+                1 if s.get("blocked") else 0,
+                s.get("reason", ""),
+                now,
+            ))
+        if not rows:
+            return 0
+        with self._lock:
+            self.conn.executemany(
+                """
+                INSERT OR REPLACE INTO dispute_state
+                (condition_id, state, blocked, reason, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            self.conn.commit()
+        return len(rows)
+
+    def get_dispute_state(self, condition_id: str) -> dict | None:
+        """Retrieve the cached dispute state for a given condition_id.
+
+        Args:
+            condition_id: The Polymarket conditionId.
+
+        Returns:
+            Dict with condition_id, state, blocked (bool), reason, updated_at,
+            or None if not found.
+        """
+        if not condition_id:
+            return None
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                SELECT condition_id, state, blocked, reason, updated_at
+                FROM dispute_state
+                WHERE condition_id = ?
+                """,
+                (condition_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return {
+                "condition_id": row["condition_id"],
+                "state": row["state"],
+                "blocked": bool(row["blocked"]),
+                "reason": row["reason"],
+                "updated_at": row["updated_at"],
+            }
 
     def close(self):
         self.conn.close()

@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 # Save any real modules already loaded so we can restore them after import
 _saved_modules = {}
 _modules_to_mock = [
-    "kalshi_api", "polymarket_api", "dashboard", "display", "recovery",
+    "kalshi_api", "dashboard", "display", "recovery",
 ]
 for _mod_name in _modules_to_mock:
     if _mod_name in sys.modules:
@@ -27,8 +27,6 @@ mock_kalshi.KALSHI_BASE_URL = "https://api.elections.kalshi.com"
 mock_kalshi.KALSHI_API_PATH = "/trade-api/v2"
 sys.modules["kalshi_api"] = mock_kalshi
 
-mock_pm = MagicMock()
-sys.modules["polymarket_api"] = mock_pm
 
 mock_dashboard = MagicMock()
 mock_dashboard.state = MagicMock()
@@ -403,6 +401,28 @@ class TestExtractKeys:
         keys = OpportunityIndex._extract_keys(opp)
         assert ("polymarket", "Test") in keys
         assert not any(k[0] == "" for k in keys)
+
+    def test_extract_keys_jev_crypto_buy_yes(self):
+        opp = {
+            "type": "JevCrypto",
+            "_action": "buy_yes",
+            "_token_ids": ["tok_yes_123", "tok_no_456"],
+        }
+        keys = OpportunityIndex._extract_keys(opp)
+        assert ("polymarket", "tok_yes_123") in keys
+        assert ("polymarket", "tok_no_456") not in keys
+        assert len(keys) == 1
+
+    def test_extract_keys_jev_crypto_buy_no(self):
+        opp = {
+            "type": "JevCrypto",
+            "_action": "buy_no",
+            "_token_ids": ["tok_yes_123", "tok_no_456"],
+        }
+        keys = OpportunityIndex._extract_keys(opp)
+        assert ("polymarket", "tok_no_456") in keys
+        assert ("polymarket", "tok_yes_123") not in keys
+        assert len(keys) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1411,3 +1431,290 @@ class TestMMPilotModeIsolation:
         source = inspect.getsource(continuous.run_continuous)
         assert "config.MM_KALSHI_PILOT_ENABLED" in source
         assert 'getattr(args, "mode", None) == "mm-pilot"' in source
+
+
+class TestFrechetContinuousScan:
+    def test_frechet_disabled_by_default(self, monkeypatch):
+        import config
+        from continuous import _scan_frechet_layer1
+        monkeypatch.setattr(config, "FRECHET_ARB_ENABLED", False)
+        markets = [{"title": "Will BTC be above $100k?"}]
+        res = _scan_frechet_layer1(markets, mode="all", min_profit=0.01)
+        assert res == []
+
+    def test_frechet_empty_markets(self, monkeypatch):
+        import config
+        from continuous import _scan_frechet_layer1
+        monkeypatch.setattr(config, "FRECHET_ARB_ENABLED", True)
+        res = _scan_frechet_layer1([], mode="all", min_profit=0.01)
+        assert res == []
+
+    def test_frechet_irrelevant_mode(self, monkeypatch):
+        import config
+        from continuous import _scan_frechet_layer1
+        monkeypatch.setattr(config, "FRECHET_ARB_ENABLED", True)
+        markets = [{"title": "Will BTC be above $100k?"}]
+        res = _scan_frechet_layer1(markets, mode="binary", min_profit=0.01)
+        assert res == []
+
+    def test_frechet_enabled_dispatches_scan_and_refine(self, monkeypatch):
+        from unittest.mock import patch, MagicMock
+        import config
+        from continuous import _scan_frechet_layer1
+        monkeypatch.setattr(config, "FRECHET_ARB_ENABLED", True)
+        markets = [{"title": "Will BTC be above $100k?"}]
+        mock_cands = [{"type": "FrechetArb", "net_profit": 0.05}]
+        mock_refined = [{"type": "FrechetArb", "net_profit": 0.04}]
+
+        with patch("scans.frechet.scan_frechet", return_value=mock_cands) as p_scan, \
+             patch("scans.frechet._refine_frechet_with_clob", return_value=mock_refined) as p_ref:
+            res = _scan_frechet_layer1(markets, mode="all", min_profit=0.01)
+
+        assert res == mock_refined
+        p_scan.assert_called_once()
+        p_ref.assert_called_once()
+
+
+class TestTemporalContinuousScan:
+    """Test _scan_temporal_layer1 continuous dispatch and gating."""
+
+    def test_temporal_disabled_returns_empty(self, monkeypatch):
+        import config
+        from continuous import _scan_temporal_layer1
+        monkeypatch.setattr(config, "TEMPORAL_ARB_ENABLED", False)
+        markets = [{"ticker": "KXBTC-26MAR31-T100000"}]
+        res = _scan_temporal_layer1(markets, mode="all", min_profit=0.01)
+        assert res == []
+
+    def test_temporal_unmatched_mode_returns_empty(self, monkeypatch):
+        import config
+        from continuous import _scan_temporal_layer1
+        monkeypatch.setattr(config, "TEMPORAL_ARB_ENABLED", True)
+        markets = [{"ticker": "KXBTC-26MAR31-T100000"}]
+        res = _scan_temporal_layer1(markets, mode="binary", min_profit=0.01)
+        assert res == []
+
+    def test_temporal_enabled_dispatches_scan_and_refine(self, monkeypatch):
+        from unittest.mock import patch
+        import config
+        from continuous import _scan_temporal_layer1
+        monkeypatch.setattr(config, "TEMPORAL_ARB_ENABLED", True)
+        markets = [{"ticker": "KXBTC-26MAR31-T100000"}]
+        mock_cands = [{"type": "TemporalArb", "net_profit": 0.05}]
+        mock_refined = [{"type": "TemporalArb", "net_profit": 0.04}]
+
+        with patch("scans.temporal.scan_temporal_arb", return_value=mock_cands) as p_scan, \
+             patch("scans.temporal._refine_temporal_with_clob", return_value=mock_refined) as p_ref:
+            res = _scan_temporal_layer1(markets, mode="all", min_profit=0.01)
+
+        assert res == mock_refined
+        p_scan.assert_called_once()
+        p_ref.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# CTF Primitives Continuous Integration (Plan 04)
+# ---------------------------------------------------------------------------
+
+class TestCTFContinuousScan:
+    """Plan 04: CTF Primitives continuous scan layer 1 tests."""
+
+    def test_ctf_disabled_returns_empty(self, monkeypatch):
+        import config
+        from continuous import _scan_ctf_layer1
+        monkeypatch.setattr(config, "CTF_ENABLED", False)
+        monkeypatch.setattr(config, "CTF_MERGE_ENABLED", False)
+        monkeypatch.setattr(config, "CTF_MINT_SELL_ENABLED", False)
+        res = _scan_ctf_layer1([{"conditionId": "0x123"}], mode="all", min_profit=0.01)
+        assert res == []
+
+    def test_ctf_unmatched_mode_returns_empty(self, monkeypatch):
+        import config
+        from continuous import _scan_ctf_layer1
+        monkeypatch.setattr(config, "CTF_ENABLED", True)
+        res = _scan_ctf_layer1([{"conditionId": "0x123"}], mode="binary", min_profit=0.01)
+        assert res == []
+
+    def test_ctf_enabled_dispatches_scan(self, monkeypatch):
+        from unittest.mock import patch
+        import config
+        from continuous import _scan_ctf_layer1
+        monkeypatch.setattr(config, "CTF_ENABLED", True)
+        markets = [{"conditionId": "0x123"}]
+        mock_opps = [{"type": "CTFMerge", "net_profit": 0.05}]
+
+        with patch("scans.ctf.scan_ctf", return_value=mock_opps) as p_scan:
+            res = _scan_ctf_layer1(markets, mode="ctf", min_profit=0.01)
+
+        assert res == mock_opps
+        p_scan.assert_called_once()
+
+    def test_ctf_explicit_mode_in_live_disabled_returns_empty(self, monkeypatch):
+        import config
+        from continuous import _scan_ctf_layer1
+        monkeypatch.setattr(config, "CTF_ENABLED", False)
+        monkeypatch.setattr(config, "CTF_MERGE_ENABLED", False)
+        monkeypatch.setattr(config, "CTF_MINT_SELL_ENABLED", False)
+        monkeypatch.setattr(config, "DRY_RUN", False)
+        markets = [{"conditionId": "0x123"}]
+        res = _scan_ctf_layer1(markets, mode="ctf", min_profit=0.01)
+        assert res == []
+
+
+# ---------------------------------------------------------------------------
+# UMA Dispute Gate Continuous Integration (Plan 05)
+# ---------------------------------------------------------------------------
+
+class TestDisputeGateContinuous:
+    """Verify UMA dispute cache update wiring in continuous mode."""
+
+    def test_continuous_dispute_cache_refresh_success(self, monkeypatch):
+        import asyncio
+        import signal as signal_module
+        import config
+        continuous_module = sys.modules["continuous"]
+
+        monkeypatch.setattr(config, "DISPUTE_GATE_ENABLED", True)
+
+        captured_signals = {}
+        def capture_sig(sig, handler):
+            if getattr(handler, "__name__", "") == "_signal_handler":
+                captured_signals[sig] = handler
+
+        monkeypatch.setattr(continuous_module.signal, "signal", capture_sig)
+
+        mock_feed = MagicMock()
+        async def mock_feed_run():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                # Coroutine cancelled on test shutdown
+                return
+        mock_feed.run = mock_feed_run
+        monkeypatch.setattr(continuous_module, "FeedManager", lambda *a, **kw: mock_feed)
+        monkeypatch.setattr(continuous_module, "reconcile_orphaned_positions", MagicMock())
+        monkeypatch.setattr(continuous_module, "display_results", MagicMock())
+        monkeypatch.setattr(continuous_module, "capture_scan_heartbeat", MagicMock())
+
+        sample_markets = [
+            {"conditionId": "0xabc", "umaResolutionStatus": "disputed"},
+            {"conditionId": "0xdef", "umaResolutionStatus": "resolved"},
+        ]
+        sample_events = [
+            {"id": "evt1", "markets": [{"conditionId": "0xevent_cid", "umaResolutionStatus": "proposed"}]}
+        ]
+        monkeypatch.setattr(continuous_module, "fetch_all_markets", lambda: sample_markets)
+        monkeypatch.setattr(continuous_module, "fetch_events", lambda: sample_events)
+        monkeypatch.setattr(continuous_module, "scan_binary_internal", lambda *a, **kw: [])
+
+        mock_db = MagicMock()
+        captured_states = {}
+
+        def on_upsert(states):
+            captured_states.update(states)
+            handler = captured_signals[signal_module.SIGTERM]
+            cells = dict(zip(handler.__code__.co_freevars, handler.__closure__ or ()))
+            cells["shutdown_event"].cell_contents.set()
+            return len(states)
+
+        mock_db.upsert_dispute_state.side_effect = on_upsert
+
+        args = MagicMock()
+        args.mode = "all"
+        args.interval = 1
+        args.top = 10
+        args.min_depth = 0
+        args.max_trade = 10
+        args.exec_mode = "manual"
+
+        mock_executor = MagicMock()
+
+        continuous_module.run_continuous(
+            args=args,
+            min_profit=0.01,
+            kalshi_client=None,
+            kalshi_api_key_id=None,
+            kalshi_private_key_path=None,
+            executor=mock_executor,
+            db=mock_db,
+            price_cache={},
+        )
+
+        mock_db.upsert_dispute_state.assert_called_once()
+        assert "0xabc" in captured_states
+        assert captured_states["0xabc"]["blocked"] is True
+        assert "0xdef" in captured_states
+        assert captured_states["0xdef"]["blocked"] is False
+        assert "0xevent_cid" in captured_states
+        assert captured_states["0xevent_cid"]["blocked"] is True
+        assert mock_executor.risk_manager.uma_state_unavailable is False
+
+    def test_continuous_dispute_cache_refresh_handles_db_exception(self, monkeypatch):
+        import asyncio
+        import signal as signal_module
+        import config
+        continuous_module = sys.modules["continuous"]
+
+        monkeypatch.setattr(config, "DISPUTE_GATE_ENABLED", True)
+
+        captured_signals = {}
+        def capture_sig(sig, handler):
+            if getattr(handler, "__name__", "") == "_signal_handler":
+                captured_signals[sig] = handler
+
+        monkeypatch.setattr(continuous_module.signal, "signal", capture_sig)
+
+        mock_feed = MagicMock()
+        async def mock_feed_run():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                # Coroutine cancelled on test shutdown
+                return
+        mock_feed.run = mock_feed_run
+        monkeypatch.setattr(continuous_module, "FeedManager", lambda *a, **kw: mock_feed)
+        monkeypatch.setattr(continuous_module, "reconcile_orphaned_positions", MagicMock())
+        monkeypatch.setattr(continuous_module, "display_results", MagicMock())
+        monkeypatch.setattr(continuous_module, "capture_scan_heartbeat", MagicMock())
+
+        sample_markets = [
+            {"conditionId": "0xabc", "umaResolutionStatus": "disputed"},
+        ]
+        monkeypatch.setattr(continuous_module, "fetch_all_markets", lambda: sample_markets)
+        monkeypatch.setattr(continuous_module, "fetch_events", lambda: [])
+        monkeypatch.setattr(continuous_module, "scan_binary_internal", lambda *a, **kw: [])
+
+        mock_db = MagicMock()
+
+        def on_upsert_error(states):
+            handler = captured_signals[signal_module.SIGTERM]
+            cells = dict(zip(handler.__code__.co_freevars, handler.__closure__ or ()))
+            cells["shutdown_event"].cell_contents.set()
+            raise RuntimeError("Database connection failure")
+
+        mock_db.upsert_dispute_state.side_effect = on_upsert_error
+
+        args = MagicMock()
+        args.mode = "binary"
+        args.interval = 1
+        args.top = 10
+        args.min_depth = 0
+        args.max_trade = 10
+        args.exec_mode = "manual"
+
+        mock_executor = MagicMock()
+
+        # The loop must catch the exception, set fail-closed, and finish safely
+        continuous_module.run_continuous(
+            args=args,
+            min_profit=0.01,
+            kalshi_client=None,
+            kalshi_api_key_id=None,
+            kalshi_private_key_path=None,
+            executor=mock_executor,
+            db=mock_db,
+            price_cache={},
+        )
+
+        mock_db.upsert_dispute_state.assert_called_once()
+        assert mock_executor.risk_manager.uma_state_unavailable is True

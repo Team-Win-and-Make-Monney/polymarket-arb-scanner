@@ -1,0 +1,20 @@
+{
+  "as_of": "2026-09-20T12:00:00Z",
+  "candidates": [
+    {
+      "venue_a": "kalshi",
+      "market_a_id": "mkt-a",
+      "question_a": "Will the Fed cut rates by at least 25 basis points at its September 2026 meeting?",
+      "venue_b": "polymarket",
+      "market_b_id": "mkt-b",
+      "question_b": "Will the Fed cut rates by at least 25 basis points at its September 2026 meeting?",
+      "equivalent": false,
+      "confidence": 0.0,
+      "reasoning": "Synthetic unresolved example"
+    }
+  ],
+  "contracts": {},
+  "trusted_hosts": [
+    "example.org"
+  ]
+}

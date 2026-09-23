@@ -1,0 +1,72 @@
+{
+  "as_of": "2026-09-20T12:00:00Z",
+  "contract_a": {
+    "id": "mkt-a",
+    "title": "Will the Fed cut rates by at least 25 basis points at its September 2026 meeting?",
+    "entity_ids": [
+      "FED"
+    ],
+    "rules": {
+      "id": "mkt-a-rules",
+      "text": "Resolves YES if the Federal Reserve lowers its target range by at least 25 basis points at the September 2026 meeting, according to its official decision.",
+      "url": "https://example.org/mkt-a-rules",
+      "published_at": "2026-09-19T10:00:00Z",
+      "available_at": "2026-09-19T10:01:00Z",
+      "captured_at": "2026-09-19T10:02:00Z",
+      "entity_ids": [
+        "FED"
+      ],
+      "kind": "market_rules"
+    },
+    "rules_complete": true,
+    "resolution_source_id": "federal-reserve",
+    "terms": {
+      "event_id": "fed-september-2026",
+      "window_start": "2026-09-23T00:00:00Z",
+      "window_end": "2026-09-24T00:00:00Z",
+      "threshold": {
+        "metric": "rate-cut",
+        "operator": "gte",
+        "value": "25",
+        "unit": "basis-points"
+      },
+      "direction": "yes"
+    }
+  },
+  "contract_b": {
+    "id": "mkt-b",
+    "title": "Will the Fed cut rates by at least 25 basis points at its September 2026 meeting?",
+    "entity_ids": [
+      "FED"
+    ],
+    "rules": {
+      "id": "mkt-b-rules",
+      "text": "Resolves YES if the Federal Reserve lowers its target range by at least 25 basis points at the September 2026 meeting, according to its official decision.",
+      "url": "https://example.org/mkt-b-rules",
+      "published_at": "2026-09-19T10:00:00Z",
+      "available_at": "2026-09-19T10:01:00Z",
+      "captured_at": "2026-09-19T10:02:00Z",
+      "entity_ids": [
+        "FED"
+      ],
+      "kind": "market_rules"
+    },
+    "rules_complete": true,
+    "resolution_source_id": "federal-reserve",
+    "terms": {
+      "event_id": "fed-september-2026",
+      "window_start": "2026-09-23T00:00:00Z",
+      "window_end": "2026-09-24T00:00:00Z",
+      "threshold": {
+        "metric": "rate-cut",
+        "operator": "gte",
+        "value": "25",
+        "unit": "basis-points"
+      },
+      "direction": "yes"
+    }
+  },
+  "trusted_hosts": [
+    "example.org"
+  ]
+}

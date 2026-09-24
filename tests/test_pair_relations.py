@@ -242,3 +242,91 @@ class TestSubsetPairDiscovery:
             platform="polymarket",
         )
         assert len(pairs_allowed) == 1
+
+
+# ---------------------------------------------------------------------------
+# Regression: live Polymarket ladders mis-paired on 2026-09-24
+# ---------------------------------------------------------------------------
+
+def _pm(question, yes_price, event_id, end="2028-01-01"):
+    """Trimmed live Polymarket gamma market (only the fields pairing reads)."""
+    return {
+        "id": question,
+        "question": question,
+        "endDateIso": end,
+        "endDate": f"{end}T04:59:00Z",
+        "outcomePrices": f'["{yes_price}", "{round(1 - yes_price, 4)}"]',
+        "events": [{"id": event_id}],
+    }
+
+
+class TestStrikeUnitsAndLadderGrouping:
+    def test_units_directly_after_the_number(self):
+        assert _normalize_num("1", "OpenAI IPO closing market cap above $1T?") == 1e12
+        assert _normalize_num("1.2", "above $1.2T?") == 1.2e12
+        assert _normalize_num("800", "above $800B?") == 8e11
+        assert _normalize_num("2.5", "above $2.5 million") == 2.5e6
+        assert _normalize_num("1", "above $1 trillion") == 1e12
+        assert _normalize_num("100", "Will BTC be above $100 by March?") == 100.0  # "by" is not billion
+        assert _normalize_num("1", "above 11t or $1 in 2021") == 1.0  # "11t" is not "1t"
+
+    def test_openai_ladder_parses_real_magnitudes(self):
+        strikes = {
+            q: parse_threshold_market(_pm(q, 0.5, "193337"), platform="polymarket").strike
+            for q in ("OpenAI IPO closing market cap above $800B?",
+                      "OpenAI IPO closing market cap above $1T?",
+                      "OpenAI IPO closing market cap above $1.2T?")
+        }
+        assert strikes == {
+            "OpenAI IPO closing market cap above $800B?": 8e11,
+            "OpenAI IPO closing market cap above $1T?": 1e12,
+            "OpenAI IPO closing market cap above $1.2T?": 1.2e12,
+        }
+
+    def test_openai_ladder_pairs_higher_strike_as_subset(self):
+        ladder = [
+            _pm("OpenAI IPO closing market cap above $800B?", 0.8605, "193337"),
+            _pm("OpenAI IPO closing market cap above $1T?", 0.715, "193337"),
+            _pm("OpenAI IPO closing market cap above $1.2T?", 0.70, "193337"),
+        ]
+        pairs = discover_subset_pairs(ladder, platform="polymarket")
+        assert len(pairs) == 3
+        for p in pairs:
+            assert p["_sub_strike"] > p["_sup_strike"]
+        subsets = {(p["sub"]["question"], p["sup"]["question"]) for p in pairs}
+        assert ("OpenAI IPO closing market cap above $800B?",
+                "OpenAI IPO closing market cap above $1T?") not in subsets
+
+    def test_coherent_openai_ladder_yields_no_frechet_candidate(self):
+        import importlib
+        frechet = sys.modules.get("scans.frechet") or importlib.import_module("scans.frechet")
+        ladder = [
+            _pm("OpenAI IPO closing market cap above $800B?", 0.8605, "193337"),
+            _pm("OpenAI IPO closing market cap above $1T?", 0.715, "193337"),
+            _pm("OpenAI IPO closing market cap above $1.2T?", 0.70, "193337"),
+        ]
+        assert frechet.scan_frechet(ladder, min_profit=0.0, min_violation=0.02, platform="polymarket") == []
+
+    def test_incoherent_metamask_pair_is_still_detected(self):
+        import importlib
+        frechet = sys.modules.get("scans.frechet") or importlib.import_module("scans.frechet")
+        pair = [
+            _pm("Metamask FDV above $2B one day after launch?", 0.0315, "73236", end="2027-01-01"),
+            _pm("Metamask FDV above $3B one day after launch?", 0.0545, "73236", end="2027-01-01"),
+        ]
+        cands = frechet.scan_frechet(pair, min_profit=0.0, min_violation=0.02, platform="polymarket")
+        assert len(cands) == 1
+        assert cands[0]["_sub_market"]["question"].startswith("Metamask FDV above $3B")
+        assert cands[0]["_sup_market"]["question"].startswith("Metamask FDV above $2B")
+
+    def test_different_expiry_or_event_never_pair(self):
+        same_event_diff_date = [
+            _pm("Will BTC be above $100k?", 0.6, "e1", end="2026-12-31"),
+            _pm("Will BTC be above $90k?", 0.5, "e1", end="2027-06-30"),
+        ]
+        diff_event_same_date = [
+            _pm("Will BTC be above $100k?", 0.6, "e1"),
+            _pm("Will BTC be above $90k?", 0.5, "e2"),
+        ]
+        assert discover_subset_pairs(same_event_diff_date, platform="polymarket") == []
+        assert discover_subset_pairs(diff_event_same_date, platform="polymarket") == []

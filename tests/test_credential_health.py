@@ -70,6 +70,21 @@ class TestCredentialHealthChecker(unittest.TestCase):
             self.assertIsInstance(endpoint_info["method"], str)
             self.assertIsInstance(endpoint_info["args"], dict)
 
+    def test_kalshi_probe_is_one_authenticated_request(self):
+        """The Kalshi probe must exercise the API key in one call, not walk public events."""
+        import kalshi_api
+        client = kalshi_api.KalshiClient()
+        client._auth_headers = mock.MagicMock(return_value={})
+        resp = mock.MagicMock(status_code=200)
+        resp.json.return_value = {"balance": 0}
+        client.session.request = mock.MagicMock(return_value=resp)
+        probe = HEALTH_ENDPOINTS["kalshi"]
+        with mock.patch("kalshi_api._rate_limit"):
+            result = getattr(client, probe["method"])(**probe["args"])
+        self.assertEqual(1, client.session.request.call_count)
+        self.assertTrue(client.session.request.call_args.args[1].endswith("/portfolio/balance"))
+        self.assertIsNotNone(result)  # a $0 balance is still a healthy credential
+
     def test_all_platforms_healthy(self):
         """Test successful health check when all platforms return valid data."""
         # Set up all clients to return success (non-None)

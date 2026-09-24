@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 HEALTH_ENDPOINTS = {
     "polymarket": {"method": "fetch_all_markets", "args": {"limit": 1}},
-    "kalshi": {"method": "fetch_all_events", "args": {"limit": 1}},
+    "kalshi": {"method": "get_balance", "args": {}},
     "betfair": {"method": "list_event_types", "args": {}},
     "smarkets": {"method": "fetch_all_markets", "args": {}},
     "sxbet": {"method": "health_check", "args": {}},

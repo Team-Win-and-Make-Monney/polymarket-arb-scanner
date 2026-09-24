@@ -154,6 +154,7 @@ class TestScanKalshiBinary:
         client = MagicMock()
         client.get_market_price.return_value = (0.45, 0.45)
         client.get_order_book_depth.return_value = {"yes_ask_size": 100, "no_ask_size": 100}
+        funnel = MagicMock()
 
         market = {
             "ticker": "KXTICKER",
@@ -169,6 +170,7 @@ class TestScanKalshiBinary:
 
         with patch("scans.kalshi._within_resolution_window", return_value=True), \
              patch("scans.kalshi.filter_dust", side_effect=lambda x: x), \
+             patch("scans.kalshi._default_funnel", return_value=funnel), \
              patch("scans.kalshi.net_profit_kalshi_binary", return_value={
                  "gross_spread": 0.10, "fees": 0.02, "net_profit": 0.08,
              }):
@@ -181,6 +183,8 @@ class TestScanKalshiBinary:
         assert opp["_kalshi_yes"] == 0.45
         assert opp["_kalshi_no"] == 0.45
         assert opp["net_profit"] == 0.08
+        funnel.record_screened.assert_called_once_with(1)
+        funnel.record_mid_candidates.assert_called_once_with(1)
 
     def test_skips_dust_prices(self):
         from scans.kalshi import scan_kalshi_binary
@@ -213,6 +217,22 @@ class TestScanKalshiBinary:
             result = scan_kalshi_binary(client, 0.01, kalshi_data=kalshi_data)
 
         assert result == []
+
+    def test_records_funnel_counts(self):
+        from scans.kalshi import scan_kalshi_binary
+
+        client = MagicMock()
+        client.get_market_price.return_value = (0.55, 0.50)
+        funnel = MagicMock()
+        markets = [{"ticker": f"K{i}", "title": "M"} for i in range(3)]
+        kalshi_data = ([{"event_ticker": "EV1"}], {"EV1": markets}, {"EV1": "Event"})
+
+        with patch("scans.kalshi._within_resolution_window", return_value=True), \
+             patch("scans.kalshi.filter_dust", side_effect=lambda x: x):
+            scan_kalshi_binary(client, 0.01, kalshi_data=kalshi_data, funnel=funnel)
+
+        funnel.record_screened.assert_called_once_with(3)
+        funnel.record_mid_candidates.assert_called_once_with(0)
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +294,32 @@ class TestScanKalshiMulti:
         assert opp["net_profit"] > 0
         assert "_kalshi_tickers" in opp
         assert "_kalshi_prices" in opp
+
+    def test_records_funnel_counts(self):
+        from scans.kalshi import scan_kalshi_multi
+
+        client = MagicMock()
+        client.get_market_price.side_effect = [(0.35, 0.65), (0.33, 0.67), (0.30, 0.70)]
+        client.get_order_book_depth.return_value = {"yes_ask_size": 50}
+        funnel = MagicMock()
+        markets = [{"ticker": f"K-{x}", "title": x} for x in "ABC"]
+        kalshi_data = (
+            [{"event_ticker": "EV1", "mutually_exclusive": True},
+             {"event_ticker": "EV2", "mutually_exclusive": False}],
+            {"EV1": markets, "EV2": [{"ticker": "K-D"}, {"ticker": "K-E"}]},
+            {"EV1": "Multi Event", "EV2": "Ladder"},
+        )
+
+        with patch("scans.kalshi._within_resolution_window", return_value=True), \
+             patch("scans.kalshi.filter_dust", side_effect=lambda x: x), \
+             patch("scans.kalshi.net_profit_kalshi_multi", return_value={
+                 "gross_spread": 0.02, "fees": 0.01, "net_profit": 0.01,
+             }):
+            result = scan_kalshi_multi(client, 0.01, kalshi_data=kalshi_data, funnel=funnel)
+
+        # Only the mutually exclusive, fully priced event counts as screened.
+        funnel.record_screened.assert_called_once_with(1)
+        funnel.record_mid_candidates.assert_called_once_with(len(result))
 
     def _gate_fixture(self, mutually_exclusive):
         client = MagicMock()

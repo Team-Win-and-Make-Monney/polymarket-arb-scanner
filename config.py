@@ -162,6 +162,16 @@ KELLY_MAX_FRACTION = _env_float("KELLY_MAX_FRACTION", "0.25")
 
 # Execution
 DRY_RUN = _env_bool("DRY_RUN", "true")
+
+# ``--mode research`` runs the Layer 1 structural strategies (Kalshi binary/multi,
+# Fréchet, temporal, CTF) observationally, without flipping their execution flags.
+# It only activates while DRY_RUN is true, so a live flip cannot turn it into trading.
+RESEARCH_MODE = "research"
+
+
+def research_dry_run(mode: str) -> bool:
+    """True when ``mode`` is the observational research mode and DRY_RUN is on."""
+    return mode == RESEARCH_MODE and DRY_RUN
 _raw_exec_mode = os.getenv("EXECUTION_MODE", "semi-auto")
 EXECUTION_MODE = "full-auto" if _raw_exec_mode == "auto" else _raw_exec_mode
 

@@ -617,6 +617,51 @@ class TestMainBranching:
         mock_db.close.assert_called_once()
 
 
+    @patch.object(_cli_mod, "start_dashboard", return_value=None)
+    @patch.object(_cli_mod, "run_continuous")
+    @patch.object(_cli_mod, "_run_oneshot")
+    @patch.object(_cli_mod, "TradeDB")
+    @patch.object(_cli_mod, "setup_logging")
+    @patch.object(_cli_mod, "load_dotenv")
+    def test_research_mode_refuses_live_or_oneshot(
+        self, mock_dotenv, mock_logging, mock_db_cls, mock_oneshot, mock_continuous, mock_dashboard, caplog,
+    ):
+        cases = (
+            (["scanner.py", "--mode", "research", "--dry-run"], "true"),  # one-shot
+            (["scanner.py", "--continuous", "--mode", "research"], "false"),  # live
+        )
+        for argv, dry_env in cases:
+            caplog.clear()
+            with patch("sys.argv", argv), patch.dict(os.environ, {"DRY_RUN": dry_env}), \
+                 patch.object(_cli_mod.config, "DRY_RUN", dry_env == "true"), \
+                 pytest.raises(SystemExit) as exc:
+                _cli_mod.main()
+            assert exc.value.code == 2
+            assert "--mode research is observational" in caplog.text
+        mock_continuous.assert_not_called()
+        mock_oneshot.assert_not_called()
+        mock_db_cls.assert_not_called()
+
+    @patch.object(_cli_mod, "start_dashboard", return_value=None)
+    @patch.object(_cli_mod, "run_continuous")
+    @patch.object(_cli_mod, "_run_oneshot")
+    @patch.object(_cli_mod, "ArbitrageExecutor")
+    @patch.object(_cli_mod, "RiskManager")
+    @patch.object(_cli_mod, "TradeDB")
+    @patch.object(_cli_mod, "setup_logging")
+    @patch.object(_cli_mod, "load_dotenv")
+    def test_research_mode_runs_continuous_dry_run(
+        self, mock_dotenv, mock_logging, mock_db_cls, mock_risk_cls,
+        mock_exec_cls, mock_oneshot, mock_continuous, mock_dashboard,
+    ):
+        with patch("sys.argv", ["scanner.py", "--continuous", "--mode", "research", "--dry-run"]), \
+             patch.object(_cli_mod.config, "DRY_RUN", True):
+            _cli_mod.main()
+        mock_continuous.assert_called_once()
+        assert mock_continuous.call_args.args[0].mode == "research"
+        assert mock_exec_cls.call_args.kwargs["dry_run"] is True
+
+
 # ---------------------------------------------------------------------------
 # Parallel data fetching in _run_oneshot
 # ---------------------------------------------------------------------------

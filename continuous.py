@@ -1209,9 +1209,21 @@ def _scan_time_decay_layer4(poly_markets, price_cache, mode,
     )
 
 
+def _log_research_strategy(mode: str, strategy: str, inputs: int, candidates: int | None, surfaced: int) -> None:
+    """One INFO line per strategy per cycle in --mode research, for edge measurement."""
+    if mode != config.RESEARCH_MODE:
+        return
+    logger.info(
+        "Research %s: %d inputs -> %s candidates -> %d surfaced after CLOB refine",
+        strategy, inputs, "n/a" if candidates is None else candidates, surfaced,
+    )
+
+
 def _scan_frechet_layer1(poly_markets, mode, min_profit, price_cache=None, funnel=None) -> list[dict]:
     """Plan 02 Fréchet-bound logical arbitrage. Returns [] when the gate is off or there are no markets."""
-    if mode not in ("all", "frechet") or not getattr(config, "FRECHET_ARB_ENABLED", False):
+    if mode not in ("all", "frechet", config.RESEARCH_MODE):
+        return []
+    if not (getattr(config, "FRECHET_ARB_ENABLED", False) or config.research_dry_run(mode)):
         return []
     if not poly_markets:
         return []
@@ -1224,7 +1236,9 @@ def _scan_frechet_layer1(poly_markets, mode, min_profit, price_cache=None, funne
             funnel=funnel,
             platform="polymarket",
         )
-        return _refine_frechet_with_clob(cands, min_profit=min_profit, price_cache=price_cache, funnel=funnel)
+        refined = _refine_frechet_with_clob(cands, min_profit=min_profit, price_cache=price_cache, funnel=funnel)
+        _log_research_strategy(mode, "frechet", len(poly_markets), len(cands), len(refined))
+        return refined
     except Exception as exc:
         logger.warning("Fréchet arbitrage scan failed: %s", exc)
         return []
@@ -1232,7 +1246,9 @@ def _scan_frechet_layer1(poly_markets, mode, min_profit, price_cache=None, funne
 
 def _scan_temporal_layer1(kalshi_markets, mode, min_profit, kalshi_client=None, funnel=None) -> list[dict]:
     """Plan 03 Cross-date temporal arbitrage. Returns [] when the gate is off or there are no markets."""
-    if mode not in ("all", "temporal") or not getattr(config, "TEMPORAL_ARB_ENABLED", False):
+    if mode not in ("all", "temporal", config.RESEARCH_MODE):
+        return []
+    if not (getattr(config, "TEMPORAL_ARB_ENABLED", False) or config.research_dry_run(mode)):
         return []
     if not kalshi_markets:
         return []
@@ -1244,7 +1260,9 @@ def _scan_temporal_layer1(kalshi_markets, mode, min_profit, kalshi_client=None, 
             min_violation=getattr(config, "TEMPORAL_MIN_VIOLATION", 0.02),
             funnel=funnel,
         )
-        return _refine_temporal_with_clob(cands, min_profit=min_profit, kalshi_client=kalshi_client, funnel=funnel)
+        refined = _refine_temporal_with_clob(cands, min_profit=min_profit, kalshi_client=kalshi_client, funnel=funnel)
+        _log_research_strategy(mode, "temporal", len(kalshi_markets), len(cands), len(refined))
+        return refined
     except Exception as exc:
         logger.warning("Temporal arbitrage scan failed: %s", exc)
         return []
@@ -1252,7 +1270,7 @@ def _scan_temporal_layer1(kalshi_markets, mode, min_profit, kalshi_client=None, 
 
 def _scan_ctf_layer1(poly_markets, mode, min_profit, price_cache=None, funnel=None) -> list[dict]:
     """Plan 04 CTF Primitives arbitrage. Returns [] when disabled or no markets."""
-    if mode not in ("all", "ctf"):
+    if mode not in ("all", "ctf", config.RESEARCH_MODE):
         return []
     is_explicit = (mode == "ctf")
     is_dry_run = getattr(config, "DRY_RUN", True)
@@ -1261,18 +1279,20 @@ def _scan_ctf_layer1(poly_markets, mode, min_profit, price_cache=None, funnel=No
         or getattr(config, "CTF_MERGE_ENABLED", False)
         or getattr(config, "CTF_MINT_SELL_ENABLED", False)
     )
-    if not enabled and not (is_explicit and is_dry_run):
+    if not enabled and not (is_explicit and is_dry_run) and not config.research_dry_run(mode):
         return []
     if not poly_markets:
         return []
     try:
         from scans.ctf import scan_ctf
-        return scan_ctf(
+        opps = scan_ctf(
             poly_markets,
             min_profit=min_profit,
             price_cache=price_cache,
             funnel=funnel,
         )
+        _log_research_strategy(mode, "ctf", len(poly_markets), None, len(opps))
+        return opps
     except Exception as exc:
         logger.warning("CTF primitives scan failed: %s", exc)
         return []
@@ -2173,7 +2193,8 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                             fetch_futures["poly_events"] = pool.submit(fetch_events)
                         if polymarket_reward_fetch_enabled(args.mode) and CONFIG_REWARDS_ENABLED:
                             fetch_futures["poly_reward_markets"] = pool.submit(fetch_reward_markets)
-                        if args.mode in ("all", "kalshi", "cross", "spread", "multi-cross", "rewards", "temporal") and kalshi_client:
+                        if args.mode in ("all", "kalshi", "cross", "spread", "multi-cross", "rewards", "temporal",
+                                         config.RESEARCH_MODE) and kalshi_client:
                             fetch_futures["kalshi_data"] = pool.submit(_fetch_kalshi_data, kalshi_client)
 
                         for key, future in fetch_futures.items():
@@ -2216,7 +2237,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                             scan_futures["negrisk"] = pool.submit(
                                 scan_negrisk_internal, poly_events, min_profit,
                                 price_cache=price_cache)
-                        if args.mode in ("all", "kalshi") and kalshi_client:
+                        if args.mode in ("all", "kalshi", config.RESEARCH_MODE) and kalshi_client:
                             scan_futures["kalshi_binary"] = pool.submit(
                                 scan_kalshi_binary, kalshi_client, min_profit, kalshi_data=kalshi_data)
                             # KalshiMulti kill-switch: disable for thin multi-outcome markets

@@ -3,6 +3,7 @@
 import logging
 import math
 import os
+import re
 import sys
 from pathlib import Path
 from dotenv import load_dotenv
@@ -42,6 +43,21 @@ def _env_non_negative_float(name: str, default: str) -> float:
             f"Environment variable {name}={value!r} must be finite and >= 0"
         )
     return value
+
+
+_ZERO_ETH_ADDRESS = "0x" + "0" * 40
+_ETH_ADDRESS_PATTERN = re.compile(r"^0x[0-9a-fA-F]{40}$")
+
+
+def _is_valid_eth_address(address: str | None) -> bool:
+    """Validate that an address is a non-empty, non-zero 20-byte hexadecimal Ethereum address."""
+    if not address or not isinstance(address, str):
+        return False
+    if not _ETH_ADDRESS_PATTERN.match(address):
+        return False
+    if address.lower() == _ZERO_ETH_ADDRESS.lower():
+        return False
+    return True
 
 
 def _env_int(name: str, default: str) -> int:
@@ -146,19 +162,38 @@ KELLY_MAX_FRACTION = _env_float("KELLY_MAX_FRACTION", "0.25")
 
 # Execution
 DRY_RUN = _env_bool("DRY_RUN", "true")
-EXECUTION_MODE = os.getenv("EXECUTION_MODE", "semi-auto")
+_raw_exec_mode = os.getenv("EXECUTION_MODE", "semi-auto")
+EXECUTION_MODE = "full-auto" if _raw_exec_mode == "auto" else _raw_exec_mode
+
+# Canary / paper gates (used by scripts/canary_trade.py and optional CLI)
+# CANARY_MODE=paper  → scan real matched pairs, build legs, log only (no orders)
+# CANARY_MODE=live   → place real orders with hard size/count caps below
+CANARY_MODE = os.getenv("CANARY_MODE", "").strip().lower()  # "", "paper", "live"
+CANARY_MAX_TRADE_SIZE = _env_float("CANARY_MAX_TRADE_SIZE", "1.0")
+CANARY_MAX_TRADES = _env_int("CANARY_MAX_TRADES", "1")
+CANARY_MIN_NET_ROI = _env_float("CANARY_MIN_NET_ROI", "0.01")  # 1%
+CANARY_PLATFORMS = frozenset(
+    p.strip().lower()
+    for p in os.getenv("CANARY_PLATFORMS", "polymarket,kalshi").split(",")
+    if p.strip()
+)
+# Live canary requires explicit acknowledgement to prevent accidental live runs.
+CANARY_LIVE_ACK = os.getenv("CANARY_LIVE_ACK", "").strip()
 
 # Platform execution whitelist — only these platforms can place live orders.
 # Comma-separated list of platform names. Platforms not listed here will still
 # be scanned for price data but will never execute trades.
 _VALID_PLATFORMS = frozenset([
-    "polymarket", "kalshi", "betfair", "smarkets",
-    "sxbet", "matchbook", "gemini", "ibkr",
+    "polymarket", "polymarket_ctf", "kalshi", "betfair", "smarkets",
+    "sxbet", "matchbook", "gemini", "ibkr", "limitless",
 ])
 _raw_enabled = os.getenv("ENABLED_EXECUTION_PLATFORMS", "kalshi")
-ENABLED_EXECUTION_PLATFORMS: frozenset[str] = frozenset(
-    p.strip().lower() for p in _raw_enabled.split(",") if p.strip()
-)
+if _raw_enabled.strip().lower() in ("all", "all platforms", "*"):
+    ENABLED_EXECUTION_PLATFORMS: frozenset[str] = _VALID_PLATFORMS
+else:
+    ENABLED_EXECUTION_PLATFORMS: frozenset[str] = frozenset(
+        p.strip().lower() for p in _raw_enabled.split(",") if p.strip()
+    )
 
 # Scan-venue pin (SCAN_VENUES preferred; PAPER_SCAN_VENUES is the legacy name).
 # When set to kalshi / kalshi-only, skip Polymarket fetches even if --mode all.
@@ -194,6 +229,7 @@ def polymarket_reward_fetch_enabled(mode: str) -> bool:
 # client-side to prevent API rejections and costly partial-fill hedging.
 PLATFORM_MIN_ORDER_SIZE: dict[str, float] = {
     "polymarket": 0.01,
+    "polymarket_ctf": 0.01,
     "kalshi": 0.01,
     "sxbet": 1.00,
     "gemini": 0.01,
@@ -201,6 +237,7 @@ PLATFORM_MIN_ORDER_SIZE: dict[str, float] = {
     "betfair": 2.50,
     "smarkets": 6.25,
     "matchbook": 5.50,
+    "limitless": 0.01,
 }
 
 # Polygon gas cost estimate (per transaction, in dollars)
@@ -239,7 +276,7 @@ STRATEGY_LAYERS: dict[str, int] = {
     "IBKRBinary": 1,
     "Spread": 1,
     # #30-#32: New Layer 1 strategies
-    "ConditionalArb": 1, "BracketArb": 1, "NWayArb": 1,
+    "ConditionalArb": 1, "BracketArb": 1, "NWayArb": 1, "FrechetArb": 1, "TemporalArb": 1,
     # Layer 2 — Near-Arbitrage
     "StalePriceOpp": 2, "ResolutionSnipeOpp": 2, "FeePromo": 2,
     # #33-#35: New Layer 2 strategies
@@ -492,6 +529,15 @@ REWARDS_POLL_INTERVAL = _env_int("REWARDS_POLL_INTERVAL", "60")
 REWARDS_MIN_RESTING_TIME = _env_int("REWARDS_MIN_RESTING_TIME", "300")
 REWARDS_MAX_MARKETS = _env_int("REWARDS_MAX_MARKETS", "100")
 
+# Limitless Exchange (Base CLOB) & delta-neutral reward farming
+LIMITLESS_API_KEY = os.getenv("LIMITLESS_API_KEY", "")
+LIMITLESS_PRIVATE_KEY = os.getenv("LIMITLESS_PRIVATE_KEY", "")
+LIMITLESS_BASE_URL = os.getenv("LIMITLESS_BASE_URL", "https://api.limitless.exchange")
+LIMITLESS_EXCHANGE_CONTRACT = os.getenv("LIMITLESS_EXCHANGE_CONTRACT", "")
+LIMITLESS_REWARDS_ENABLED = _env_bool("LIMITLESS_REWARDS_ENABLED", "false")
+LIMITLESS_MAX_INVENTORY = _env_float("LIMITLESS_MAX_INVENTORY", "200.0")
+LIMITLESS_RATE_LIMIT = _env_float("LIMITLESS_RATE_LIMIT", "0.2")
+
 # Kalshi Liquidity Incentive Program (LIP) — snapshot scoring of resting orders.
 KALSHI_LIP_ENABLED = _env_bool("KALSHI_LIP_ENABLED", "false")
 # Kalshi Volume Incentive Program (VIP) — passive volume-rebate tracking.
@@ -550,6 +596,16 @@ NEWS_SNIPE_COOLDOWN = _env_float("NEWS_SNIPE_COOLDOWN", "30.0")
 NEWS_SNIPE_CONFIDENCE_THRESHOLD = _env_float("NEWS_SNIPE_CONFIDENCE_THRESHOLD", "0.5")
 # Stage 2 refiner: drop signals where the headline is older than this window.
 NEWS_SNIPE_MAX_AGE_MINUTES = _env_int("NEWS_SNIPE_MAX_AGE_MINUTES", "60")
+
+# Firecrawl web-search news source — alternative/supplemental to Finnhub for
+# STRAT-02. Fills the specced-but-unbuilt news_monitor.py slot
+# (.planning/research/ARCHITECTURE.md Pattern 6). Disabled by default; when
+# enabled it is passed into scan_news_snipe() as an alternate client, NOT
+# auto-wired into signal_aggregator.py's live source weights — that wiring
+# is a separate, explicit decision (see DEFAULT_SOURCE_WEIGHTS).
+FIRECRAWL_NEWS_ENABLED = _env_bool("FIRECRAWL_NEWS_ENABLED", "false")
+FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY", "")
+FIRECRAWL_NEWS_REQUEST_TIMEOUT = _env_float("FIRECRAWL_NEWS_REQUEST_TIMEOUT", "15.0")
 
 # STRAT-06: Correlated Market Pairs
 CORRELATED_ENABLED = _env_bool("CORRELATED_ENABLED", "false")
@@ -629,6 +685,31 @@ POLYGONSCAN_API_KEY = os.getenv("POLYGONSCAN_API_KEY", "")
 # ---------------------------------------------------------------------------
 
 # Layer 1 — Pure Arbitrage (New)
+# Plan 02: Fréchet-Bound Logical Arbitrage — A ⊆ B coherence bounds P(A) <= P(B)
+FRECHET_ARB_ENABLED = _env_bool("FRECHET_ARB_ENABLED", "false")
+FRECHET_MIN_VIOLATION = _env_float("FRECHET_MIN_VIOLATION", "0.02")
+FRECHET_ARB_MAX_TRADE_SIZE = _env_float("FRECHET_ARB_MAX_TRADE_SIZE", "25.0")
+
+# Plan 03: Cross-Date / Nested Temporal Arbitrage — D_early < D_late monotonicity bounds P(early) <= P(late)
+TEMPORAL_ARB_ENABLED = _env_bool("TEMPORAL_ARB_ENABLED", "false")
+TEMPORAL_MIN_VIOLATION = _env_float("TEMPORAL_MIN_VIOLATION", "0.02")
+TEMPORAL_ARB_MAX_TRADE_SIZE = _env_float("TEMPORAL_ARB_MAX_TRADE_SIZE", "25.0")
+
+# Plan 04: CTF mint/split & merge/redeem primitives (Polymarket on-chain CTF)
+CTF_ENABLED = _env_bool("CTF_ENABLED", "false")
+CTF_MERGE_ENABLED = _env_bool("CTF_MERGE_ENABLED", "false")
+CTF_MINT_SELL_ENABLED = _env_bool("CTF_MINT_SELL_ENABLED", "false")
+CTF_CONVERT_ENABLED = _env_bool("CTF_CONVERT_ENABLED", "false")
+CTF_MIN_PROFIT = _env_float("CTF_MIN_PROFIT", "0.005")
+CTF_MAX_TRADE_SIZE = _env_float("CTF_MAX_TRADE_SIZE", "25.0")
+CTF_GAS_ESTIMATE = _env_non_negative_float("CTF_GAS_ESTIMATE", "0.01")
+CONDITIONAL_TOKENS_ADDRESS = os.getenv("CONDITIONAL_TOKENS_ADDRESS", "0x4d97dcd9" "7ec945f40cf65f87097ace5ea0476045")
+NEG_RISK_ADAPTER_ADDRESS = os.getenv("NEG_RISK_ADAPTER_ADDRESS", "0xd91e80cf2e7be2e162c6513ced06f1dd0da35296")
+COLLATERAL_TOKEN_ADDRESS = os.getenv("COLLATERAL_TOKEN_ADDRESS", "0xc011a7e1" "2a19f7b1f670d46f03b03f3342e82dfb")
+
+# Plan 05: UMA oracle dispute-risk gate (defensive) — block resolution-held Polymarket arbs in proposal/dispute window
+DISPUTE_GATE_ENABLED = _env_bool("DISPUTE_GATE_ENABLED", "false")
+
 # #30: Conditional Market Arbitrage — P(X|Y) × P(Y) ≠ P(X) detection
 CONDITIONAL_ARB_ENABLED = _env_bool("CONDITIONAL_ARB_ENABLED", "false")
 CONDITIONAL_ARB_MIN_DIVERGENCE = _env_float("CONDITIONAL_ARB_MIN_DIVERGENCE", "0.05")
@@ -862,6 +943,16 @@ DISCOVERY_VERIFIED_PATH = os.getenv(
     "DISCOVERY_VERIFIED_PATH", os.path.join(DATA_DIR, "discovery", "verified_pairs.yaml")
 )
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+# ---------------------------------------------------------------------------
+# Jev System One Decision Engine
+# ---------------------------------------------------------------------------
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+JEV_MODEL = os.getenv("TYPESAFE_MODEL", "jev-1.13.0")
+JEV_CONFIDENCE_THRESHOLD = _env_float("JEV_CONFIDENCE_THRESHOLD", "0.70")
+JEV_MIN_EDGE = _env_float("JEV_MIN_EDGE", "0.04")
+JEV_CRYPTO_ENABLED = _env_bool("JEV_CRYPTO_ENABLED", "false")
+JEV_CROSS_EQUIVALENCE_ENABLED = _env_bool("JEV_CROSS_EQUIVALENCE_ENABLED", "false")
 
 # Fee model: "expected_value" uses probability-weighted average fees,
 # "worst_case" uses max(case1, case2) — more conservative but overfilters.
@@ -1188,6 +1279,8 @@ _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 _VALID_EXECUTION_MODES = {"semi-auto", "full-auto"}
 _VALID_FEE_MODELS = {"expected_value", "worst_case"}
 _VALID_GEMINI_ORDER_TYPES = {"ioc", "gtc"}
+_VALID_CANARY_MODES = {"", "paper", "live"}
+_CANARY_LIVE_ACK_TOKEN = "I_ACCEPT_LIVE_CANARY"
 
 
 def validate_config() -> list[str]:
@@ -1271,6 +1364,7 @@ def validate_config() -> list[str]:
         "MM_CANARY_QUOTE_SIZE_USD": MM_CANARY_QUOTE_SIZE_USD,
         "MM_CANARY_MAX_LOSS_USD": MM_CANARY_MAX_LOSS_USD,
         "MM_CANARY_MIN_HOURS": MM_CANARY_MIN_HOURS,
+        "CTF_MAX_TRADE_SIZE": CTF_MAX_TRADE_SIZE,
     }
     for name, val in _positive.items():
         if val <= 0:
@@ -1438,6 +1532,42 @@ def validate_config() -> list[str]:
             "ENABLED_EXECUTION_PLATFORMS."
         )
 
+    # Limitless reward farming validation
+    if LIMITLESS_REWARDS_ENABLED and not DRY_RUN:
+        if not LIMITLESS_API_KEY:
+            raise ConfigError(
+                "LIMITLESS_REWARDS_ENABLED=true and DRY_RUN=false requires LIMITLESS_API_KEY"
+            )
+        if not LIMITLESS_PRIVATE_KEY:
+            raise ConfigError(
+                "LIMITLESS_REWARDS_ENABLED=true and DRY_RUN=false requires LIMITLESS_PRIVATE_KEY"
+            )
+        if not _is_valid_eth_address(LIMITLESS_EXCHANGE_CONTRACT):
+            raise ConfigError(
+                f"LIMITLESS_REWARDS_ENABLED=true and DRY_RUN=false requires valid non-zero "
+                f"LIMITLESS_EXCHANGE_CONTRACT address, got {LIMITLESS_EXCHANGE_CONTRACT!r}"
+            )
+        if "limitless" not in ENABLED_EXECUTION_PLATFORMS:
+            raise ConfigError(
+                "LIMITLESS_REWARDS_ENABLED=true and DRY_RUN=false requires 'limitless' in "
+                "ENABLED_EXECUTION_PLATFORMS. Add limitless to the execution whitelist."
+            )
+
+    # Plan 04: CTF validation — require valid non-zero 20-byte addresses if CTF features are enabled
+    if CTF_ENABLED or CTF_MERGE_ENABLED or CTF_MINT_SELL_ENABLED or CTF_CONVERT_ENABLED:
+        if not _is_valid_eth_address(CONDITIONAL_TOKENS_ADDRESS):
+            raise ConfigError(
+                f"CONDITIONAL_TOKENS_ADDRESS must be a valid non-zero 20-byte hexadecimal address, got {CONDITIONAL_TOKENS_ADDRESS!r}"
+            )
+        if not _is_valid_eth_address(COLLATERAL_TOKEN_ADDRESS):
+            raise ConfigError(
+                f"COLLATERAL_TOKEN_ADDRESS must be a valid non-zero 20-byte hexadecimal address, got {COLLATERAL_TOKEN_ADDRESS!r}"
+            )
+        if CTF_CONVERT_ENABLED and not _is_valid_eth_address(NEG_RISK_ADAPTER_ADDRESS):
+            raise ConfigError(
+                f"NEG_RISK_ADAPTER_ADDRESS must be a valid non-zero 20-byte hexadecimal address when CTF_CONVERT_ENABLED=true, got {NEG_RISK_ADAPTER_ADDRESS!r}"
+            )
+
     # --- Strategy-specific validation (Phase 8) ---
 
     # STRAT-01: Order Book Imbalance
@@ -1457,6 +1587,13 @@ def validate_config() -> list[str]:
         raise ConfigError(
             f"NEWS_SNIPE_CONFIDENCE_THRESHOLD={NEWS_SNIPE_CONFIDENCE_THRESHOLD} "
             f"must be in (0, 1]"
+        )
+
+    # Firecrawl news source (alternative/supplemental to Finnhub for STRAT-02)
+    if FIRECRAWL_NEWS_ENABLED and not FIRECRAWL_API_KEY:
+        warnings.append(
+            "Firecrawl news enabled (FIRECRAWL_NEWS_ENABLED=true) but "
+            "FIRECRAWL_API_KEY not set; disabling Firecrawl news"
         )
 
     # STRAT-06: Correlated Market Pairs
@@ -1490,6 +1627,29 @@ def validate_config() -> list[str]:
         warnings.append(
             "EXECUTION_MODE=full-auto but DRY_RUN=true — "
             "no trades will be executed"
+        )
+
+    if CANARY_MODE and CANARY_MODE not in _VALID_CANARY_MODES:
+        raise ConfigError(
+            f"CANARY_MODE={CANARY_MODE!r} is not valid "
+            f"(expected one of {{'paper', 'live'}} or empty)"
+        )
+
+    if CANARY_MODE == "live" and CANARY_LIVE_ACK != _CANARY_LIVE_ACK_TOKEN:
+        raise ConfigError(
+            "CANARY_MODE=live requires "
+            f"CANARY_LIVE_ACK={_CANARY_LIVE_ACK_TOKEN!r} "
+            "(refusing accidental live canary)"
+        )
+
+    if CANARY_MODE == "live" and CANARY_MAX_TRADE_SIZE > 5.0:
+        raise ConfigError(
+            f"CANARY_MAX_TRADE_SIZE={CANARY_MAX_TRADE_SIZE} exceeds hard cap $5.00"
+        )
+
+    if CANARY_MODE == "live" and CANARY_MAX_TRADES > 3:
+        raise ConfigError(
+            f"CANARY_MAX_TRADES={CANARY_MAX_TRADES} exceeds hard cap 3"
         )
 
     # --- Live envelope: DRY_RUN=false requires an operator five-item file ---

@@ -170,6 +170,7 @@ def scan_negrisk_internal(events: list[dict], min_profit: float,
             for m in markets:
                 tids = _extract_token_ids(m)
                 negrisk_token_ids.append(tids[0] if tids else "")
+            negrisk_cids = [m.get("conditionId") or m.get("condition_id") for m in markets if m.get("conditionId") or m.get("condition_id")]
             opportunities.append({
                 "type": f"NegRisk({len(yes_prices)})",
                 "_layer": 1,  # Layer 1: pure arbitrage
@@ -183,6 +184,8 @@ def scan_negrisk_internal(events: list[dict], min_profit: float,
                 "volume": f"${sum(float(m.get('volume', 0) or 0) for m in markets):,.0f}",
                 "_event_key": event_key,
                 "_token_ids": negrisk_token_ids,
+                "_condition_ids": negrisk_cids,
+                "_condition_id": negrisk_cids[0] if negrisk_cids else "",
                 "_days_to_resolution": _days_to_resolution(markets[0], "polymarket"),
             })
 
@@ -260,6 +263,7 @@ def scan_negrisk_no_side(events: list[dict], min_profit: float,
 
             event_key = event.get("id", event.get("title", ""))
             events_by_title[event_key] = event
+            negrisk_no_cids = [m.get("conditionId") or m.get("condition_id") for m in markets if m.get("conditionId") or m.get("condition_id")]
             opportunities.append({
                 "type": f"NegRiskNO({n})",
                 "_layer": 1,  # Layer 1: pure arbitrage
@@ -274,6 +278,8 @@ def scan_negrisk_no_side(events: list[dict], min_profit: float,
                 "_event_key": event_key,
                 "_token_ids": no_token_ids,      # NO tokens (used by _build_legs)
                 "_no_prices": list(no_prices),   # full list for execution (no truncation)
+                "_condition_ids": negrisk_no_cids,
+                "_condition_id": negrisk_no_cids[0] if negrisk_no_cids else "",
                 "_days_to_resolution": _days_to_resolution(markets[0], "polymarket"),
             })
 

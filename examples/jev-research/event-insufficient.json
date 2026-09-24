@@ -1,0 +1,16 @@
+{
+  "as_of": "2026-09-20T12:00:00Z",
+  "issuer_id": "ACME",
+  "source": {
+    "id": "acme-new",
+    "text": "",
+    "url": "https://example.org/acme-new",
+    "published_at": "2026-09-20T10:00:00Z",
+    "available_at": "2026-09-20T10:01:00Z",
+    "captured_at": "2026-09-20T10:02:00Z",
+    "entity_ids": [
+      "ACME"
+    ],
+    "kind": "news"
+  }
+}

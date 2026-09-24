@@ -14,6 +14,8 @@ progress:
   percent: 100
 ---
 
+> **Legacy GSD milestone state.** This file is a completed April 2026 planning snapshot, not the canonical portfolio state. Use [`../STATE.md`](../STATE.md) for current state and the single next action.
+
 # STATE.md — Polymarket Arb Scanner
 
 ## Current Phase

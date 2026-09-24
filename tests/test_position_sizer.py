@@ -160,6 +160,24 @@ class TestExtractNetRoi:
         # "5.23%" → 0.0523
         assert PositionSizer._extract_net_roi({"net_roi": "5.23%"}) == pytest.approx(0.0523)
 
+    def test_string_with_sub_one_percent(self):
+        # "0.50%" must be 0.005, not 0.50 (which would be 50% ROI)
+        assert PositionSizer._extract_net_roi({"net_roi": "0.50%"}) == pytest.approx(0.0050)
+        assert PositionSizer._extract_net_roi({"net_roi": "0.15%"}) == pytest.approx(0.0015)
+        assert PositionSizer._extract_net_roi({"net_roi": "0.99%"}) == pytest.approx(0.0099)
+
+    def test_string_with_exact_one_percent(self):
+        # "1.00%" must be 0.01, not 1.0 (which would be 100% ROI)
+        assert PositionSizer._extract_net_roi({"net_roi": "1.00%"}) == pytest.approx(0.01)
+
+    def test_string_with_negative_percent(self):
+        assert PositionSizer._extract_net_roi({"net_roi": "-0.50%"}) == pytest.approx(-0.0050)
+        assert PositionSizer._extract_net_roi({"net_roi": "-5.23%"}) == pytest.approx(-0.0523)
+
+    def test_string_with_zero_percent(self):
+        assert PositionSizer._extract_net_roi({"net_roi": "0%"}) == 0.0
+        assert PositionSizer._extract_net_roi({"net_roi": "0.00%"}) == 0.0
+
     def test_string_without_percent_already_decimal(self):
         # "0.05" → 0.05
         assert PositionSizer._extract_net_roi({"net_roi": "0.05"}) == 0.05

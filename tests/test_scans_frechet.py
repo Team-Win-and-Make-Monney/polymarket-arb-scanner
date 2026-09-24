@@ -163,6 +163,23 @@ class TestScansFrechet:
         funnel.record_clob_evaluated.assert_called_once_with(1)
         funnel.record_surfaced.assert_called_once_with(1)
 
+    def test_refine_frechet_unknown_depth_is_zero_not_none(self):
+        """Cached books can carry no sizes; the surfaced depth must stay numeric (fails closed)."""
+        m_sub = {"condition_id": "0xsub", "title": "BTC above $100k?"}
+        m_sup = {"condition_id": "0xsup", "title": "BTC above $90k?"}
+        cand = {"type": "FrechetArb", "_platform": "polymarket", "_sub_market": m_sub, "_sup_market": m_sup}
+
+        def mock_fetch(market, cache):
+            if market["condition_id"] == "0xsup":
+                return market, {"yes_ask": 0.45, "yes_ask_size": 0}
+            return market, {"no_ask": 0.30, "no_ask_size": 0}
+
+        with patch("scans.frechet._fetch_clob_for_market", side_effect=mock_fetch):
+            refined = _frechet()._refine_frechet_with_clob([cand], min_profit=0.01)
+
+        assert len(refined) == 1
+        assert refined[0]["_clob_depth"] == 0.0
+
     def test_refine_frechet_with_clob_drops_unprofitable(self):
         m_sub = {"condition_id": "0xsub"}
         m_sup = {"condition_id": "0xsup"}

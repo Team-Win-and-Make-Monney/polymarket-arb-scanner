@@ -40,8 +40,9 @@ RUN mkdir -p /data
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
   CMD python -c "import os,urllib.request; urllib.request.urlopen(f'http://localhost:{os.environ.get(\"DASHBOARD_PORT\") or os.environ.get(\"PORT\") or \"8080\"}/healthz')" || exit 1
 
-# Railway's retained mission is narrow Kalshi research. The broad `all` mode
-# duplicated venue fetches and produced multi-minute cycles that blinded the
-# asyncio feed-health tasks. Broad scans remain available as an explicit CLI
-# choice, but are not the unattended deployment default.
-ENTRYPOINT ["python", "scanner.py", "--continuous", "--mode", "kalshi"]
+# Railway runs `research`: the Kalshi binary/multi scans plus the Layer 1
+# structural strategies (Fréchet, temporal, CTF), observationally. It refuses to
+# start unless DRY_RUN=true and never flips any strategy's execution flag. The
+# broad `all` mode stays off: it duplicated venue fetches and produced
+# multi-minute cycles that blinded the asyncio feed-health tasks.
+ENTRYPOINT ["python", "scanner.py", "--continuous", "--mode", "research"]

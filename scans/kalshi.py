@@ -15,6 +15,15 @@ from scans.helpers import _parallel_fetch_kalshi, _within_resolution_window, fil
 logger = logging.getLogger(__name__)
 
 
+def _default_funnel():
+    """Global funnel tracker, or None when telemetry is unavailable."""
+    try:
+        from funnel import get_funnel_tracker
+        return get_funnel_tracker()
+    except ImportError:
+        return None
+
+
 def _blocked_event_tickers(events: list[dict]) -> set[str]:
     return {e.get("event_ticker", "") for e in events if e.get("event_ticker") and _event_blocked(e)}
 
@@ -105,8 +114,11 @@ def scan_kalshi_binary(
     kalshi_client: KalshiClient,
     min_profit: float,
     kalshi_data: tuple | None = None,
+    funnel=None,
 ) -> list[dict]:
     """Scan for Kalshi binary arbitrage (YES + NO < $1.00 on same market)."""
+    if funnel is None:
+        funnel = _default_funnel()
     opportunities = []
 
     if not kalshi_client:
@@ -166,6 +178,9 @@ def scan_kalshi_binary(
     if skipped_blocked:
         logger.info("Skipped %d Kalshi events blocked as sports/mentions.", skipped_blocked)
     logger.info("Scanned %d Kalshi markets across %d events.", total_markets - filtered_resolution, len(events))
+    if funnel:
+        funnel.record_screened(total_markets - filtered_resolution)
+        funnel.record_mid_candidates(len(opportunities))
 
     # Stage 2: Re-fetch order book depth for top candidates (parallel)
     if opportunities:
@@ -195,8 +210,11 @@ def scan_kalshi_multi(
     kalshi_client: KalshiClient,
     min_profit: float,
     kalshi_data: tuple | None = None,
+    funnel=None,
 ) -> list[dict]:
     """Scan for Kalshi multi-outcome arbitrage (sum of YES prices < $1.00 across event)."""
+    if funnel is None:
+        funnel = _default_funnel()
     opportunities = []
 
     if not kalshi_client:
@@ -262,6 +280,7 @@ def scan_kalshi_multi(
     filtered_resolution = 0
     skipped_non_exclusive = 0
     skipped_non_exhaustive = 0
+    priced_events = 0
     for event_ticker, markets in markets_by_event.items():
         if event_ticker in blocked:
             skipped_blocked += 1
@@ -293,6 +312,7 @@ def scan_kalshi_multi(
 
         if not valid or not yes_prices:
             continue
+        priced_events += 1
 
         # Completeness guard: for a true single-winner market the YES asks sum to
         # just under/over 1.0. A sum well below the floor means missing/closed
@@ -339,6 +359,9 @@ def scan_kalshi_multi(
         logger.info("Skipped %d Kalshi strike-ladder events without open tail buckets (non-exhaustive sets).", skipped_non_exhaustive)
     if skipped_blocked:
         logger.info("Skipped %d Kalshi multi events blocked as sports/mentions.", skipped_blocked)
+    if funnel:
+        funnel.record_screened(priced_events)
+        funnel.record_mid_candidates(len(opportunities))
 
     # Stage 2: Re-fetch order book depth for candidates (parallel, min depth across all legs)
     if opportunities:

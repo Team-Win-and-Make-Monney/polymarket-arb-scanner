@@ -676,6 +676,35 @@ class TestKalshiFetchData:
         assert client.session.request.call_count == 2
 
     @patch("kalshi_api._rate_limit")
+    def test_fetch_all_events_warns_when_truncated(self, mock_rl, client, caplog):
+        """Exhausting max_pages with a live cursor logs a truncation warning."""
+        client.session.request.side_effect = [
+            _mock_response(200, {"events": [{"event_ticker": f"E{i}"}], "cursor": "more"})
+            for i in range(2)
+        ]
+        with caplog.at_level("WARNING", logger="kalshi_api"):
+            result = client.fetch_all_events(max_pages=2)
+        assert len(result) == 2
+        assert "truncated at max_pages=2" in caplog.text
+
+    @patch("kalshi_api._rate_limit")
+    def test_fetch_all_events_no_warning_when_complete(self, mock_rl, client, caplog):
+        """A cursor that ends within max_pages does not warn."""
+        client.session.request.return_value = _mock_response(200, {
+            "events": [{"event_ticker": "E1"}], "cursor": "",
+        })
+        with caplog.at_level("WARNING", logger="kalshi_api"):
+            client.fetch_all_events(max_pages=2)
+        assert "truncated" not in caplog.text
+
+    def test_fetch_all_events_default_page_cap_covers_live_universe(self):
+        """The default cap must exceed the ~14k open events seen live (2026-09-23)."""
+        import inspect
+        from kalshi_api import KalshiClient
+        params = inspect.signature(KalshiClient.fetch_all_events).parameters
+        assert params["limit"].default * params["max_pages"].default >= 30_000
+
+    @patch("kalshi_api._rate_limit")
     def test_fetch_all_events_stops_on_error(self, mock_rl, client):
         """Stops pagination on non-200 response."""
         client.session.request.return_value = _mock_response(500)

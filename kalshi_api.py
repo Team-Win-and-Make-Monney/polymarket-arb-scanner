@@ -235,7 +235,7 @@ class KalshiClient:
             logger.warning("Kalshi request failed (%s %s): %s", method, path, e)
             return None
 
-    def fetch_all_events(self, limit: int = 200, max_pages: int = 50,
+    def fetch_all_events(self, limit: int = 200, max_pages: int = 150,
                          with_nested_markets: bool = True) -> list[dict]:
         """Fetch all active events from Kalshi with cursor pagination.
 
@@ -244,6 +244,9 @@ class KalshiClient:
         N follow-up ``/markets?event_ticker=…`` calls. This is the
         single biggest scan-cycle latency win available without
         switching to WebSocket-driven evaluation.
+
+        Logs a warning when *max_pages* is exhausted while the cursor is still
+        live, so a truncated event universe is never silent.
         """
         all_events = []
         cursor = None
@@ -267,6 +270,11 @@ class KalshiClient:
             cursor = data.get("cursor")
             if not cursor or not events:
                 break
+        else:
+            logger.warning(
+                "Kalshi events pagination truncated at max_pages=%d (%d events fetched, cursor still live)",
+                max_pages, len(all_events),
+            )
 
         return all_events
 

@@ -70,6 +70,33 @@ class TestCredentialHealthChecker(unittest.TestCase):
             self.assertIsInstance(endpoint_info["method"], str)
             self.assertIsInstance(endpoint_info["args"], dict)
 
+    def _kalshi_probe(self, status_code, body):
+        """Run the checker's Kalshi probe against a real KalshiClient with a mocked session."""
+        import kalshi_api
+        client = kalshi_api.KalshiClient()
+        client._auth_headers = mock.MagicMock(return_value={"KALSHI-ACCESS-KEY": "test-key-id"})
+        resp = mock.MagicMock(status_code=status_code)
+        resp.json.return_value = body
+        client.session.request = mock.MagicMock(return_value=resp)
+        self.health_checker.clients["kalshi"] = client
+        with mock.patch("kalshi_api._rate_limit"):
+            healthy = asyncio.run(self.health_checker._check_platform_health("kalshi"))
+        return healthy, client.session.request
+
+    def test_kalshi_probe_zero_balance_is_healthy_in_one_signed_request(self):
+        """The probe exercises the API key in one call, and a $0 balance is still healthy."""
+        healthy, request = self._kalshi_probe(200, {"balance": 0})
+        self.assertTrue(healthy)
+        self.assertEqual(1, request.call_count)
+        self.assertTrue(request.call_args.args[1].endswith("/portfolio/balance"))
+        self.assertEqual({"KALSHI-ACCESS-KEY": "test-key-id"}, request.call_args.kwargs["headers"])
+
+    def test_kalshi_probe_rejected_credentials_are_unhealthy(self):
+        """A rejected balance request is classified as an unhealthy credential."""
+        healthy, request = self._kalshi_probe(401, {"error": "unauthorized"})
+        self.assertFalse(healthy)
+        self.assertEqual(1, request.call_count)
+
     def test_all_platforms_healthy(self):
         """Test successful health check when all platforms return valid data."""
         # Set up all clients to return success (non-None)

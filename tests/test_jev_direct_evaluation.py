@@ -142,7 +142,8 @@ class TestSemanticEvidenceBoundaries:
         executor._log_skipped = MagicMock()
         assert executor.execute({"type": "JevCrypto"}) is False
         assert executor.execute({"type": "anything", "_research_only": True}) is False
-        assert executor._log_skipped.call_count == 2
+        assert executor.execute({"type": "NewsSnipe", "_sentiment_source": "jev"}) is False
+        assert executor._log_skipped.call_count == 3
 
     def test_missing_rules_and_expiry_do_not_call_model(self):
         from scans.jev_crypto import scan_jev_crypto

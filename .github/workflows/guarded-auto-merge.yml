@@ -5,7 +5,7 @@ on:
     types: [labeled, unlabeled, synchronize, converted_to_draft]
 
 concurrency:
-  group: guarded-auto-merge-${{ github.event.pull_request.number }}
+  group: guarded-auto-merge-${{ github.event.pull_request.number }}-${{ github.event.action }}
   cancel-in-progress: true
 
 permissions:
@@ -56,6 +56,11 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
+          if [[ "$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq 'any(.labels[]; .name == "automerge")')" != "true" ]]; then
+            echo "PR $PR_NUMBER does not currently have the automerge label; skipping enable."
+            exit 0
+          fi
+
           permission="$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$LABEL_ACTOR/permission" --jq '.permission')"
           case "$permission" in
             admin|maintain|write|push) ;;

@@ -129,3 +129,44 @@ class TestSyncWsFeedsScanLoop:
         # A running task later takes the ordinary update branch, not the late-start fallback.
         continuous._sync_ws_feeds(fm, ws_task, 2, ["tok"], ["KXA", "KXB"], object())
         fm.update_subscriptions.assert_called_once_with(poly_token_ids=["tok"], kalshi_tickers=["KXA", "KXB"])
+
+
+class TestWsFeedsActiveIndicator:
+    """Dashboard ws_connections and the combined ws_connected metric count a late Kalshi feed."""
+
+    def test_running_startup_task_counts_as_active(self):
+        fm = MagicMock()
+        assert continuous._ws_feeds_active(fm, _task(done=False)) is True
+        fm.kalshi_late_feed_running.assert_not_called()
+
+    def test_finished_startup_task_defers_to_late_kalshi_feed(self):
+        fm = MagicMock()
+        fm.kalshi_late_feed_running.return_value = False
+        assert continuous._ws_feeds_active(fm, _task()) is False
+        assert continuous._ws_feeds_active(fm, None) is False
+        fm.kalshi_late_feed_running.return_value = True
+        assert continuous._ws_feeds_active(fm, _task()) is True
+
+    def test_real_late_feed_reports_active_until_it_stops(self):
+        fm, _ws_feeds = _feed_manager()
+
+        async def scenario():
+            release = asyncio.Event()
+
+            async def fake_run_kalshi():
+                await release.wait()
+
+            ws_task = asyncio.ensure_future(fm.run())
+            await asyncio.wait([ws_task])  # empty first scan: startup task finishes at once
+            before = continuous._ws_feeds_active(fm, ws_task)
+            with patch.object(fm, "_run_kalshi", fake_run_kalshi):
+                continuous._sync_ws_feeds(fm, ws_task, 2, [], ["KXPILOT-1"], object())
+            await asyncio.sleep(0)
+            during = continuous._ws_feeds_active(fm, ws_task)
+            release.set()
+            await asyncio.wait([fm._kalshi_late_task])
+            after = continuous._ws_feeds_active(fm, ws_task)
+            return before, during, after
+
+        before, during, after = asyncio.run(scenario())
+        assert (before, during, after) == (False, True, False)

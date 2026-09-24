@@ -195,6 +195,13 @@ def _sync_ws_feeds(feed_manager, ws_task, scan_count: int, poly_sub_ids: list[st
     return ws_task
 
 
+def _ws_feeds_active(feed_manager, ws_task) -> bool:
+    """True while any WS feed runs, including a Kalshi feed started after an empty run."""
+    if ws_task is not None and not ws_task.done():
+        return True
+    return feed_manager.kalshi_late_feed_running()
+
+
 def _ws_tracking_probability(platform: str, entry: dict | None) -> float | None:
     """Extract one executable scalar probability for WS-driven trackers."""
     if platform == "polymarket":
@@ -2859,7 +2866,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                 dashboard_state.last_opportunities = all_opportunities[:20]
                 dashboard_state.open_positions = db.get_open_positions_count()
                 dashboard_state.daily_pnl = db.get_daily_pnl()
-                dashboard_state.ws_connections = (1 if ws_task and not ws_task.done() else 0)
+                dashboard_state.ws_connections = (1 if _ws_feeds_active(feed_manager, ws_task) else 0)
                 # Update Layer 2-5 dashboard counters
                 dashboard_state.stale_detections = sum(
                     1 for o in all_opportunities if o.get("type") == "StalePriceOpp")
@@ -2911,7 +2918,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                         for opp in all_opportunities:
                             _metrics.observe("opportunity_profit", value=opp.get("net_profit", 0))
                     _metrics.set("ws_connected", {"platform": "combined"},
-                                 value=1 if ws_task and not ws_task.done() else 0)
+                                 value=1 if _ws_feeds_active(feed_manager, ws_task) else 0)
 
                 # Check for stale WS feeds (no data received for > 120s)
                 stale_feeds = feed_manager.get_stale_feeds(max_silent_seconds=120.0)

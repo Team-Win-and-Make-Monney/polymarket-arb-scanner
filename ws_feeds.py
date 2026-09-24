@@ -239,6 +239,11 @@ class FeedManager:
                     len(self._kalshi_tickers))
         return True
 
+    def kalshi_late_feed_running(self) -> bool:
+        """True while a Kalshi feed started by start_kalshi_feed_late() is still running."""
+        task = self._kalshi_late_task
+        return task is not None and not task.done()
+
     def get_stale_feeds(self, max_silent_seconds: float = 120.0) -> list[str]:
         """Return list of platform names that have gone silent beyond threshold.
 

@@ -326,7 +326,9 @@ class ArbitrageExecutor:
 
         # Experimental Jev forecasts have no demonstrated trading calibration.
         # Check the type as well as the marker so a plain dict cannot omit the guard.
-        if not self.dry_run and (opp_type == "JevCrypto" or opportunity.get("_research_only")):
+        # A news snipe whose direction Jev chose is a Jev forecast too.
+        jev_directed = str(opportunity.get("_sentiment_source") or "").startswith("jev")
+        if not self.dry_run and (opp_type == "JevCrypto" or opportunity.get("_research_only") or jev_directed):
             self._log_skipped(opportunity, "jev_research_only")
             return False
 

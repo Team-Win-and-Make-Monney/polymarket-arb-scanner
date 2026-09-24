@@ -115,7 +115,7 @@ class RiskManager:
 
         # 4. Order book depth check (tiered by ROI)
         # Skip depth check for types that create liquidity or are signal-based
-        depth = opportunity.get("_clob_depth", 0)
+        depth = opportunity.get("_clob_depth") or 0
         net_profit = opportunity.get("net_profit", 0)
         total_cost_str = opportunity.get("total_cost", "$0")
         total_cost = float(total_cost_str.replace("$", "")) if isinstance(total_cost_str, str) else float(total_cost_str)
@@ -212,7 +212,7 @@ class RiskManager:
         size = base_size * (1 + roi * aggressiveness * 20)
 
         # Cap at 50% of available depth to avoid slippage
-        depth = opportunity.get("_clob_depth", 0)
+        depth = opportunity.get("_clob_depth") or 0
         if depth > 0:
             size = min(size, depth * 0.5)
 

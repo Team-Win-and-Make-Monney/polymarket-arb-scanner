@@ -238,7 +238,8 @@ def _refine_temporal_with_clob(
                 funnel.record_clob_dropped(1)
             continue
 
-        clob_depth = min(late_depth, early_depth) if (late_depth > 0 and early_depth > 0) else None
+        # Unknown depth is 0, never None: downstream depth checks compare numerically.
+        clob_depth = min(late_depth, early_depth) if (late_depth > 0 and early_depth > 0) else 0.0
 
         cand["_kalshi_late_yes"] = late_yes_ask
         cand["_kalshi_early_no"] = early_no_ask

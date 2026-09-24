@@ -2776,7 +2776,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                 if args.min_depth > 0:
                     all_opportunities = [
                         opp for opp in all_opportunities
-                        if opp.get("_clob_depth", 0) >= args.min_depth
+                        if (opp.get("_clob_depth") or 0) >= args.min_depth
                     ]
                     if _funnel:
                         _funnel.record_depth_dropped(_pre_depth_count - len(all_opportunities))

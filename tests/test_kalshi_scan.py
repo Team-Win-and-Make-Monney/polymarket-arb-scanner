@@ -154,6 +154,7 @@ class TestScanKalshiBinary:
         client = MagicMock()
         client.get_market_price.return_value = (0.45, 0.45)
         client.get_order_book_depth.return_value = {"yes_ask_size": 100, "no_ask_size": 100}
+        funnel = MagicMock()
 
         market = {
             "ticker": "KXTICKER",
@@ -169,6 +170,7 @@ class TestScanKalshiBinary:
 
         with patch("scans.kalshi._within_resolution_window", return_value=True), \
              patch("scans.kalshi.filter_dust", side_effect=lambda x: x), \
+             patch("scans.kalshi._default_funnel", return_value=funnel), \
              patch("scans.kalshi.net_profit_kalshi_binary", return_value={
                  "gross_spread": 0.10, "fees": 0.02, "net_profit": 0.08,
              }):
@@ -181,6 +183,8 @@ class TestScanKalshiBinary:
         assert opp["_kalshi_yes"] == 0.45
         assert opp["_kalshi_no"] == 0.45
         assert opp["net_profit"] == 0.08
+        funnel.record_screened.assert_called_once_with(1)
+        funnel.record_mid_candidates.assert_called_once_with(1)
 
     def test_skips_dust_prices(self):
         from scans.kalshi import scan_kalshi_binary

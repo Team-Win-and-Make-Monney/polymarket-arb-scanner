@@ -31,6 +31,9 @@ class ThresholdSpec:
     date_key: str
     platform: str
     market: dict
+    # Polymarket event id: strike ladders are one event, and only rungs of the same
+    # ladder share resolution rules. "" when unknown (Kalshi tickers, synthetic data).
+    event_key: str = ""
 
 
 # Kalshi ticker pattern: e.g. KXBTC-26DEC31-T100000 or KXINFL-26DEC-B2.5
@@ -39,34 +42,60 @@ _KALSHI_TICKER_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Text threshold patterns for title parsing
+# Magnitude units that may follow a number. The unit must sit directly after the
+# number and end on a word boundary ("$1T", "$800B", "$2.5 million"), never a letter
+# that merely starts the next word ("$100 by March").
+_UNIT_MULTIPLIERS = {
+    "k": 1e3, "thousand": 1e3,
+    "m": 1e6, "million": 1e6,
+    "b": 1e9, "bn": 1e9, "billion": 1e9,
+    "t": 1e12, "tn": 1e12, "trillion": 1e12,
+}
+_UNIT_ALT = "thousand|million|billion|trillion|bn|tn|k|m|b|t"
+_NUM = r"([0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?)"
+_UNIT = r"(?:\s*(" + _UNIT_ALT + r")\b)?"
+
+# Text threshold patterns for title parsing: groups are (underlying, number, unit, rest)
 _ABOVE_PATTERNS = [
-    re.compile(r"(.+?)\s+(?:above|over|greater than|at or above|≥|\>\=?)\s*\$?([0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?)\s*(?:k|m|b)?\s*(.*)", re.IGNORECASE),
-    re.compile(r"(.+?)\s+\$?([0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?)\s*(?:k|m|b)?\s*\+\s*(.*)", re.IGNORECASE),
+    re.compile(r"(.+?)\s+(?:above|over|greater than|at or above|≥|\>\=?)\s*\$?" + _NUM + _UNIT + r"\s*(.*)", re.IGNORECASE),
+    re.compile(r"(.+?)\s+\$?" + _NUM + _UNIT + r"\s*\+\s*(.*)", re.IGNORECASE),
 ]
 
 _BELOW_PATTERNS = [
-    re.compile(r"(.+?)\s+(?:below|under|less than|at or below|≤|\<\=?)\s*\$?([0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?)\s*(?:k|m|b)?\s*(.*)", re.IGNORECASE),
+    re.compile(r"(.+?)\s+(?:below|under|less than|at or below|≤|\<\=?)\s*\$?" + _NUM + _UNIT + r"\s*(.*)", re.IGNORECASE),
 ]
 
 
 def _normalize_num(num_str: str, full_match_str: str = "") -> float | None:
-    """Parse numeric string taking into account k/m/b suffixes."""
-    clean = num_str.replace(",", "").strip()
+    """Parse a number, applying the k/m/b/t (or word) unit written directly after it.
+
+    ``full_match_str`` is the text the number came from. Only a unit immediately
+    following this exact number counts; a digit or decimal just before it (``11``
+    for ``1``) or a longer word after it (``by`` for ``b``) does not.
+    """
+    raw = num_str.strip()
+    clean = raw.replace(",", "")
     try:
         val = float(clean)
     except ValueError:
         return None
 
-    # Check for multiplier in surrounding string
-    lower = full_match_str.lower()
-    if f"{clean.lower()}k" in lower or f"{num_str.lower()}k" in lower:
-        val *= 1_000.0
-    elif f"{clean.lower()}m" in lower or f"{num_str.lower()}m" in lower:
-        val *= 1_000_000.0
-    elif f"{clean.lower()}b" in lower or f"{num_str.lower()}b" in lower:
-        val *= 1_000_000_000.0
+    if full_match_str:
+        unit = re.search(
+            r"(?<![0-9.,])" + re.escape(raw.lower()) + r"\s*(" + _UNIT_ALT + r")\b",
+            full_match_str.lower(),
+        )
+        if unit:
+            val *= _UNIT_MULTIPLIERS[unit.group(1)]
     return val
+
+
+def _event_key(market: dict) -> str:
+    """Stable id of the market's parent event, or "" when the market carries none."""
+    events = market.get("events")
+    if isinstance(events, list) and events and isinstance(events[0], dict):
+        return str(events[0].get("id") or events[0].get("slug") or "")
+    return str(market.get("event_id") or market.get("eventSlug") or "")
 
 
 def _normalize_underlying(raw: str) -> str:
@@ -99,6 +128,8 @@ def parse_threshold_market(market: dict, platform: str = "polymarket") -> Thresh
     title = market.get("title") or market.get("question") or market.get("description", "")
     end_date = (
         market.get("end_date_iso")
+        or market.get("endDateIso")
+        or market.get("endDate")
         or market.get("close_time")
         or market.get("expiration_time")
         or ""
@@ -134,7 +165,7 @@ def parse_threshold_market(market: dict, platform: str = "polymarket") -> Thresh
             groups = match.groups()
             raw_underlying = groups[0]
             num_str = groups[1]
-            strike_val = _normalize_num(num_str, title)
+            strike_val = _normalize_num(num_str, num_str + (groups[2] or ""))
             if strike_val is not None:
                 return ThresholdSpec(
                     underlying=_normalize_underlying(raw_underlying),
@@ -143,6 +174,7 @@ def parse_threshold_market(market: dict, platform: str = "polymarket") -> Thresh
                     date_key=date_key,
                     platform=platform,
                     market=market,
+                    event_key=_event_key(market),
                 )
 
     # 3. Try title patterns for "below" / "under"
@@ -152,7 +184,7 @@ def parse_threshold_market(market: dict, platform: str = "polymarket") -> Thresh
             groups = match.groups()
             raw_underlying = groups[0]
             num_str = groups[1]
-            strike_val = _normalize_num(num_str, title)
+            strike_val = _normalize_num(num_str, num_str + (groups[2] or ""))
             if strike_val is not None:
                 return ThresholdSpec(
                     underlying=_normalize_underlying(raw_underlying),
@@ -161,6 +193,7 @@ def parse_threshold_market(market: dict, platform: str = "polymarket") -> Thresh
                     date_key=date_key,
                     platform=platform,
                     market=market,
+                    event_key=_event_key(market),
                 )
 
     return None
@@ -205,15 +238,15 @@ def discover_subset_pairs(
     pairs: list[dict] = []
 
     # 1. Parse threshold specs
-    grouped: dict[tuple[str, str, str, str], list[ThresholdSpec]] = {}
+    grouped: dict[tuple[str, str, str, str, str], list[ThresholdSpec]] = {}
     for mkt in market_list:
         spec = parse_threshold_market(mkt, platform=platform)
         if spec:
-            key = (spec.underlying, spec.date_key, spec.direction, spec.platform)
+            key = (spec.underlying, spec.date_key, spec.direction, spec.platform, spec.event_key)
             grouped.setdefault(key, []).append(spec)
 
     # 2. Derive threshold implication pairs
-    for (underlying, date_key, direction, mkt_platform), specs in grouped.items():
+    for (underlying, date_key, direction, mkt_platform, _event), specs in grouped.items():
         if len(specs) < 2:
             continue
 

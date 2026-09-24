@@ -36,9 +36,9 @@ jobs:
             gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --disable-auto
           fi
 
-      - name: Remove stale authorization after a head change
+      - name: Remove stale authorization after a head change or draft conversion
         if: >-
-          github.event.action == 'synchronize' &&
+          (github.event.action == 'synchronize' || github.event.action == 'converted_to_draft') &&
           contains(github.event.pull_request.labels.*.name, 'automerge')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -58,7 +58,7 @@ jobs:
         run: |
           permission="$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$LABEL_ACTOR/permission" --jq '.permission')"
           case "$permission" in
-            push|maintain|admin) ;;
+            admin|maintain|write|push) ;;
             *) echo "Actor $LABEL_ACTOR lacks merge-level repository permission"; exit 1 ;;
           esac
 

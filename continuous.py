@@ -148,6 +148,24 @@ def _cache_probability(entry: dict | None, *keys: str) -> float | None:
     return None
 
 
+def _start_kalshi_ws_after_empty_run(feed_manager, ws_task, kalshi_tickers: list[str]) -> bool:
+    """Start the Kalshi WS feed when the first scan had nothing to subscribe.
+
+    ``FeedManager.run()`` returns immediately when scan #1 has no tickers. That
+    happens in ``--mode mm-pilot`` because the pilot selects its markets after
+    the first scan. After that, the per-scan update path, which requires a
+    running ``ws_task``, never fires, so pilot tickers never reach the WS feed.
+    Only a task that finished cleanly is restarted this way; a crashed or
+    cancelled task keeps its existing behaviour. Must run on the event loop.
+    """
+    if ws_task is None or not ws_task.done() or ws_task.cancelled() or ws_task.exception() is not None:
+        return False
+    if not kalshi_tickers:
+        return False
+    feed_manager.update_subscriptions(kalshi_tickers=kalshi_tickers)
+    return feed_manager.start_kalshi_feed_late()
+
+
 def _ws_tracking_probability(platform: str, entry: dict | None) -> float | None:
     """Extract one executable scalar probability for WS-driven trackers."""
     if platform == "polymarket":
@@ -3181,6 +3199,11 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                     # never spawned by run() — start it now (idempotent).
                     if kalshi_client is not None:
                         feed_manager.start_kalshi_feed_late()
+                elif ws_task and kalshi_client is not None:
+                    # run() already returned because scan #1 had nothing to
+                    # subscribe (mm-pilot before selection); start Kalshi now
+                    # and queue later re-selections onto the live connection.
+                    _start_kalshi_ws_after_empty_run(feed_manager, ws_task, kalshi_sub_tickers)
 
                 # Sentry Crons heartbeat: emitted as the LAST step of the try
                 # block so a failure anywhere in the cycle reports "error",

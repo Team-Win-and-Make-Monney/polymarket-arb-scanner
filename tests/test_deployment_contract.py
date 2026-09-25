@@ -17,3 +17,13 @@ class TestRailwayEntrypoint:
         monkeypatch.setattr(config, "DRY_RUN", True)
         assert config.research_dry_run(config.RESEARCH_MODE) is True
         assert config.research_dry_run("all") is False
+
+    def test_research_mode_enables_polymarket_unless_pinned(self, monkeypatch):
+        """Research mode scans Polymarket unless the venue pin restricts it to Kalshi."""
+        import config
+
+        monkeypatch.setattr(config, "_PAPER_SCAN_VENUES", "")
+        assert config.polymarket_scan_enabled(config.RESEARCH_MODE) is True
+
+        monkeypatch.setattr(config, "_PAPER_SCAN_VENUES", "kalshi")
+        assert config.polymarket_scan_enabled(config.RESEARCH_MODE) is False

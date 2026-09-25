@@ -45,4 +45,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
 # start unless DRY_RUN=true and never flips any strategy's execution flag. The
 # broad `all` mode stays off: it duplicated venue fetches and produced
 # multi-minute cycles that blinded the asyncio feed-health tasks.
+# Note: SCAN_VENUES / PAPER_SCAN_VENUES must not be pinned to kalshi-only so
+# research mode fetches Polymarket markets for Fréchet and CTF scans.
 ENTRYPOINT ["python", "scanner.py", "--continuous", "--mode", "research"]

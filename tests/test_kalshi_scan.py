@@ -1,5 +1,6 @@
 """Tests for scans/kalshi.py — Kalshi binary and multi-outcome scan logic."""
 
+import logging
 import pytest
 from unittest.mock import MagicMock, patch
 from typing import ClassVar
@@ -267,12 +268,13 @@ class TestScanKalshiMulti:
         ]
         client.get_order_book_depth.return_value = {"yes_ask_size": 50}
 
+        # Categorical legs need a catch-all leg to form a complete set.
         markets = [
-            {"ticker": "K-A", "title": "A", "close_time": "2030-01-01T00:00:00Z",
+            {"ticker": "K-A", "title": "A", "yes_sub_title": "A", "close_time": "2030-01-01T00:00:00Z",
              "expiration_time": "2030-01-01T00:00:00Z"},
-            {"ticker": "K-B", "title": "B", "close_time": "2030-01-01T00:00:00Z",
+            {"ticker": "K-B", "title": "B", "yes_sub_title": "B", "close_time": "2030-01-01T00:00:00Z",
              "expiration_time": "2030-01-01T00:00:00Z"},
-            {"ticker": "K-C", "title": "C", "close_time": "2030-01-01T00:00:00Z",
+            {"ticker": "K-OTHER", "title": "Other", "yes_sub_title": "Other", "close_time": "2030-01-01T00:00:00Z",
              "expiration_time": "2030-01-01T00:00:00Z"},
         ]
         kalshi_data = (
@@ -302,7 +304,7 @@ class TestScanKalshiMulti:
         client.get_market_price.side_effect = [(0.35, 0.65), (0.33, 0.67), (0.30, 0.70)]
         client.get_order_book_depth.return_value = {"yes_ask_size": 50}
         funnel = MagicMock()
-        markets = [{"ticker": f"K-{x}", "title": x} for x in "ABC"]
+        markets = [{"ticker": f"K-{x}", "title": x, "yes_sub_title": x} for x in ("A", "B", "Other")]
         kalshi_data = (
             [{"event_ticker": "EV1", "mutually_exclusive": True},
              {"event_ticker": "EV2", "mutually_exclusive": False}],
@@ -327,9 +329,9 @@ class TestScanKalshiMulti:
         client.get_market_price.side_effect = [(0.35, 0.65), (0.30, 0.70), (0.25, 0.75)]
         client.get_order_book_depth.return_value = {"yes_ask_size": 50}
         markets = [
-            {"ticker": f"K-{x}", "title": x, "close_time": "2030-01-01T00:00:00Z",
+            {"ticker": f"K-{x}", "title": x, "yes_sub_title": x, "close_time": "2030-01-01T00:00:00Z",
              "expiration_time": "2030-01-01T00:00:00Z"}
-            for x in ("A", "B", "C")
+            for x in ("A", "B", "Other")
         ]
         event = {"event_ticker": "EV1", "title": "Multi Event"}
         if mutually_exclusive is not None:
@@ -361,7 +363,7 @@ class TestScanKalshiMulti:
         assert len(result) >= 1
         assert result[0]["type"].startswith("KalshiMulti")
 
-    def test_skips_mutually_exclusive_with_implausible_sum(self):
+    def test_skips_mutually_exclusive_with_implausible_sum(self, caplog):
         """MECE event whose YES asks sum far below 1.0 → missing/stale legs, not arb."""
         from scans.kalshi import scan_kalshi_multi
 
@@ -370,9 +372,9 @@ class TestScanKalshiMulti:
         client.get_market_price.side_effect = [(0.10, 0.90), (0.10, 0.90), (0.10, 0.90)]
 
         markets = [
-            {"ticker": "K-A", "title": "A", "close_time": "2030-01-01T00:00:00Z"},
-            {"ticker": "K-B", "title": "B", "close_time": "2030-01-01T00:00:00Z"},
-            {"ticker": "K-C", "title": "C", "close_time": "2030-01-01T00:00:00Z"},
+            {"ticker": "K-A", "title": "A", "yes_sub_title": "A", "close_time": "2030-01-01T00:00:00Z"},
+            {"ticker": "K-B", "title": "B", "yes_sub_title": "B", "close_time": "2030-01-01T00:00:00Z"},
+            {"ticker": "K-OTHER", "title": "Other", "yes_sub_title": "Other", "close_time": "2030-01-01T00:00:00Z"},
         ]
         kalshi_data = (
             [{"event_ticker": "EV1", "title": "Sparse", "mutually_exclusive": True}],
@@ -381,10 +383,12 @@ class TestScanKalshiMulti:
         )
 
         with patch("scans.kalshi._within_resolution_window", return_value=True), \
-             patch("scans.kalshi.filter_dust", side_effect=lambda x: x):
+             patch("scans.kalshi.filter_dust", side_effect=lambda x: x), \
+             caplog.at_level(logging.WARNING, logger="scans.kalshi"):
             result = scan_kalshi_multi(client, 0.01, kalshi_data=kalshi_data)
 
         assert result == []
+        assert "Implausible multi sum" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -459,13 +463,158 @@ class TestScanKalshiMultiExhaustiveness:
         result = self._scan(markets, prices)
         assert len(result) == 1
 
-    def test_categorical_event_without_strikes_unchanged(self):
-        # No strike fields at all -> no structural signal; existing behavior kept.
+    def test_categorical_event_without_strikes_skips_ladder_gate(self):
+        # No strike fields -> the ladder gate has no signal and defers to the
+        # categorical gate, which this catch-all leg satisfies.
         markets = [
-            {"ticker": "K-A", "title": "A", **self.CLOSE},
-            {"ticker": "K-B", "title": "B", **self.CLOSE},
-            {"ticker": "K-C", "title": "C", **self.CLOSE},
+            {"ticker": "K-A", "title": "A", "yes_sub_title": "A", **self.CLOSE},
+            {"ticker": "K-B", "title": "B", "yes_sub_title": "B", **self.CLOSE},
+            {"ticker": "K-OTHER", "title": "Other", "yes_sub_title": "Other", **self.CLOSE},
         ]
         prices = [(0.35, 0.65), (0.30, 0.70), (0.25, 0.75)]  # asks sum 0.90
         result = self._scan(markets, prices)
         assert len(result) == 1
+
+
+# ---------------------------------------------------------------------------
+# scan_kalshi_multi — categorical completeness gate (2026-09-24 false positive)
+# ---------------------------------------------------------------------------
+
+
+class TestScanKalshiMultiCategoricalCompleteness:
+    """Categorical events have no strike fields, so the ladder gate cannot judge
+    them. KXTOPMODEL-26SEP28 "Top AI model this week" listed six models (asks
+    0.74/0.06/0.05/0.02/0.02/0.01, net $0.03) and no catch-all leg: an unlisted
+    model finishing first resolves every leg NO. A categorical basket counts
+    only with an explicit catch-all leg and no rule letting every leg lose."""
+
+    CLOSE: ClassVar[dict[str, str]] = {"close_time": "2030-01-01T00:00:00Z", "expiration_time": "2030-01-01T00:00:00Z"}
+    TIEBREAK = (
+        "If two models are tied under Rank (UB), then the model with the highest Arena Score will win. "
+        "If two models are still tied after that, then the model with the most votes will win. "
+        "If two models are still tied after that, the model that was released earlier will win."
+    )
+    MODELS: ClassVar[list[str]] = [
+        "claude-fable-5.1-max", "claude-opus-5-max", "claude-opus-5-high",
+        "claude-opus-4-6-high", "claude-opus-4-6", "gemini-3.8-flash-high",
+    ]
+
+    def _leg(self, label, rules_primary="", rules_secondary=""):
+        slug = "".join(ch for ch in label.upper() if ch.isalnum())
+        return {
+            "ticker": f"K-{slug}", "yes_sub_title": label, "strike_type": "custom",
+            "custom_strike": {"Model": label}, "rules_primary": rules_primary,
+            "rules_secondary": rules_secondary, **self.CLOSE,
+        }
+
+    def _leaderboard_leg(self, label):
+        return self._leg(
+            label,
+            f"If {label} is the top-ranked AI model on Sep 28, 2026 at 10:00 AM ET, then the market resolves to Yes.",
+            self.TIEBREAK,
+        )
+
+    def _scan(self, markets, yes_prices, funnel=None):
+        from scans.kalshi import scan_kalshi_multi
+        client = MagicMock()
+        client.get_market_price.side_effect = [(p, round(1.01 - p, 2)) for p in yes_prices]
+        client.get_order_book_depth.return_value = {"yes_ask_size": 50}
+        event = {
+            "event_ticker": "KXTOPMODEL-26SEP28", "title": "Top AI model this week",
+            "category": "Science and Technology", "mutually_exclusive": True,
+            "collateral_return_type": "MECNET",
+        }
+        kalshi_data = ([event], {"KXTOPMODEL-26SEP28": markets}, {"KXTOPMODEL-26SEP28": "Top AI model this week"})
+        with patch("scans.kalshi._within_resolution_window", return_value=True), \
+             patch("scans.kalshi.filter_dust", side_effect=lambda x: x):
+            result = scan_kalshi_multi(client, 0.01, kalshi_data=kalshi_data, funnel=funnel)
+        return result, client
+
+    def test_top_ai_model_week_without_catch_all_is_rejected(self, caplog):
+        from fees import net_profit_kalshi_multi
+        prices = [0.74, 0.06, 0.05, 0.02, 0.02, 0.01]
+        # The incident basket clears fees: without the gate it is reported.
+        assert net_profit_kalshi_multi(prices)["net_profit"] == pytest.approx(0.03)
+
+        funnel = MagicMock()
+        with caplog.at_level(logging.INFO, logger="scans.kalshi"):
+            result, client = self._scan([self._leaderboard_leg(m) for m in self.MODELS], prices, funnel=funnel)
+
+        assert result == []
+        # Rejected before pricing — not by the sum floor or fees.
+        client.get_market_price.assert_not_called()
+        funnel.record_screened.assert_called_once_with(0)
+        assert "Skipped 1 categorical Kalshi events" in caplog.text
+
+    def test_top_ai_model_week_with_catch_all_leg_is_kept(self):
+        # The same leaderboard, had Kalshi listed a catch-all: exhaustive.
+        other = self._leg(
+            "Other",
+            "If a model not listed in any other market is the top-ranked AI model on Sep 28, 2026 at 10:00 AM ET, "
+            "then the market resolves to Yes.",
+            self.TIEBREAK,
+        )
+        markets = [self._leaderboard_leg(m) for m in self.MODELS] + [other]
+        result, _ = self._scan(markets, [0.72, 0.06, 0.05, 0.02, 0.02, 0.01, 0.02])  # asks sum 0.90
+        assert len(result) == 1
+        assert result[0]["type"] == "KalshiMulti(7)"
+        assert "K-OTHER" in result[0]["_kalshi_tickers"]
+
+    def test_catch_all_with_deadline_rule_is_rejected(self):
+        # KXMODELHIGH-27-1550 lists "Other", but YES needs a model to reach 1550
+        # before Jan 1, 2027. If none does, every leg resolves NO.
+        markets = [
+            self._leg(label, f"If a model by {label} is the first to hit 1550 on Text Arena before Jan 1, 2027, "
+                             "then the market resolves to Yes.")
+            for label in ("Claude", "ChatGPT", "Gemini", "Grok", "Other")
+        ]
+        result, client = self._scan(markets, [0.40, 0.25, 0.15, 0.08, 0.02])
+        assert result == []
+        client.get_market_price.assert_not_called()
+
+    @pytest.mark.parametrize("rules_secondary", [
+        "If no award is given, all participant markets resolve to No.",  # KXBALLONDORAWARD
+        "If no new team governor formally holds the position, then all markets resolve to No.",  # KXNBANEXTGOVERNOR
+        "If no person has qualified, every named market resolves NO.",  # KXQUEBECPREMIER
+        "Should the ceremony be cancelled, all markets resolve to No.",
+        "If nobody is appointed, each market resolves to No.",
+        "If the event is cancelled, all markets will be resolved to No.",
+    ])
+    def test_catch_all_with_no_winner_rule_is_rejected(self, rules_secondary):
+        from scans.kalshi import _is_exhaustive_categorical
+        markets = [
+            self._leg(label, f"If {label} wins the award, then the market resolves to Yes.", rules_secondary)
+            for label in ("Nominee A", "Nominee B", "Other")
+        ]
+        assert _is_exhaustive_categorical(markets) is False
+
+    def test_exclusivity_clause_is_not_a_no_winner_rule(self):
+        # "all other markets resolve to No" restates mutual exclusivity.
+        from scans.kalshi import _is_exhaustive_categorical
+        markets = [
+            self._leg(label, f"If {label} wins the award, then the market resolves to Yes.",
+                      "If one nominee wins, all other markets will resolve to No.")
+            for label in ("Nominee A", "Nominee B", "Other")
+        ]
+        assert _is_exhaustive_categorical(markets) is True
+
+    @pytest.mark.parametrize("label", [
+        "Other", "Others", "OTHER", " other. ", "Any other", "All others",
+        "Someone else", "Anyone else", "Field", "The Field", "None of the above",
+    ])
+    def test_catch_all_labels_recognized(self, label):
+        from scans.kalshi import _is_catch_all_label
+        assert _is_catch_all_label(label) is True
+
+    @pytest.mark.parametrize("label", [
+        "No other person",  # KXNEXTSTATE-29: the no-appointee leg
+        "Other renewables",  # KXPRIMEENGCONSUMPTION-30: one named category
+        "The Outlaw Cherie Lee & Other Western Tales",  # Grammy album title
+        "Any MLS Club",  # KXJOINLEAGUE: one league among several
+        "Any other person (excluding Jeanie Buss)",  # qualified: fails closed
+        "Any other Democrat",  # narrower than the event
+        "nobody", "No one", "None", "Tie", "", None,
+    ])
+    def test_non_catch_all_labels_rejected(self, label):
+        from scans.kalshi import _is_catch_all_label
+        assert _is_catch_all_label(label) is False

@@ -10,6 +10,7 @@ from pair_relations import (
     discover_subset_pairs,
     _normalize_num,
     _normalize_underlying,
+    _event_key,
 )
 
 
@@ -370,3 +371,29 @@ class TestStrikeUnitsAndLadderGrouping:
         assert spec.date_key == "2028-06-15"
         pairs = discover_subset_pairs([m_fallback, m_diff], platform="polymarket")
         assert len(pairs) == 0
+
+    def test_event_key_falls_back_when_first_event_has_no_id_or_slug(self):
+        mkt = {
+            "events": [{"title": "Incomplete Event with No ID"}],
+            "event_id": "market-level-event-123",
+        }
+        assert _event_key(mkt) == "market-level-event-123"
+
+        mkt_slug = {
+            "events": [{}],
+            "eventSlug": "market-level-slug-456",
+        }
+        assert _event_key(mkt_slug) == "market-level-slug-456"
+
+        spec = parse_threshold_market(
+            {
+                "id": "q1",
+                "question": "Will BTC be above $100k?",
+                "endDate": "2028-06-15T00:00:00Z",
+                "events": [{"title": "No ID"}],
+                "event_id": "market-level-event-123",
+            },
+            platform="polymarket",
+        )
+        assert spec is not None
+        assert spec.event_key == "market-level-event-123"

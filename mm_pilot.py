@@ -319,8 +319,8 @@ class ControlsPoller:
 
     @staticmethod
     def _max_stale() -> float:
-        from config import MM_CONTROLS_MAX_STALE_SECONDS
-        return MM_CONTROLS_MAX_STALE_SECONDS
+        import config
+        return config.MM_CONTROLS_MAX_STALE_SECONDS
 
     def set_cached(self, value: bool, fetched_at: float | None = None) -> None:
         """Directly seed the cache (tests / local override)."""

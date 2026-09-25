@@ -23,6 +23,7 @@ from scans.helpers import (
     _days_to_resolution,
     filter_dust,
 )
+from .kalshi import _is_catch_all_label
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,31 @@ def _normalize_outcome_label(label: str) -> str:
     for old, new in _OUTCOME_SYNONYMS.items():
         norm = norm.replace(old, new)
     return norm
+
+
+def _is_unnamed_pm_leg(market: dict) -> bool:
+    """Whether a Polymarket leg lacks a fixed referent another venue could share.
+
+    Augmented negRisk events carry placeholder legs ("Person C", "Team A") that
+    Gamma marks ``active: false`` until Polymarket names them, and an Other leg
+    (``negRiskOther``) whose coverage narrows as placeholders are named. A bare
+    catch-all label covers whatever that venue did not list. Each belongs in the
+    complete set as its own Polymarket token; substituting a Kalshi outcome for
+    it breaks the set. On 2026-09-25 fuzzy matching paired Serie A's Other leg
+    with Kalshi's "Inter" and a "Song T" placeholder with "stupid song".
+
+    Args:
+        market: A Polymarket negRisk market dict from Gamma.
+
+    Returns:
+        True for placeholder, ``negRiskOther`` and bare catch-all legs.
+    """
+    label = market.get("groupItemTitle") or market.get("question") or ""
+    return (
+        market.get("negRiskOther") is True
+        or market.get("active") is False
+        or _is_catch_all_label(label)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -156,8 +182,10 @@ def _match_outcomes(
 ) -> list[dict]:
     """Match individual outcomes within a matched event pair.
 
-    For each PM outcome, tries to find the corresponding Kalshi market
-    by normalised title/question similarity.
+    For each named PM outcome, tries to find the corresponding Kalshi market
+    by normalised title/question similarity. Unnamed PM legs (placeholders,
+    Other) keep their Polymarket price, and Kalshi catch-all legs are never
+    candidates: a catch-all covers a different outcome set on each venue.
 
     Returns:
         List of outcome dicts, each with:
@@ -187,6 +215,8 @@ def _match_outcomes(
     for km in kalshi_markets:
         sub_title = km.get("yes_sub_title", "")
         title = sub_title if sub_title else km.get("title", km.get("ticker", ""))
+        if _is_catch_all_label(title):
+            continue
         norm = _normalize_outcome_label(title)
         if kalshi_client:
             yes_price, _ = kalshi_client.get_market_price(km)
@@ -198,15 +228,16 @@ def _match_outcomes(
     kalshi_matched = set()
 
     for pm_m in pm_markets:
-        label = pm_m.get("groupItemTitle", pm_m.get("question", "?"))
+        label = pm_m.get("groupItemTitle") or pm_m.get("question") or "?"
         pm_norm = _normalize_outcome_label(label)
         prices = parse_outcome_prices(pm_m)
         pm_yes = prices[0] if prices else None
 
-        # Find best matching Kalshi outcome
+        # Find best matching Kalshi outcome; unnamed legs trade on Polymarket only
         best_idx = None
         best_score = 0
-        for i, (km, knorm, kprice) in enumerate(kalshi_by_norm):
+        kalshi_candidates = [] if _is_unnamed_pm_leg(pm_m) else kalshi_by_norm
+        for i, (km, knorm, kprice) in enumerate(kalshi_candidates):
             if i in kalshi_matched:
                 continue
             score = fuzz.token_sort_ratio(pm_norm, knorm)
@@ -330,6 +361,13 @@ def scan_multi_cross(
 
         # Match individual outcomes
         outcomes = _match_outcomes(pm_markets, kalshi_markets, kalshi_client)
+
+        if any(o.get("pm_market") and _is_unnamed_pm_leg(o["pm_market"]) for o in outcomes):
+            logger.debug(
+                "MultiCross skipped: '%s' contains an unnamed Polymarket leg",
+                pm_event.get("title", "?")[:40],
+            )
+            continue
 
         # Require ALL Polymarket outcomes to be matched — if any outcome is
         # dropped, the total cost is artificially low and produces false arbs

@@ -357,3 +357,85 @@ class TestScansTemporal:
         assert refined[0]["_kalshi_late_yes"] == 0.49
         assert refined[0]["_kalshi_early_no"] == 0.35
         mock_client.fetch_order_book.assert_not_called()
+
+    def test_refine_temporal_invalid_cached_price_falls_back(self) -> None:
+        cand = {
+            "type": "TemporalArb",
+            "_early_ticker": "KXBTC-26MAR31-T100000",
+            "_late_ticker": "KXBTC-26JUN30-T100000",
+            "_sup_market": {},
+            "_sub_market": {},
+            "net_profit": 0.08,
+        }
+        # Out-of-range yes_ask (> 1.0) and non-numeric no_ask
+        price_cache = {
+            ("kalshi", "KXBTC-26JUN30-T100000"): {
+                "yes_ask": 1.50,  # Invalid price, must be rejected
+                "yes_ask_size": 100,
+                "orderbook": {
+                    "orderbook_fp": {
+                        "yes_dollars": [["0.45", "100"]],
+                        "no_dollars": [["0.51", "100"]],  # Yields valid 0.49
+                    }
+                },
+                "_ts": time.time(),
+            },
+            ("kalshi", "KXBTC-26MAR31-T100000"): {
+                "no_ask": "not-a-number",  # Invalid price
+                "no_ask_size": 120,
+                "_ts": time.time(),
+            },
+        }
+        mock_client = MagicMock()
+        mock_client.fetch_order_book.return_value = {
+            "orderbook_fp": {
+                "yes_dollars": [["0.65", "120"]],
+                "no_dollars": [["0.30", "150"]],
+            }
+        }
+        refined = _refine_temporal_with_clob(
+            [cand],
+            min_profit=0.01,
+            kalshi_client=mock_client,
+            price_cache=price_cache,
+        )
+        assert len(refined) == 1
+        # Late fell back to embedded orderbook (0.49), early fell back to REST (0.35)
+        assert refined[0]["_kalshi_late_yes"] == 0.49
+        assert refined[0]["_kalshi_early_no"] == 0.35
+        mock_client.fetch_order_book.assert_called_once_with("KXBTC-26MAR31-T100000")
+
+    def test_refine_temporal_invalid_cached_size_treated_as_zero(self) -> None:
+        cand = {
+            "type": "TemporalArb",
+            "_early_ticker": "KXBTC-26MAR31-T100000",
+            "_late_ticker": "KXBTC-26JUN30-T100000",
+            "_sup_market": {},
+            "_sub_market": {},
+            "net_profit": 0.08,
+        }
+        # Non-numeric or non-scalar sizes must become 0.0 without raising
+        price_cache = {
+            ("kalshi", "KXBTC-26JUN30-T100000"): {
+                "yes_ask": 0.49,
+                "yes_ask_size": "unparseable_size",
+                "_ts": time.time(),
+            },
+            ("kalshi", "KXBTC-26MAR31-T100000"): {
+                "no_ask": 0.35,
+                "no_ask_size": {"nested": "dict"},
+                "_ts": time.time(),
+            },
+        }
+        mock_client = MagicMock()
+        refined = _refine_temporal_with_clob(
+            [cand],
+            min_profit=0.01,
+            kalshi_client=mock_client,
+            price_cache=price_cache,
+        )
+        assert len(refined) == 1
+        assert refined[0]["_kalshi_late_yes"] == 0.49
+        assert refined[0]["_kalshi_early_no"] == 0.35
+        assert refined[0]["_clob_depth"] == 0.0
+        mock_client.fetch_order_book.assert_not_called()

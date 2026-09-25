@@ -19,7 +19,7 @@ import time
 
 from fees import net_profit_frechet_implication
 from kalshi_ticker import find_temporal_pairs
-from scans.helpers import _WS_CACHE_MAX_AGE, _days_to_resolution
+from .helpers import _WS_CACHE_MAX_AGE, _days_to_resolution
 
 logger = logging.getLogger(__name__)
 
@@ -162,11 +162,29 @@ def _get_cached_kalshi_quote(ticker: str, price_cache: dict | None) -> dict | No
     if ts is not None and (now - ts > _WS_CACHE_MAX_AGE):
         return None
 
+    def _valid_price(v: object) -> float | None:
+        if v is None or isinstance(v, (bool, dict, list, tuple)):
+            return None
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f if 0.0 <= f <= 1.0 else None
+
+    def _safe_size(value: object) -> float:
+        if value is None or isinstance(value, (bool, dict, list, tuple)):
+            return 0.0
+        try:
+            s = float(value)
+            return s if s > 0.0 else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
     # Check for direct ask fields from normalised WS feeds
-    yes_ask = cached.get("yes_ask")
-    no_ask = cached.get("no_ask")
-    yes_ask_size = cached.get("yes_ask_size")
-    no_ask_size = cached.get("no_ask_size")
+    yes_ask = _valid_price(cached.get("yes_ask"))
+    no_ask = _valid_price(cached.get("no_ask"))
+    yes_ask_size = _safe_size(cached.get("yes_ask_size"))
+    no_ask_size = _safe_size(cached.get("no_ask_size"))
 
     # Fallback to embedded raw orderbook if direct fields missing
     if yes_ask is None or no_ask is None:
@@ -177,17 +195,23 @@ def _get_cached_kalshi_quote(ticker: str, price_cache: dict | None) -> dict | No
             if yes_ask is None:
                 yt = best_yes_ask(parsed)
                 if yt is not None:
-                    yes_ask, yes_ask_size = yt
+                    p = _valid_price(yt[0])
+                    if p is not None:
+                        yes_ask = p
+                        yes_ask_size = _safe_size(yt[1])
             if no_ask is None:
                 nt = best_no_ask(parsed)
                 if nt is not None:
-                    no_ask, no_ask_size = nt
+                    p = _valid_price(nt[0])
+                    if p is not None:
+                        no_ask = p
+                        no_ask_size = _safe_size(nt[1])
 
     return {
-        "yes_ask": float(yes_ask) if yes_ask is not None else None,
-        "yes_ask_size": float(yes_ask_size or 0.0),
-        "no_ask": float(no_ask) if no_ask is not None else None,
-        "no_ask_size": float(no_ask_size or 0.0),
+        "yes_ask": yes_ask,
+        "yes_ask_size": yes_ask_size,
+        "no_ask": no_ask,
+        "no_ask_size": no_ask_size,
     }
 
 

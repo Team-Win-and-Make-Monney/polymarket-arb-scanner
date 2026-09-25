@@ -1718,3 +1718,160 @@ class TestDisputeGateContinuous:
 
         mock_db.upsert_dispute_state.assert_called_once()
         assert mock_executor.risk_manager.uma_state_unavailable is True
+
+
+class TestContinuousDepthFilter:
+    """Verify min_depth filtering in continuous mode handles None and numeric depths."""
+
+    def test_continuous_depth_filter_handles_none_and_numeric_depths(self, monkeypatch):
+        import asyncio
+        import signal as signal_module
+        continuous_module = sys.modules["continuous"]
+
+        captured_signals = {}
+        def capture_sig(sig, handler):
+            if getattr(handler, "__name__", "") == "_signal_handler":
+                captured_signals[sig] = handler
+
+        monkeypatch.setattr(continuous_module.signal, "signal", capture_sig)
+
+        mock_feed = MagicMock()
+        async def mock_feed_run():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                return
+        mock_feed.run = mock_feed_run
+        monkeypatch.setattr(continuous_module, "FeedManager", lambda *a, **kw: mock_feed)
+        monkeypatch.setattr(continuous_module, "reconcile_orphaned_positions", MagicMock())
+        monkeypatch.setattr(continuous_module, "capture_scan_heartbeat", MagicMock())
+        monkeypatch.setattr(continuous_module, "fetch_all_markets", lambda: [{"conditionId": "0x1"}])
+        monkeypatch.setattr(continuous_module, "fetch_events", lambda: [])
+
+        sample_opps = [
+            {"type": "Binary", "market": "M1", "net_profit": 0.05, "total_cost": "$0.95", "_clob_depth": None},
+            {"type": "Binary", "market": "M2", "net_profit": 0.05, "total_cost": "$0.95", "_clob_depth": 10.0},
+            {"type": "Binary", "market": "M3", "net_profit": 0.05, "total_cost": "$0.95", "_clob_depth": 50.0},
+            {"type": "Binary", "market": "M4", "net_profit": 0.05, "total_cost": "$0.95", "_clob_depth": 100.0},
+            {"type": "Binary", "market": "M5", "net_profit": 0.05, "total_cost": "$0.95"},
+        ]
+        monkeypatch.setattr(continuous_module, "scan_binary_internal", lambda *a, **kw: list(sample_opps))
+
+        mock_display = MagicMock()
+        captured_displayed = []
+
+        def on_display(opps, json_flag):
+            captured_displayed.extend(opps)
+            handler = captured_signals[signal_module.SIGTERM]
+            cells = dict(zip(handler.__code__.co_freevars, handler.__closure__ or ()))
+            cells["shutdown_event"].cell_contents.set()
+
+        mock_display.side_effect = on_display
+        monkeypatch.setattr(continuous_module, "display_results", mock_display)
+
+        args = MagicMock()
+        args.mode = "binary"
+        args.interval = 1
+        args.top = 10
+        args.min_depth = 50.0
+        args.max_trade = 10
+        args.exec_mode = "manual"
+        args.limit = None
+        args.json = False
+
+        mock_executor = MagicMock()
+        mock_db = MagicMock()
+
+        continuous_module.run_continuous(
+            args=args,
+            min_profit=0.01,
+            kalshi_client=None,
+            kalshi_api_key_id=None,
+            kalshi_private_key_path=None,
+            executor=mock_executor,
+            db=mock_db,
+            price_cache={},
+        )
+
+        mock_display.assert_called_once()
+        retained_markets = [o["market"] for o in captured_displayed]
+        assert "M3" in retained_markets
+        assert "M4" in retained_markets
+        assert "M1" not in retained_markets
+        assert "M2" not in retained_markets
+        assert "M5" not in retained_markets
+
+    def test_continuous_depth_filter_disabled_when_zero(self, monkeypatch):
+        import asyncio
+        import signal as signal_module
+        continuous_module = sys.modules["continuous"]
+
+        captured_signals = {}
+        def capture_sig(sig, handler):
+            if getattr(handler, "__name__", "") == "_signal_handler":
+                captured_signals[sig] = handler
+
+        monkeypatch.setattr(continuous_module.signal, "signal", capture_sig)
+
+        mock_feed = MagicMock()
+        async def mock_feed_run():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                return
+        mock_feed.run = mock_feed_run
+        monkeypatch.setattr(continuous_module, "FeedManager", lambda *a, **kw: mock_feed)
+        monkeypatch.setattr(continuous_module, "reconcile_orphaned_positions", MagicMock())
+        monkeypatch.setattr(continuous_module, "capture_scan_heartbeat", MagicMock())
+        monkeypatch.setattr(continuous_module, "fetch_all_markets", lambda: [{"conditionId": "0x1"}])
+        monkeypatch.setattr(continuous_module, "fetch_events", lambda: [])
+
+        sample_opps = [
+            {"type": "Binary", "market": "M1", "net_profit": 0.05, "total_cost": "$0.95", "_clob_depth": None},
+            {"type": "Binary", "market": "M2", "net_profit": 0.05, "total_cost": "$0.95", "_clob_depth": 10.0},
+            {"type": "Binary", "market": "M3", "net_profit": 0.05, "total_cost": "$0.95"},
+        ]
+        monkeypatch.setattr(continuous_module, "scan_binary_internal", lambda *a, **kw: list(sample_opps))
+
+        mock_display = MagicMock()
+        captured_displayed = []
+
+        def on_display(opps, json_flag):
+            captured_displayed.extend(opps)
+            handler = captured_signals[signal_module.SIGTERM]
+            cells = dict(zip(handler.__code__.co_freevars, handler.__closure__ or ()))
+            cells["shutdown_event"].cell_contents.set()
+
+        mock_display.side_effect = on_display
+        monkeypatch.setattr(continuous_module, "display_results", mock_display)
+
+        args = MagicMock()
+        args.mode = "binary"
+        args.interval = 1
+        args.top = 10
+        args.min_depth = 0
+        args.max_trade = 10
+        args.exec_mode = "manual"
+        args.limit = None
+        args.json = False
+
+        mock_executor = MagicMock()
+        mock_db = MagicMock()
+
+        continuous_module.run_continuous(
+            args=args,
+            min_profit=0.01,
+            kalshi_client=None,
+            kalshi_api_key_id=None,
+            kalshi_private_key_path=None,
+            executor=mock_executor,
+            db=mock_db,
+            price_cache={},
+        )
+
+        mock_display.assert_called_once()
+        retained_markets = [o["market"] for o in captured_displayed]
+        assert len(retained_markets) == 3
+        assert "M1" in retained_markets
+        assert "M2" in retained_markets
+        assert "M3" in retained_markets

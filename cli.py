@@ -1082,7 +1082,7 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
         before = len(all_opportunities)
         all_opportunities = [
             opp for opp in all_opportunities
-            if opp.get("_clob_depth", 0) >= args.min_depth
+            if (opp.get("_clob_depth") or 0) >= args.min_depth
         ]
         filtered = before - len(all_opportunities)
         if filtered:

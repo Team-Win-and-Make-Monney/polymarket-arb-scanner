@@ -17,6 +17,10 @@ class TestCapitalEfficiencyScore:
         score = capital_efficiency_score(opp)
         assert score == pytest.approx(0.10 / 0.90 * 50, rel=1e-3)
 
+    def test_none_depth_does_not_crash_the_priority_sort(self):
+        opp = {"net_profit": 0.02, "total_cost": "$0.9500", "_clob_depth": None}
+        assert capital_efficiency_score(opp) == pytest.approx(0.02 / 0.95)
+
     def test_low_roi_scores_lower(self):
         opp = {"net_profit": 0.005, "total_cost": "$0.9950", "_clob_depth": 100.0}
         # ROI = 0.005/0.995 = 0.50%, depth capped at 50 -> score = ~0.251

@@ -21,6 +21,7 @@ class TestScansFrechet:
             "end_date_iso": "2026-12-31T00:00:00Z",
             "outcomePrices": ["0.70", "0.30"],
             "clobTokenIds": ["tok_sub_yes", "tok_sub_no"],
+            "events": [{"id": "btc-ladder"}],
         }
         m_sup = {
             "condition_id": "0xsup",
@@ -28,6 +29,7 @@ class TestScansFrechet:
             "end_date_iso": "2026-12-31T00:00:00Z",
             "outcomePrices": ["0.45", "0.55"],
             "clobTokenIds": ["tok_sup_yes", "tok_sup_no"],
+            "events": [{"id": "btc-ladder"}],
         }
         # Violation: P(A=100k) = 0.70 > P(B=90k) = 0.45
         candidates = _frechet().scan_frechet([m_sub, m_sup], platform="polymarket", min_profit=0.01)
@@ -49,6 +51,7 @@ class TestScansFrechet:
             "end_date_iso": "2026-12-31T00:00:00Z",
             "outcomePrices": ["0.40", "0.60"],
             "clobTokenIds": ["tok_sub_yes", "tok_sub_no"],
+            "events": [{"id": "btc-ladder"}],
         }
         m_sup = {
             "condition_id": "0xsup",
@@ -56,6 +59,7 @@ class TestScansFrechet:
             "end_date_iso": "2026-12-31T00:00:00Z",
             "outcomePrices": ["0.65", "0.35"],
             "clobTokenIds": ["tok_sup_yes", "tok_sup_no"],
+            "events": [{"id": "btc-ladder"}],
         }
         # Coherent: P(A=100k) = 0.40 <= P(B=90k) = 0.65
         candidates = _frechet().scan_frechet([m_sub, m_sup], platform="polymarket")
@@ -68,6 +72,7 @@ class TestScansFrechet:
             "end_date_iso": "2026-12-31T00:00:00Z",
             "outcomePrices": ["0.51", "0.49"],
             "clobTokenIds": ["tok_sub_yes", "tok_sub_no"],
+            "events": [{"id": "btc-ladder"}],
         }
         m_sup = {
             "condition_id": "0xsup",
@@ -75,6 +80,7 @@ class TestScansFrechet:
             "end_date_iso": "2026-12-31T00:00:00Z",
             "outcomePrices": ["0.50", "0.50"],
             "clobTokenIds": ["tok_sup_yes", "tok_sup_no"],
+            "events": [{"id": "btc-ladder"}],
         }
         # Spread is 0.01 < min_violation=0.02
         candidates = _frechet().scan_frechet([m_sub, m_sup], min_violation=0.02)
@@ -107,6 +113,7 @@ class TestScansFrechet:
             "end_date_iso": "2026-12-31T00:00:00Z",
             "outcomePrices": ["0.70", "0.30"],
             "clobTokenIds": ["tok_sub_yes", "tok_sub_no"],
+            "events": [{"id": "btc-ladder"}],
         }
         m_sup = {
             "condition_id": "0xsup",
@@ -114,6 +121,7 @@ class TestScansFrechet:
             "end_date_iso": "2026-12-31T00:00:00Z",
             "outcomePrices": ["0.45", "0.55"],
             "clobTokenIds": ["tok_sup_yes", "tok_sup_no"],
+            "events": [{"id": "btc-ladder"}],
         }
         funnel = MagicMock()
         candidates = _frechet().scan_frechet([m_sub, m_sup], platform="polymarket", funnel=funnel)
@@ -162,6 +170,23 @@ class TestScansFrechet:
         assert res["_p_b"] == pytest.approx(0.45)
         funnel.record_clob_evaluated.assert_called_once_with(1)
         funnel.record_surfaced.assert_called_once_with(1)
+
+    def test_refine_frechet_unknown_depth_is_zero_not_none(self):
+        """Cached books can carry no sizes; the surfaced depth must stay numeric (fails closed)."""
+        m_sub = {"condition_id": "0xsub", "title": "BTC above $100k?"}
+        m_sup = {"condition_id": "0xsup", "title": "BTC above $90k?"}
+        cand = {"type": "FrechetArb", "_platform": "polymarket", "_sub_market": m_sub, "_sup_market": m_sup}
+
+        def mock_fetch(market, cache):
+            if market["condition_id"] == "0xsup":
+                return market, {"yes_ask": 0.45, "yes_ask_size": 0}
+            return market, {"no_ask": 0.30, "no_ask_size": 0}
+
+        with patch("scans.frechet._fetch_clob_for_market", side_effect=mock_fetch):
+            refined = _frechet()._refine_frechet_with_clob([cand], min_profit=0.01)
+
+        assert len(refined) == 1
+        assert refined[0]["_clob_depth"] == 0.0
 
     def test_refine_frechet_with_clob_drops_unprofitable(self):
         m_sub = {"condition_id": "0xsub"}

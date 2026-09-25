@@ -667,6 +667,13 @@ class KalshiMMPilot:
                               for oid, info in self._orders.items()}
             selected = sorted(self._selected) if self._selected else []
         status_val = "halted" if self.halted else ("stopped" if self._stopped else "active")
+        kill_switch = None
+        if self._controls is not None:
+            try:
+                kill_switch = self._controls.is_enabled()
+            except Exception as e:
+                logger.debug("Failed reading kill switch status for persistence: %s", e)
+
         state = {
             "active": (not self.halted) and (not self._stopped),
             "status": status_val,
@@ -680,6 +687,7 @@ class KalshiMMPilot:
             "dry_run": self.dry_run,
             "reconciled": self._reconciled,
             "fills_blind": self._fills_blind,
+            "kill_switch_enabled": kill_switch,
             "last_fill_ts": self._last_fill_ts,
             "orders": orders_snapshot,
             "selected_markets": selected,

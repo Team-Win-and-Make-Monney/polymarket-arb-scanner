@@ -1690,6 +1690,7 @@ class TestMMPilotStatusTelemetry:
         assert saved["selected_markets"] == [TICKER]
         assert oid in saved["orders"]
         assert "inventory" in saved
+        assert "kill_switch_enabled" in saved
         assert "saved_at" in saved
 
     def test_stop_persists_stopped_state(self, pilot_env, clock, tmp_path):

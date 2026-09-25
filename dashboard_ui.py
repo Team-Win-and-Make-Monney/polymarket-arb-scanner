@@ -1390,6 +1390,9 @@ function renderMMPilot(data) {
   } else if (data.halted) {
     statusBadge.className = 'badge badge-error';
     statusBadge.textContent = 'PILOT: HALTED' + (data.halt_reason ? ' (' + data.halt_reason + ')' : '');
+  } else if (data.reconciled === false) {
+    statusBadge.className = 'badge badge-error';
+    statusBadge.textContent = 'PILOT: NOT READY';
   } else if (data.dry_run) {
     statusBadge.className = 'badge badge-dry';
     statusBadge.textContent = 'PILOT: DRY-RUN';

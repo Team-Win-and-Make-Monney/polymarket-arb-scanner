@@ -1149,12 +1149,43 @@ class TestMMPilotDashboardIntegration:
         finally:
             server.shutdown()
 
+    def test_mm_pilot_endpoint_legacy_file_without_lifecycle_treated_as_stale(self, tmp_path):
+        """Legacy state file with recent timestamp but missing active/status is treated as stale."""
+        orig_pilot = state.mm_pilot
+        orig_path = state.mm_pilot_state_path
+        state.mm_pilot = None
+
+        state_file = tmp_path / "mm_pilot_state.json"
+        state_data = {
+            "dry_run": True,
+            "orders": {},
+            "inventory": {"net": {}, "avg": {}, "realized": {}},
+            "saved_at": time.time(),
+        }
+        state_file.write_text(json.dumps(state_data))
+        state.mm_pilot_state_path = str(state_file)
+
+        server, url = _start_test_server(18859)
+        try:
+            with patch("config.DASHBOARD_PASS", ""):
+                status, body, _ = _get(url, "/api/mm-pilot")
+            assert status == 200
+            data = json.loads(body)
+            assert data["source"] == "file"
+            assert data["active"] is False
+            assert data["status"] == "stale"
+        finally:
+            server.shutdown()
+            state.mm_pilot = orig_pilot
+            state.mm_pilot_state_path = orig_path
+
     def test_dashboard_ui_html_inventory_and_stopped_badges(self):
         """Verify dashboard HTML contains renderMMPilot with inventory mapping and stopped/stale badges."""
         from dashboard_ui import get_dashboard_html
         html = get_dashboard_html()
         assert "PILOT: STOPPED" in html
         assert "PILOT: STALE" in html
+        assert "PILOT: NOT READY" in html
         assert "inventory.net" in html
 
     def test_dashboard_ui_html_telemetry_failure_and_inactive_reset(self):

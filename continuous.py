@@ -1280,6 +1280,7 @@ def _scan_frechet_layer1(poly_markets, mode, min_profit, price_cache=None, funne
     if not (getattr(config, "FRECHET_ARB_ENABLED", False) or config.research_dry_run(mode)):
         return []
     if not poly_markets:
+        _log_research_strategy(mode, "frechet", 0, 0, 0)
         return []
     try:
         from scans.frechet import scan_frechet, _refine_frechet_with_clob
@@ -1305,6 +1306,7 @@ def _scan_temporal_layer1(kalshi_markets, mode, min_profit, kalshi_client=None, 
     if not (getattr(config, "TEMPORAL_ARB_ENABLED", False) or config.research_dry_run(mode)):
         return []
     if not kalshi_markets:
+        _log_research_strategy(mode, "temporal", 0, 0, 0)
         return []
     try:
         from scans.temporal import scan_temporal_arb, _refine_temporal_with_clob
@@ -1336,6 +1338,7 @@ def _scan_ctf_layer1(poly_markets, mode, min_profit, price_cache=None, funnel=No
     if not enabled and not (is_explicit and is_dry_run) and not config.research_dry_run(mode):
         return []
     if not poly_markets:
+        _log_research_strategy(mode, "ctf", 0, None, 0)
         return []
     try:
         from scans.ctf import scan_ctf

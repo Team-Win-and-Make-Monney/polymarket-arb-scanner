@@ -1530,6 +1530,20 @@ class TestResearchModeLayer1Scans:
         assert _scan_frechet_layer1([{"title": "m"}], mode="all", min_profit=0.01) == []
         assert _scan_temporal_layer1([{"ticker": "K"}], mode="all", min_profit=0.01) == []
 
+    def test_research_empty_inputs_log_strategy_reports(self, monkeypatch, caplog):
+        from continuous import _scan_ctf_layer1, _scan_frechet_layer1, _scan_temporal_layer1
+        self._flags_off(monkeypatch, dry_run=True)
+        with caplog.at_level("INFO", logger="continuous"):
+            assert _scan_frechet_layer1([], mode="research", min_profit=0.01) == []
+            assert _scan_temporal_layer1([], mode="research", min_profit=0.01) == []
+            assert _scan_ctf_layer1([], mode="research", min_profit=0.01) == []
+        lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Research ")]
+        assert lines == [
+            "Research frechet: 0 inputs -> 0 candidates -> 0 surfaced after CLOB refine",
+            "Research temporal: 0 inputs -> 0 candidates -> 0 surfaced after CLOB refine",
+            "Research ctf: 0 inputs -> n/a candidates -> 0 surfaced after CLOB refine",
+        ]
+
 
 class TestTemporalContinuousScan:
     """Test _scan_temporal_layer1 continuous dispatch and gating."""

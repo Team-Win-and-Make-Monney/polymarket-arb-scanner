@@ -9,6 +9,7 @@ import base64
 import hmac
 import json
 import logging
+import os
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -96,6 +97,111 @@ def _build_rewards_metrics(reward_tracker) -> dict:
     }
 
 
+def _get_mm_pilot_telemetry() -> dict:
+    """Retrieve MM Pilot telemetry from active instance or persisted state file.
+
+    Returns:
+        Dict with pilot status, orders, inventory, and safety attributes.
+    """
+    # 1. Check in-process active pilot instance
+    if state.mm_pilot is not None:
+        try:
+            status = state.mm_pilot.get_status()
+            status["source"] = "instance"
+            return status
+        except Exception as e:
+            logger.debug("Error getting mm_pilot status from instance: %s", e)
+
+    # 2. Check persisted state file
+    candidate_paths: list[str] = []
+    if state.mm_pilot_state_path:
+        candidate_paths.append(state.mm_pilot_state_path)
+    env_path = os.getenv("MM_STATE_PATH")
+    if env_path:
+        candidate_paths.append(env_path)
+    candidate_paths.append("mm_pilot_state.json")
+    candidate_paths.append("/app/mm_pilot_state.json")
+
+    for path in candidate_paths:
+        try:
+            norm_path = os.path.normpath(path)
+            if os.path.isfile(norm_path):
+                with open(norm_path, "r", encoding="utf-8") as f:
+                    file_state = json.load(f)
+                if isinstance(file_state, dict):
+                    # Normalize orders dict to list
+                    raw_orders = file_state.get("orders")
+                    if isinstance(raw_orders, dict):
+                        file_state["orders"] = [
+                            {"order_id": oid, **info}
+                            for oid, info in raw_orders.items()
+                            if isinstance(info, dict)
+                        ]
+                        file_state["resting_orders"] = len(file_state["orders"])
+                    elif isinstance(raw_orders, list):
+                        file_state["resting_orders"] = len(raw_orders)
+                    else:
+                        file_state["orders"] = []
+                        file_state["resting_orders"] = 0
+
+                    # Derive inventory totals from snapshot if not directly provided
+                    inv = file_state.get("inventory")
+                    if isinstance(inv, dict):
+                        net_map = inv.get("net", {}) if isinstance(inv.get("net"), dict) else {}
+                        avg_map = inv.get("avg", {}) if isinstance(inv.get("avg"), dict) else {}
+                        realized_map = inv.get("realized", {}) if isinstance(inv.get("realized"), dict) else {}
+                        if "total_inventory_usd" not in file_state:
+                            file_state["total_inventory_usd"] = sum(
+                                abs(cnt) * avg_map.get(tk, 0.0)
+                                for tk, cnt in net_map.items()
+                                if isinstance(cnt, (int, float))
+                            )
+                        if "realized_pnl" not in file_state:
+                            file_state["realized_pnl"] = sum(
+                                val for val in realized_map.values()
+                                if isinstance(val, (int, float))
+                            )
+                    else:
+                        file_state.setdefault("total_inventory_usd", 0.0)
+                        file_state.setdefault("realized_pnl", 0.0)
+
+                    # Freshness and explicit lifecycle status check
+                    saved_at = file_state.get("saved_at")
+                    is_stopped = file_state.get("stopped", False)
+                    is_halted = file_state.get("halted", False)
+                    now = time.time()
+
+                    if is_stopped:
+                        file_state["active"] = False
+                        file_state["status"] = "stopped"
+                    elif is_halted:
+                        file_state["active"] = False
+                        file_state["status"] = "halted"
+                    elif not isinstance(saved_at, (int, float)) or (now - saved_at > 120.0):
+                        file_state["active"] = False
+                        file_state["status"] = "stale"
+                    elif "active" not in file_state or "status" not in file_state:
+                        file_state["active"] = False
+                        file_state["status"] = "stale"
+                    elif file_state.get("active", False):
+                        file_state["status"] = "active"
+                    else:
+                        file_state["active"] = False
+                        file_state["status"] = "inactive"
+
+                    file_state["source"] = "file"
+                    file_state["path"] = norm_path
+                    return file_state
+        except Exception as e:
+            logger.debug("Error reading mm_pilot state from %s: %s", path, e)
+
+    return {
+        "active": False,
+        "status": "inactive",
+        "message": "Kalshi MM Pilot not active (no running instance or state file)",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Shared scanner state (updated by cli.py / continuous.py)
 # ---------------------------------------------------------------------------
@@ -124,6 +230,9 @@ class _DashboardState:
         self.convergence_signals = 0
         self.jev_crypto_opps = 0
         self.signal_sources_active = 0
+        # MM Pilot telemetry
+        self.mm_pilot = None
+        self.mm_pilot_state_path: str | None = None
         # Analytics (MON-01): per-strategy P&L metrics
         self.strategy_metrics: list[dict] = []
         self.platform_health: dict = {}
@@ -150,6 +259,7 @@ class _DashboardState:
     def to_dict(self) -> dict:
         # Build rewards metrics if tracker is available
         rewards_metrics = _build_rewards_metrics(self.reward_tracker)
+        mm_pilot_telemetry = _get_mm_pilot_telemetry()
 
         return {
             "scan_count": self.scan_count,
@@ -171,6 +281,16 @@ class _DashboardState:
             "strategy_metrics": self.strategy_metrics,
             "platform_health": self.platform_health,
             "rewards": rewards_metrics,
+            "mm_pilot": {
+                "active": mm_pilot_telemetry.get("active", False),
+                "halted": mm_pilot_telemetry.get("halted", False),
+                "dry_run": mm_pilot_telemetry.get("dry_run", True),
+                "canary_graduated": mm_pilot_telemetry.get("canary_graduated", False),
+                "canary_clean_fills": mm_pilot_telemetry.get("canary_clean_fills", 0),
+                "resting_orders": mm_pilot_telemetry.get("resting_orders", 0),
+                "total_inventory_usd": mm_pilot_telemetry.get("total_inventory_usd", 0.0),
+                "realized_pnl": mm_pilot_telemetry.get("realized_pnl", 0.0),
+            },
         }
 
 
@@ -377,6 +497,7 @@ class _Handler(BaseHTTPRequestHandler):
             "/api/validation": self._handle_validation,
             "/api/jev/calibration": self._handle_jev_calibration,
             "/api/funnel": self._handle_funnel,
+            "/api/mm-pilot": self._handle_mm_pilot,
         }
 
         handler_fn = routes.get(path)
@@ -456,6 +577,11 @@ class _Handler(BaseHTTPRequestHandler):
             "cumulative": tracker.cumulative.to_dict(),
             "history": tracker.cycle_history[-20:],
         })
+
+    def _handle_mm_pilot(self):
+        """Serve Kalshi MM Pilot telemetry JSON."""
+        data = _get_mm_pilot_telemetry()
+        _send_json(self, data)
 
     def _handle_metrics(self):
         """Prometheus-compatible metrics endpoint (text exposition format).

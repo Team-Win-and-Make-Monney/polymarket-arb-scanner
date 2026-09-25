@@ -333,6 +333,11 @@ class TestClampSize:
         result = rm.clamp_size(desired_size=5.0, depth=0, balance=100.0)
         assert result == 5.0
 
+    def test_none_depth_not_used(self, rm):
+        # depth=None should fall back to 0 without raising TypeError
+        result = rm.clamp_size(desired_size=5.0, depth=None, balance=100.0)
+        assert result == 5.0
+
     def test_none_balance(self, rm):
         result = rm.clamp_size(desired_size=5.0, depth=100.0, balance=None)
         assert result == 5.0

@@ -185,7 +185,7 @@ def capital_efficiency_score(opp: dict) -> float:
     if total_cost <= 0:
         return 0.0
 
-    depth = opp.get("_clob_depth", 0)
+    depth = opp.get("_clob_depth") or 0
     if depth <= 0:
         depth = 1
 

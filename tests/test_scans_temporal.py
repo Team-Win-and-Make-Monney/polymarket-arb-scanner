@@ -126,6 +126,23 @@ class TestScansTemporal:
         assert ref["_clob_depth"] == 100  # min(100, 120)
         assert ref["net_profit"] > 0.05
 
+    def test_refine_temporal_unknown_depth_is_zero_not_none(self) -> None:
+        cand = {
+            "type": "TemporalArb",
+            "_early_ticker": "KXBTC-26MAR31-T100000",
+            "_late_ticker": "KXBTC-26JUN30-T100000",
+            "_sup_market": {"orderbook": {"orderbook_fp": {
+                "yes_dollars": [["0.45", "0"]], "no_dollars": [["0.51", "0"]]}}},
+            "_sub_market": {"orderbook": {"orderbook_fp": {
+                "yes_dollars": [["0.65", "0"]], "no_dollars": [["0.30", "0"]]}}},
+            "net_profit": 0.08,
+            "_p_early": 0.65,
+            "_p_late": 0.49,
+        }
+        refined = _refine_temporal_with_clob([cand], min_profit=0.01)
+        assert len(refined) == 1
+        assert refined[0]["_clob_depth"] == 0.0
+
     def test_refine_temporal_drops_when_clob_spread_erodes(self) -> None:
         cand = {
             "type": "TemporalArb",

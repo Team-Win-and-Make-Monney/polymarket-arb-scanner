@@ -220,8 +220,9 @@ class RiskManager:
         size = min(size, self.max_trade_size)
         return max(0, size)
 
-    def clamp_size(self, desired_size: float, depth: float, balance: float | None) -> float:
+    def clamp_size(self, desired_size: float, depth: float | None, balance: float | None) -> float:
         """Calculate safe trade size given constraints."""
+        depth = depth or 0
         size = min(desired_size, self.max_trade_size)
         if depth > 0:
             size = min(size, depth)

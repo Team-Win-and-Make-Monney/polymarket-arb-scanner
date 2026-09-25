@@ -94,7 +94,9 @@ def _event_key(market: dict) -> str:
     """Stable id of the market's parent event, or "" when the market carries none."""
     events = market.get("events")
     if isinstance(events, list) and events and isinstance(events[0], dict):
-        return str(events[0].get("id") or events[0].get("slug") or "")
+        key = str(events[0].get("id") or events[0].get("slug") or "")
+        if key:
+            return key
     return str(market.get("event_id") or market.get("eventSlug") or "")
 
 
@@ -242,6 +244,8 @@ def discover_subset_pairs(
     for mkt in market_list:
         spec = parse_threshold_market(mkt, platform=platform)
         if spec:
+            if spec.platform == "polymarket" and not spec.event_key:
+                continue
             key = (spec.underlying, spec.date_key, spec.direction, spec.platform, spec.event_key)
             grouped.setdefault(key, []).append(spec)
 

@@ -148,6 +148,60 @@ def _cache_probability(entry: dict | None, *keys: str) -> float | None:
     return None
 
 
+def _start_kalshi_ws_after_empty_run(feed_manager, ws_task, kalshi_tickers: list[str]) -> bool:
+    """Start the Kalshi WS feed when the first scan had nothing to subscribe.
+
+    ``FeedManager.run()`` returns immediately when scan #1 has no tickers. That
+    happens in ``--mode mm-pilot`` because the pilot selects its markets after
+    the first scan. After that, the per-scan update path, which requires a
+    running ``ws_task``, never fires, so pilot tickers never reach the WS feed.
+    Only a task that finished cleanly is restarted this way; a crashed or
+    cancelled task keeps its existing behaviour. Must run on the event loop.
+    """
+    if ws_task is None or not ws_task.done() or ws_task.cancelled() or ws_task.exception() is not None:
+        return False
+    if not kalshi_tickers:
+        return False
+    feed_manager.update_subscriptions(kalshi_tickers=kalshi_tickers)
+    return feed_manager.start_kalshi_feed_late()
+
+
+def _sync_ws_feeds(feed_manager, ws_task, scan_count: int, poly_sub_ids: list[str],
+                   kalshi_sub_tickers: list[str], kalshi_client):
+    """Start WS feeds on scan #1, then keep subscriptions current. Returns the WS task."""
+    if scan_count == 1 and not ws_task:
+        feed_manager.subscribe_polymarket(poly_sub_ids)
+        if kalshi_client:
+            feed_manager.subscribe_kalshi(kalshi_sub_tickers)
+        ws_task = asyncio.create_task(feed_manager.run())
+        logger.info(
+            "WS feeds started: %d Polymarket tokens, %d Kalshi tickers",
+            len(poly_sub_ids), len(kalshi_sub_tickers),
+        )
+    elif ws_task and not ws_task.done():
+        feed_manager.update_subscriptions(
+            poly_token_ids=poly_sub_ids,
+            kalshi_tickers=kalshi_sub_tickers,
+        )
+        # If Kalshi healed after a degraded boot, its WS task was
+        # never spawned by run() — start it now (idempotent).
+        if kalshi_client is not None:
+            feed_manager.start_kalshi_feed_late()
+    elif ws_task and kalshi_client is not None:
+        # run() already returned because scan #1 had nothing to
+        # subscribe (mm-pilot before selection); start Kalshi now
+        # and queue later re-selections onto the live connection.
+        _start_kalshi_ws_after_empty_run(feed_manager, ws_task, kalshi_sub_tickers)
+    return ws_task
+
+
+def _ws_feeds_active(feed_manager, ws_task) -> bool:
+    """True while any WS feed runs, including a Kalshi feed started after an empty run."""
+    if ws_task is not None and not ws_task.done():
+        return True
+    return feed_manager.kalshi_late_feed_running()
+
+
 def _ws_tracking_probability(platform: str, entry: dict | None) -> float | None:
     """Extract one executable scalar probability for WS-driven trackers."""
     if platform == "polymarket":
@@ -2833,7 +2887,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                 dashboard_state.last_opportunities = all_opportunities[:20]
                 dashboard_state.open_positions = db.get_open_positions_count()
                 dashboard_state.daily_pnl = db.get_daily_pnl()
-                dashboard_state.ws_connections = (1 if ws_task and not ws_task.done() else 0)
+                dashboard_state.ws_connections = (1 if _ws_feeds_active(feed_manager, ws_task) else 0)
                 # Update Layer 2-5 dashboard counters
                 dashboard_state.stale_detections = sum(
                     1 for o in all_opportunities if o.get("type") == "StalePriceOpp")
@@ -2885,7 +2939,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                         for opp in all_opportunities:
                             _metrics.observe("opportunity_profit", value=opp.get("net_profit", 0))
                     _metrics.set("ws_connected", {"platform": "combined"},
-                                 value=1 if ws_task and not ws_task.done() else 0)
+                                 value=1 if _ws_feeds_active(feed_manager, ws_task) else 0)
 
                 # Check for stale WS feeds (no data received for > 120s)
                 stale_feeds = feed_manager.get_stale_feeds(max_silent_seconds=120.0)
@@ -3184,24 +3238,9 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                         if _pt and _pt not in kalshi_sub_tickers:
                             kalshi_sub_tickers.append(_pt)
 
-                if scan_count == 1 and not ws_task:
-                    feed_manager.subscribe_polymarket(poly_sub_ids)
-                    if kalshi_client:
-                        feed_manager.subscribe_kalshi(kalshi_sub_tickers)
-                    ws_task = asyncio.create_task(feed_manager.run())
-                    logger.info(
-                        "WS feeds started: %d Polymarket tokens, %d Kalshi tickers",
-                        len(poly_sub_ids), len(kalshi_sub_tickers),
-                    )
-                elif ws_task and not ws_task.done():
-                    feed_manager.update_subscriptions(
-                        poly_token_ids=poly_sub_ids,
-                        kalshi_tickers=kalshi_sub_tickers,
-                    )
-                    # If Kalshi healed after a degraded boot, its WS task was
-                    # never spawned by run() — start it now (idempotent).
-                    if kalshi_client is not None:
-                        feed_manager.start_kalshi_feed_late()
+                ws_task = _sync_ws_feeds(
+                    feed_manager, ws_task, scan_count, poly_sub_ids, kalshi_sub_tickers, kalshi_client,
+                )
 
                 # Sentry Crons heartbeat: emitted as the LAST step of the try
                 # block so a failure anywhere in the cycle reports "error",

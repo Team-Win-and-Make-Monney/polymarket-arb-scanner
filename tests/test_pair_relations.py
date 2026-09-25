@@ -10,6 +10,7 @@ from pair_relations import (
     discover_subset_pairs,
     _normalize_num,
     _normalize_underlying,
+    _event_key,
 )
 
 
@@ -129,12 +130,14 @@ class TestSubsetPairDiscovery:
             "condition_id": "0xbtc90",
             "title": "Will Bitcoin be above $90k by Dec 31?",
             "end_date_iso": "2026-12-31T00:00:00Z",
+            "events": [{"id": "test-btc-ladder"}],
             "tokens": [{"token_id": "tok90_yes", "outcome": "Yes"}, {"token_id": "tok90_no", "outcome": "No"}],
         }
         m100 = {
             "condition_id": "0xbtc100",
             "title": "Will Bitcoin be above $100k by Dec 31?",
             "end_date_iso": "2026-12-31T00:00:00Z",
+            "events": [{"id": "test-btc-ladder"}],
             "tokens": [{"token_id": "tok100_yes", "outcome": "Yes"}, {"token_id": "tok100_no", "outcome": "No"}],
         }
 
@@ -148,6 +151,23 @@ class TestSubsetPairDiscovery:
         assert pair["_sub_strike"] == 100000.0
         assert pair["_sup_strike"] == 90000.0
 
+    def test_discover_subset_pairs_missing_event_key_ignored(self):
+        # Polymarket markets without an event_key should not pair into synthetic ladders
+        m90 = {
+            "condition_id": "0xbtc90",
+            "title": "Will Bitcoin be above $90k by Dec 31?",
+            "end_date_iso": "2026-12-31T00:00:00Z",
+            "tokens": [{"token_id": "tok90_yes", "outcome": "Yes"}, {"token_id": "tok90_no", "outcome": "No"}],
+        }
+        m100 = {
+            "condition_id": "0xbtc100",
+            "title": "Will Bitcoin be above $100k by Dec 31?",
+            "end_date_iso": "2026-12-31T00:00:00Z",
+            "tokens": [{"token_id": "tok100_yes", "outcome": "Yes"}, {"token_id": "tok100_no", "outcome": "No"}],
+        }
+        pairs = discover_subset_pairs([m90, m100], platform="polymarket")
+        assert len(pairs) == 0
+
     def test_discover_subset_pairs_below_strikes(self):
         # CPI < 2.0% implies CPI < 3.0%
         # Lower strike (2.0%) is subset (A), higher strike (3.0%) is superset (B)
@@ -155,11 +175,13 @@ class TestSubsetPairDiscovery:
             "condition_id": "0xcpi2",
             "title": "US CPI under 2.0% in Dec",
             "end_date_iso": "2026-12-31T00:00:00Z",
+            "events": [{"id": "test-cpi-ladder"}],
         }
         m3 = {
             "condition_id": "0xcpi3",
             "title": "US CPI under 3.0% in Dec",
             "end_date_iso": "2026-12-31T00:00:00Z",
+            "events": [{"id": "test-cpi-ladder"}],
         }
 
         pairs = discover_subset_pairs([m2, m3], platform="polymarket")
@@ -330,3 +352,48 @@ class TestStrikeUnitsAndLadderGrouping:
         ]
         assert discover_subset_pairs(same_event_diff_date, platform="polymarket") == []
         assert discover_subset_pairs(diff_event_same_date, platform="polymarket") == []
+
+    def test_end_date_fallback_without_iso(self):
+        m_fallback = {
+            "id": "q1",
+            "question": "Will BTC be above $100k?",
+            "endDate": "2028-06-15T00:00:00Z",
+            "events": [{"id": "e1"}],
+        }
+        m_diff = {
+            "id": "q2",
+            "question": "Will BTC be above $90k?",
+            "endDate": "2028-12-31T00:00:00Z",
+            "events": [{"id": "e1"}],
+        }
+        spec = parse_threshold_market(m_fallback, platform="polymarket")
+        assert spec is not None
+        assert spec.date_key == "2028-06-15"
+        pairs = discover_subset_pairs([m_fallback, m_diff], platform="polymarket")
+        assert len(pairs) == 0
+
+    def test_event_key_falls_back_when_first_event_has_no_id_or_slug(self):
+        mkt = {
+            "events": [{"title": "Incomplete Event with No ID"}],
+            "event_id": "market-level-event-123",
+        }
+        assert _event_key(mkt) == "market-level-event-123"
+
+        mkt_slug = {
+            "events": [{}],
+            "eventSlug": "market-level-slug-456",
+        }
+        assert _event_key(mkt_slug) == "market-level-slug-456"
+
+        spec = parse_threshold_market(
+            {
+                "id": "q1",
+                "question": "Will BTC be above $100k?",
+                "endDate": "2028-06-15T00:00:00Z",
+                "events": [{"title": "No ID"}],
+                "event_id": "market-level-event-123",
+            },
+            platform="polymarket",
+        )
+        assert spec is not None
+        assert spec.event_key == "market-level-event-123"

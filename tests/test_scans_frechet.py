@@ -21,6 +21,7 @@ class TestScansFrechet:
             "end_date_iso": "2026-12-31T00:00:00Z",
             "outcomePrices": ["0.70", "0.30"],
             "clobTokenIds": ["tok_sub_yes", "tok_sub_no"],
+            "events": [{"id": "btc-ladder"}],
         }
         m_sup = {
             "condition_id": "0xsup",
@@ -28,6 +29,7 @@ class TestScansFrechet:
             "end_date_iso": "2026-12-31T00:00:00Z",
             "outcomePrices": ["0.45", "0.55"],
             "clobTokenIds": ["tok_sup_yes", "tok_sup_no"],
+            "events": [{"id": "btc-ladder"}],
         }
         # Violation: P(A=100k) = 0.70 > P(B=90k) = 0.45
         candidates = _frechet().scan_frechet([m_sub, m_sup], platform="polymarket", min_profit=0.01)
@@ -49,6 +51,7 @@ class TestScansFrechet:
             "end_date_iso": "2026-12-31T00:00:00Z",
             "outcomePrices": ["0.40", "0.60"],
             "clobTokenIds": ["tok_sub_yes", "tok_sub_no"],
+            "events": [{"id": "btc-ladder"}],
         }
         m_sup = {
             "condition_id": "0xsup",
@@ -56,6 +59,7 @@ class TestScansFrechet:
             "end_date_iso": "2026-12-31T00:00:00Z",
             "outcomePrices": ["0.65", "0.35"],
             "clobTokenIds": ["tok_sup_yes", "tok_sup_no"],
+            "events": [{"id": "btc-ladder"}],
         }
         # Coherent: P(A=100k) = 0.40 <= P(B=90k) = 0.65
         candidates = _frechet().scan_frechet([m_sub, m_sup], platform="polymarket")
@@ -68,6 +72,7 @@ class TestScansFrechet:
             "end_date_iso": "2026-12-31T00:00:00Z",
             "outcomePrices": ["0.51", "0.49"],
             "clobTokenIds": ["tok_sub_yes", "tok_sub_no"],
+            "events": [{"id": "btc-ladder"}],
         }
         m_sup = {
             "condition_id": "0xsup",
@@ -75,6 +80,7 @@ class TestScansFrechet:
             "end_date_iso": "2026-12-31T00:00:00Z",
             "outcomePrices": ["0.50", "0.50"],
             "clobTokenIds": ["tok_sup_yes", "tok_sup_no"],
+            "events": [{"id": "btc-ladder"}],
         }
         # Spread is 0.01 < min_violation=0.02
         candidates = _frechet().scan_frechet([m_sub, m_sup], min_violation=0.02)
@@ -107,6 +113,7 @@ class TestScansFrechet:
             "end_date_iso": "2026-12-31T00:00:00Z",
             "outcomePrices": ["0.70", "0.30"],
             "clobTokenIds": ["tok_sub_yes", "tok_sub_no"],
+            "events": [{"id": "btc-ladder"}],
         }
         m_sup = {
             "condition_id": "0xsup",
@@ -114,6 +121,7 @@ class TestScansFrechet:
             "end_date_iso": "2026-12-31T00:00:00Z",
             "outcomePrices": ["0.45", "0.55"],
             "clobTokenIds": ["tok_sup_yes", "tok_sup_no"],
+            "events": [{"id": "btc-ladder"}],
         }
         funnel = MagicMock()
         candidates = _frechet().scan_frechet([m_sub, m_sup], platform="polymarket", funnel=funnel)

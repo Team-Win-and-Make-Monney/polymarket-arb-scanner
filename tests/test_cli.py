@@ -451,6 +451,21 @@ class TestRunOneshotFilteringAndExecution:
     @patch.object(_cli_mod, "dashboard_state")
     @patch.object(_cli_mod, "scan_binary_internal")
     @patch.object(_cli_mod, "fetch_all_markets", return_value=[{"question": "test"}])
+    def test_min_depth_filters_none_depth_opps(self, mock_fetch, mock_scan, mock_dash, mock_display):
+        mock_scan.return_value = [
+            {"type": "BinaryInternal", "net_profit": 0.05, "_clob_depth": None},
+            {"type": "BinaryInternal", "net_profit": 0.08, "_clob_depth": 100},
+        ]
+        args = _make_args(min_depth=50)
+        _cli_mod._run_oneshot(args, 0.01, None, _make_executor(), _make_db())
+        displayed = mock_display.call_args[0][0]
+        assert len(displayed) == 1
+        assert displayed[0]["_clob_depth"] == 100
+
+    @patch.object(_cli_mod, "display_results")
+    @patch.object(_cli_mod, "dashboard_state")
+    @patch.object(_cli_mod, "scan_binary_internal")
+    @patch.object(_cli_mod, "fetch_all_markets", return_value=[{"question": "test"}])
     def test_limit_caps_results(self, mock_fetch, mock_scan, mock_dash, mock_display):
         mock_scan.return_value = [
             {"type": "BinaryInternal", "net_profit": 0.05, "net_roi": 0.05, "_clob_depth": 50},
@@ -629,6 +644,7 @@ class TestMainBranching:
         cases = (
             (["scanner.py", "--mode", "research", "--dry-run"], "true"),  # one-shot
             (["scanner.py", "--continuous", "--mode", "research"], "false"),  # live
+            (["scanner.py", "--continuous", "--mode", "research", "--dry-run"], "false"),  # flag with DRY_RUN=false
         )
         for argv, dry_env in cases:
             caplog.clear()

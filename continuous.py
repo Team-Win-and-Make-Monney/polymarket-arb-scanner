@@ -1806,7 +1806,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
         # only re-checks opps the slow scan already found — this surfaces
         # *new* Cross opps the moment a price moves into arb territory,
         # bypassing the 16-min scan-cycle latency entirely.
-        if cross_pair_ws_enabled and ws_trigger_enabled:
+        if cross_pair_ws_enabled and ws_trigger_enabled and args.mode != config.RESEARCH_MODE:
             cross_min_profit = max(min_profit * _cross_pair_min_profit_factor,
                                    ws_trigger_threshold)
             for pair in cross_pair_index.lookup(platform, ticker):
@@ -2319,7 +2319,9 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                 # scan cycle (vs a separate timer) reuses the data we just
                 # fetched for free; the WS handler then evaluates pairs on
                 # every tick without waiting for the 16-min cycle to find them.
-                if cross_pair_ws_enabled and poly_markets and kalshi_events_preloaded:
+                if (cross_pair_ws_enabled
+                        and args.mode != config.RESEARCH_MODE
+                        and poly_markets and kalshi_events_preloaded):
                     try:
                         n_pairs = cross_pair_index.rebuild(
                             poly_markets, kalshi_events_preloaded,

@@ -26,11 +26,15 @@ CATCH_ALL_LABELS = frozenset({
 # hits 1550 before Jan 1, 2027, and KXNBANEXTGOVERNOR's "Any other person"
 # leg sits under "If no new team governor ... all markets resolve to No".
 # "All other markets resolve to No" only restates exclusivity, so it is exempt.
+# Tie clauses such as "If a tie occurs, no market resolves to Yes" also prevent
+# any leg from resolving YES.
 NO_WINNER_RULE = re.compile(
     r"\bbefore\b"
-    r"|\bif (?:no|none|nobody)\b"
+    r"|\bif (?:no|none|nobody)\b[^.]*?\b(?:resolved?|resolves)\s+(?:to\s+)?\W?no\b"
     r"|\b(?:all|every|each)\s+(?!other\b)(?:\w+\s+){0,2}?(?:markets?|contracts?|strikes?)\b[^.]*?"
-    r"\b(?:resolved?|resolves)\s+(?:to\s+)?\W?no\b",
+    r"\b(?:resolved?|resolves)\s+(?:to\s+)?\W?no\b"
+    r"|\bno\s+(?!other\b)(?:\w+\s+){0,2}?(?:markets?|contracts?|strikes?)\b[^.]*?"
+    r"\b(?:resolved?|resolves)\s+(?:to\s+)?\W?yes\b",
     re.IGNORECASE,
 )
 

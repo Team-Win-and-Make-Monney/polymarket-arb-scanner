@@ -579,6 +579,7 @@ class TestScanKalshiMultiCategoricalCompleteness:
         "Should the ceremony be cancelled, all markets resolve to No.",
         "If nobody is appointed, each market resolves to No.",
         "If the event is cancelled, all markets will be resolved to No.",
+        "If a tie occurs, no market resolves to Yes.",
     ])
     def test_catch_all_with_no_winner_rule_is_rejected(self, rules_secondary):
         from scans.kalshi import _is_exhaustive_categorical
@@ -595,6 +596,16 @@ class TestScanKalshiMultiCategoricalCompleteness:
             self._leg(label, f"If {label} wins the award, then the market resolves to Yes.",
                       "If one nominee wins, all other markets will resolve to No.")
             for label in ("Nominee A", "Nominee B", "Other")
+        ]
+        assert _is_exhaustive_categorical(markets) is True
+
+    def test_positive_catch_all_rule_is_accepted(self):
+        # "If no other market wins, this market resolves to Yes" is an exhaustive catch-all.
+        from scans.kalshi import _is_exhaustive_categorical
+        markets = [
+            self._leg("Nominee A", "If Nominee A wins the award, then the market resolves to Yes."),
+            self._leg("Nominee B", "If Nominee B wins the award, then the market resolves to Yes."),
+            self._leg("Other", "If no other market wins, this market resolves to Yes."),
         ]
         assert _is_exhaustive_categorical(markets) is True
 

@@ -10,7 +10,10 @@ from kalshi_api import KalshiClient
 from config import KALSHI_MULTI_MIN_SUM as _KALSHI_MULTI_MIN_SUM
 from fees import net_profit_kalshi_binary, net_profit_kalshi_multi
 from kalshi_policy import event_blocked as _event_blocked
-from kalshi_completeness import is_exhaustive_categorical as _is_exhaustive_categorical
+from kalshi_completeness import (
+    is_exhaustive_categorical as _is_exhaustive_categorical,
+    is_catch_all_label as _is_catch_all_label,
+)
 from scans.helpers import _parallel_fetch_kalshi, _within_resolution_window, filter_dust, _days_to_resolution
 
 logger = logging.getLogger(__name__)

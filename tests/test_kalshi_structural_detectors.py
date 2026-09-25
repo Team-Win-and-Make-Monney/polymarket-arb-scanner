@@ -105,6 +105,25 @@ def test_categorical_catch_all_with_no_winner_rule_is_not_complete_set():
     assert "complete_set_underprice" not in kinds
 
 
+def test_categorical_catch_all_with_tie_no_winner_rule_is_not_complete_set():
+    # If a tie occurs, no market resolves to Yes.
+    event = _top_ai_model_event([*TOP_AI_MODELS, ("Other", 0.03)])
+    for market in event["markets"]:
+        market["rules_secondary"] = "If a tie occurs, no market resolves to Yes."
+    kinds = {row["kind"] for row in detect_event(event)}
+    assert "complete_set_underprice" not in kinds
+
+
+def test_categorical_catch_all_with_positive_catch_all_rule_is_complete_set():
+    # "If no other market wins, this market resolves to Yes."
+    event = _top_ai_model_event([*TOP_AI_MODELS, ("Other", 0.03)])
+    event["markets"][-1]["rules_primary"] = "If no other market wins, this market resolves to Yes."
+    flags = [row for row in detect_event(event) if row["kind"] == "complete_set_underprice"]
+    assert len(flags) == 1
+    assert flags[0]["n_outcomes"] == 7
+    assert flags[0]["yes_ask_sum"] == 0.93
+
+
 def test_closed_market_is_not_late_window():
     event = {
         "event_ticker": "KXOLD",

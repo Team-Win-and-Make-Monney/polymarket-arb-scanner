@@ -230,9 +230,9 @@ _CATCH_ALL_LABELS = frozenset({
 # "All other markets resolve to No" only restates exclusivity, so it is exempt.
 _NO_WINNER_RULE = re.compile(
     r"\bbefore\b"
-    r"|\bif no\b"
-    r"|\b(?:all|every)\s+(?!other\b)(?:\w+\s+){0,2}?(?:markets?|contracts?|strikes?)\b[^.]*?"
-    r"\bresolves?\s+(?:to\s+)?\W?no\b",
+    r"|\bif (?:no|none|nobody)\b"
+    r"|\b(?:all|every|each)\s+(?!other\b)(?:\w+\s+){0,2}?(?:markets?|contracts?|strikes?)\b[^.]*?"
+    r"\b(?:resolved?|resolves)\s+(?:to\s+)?\W?no\b",
     re.IGNORECASE,
 )
 

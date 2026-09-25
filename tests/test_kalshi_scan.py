@@ -577,6 +577,8 @@ class TestScanKalshiMultiCategoricalCompleteness:
         "If no new team governor formally holds the position, then all markets resolve to No.",  # KXNBANEXTGOVERNOR
         "If no person has qualified, every named market resolves NO.",  # KXQUEBECPREMIER
         "Should the ceremony be cancelled, all markets resolve to No.",
+        "If nobody is appointed, each market resolves to No.",
+        "If the event is cancelled, all markets will be resolved to No.",
     ])
     def test_catch_all_with_no_winner_rule_is_rejected(self, rules_secondary):
         from scans.kalshi import _is_exhaustive_categorical

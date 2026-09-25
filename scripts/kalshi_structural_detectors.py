@@ -19,6 +19,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from kalshi_completeness import is_exhaustive_categorical  # noqa: E402
 from kalshi_policy import event_blocked  # noqa: E402
 
 EVENTS_URL = "https://api.elections.kalshi.com/trade-api/v2/events"
@@ -28,7 +29,8 @@ def _is_exhaustive_strike_ladder(event_markets: list[dict]) -> bool | None:
     """Same exhaustiveness rule as scans/kalshi.py complete-set gate.
 
     mutually_exclusive only means at most one YES pays. Scalar ladders still
-    need open tails. Categorical events (no strike fields) return None.
+    need open tails. Categorical events (no strike fields) return None;
+    ``is_exhaustive_categorical`` judges those.
     """
     strikes = [(m.get("floor_strike"), m.get("cap_strike")) for m in event_markets]
     if all(floor is None and cap is None for floor, cap in strikes):
@@ -110,11 +112,11 @@ def detect_event(event: dict) -> list[dict]:
             })
         if yes_ask_f is not None:
             yes_asks.append(yes_ask_f)
-    if (
-        event.get("mutually_exclusive") is True
-        and _is_exhaustive_strike_ladder(markets) is not False
-        and len(yes_asks) >= 2
-    ):
+    ladder_exhaustive = _is_exhaustive_strike_ladder(markets)
+    exhaustive = ladder_exhaustive is True or (
+        ladder_exhaustive is None and is_exhaustive_categorical(markets)
+    )
+    if event.get("mutually_exclusive") is True and exhaustive and len(yes_asks) >= 2:
         total = sum(yes_asks)
         if total < 0.98:
             flags.append({

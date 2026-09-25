@@ -579,6 +579,7 @@ class TestScanKalshiMultiCategoricalCompleteness:
         "Should the ceremony be cancelled, all markets resolve to No.",
         "If nobody is appointed, each market resolves to No.",
         "If the event is cancelled, all markets will be resolved to No.",
+        "If a tie occurs, no market resolves to Yes.",
     ])
     def test_catch_all_with_no_winner_rule_is_rejected(self, rules_secondary):
         from scans.kalshi import _is_exhaustive_categorical
@@ -598,13 +599,23 @@ class TestScanKalshiMultiCategoricalCompleteness:
         ]
         assert _is_exhaustive_categorical(markets) is True
 
+    def test_positive_catch_all_rule_is_accepted(self):
+        # "If no other market wins, this market resolves to Yes" is an exhaustive catch-all.
+        from scans.kalshi import _is_exhaustive_categorical
+        markets = [
+            self._leg("Nominee A", "If Nominee A wins the award, then the market resolves to Yes."),
+            self._leg("Nominee B", "If Nominee B wins the award, then the market resolves to Yes."),
+            self._leg("Other", "If no other market wins, this market resolves to Yes."),
+        ]
+        assert _is_exhaustive_categorical(markets) is True
+
     @pytest.mark.parametrize("label", [
         "Other", "Others", "OTHER", " other. ", "Any other", "All others",
         "Someone else", "Anyone else", "Field", "The Field", "None of the above",
     ])
     def test_catch_all_labels_recognized(self, label):
-        from scans.kalshi import _is_catch_all_label
-        assert _is_catch_all_label(label) is True
+        from kalshi_completeness import is_catch_all_label
+        assert is_catch_all_label(label) is True
 
     @pytest.mark.parametrize("label", [
         "No other person",  # KXNEXTSTATE-29: the no-appointee leg
@@ -616,5 +627,5 @@ class TestScanKalshiMultiCategoricalCompleteness:
         "nobody", "No one", "None", "Tie", "", None,
     ])
     def test_non_catch_all_labels_rejected(self, label):
-        from scans.kalshi import _is_catch_all_label
-        assert _is_catch_all_label(label) is False
+        from kalshi_completeness import is_catch_all_label
+        assert is_catch_all_label(label) is False

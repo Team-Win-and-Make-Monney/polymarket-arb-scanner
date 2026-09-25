@@ -216,6 +216,19 @@ class TestMatchOutcomes:
         assert _is_unnamed_pm_leg({"groupItemTitle": "Alice", "active": True}) is False
         assert _is_unnamed_pm_leg({"question": "Alice", "active": True}) is False
 
+    def test_matching_falls_back_to_question_when_group_item_title_is_none(self):
+        """When groupItemTitle is None, question is used for outcome matching and catch-all classification."""
+        outcomes = self._match(
+            [{"groupItemTitle": None, "question": "Other", "_yes": 0.25}],
+            [{"yes_sub_title": "Other", "yes_price": 0.10}],
+        )
+
+        assert "Other" in outcomes
+        leg = outcomes["Other"]
+        assert leg["kalshi_market"] is None
+        assert leg["best_platform"] == "polymarket"
+        assert leg["best_price"] == 0.25
+
 
 # ---------------------------------------------------------------------------
 # Main scan function
@@ -330,17 +343,17 @@ class TestScanMultiCross:
         pm_event = {
             "title": "Who will win the election?", "id": "ev-aug", "negRiskAugmented": True,
             "markets": [
-                {"groupItemTitle": "Alice", "active": True, "_yes": 0.36},
+                {"groupItemTitle": "Alice", "active": True, "_yes": 0.20},
                 {"groupItemTitle": "Bob", "active": True, "_yes": 0.35},
-                {"groupItemTitle": "Person C", "active": False, "_yes": 0.5},
-                {"groupItemTitle": "Other", "active": False, "negRiskOther": True, "_yes": 0.5},
+                {"groupItemTitle": "Person C", "active": False, "_yes": 0.15},
+                {"groupItemTitle": "Other", "active": False, "negRiskOther": True, "_yes": 0.15},
             ],
         }
         kalshi_markets = [
-            {"yes_sub_title": "Alice", "ticker": "K-A", "yes_price": 0.38},
-            {"yes_sub_title": "Bob", "ticker": "K-B", "yes_price": 0.33},
-            {"yes_sub_title": "Person C", "ticker": "K-C", "yes_price": 0.01},
-            {"yes_sub_title": "Other", "ticker": "K-O", "yes_price": 0.01},
+            {"yes_sub_title": "Alice", "ticker": "K-A", "yes_price": 0.35},
+            {"yes_sub_title": "Bob", "ticker": "K-B", "yes_price": 0.20},
+            {"yes_sub_title": "Person C", "ticker": "K-C", "yes_price": 0.30},
+            {"yes_sub_title": "Other", "ticker": "K-O", "yes_price": 0.30},
         ]
         kalshi_data = (
             [{"event_ticker": "EV-1", "mutually_exclusive": True}],
@@ -373,14 +386,14 @@ class TestScanMultiCross:
             "title": "Who will win the tournament?", "id": "ev-tourney",
             "markets": [
                 {"groupItemTitle": "Team Alpha", "active": True, "_yes": 0.20},
-                {"groupItemTitle": "Team Beta", "active": True, "_yes": 0.20},
-                {"groupItemTitle": "Other", "active": True, "negRiskOther": True, "_yes": 0.10},
+                {"groupItemTitle": "Team Beta", "active": True, "_yes": 0.35},
+                {"groupItemTitle": "Other", "active": True, "negRiskOther": True, "_yes": 0.15},
             ],
         }
         kalshi_markets = [
-            {"yes_sub_title": "Team Alpha", "ticker": "K-A", "yes_price": 0.25},
-            {"yes_sub_title": "Team Beta", "ticker": "K-B", "yes_price": 0.25},
-            {"yes_sub_title": "Other", "ticker": "K-O", "yes_price": 0.15},
+            {"yes_sub_title": "Team Alpha", "ticker": "K-A", "yes_price": 0.35},
+            {"yes_sub_title": "Team Beta", "ticker": "K-B", "yes_price": 0.20},
+            {"yes_sub_title": "Other", "ticker": "K-O", "yes_price": 0.30},
         ]
         kalshi_data = (
             [{"event_ticker": "EV-1", "mutually_exclusive": True}],

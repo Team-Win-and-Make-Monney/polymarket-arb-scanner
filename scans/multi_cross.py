@@ -228,7 +228,7 @@ def _match_outcomes(
     kalshi_matched = set()
 
     for pm_m in pm_markets:
-        label = pm_m.get("groupItemTitle", pm_m.get("question", "?"))
+        label = pm_m.get("groupItemTitle") or pm_m.get("question") or "?"
         pm_norm = _normalize_outcome_label(label)
         prices = parse_outcome_prices(pm_m)
         pm_yes = prices[0] if prices else None

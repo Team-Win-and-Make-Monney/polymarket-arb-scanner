@@ -242,6 +242,8 @@ def discover_subset_pairs(
     for mkt in market_list:
         spec = parse_threshold_market(mkt, platform=platform)
         if spec:
+            if spec.platform == "polymarket" and not spec.event_key:
+                continue
             key = (spec.underlying, spec.date_key, spec.direction, spec.platform, spec.event_key)
             grouped.setdefault(key, []).append(spec)
 

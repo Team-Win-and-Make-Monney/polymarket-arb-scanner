@@ -543,6 +543,83 @@ a:hover { text-decoration: underline; }
     </div>
   </div>
 
+  <!-- Kalshi MM Pilot (LIP Market Maker) Telemetry -->
+  <div class="section" id="mm-pilot-section">
+    <div class="section-header" style="display:flex;justify-content:space-between;align-items:center;">
+      <span>Kalshi MM Pilot (LIP Market Maker)</span>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <span class="badge" id="mm-pilot-status-badge">PILOT: INACTIVE</span>
+        <span class="badge" id="mm-pilot-canary-badge">CANARY: --</span>
+        <span class="badge" id="mm-pilot-kill-badge">KILL SWITCH: --</span>
+      </div>
+    </div>
+    <div class="section-body" id="mm-pilot-body">
+      <div class="cards" style="margin-bottom:14px;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));">
+        <div class="card" style="padding:10px 14px;">
+          <div class="card-label">Resting Orders</div>
+          <div class="card-value" id="mm-resting-orders">0</div>
+          <div class="card-sub" id="mm-resting-sub">Active quotes</div>
+        </div>
+        <div class="card" style="padding:10px 14px;">
+          <div class="card-label">Net Inventory</div>
+          <div class="card-value" id="mm-inventory-usd">$0.00</div>
+          <div class="card-sub" id="mm-inventory-sub">0 contracts</div>
+        </div>
+        <div class="card" style="padding:10px 14px;">
+          <div class="card-label">Realized P&L</div>
+          <div class="card-value" id="mm-realized-pnl">$0.00</div>
+          <div class="card-sub" id="mm-pnl-sub">Fills return</div>
+        </div>
+        <div class="card" style="padding:10px 14px;">
+          <div class="card-label">Selected Markets</div>
+          <div class="card-value" id="mm-selected-count">0</div>
+          <div class="card-sub" id="mm-selected-sub">LIP targets</div>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div>
+          <div style="font-weight:600;font-size:0.85rem;margin-bottom:6px;color:var(--text-muted);">ACTIVE RESTING ORDERS</div>
+          <div class="tbl-wrap" style="max-height:220px;overflow-y:auto;">
+            <table class="tbl" id="mm-orders-table">
+              <thead>
+                <tr>
+                  <th>Ticker</th>
+                  <th>Side</th>
+                  <th>Action</th>
+                  <th class="right">Price</th>
+                  <th class="right">Count</th>
+                </tr>
+              </thead>
+              <tbody id="mm-orders-tbody">
+                <tr><td colspan="5" class="empty">No resting orders</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div>
+          <div style="font-weight:600;font-size:0.85rem;margin-bottom:6px;color:var(--text-muted);">INVENTORY EXPOSURE BY TICKER</div>
+          <div class="tbl-wrap" style="max-height:220px;overflow-y:auto;">
+            <table class="tbl" id="mm-inventory-table">
+              <thead>
+                <tr>
+                  <th>Ticker</th>
+                  <th class="right">Net YES</th>
+                  <th class="right">Avg Cost</th>
+                  <th class="right">Net USD</th>
+                  <th class="right">Realized</th>
+                </tr>
+              </thead>
+              <tbody id="mm-inventory-tbody">
+                <tr><td colspan="5" class="empty">Flat inventory</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
 </div>
 
 <div class="footer">
@@ -1258,6 +1335,123 @@ function updateRewardsRow(status) {
 }
 
 // ---------------------------------------------------------------------------
+// Kalshi MM Pilot telemetry
+// ---------------------------------------------------------------------------
+function renderMMPilot(data) {
+  if (!data) return;
+  const statusBadge = $('mm-pilot-status-badge');
+  const canaryBadge = $('mm-pilot-canary-badge');
+  const killBadge = $('mm-pilot-kill-badge');
+
+  if (!data.active && data.status === 'inactive') {
+    statusBadge.className = 'badge';
+    statusBadge.textContent = 'PILOT: INACTIVE';
+    canaryBadge.className = 'badge';
+    canaryBadge.textContent = 'CANARY: --';
+    killBadge.className = 'badge';
+    killBadge.textContent = 'KILL SWITCH: --';
+    $('mm-resting-orders').textContent = '0';
+    $('mm-inventory-usd').textContent = '$0.00';
+    $('mm-realized-pnl').textContent = '$0.00';
+    $('mm-selected-count').textContent = '0';
+    setEmpty($('mm-orders-tbody'), 5, 'Pilot inactive');
+    setEmpty($('mm-inventory-tbody'), 5, 'Pilot inactive');
+    return;
+  }
+
+  // Active or halted pilot
+  if (data.halted) {
+    statusBadge.className = 'badge badge-error';
+    statusBadge.textContent = 'PILOT: HALTED' + (data.halt_reason ? ' (' + data.halt_reason + ')' : '');
+  } else if (data.dry_run) {
+    statusBadge.className = 'badge badge-dry';
+    statusBadge.textContent = 'PILOT: DRY-RUN';
+  } else {
+    statusBadge.className = 'badge badge-live';
+    statusBadge.textContent = 'PILOT: LIVE';
+  }
+
+  if (data.canary_graduated) {
+    canaryBadge.className = 'badge badge-live';
+    canaryBadge.textContent = 'CANARY: GRADUATED';
+  } else {
+    canaryBadge.className = 'badge badge-dry';
+    canaryBadge.textContent = 'CANARY: ' + (data.canary_clean_fills || 0) + '/' + (data.canary_target_fills || 50);
+  }
+
+  if (data.kill_switch_enabled === true) {
+    killBadge.className = 'badge badge-live';
+    killBadge.textContent = 'KILL SWITCH: ARMED';
+  } else if (data.kill_switch_enabled === false) {
+    killBadge.className = 'badge badge-error';
+    killBadge.textContent = 'KILL SWITCH: TRIPPED';
+  } else {
+    killBadge.className = 'badge';
+    killBadge.textContent = 'KILL SWITCH: UNKNOWN';
+  }
+
+  // Summary KPIs
+  const ordersCount = data.resting_orders != null ? data.resting_orders : (data.orders ? data.orders.length : 0);
+  $('mm-resting-orders').textContent = ordersCount;
+  $('mm-resting-sub').textContent = (data.source === 'file' ? 'Persisted file' : 'Active instance');
+
+  const invUsd = data.total_inventory_usd || 0.0;
+  $('mm-inventory-usd').textContent = fmtUSD(invUsd);
+
+  const realizedPnl = data.realized_pnl || 0.0;
+  $('mm-realized-pnl').textContent = fmtUSD(realizedPnl);
+  $('mm-realized-pnl').className = 'card-value ' + pnlClass(realizedPnl);
+
+  const selectedCount = data.selected_markets ? data.selected_markets.length : 0;
+  $('mm-selected-count').textContent = selectedCount;
+
+  // Orders table
+  const ordersTbody = $('mm-orders-tbody');
+  const orders = data.orders || [];
+  if (orders.length === 0) {
+    setEmpty(ordersTbody, 5, 'No resting orders');
+  } else {
+    const rows = orders.map(o => {
+      const tr = document.createElement('tr');
+      tr.appendChild(makeCell(o.ticker || '--'));
+      tr.appendChild(makeCell((o.side || '--').toUpperCase()));
+      tr.appendChild(makeCell((o.action || '--').toUpperCase()));
+      tr.appendChild(makeCell(fmtUSD(o.price || 0), { className: 'mono right' }));
+      tr.appendChild(makeCell(o.count || 0, { className: 'mono right' }));
+      return tr;
+    });
+    ordersTbody.replaceChildren(...rows);
+  }
+
+  // Inventory table
+  const invTbody = $('mm-inventory-tbody');
+  const inventory = data.inventory || {};
+  const invTickers = Object.keys(inventory);
+  if (invTickers.length === 0) {
+    setEmpty(invTbody, 5, 'Flat inventory');
+  } else {
+    let totalContracts = 0;
+    const rows = invTickers.map(t => {
+      const pos = inventory[t] || {};
+      const net = pos.net || 0;
+      totalContracts += Math.abs(net);
+      const avg = pos.avg_cost || 0;
+      const usd = pos.usd || 0;
+      const rPnl = pos.realized || 0;
+      const tr = document.createElement('tr');
+      tr.appendChild(makeCell(t));
+      tr.appendChild(makeCell(net, { className: 'mono right' }));
+      tr.appendChild(makeCell(fmtUSD(avg), { className: 'mono right' }));
+      tr.appendChild(makeCell(fmtUSD(usd), { className: 'mono right' }));
+      tr.appendChild(makeCell(fmtUSD(rPnl), { className: 'mono right ' + pnlClass(rPnl) }));
+      return tr;
+    });
+    invTbody.replaceChildren(...rows);
+    $('mm-inventory-sub').textContent = totalContracts + ' contracts';
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main refresh loop
 // ---------------------------------------------------------------------------
 async function refresh() {
@@ -1266,7 +1460,7 @@ async function refresh() {
 
   const [status, health, slippage, history, strategies, positions,
          platforms, trades, opportunities, alerts, pauseState, failures,
-         strategyPnl, balancesData, rebalanceData, leaderboardData] = await Promise.all([
+         strategyPnl, balancesData, rebalanceData, leaderboardData, mmPilotData] = await Promise.all([
     api('/status'),
     api('/api/health'),
     api('/api/slippage'),
@@ -1283,6 +1477,7 @@ async function refresh() {
     api('/api/balances'),
     api('/api/rebalance'),
     api('/api/strategy-leaderboard'),
+    api('/api/mm-pilot'),
   ]);
 
   renderStatus(status);
@@ -1304,6 +1499,7 @@ async function refresh() {
   updateBalancesChart(balancesData);
   renderBalancesTable(balancesData, rebalanceData);
   renderLeaderboard(leaderboardData);
+  renderMMPilot(mmPilotData);
 
   // Positions subtitle
   if (platforms && platforms.length > 0) {

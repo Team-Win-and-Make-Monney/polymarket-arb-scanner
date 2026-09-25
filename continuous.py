@@ -1699,6 +1699,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                 daemon=True,
             )
             _mm_pilot_thread.start()
+            dashboard_state.mm_pilot = _mm_pilot
             logger.info("Kalshi MM pilot started (dry_run=%s).",
                         _mm_pilot.dry_run)
         except Exception as exc:
@@ -1728,6 +1729,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
             if thread_stopped:
                 _mm_pilot = None
                 _mm_pilot_thread = None
+                dashboard_state.mm_pilot = None
             else:
                 logger.critical(
                     "MM pilot startup-failure thread is still alive after "
@@ -2914,6 +2916,12 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                     dashboard_state.mm_active_markets = mm_status["active_markets"]
                     dashboard_state.mm_active_orders = mm_status["active_orders"]
                     dashboard_state.mm_total_exposure = mm_status["total_exposure"]
+                elif _mm_pilot:
+                    dashboard_state.mm_pilot = _mm_pilot
+                    pilot_status = _mm_pilot.get_status()
+                    dashboard_state.mm_active_markets = len(pilot_status.get("selected_markets", []))
+                    dashboard_state.mm_active_orders = pilot_status.get("resting_orders", 0)
+                    dashboard_state.mm_total_exposure = pilot_status.get("total_inventory_usd", 0.0)
 
                 # Update reward tracker reference for dashboard metrics
                 if CONFIG_REWARDS_ENABLED and _reward_tracker:
@@ -3297,6 +3305,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
         # thread it left running.
         if _mm_pilot or _mm_pilot_thread is not None:
             logger.info("Stopping Kalshi MM pilot...")
+            dashboard_state.mm_pilot = None
             _mm_pilot_stop.set()
             if _mm_pilot_thread is not None:
                 _mm_pilot_thread.join(timeout=15)

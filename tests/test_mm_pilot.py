@@ -167,7 +167,7 @@ def pilot_env(monkeypatch):
 
 def build_pilot(clock, client=None, dry_run=False, hedger=None,
                 controls_on=True, detector=None, vol=None,
-                selection=(TICKER,), reconciled=True):
+                selection=(TICKER,), reconciled=True, state_path=None):
     def time_fn():
         return clock[0]
     controls = ControlsPoller(time_fn=time_fn)
@@ -194,11 +194,11 @@ def build_pilot(clock, client=None, dry_run=False, hedger=None,
         # cancel-retry backoff, etc.) move both together. Real
         # time.monotonic() would ignore the fake clock entirely.
         mono_fn=time_fn,
-        # Disable local-file persistence in unit tests (parallels
-        # decision_writer=... above disabling decisions.jsonl writes).
-        state_path=None,
+        # Disable local-file persistence in unit tests unless explicitly requested.
+        state_path=state_path,
     )
-    pilot.update_selection(list(selection))
+    if selection is not None:
+        pilot.update_selection(list(selection))
     if client is not None:
         for ticker, book in client.books.items():
             pilot.update_book(ticker, book)
@@ -1611,3 +1611,79 @@ class TestShutdownCancellation:
         assert client.cancel_order_calls >= 3
         assert client.get_open_orders() == []
         assert pilot.resting_orders() == []
+
+
+class TestMMPilotStatusTelemetry:
+    """Test get_status() and _persist_state() extended telemetry snapshots."""
+
+    def test_get_status_contains_all_extended_fields(self, pilot_env, clock):
+        pilot = build_pilot(clock, selection=None)
+        status = pilot.get_status()
+
+        # Core status
+        assert "active" in status
+        assert status["active"] is True
+        assert status["halted"] is False
+        assert status["halt_reason"] == ""
+        assert status["markets_halted"] == {}
+        # Canary
+        assert status["canary_graduated"] is False
+        assert status["canary_clean_fills"] == 0
+        assert status["canary_target_fills"] == 50
+        # Orders and inventory
+        assert status["resting_orders"] == 0
+        assert status["orders"] == []
+        assert status["selected_markets"] == []
+        assert status["total_inventory_usd"] == 0.0
+        assert status["realized_pnl"] == 0.0
+        assert status["inventory"] == {"net": {}, "avg": {}, "realized": {}}
+        # Safety & control
+        assert "reconciled" in status
+        assert "fills_blind" in status
+        assert "kill_switch_enabled" in status
+        assert "loop_error_streak" in status
+        assert "last_fill_ts" in status
+
+    def test_get_status_with_resting_orders_and_inventory(self, pilot_env, clock):
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client)
+        pilot.update_selection([TICKER])
+
+        oid = pilot.place_pilot_order(
+            TICKER, "yes", "buy", 4, 0.49, purpose="quote_bid"
+        )
+        assert oid
+
+        # Apply a fill to generate inventory
+        pilot.inventory.apply_fill(TICKER, "yes", "buy", 4, 0.49)
+
+        status = pilot.get_status()
+        assert status["resting_orders"] == 1
+        assert len(status["orders"]) == 1
+        assert status["orders"][0]["order_id"] == oid
+        assert status["selected_markets"] == [TICKER]
+        assert status["total_inventory_usd"] > 0
+        assert TICKER in status["inventory"]["net"]
+        assert status["inventory"]["net"][TICKER] == 4
+
+    def test_persist_state_includes_extended_telemetry(self, pilot_env, clock, tmp_path):
+        client = FakeKalshiClient()
+        state_file = tmp_path / "mm_state.json"
+        pilot = build_pilot(clock, client=client, state_path=str(state_file))
+        pilot.update_selection([TICKER])
+        oid = pilot.place_pilot_order(
+            TICKER, "yes", "buy", 4, 0.49, purpose="quote_bid"
+        )
+        assert oid
+
+        pilot._persist_state()
+
+        assert state_file.exists()
+        saved = json.loads(state_file.read_text())
+        assert saved["active"] is True
+        assert saved["halted"] is False
+        assert saved["canary_target_fills"] == 50
+        assert saved["selected_markets"] == [TICKER]
+        assert oid in saved["orders"]
+        assert "inventory" in saved
+        assert "saved_at" in saved

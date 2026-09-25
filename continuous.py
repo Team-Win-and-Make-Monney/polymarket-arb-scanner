@@ -3305,7 +3305,6 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
         # thread it left running.
         if _mm_pilot or _mm_pilot_thread is not None:
             logger.info("Stopping Kalshi MM pilot...")
-            dashboard_state.mm_pilot = None
             _mm_pilot_stop.set()
             if _mm_pilot_thread is not None:
                 _mm_pilot_thread.join(timeout=15)

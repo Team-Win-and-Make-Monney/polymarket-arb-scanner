@@ -1338,10 +1338,28 @@ function updateRewardsRow(status) {
 // Kalshi MM Pilot telemetry
 // ---------------------------------------------------------------------------
 function renderMMPilot(data) {
-  if (!data) return;
   const statusBadge = $('mm-pilot-status-badge');
   const canaryBadge = $('mm-pilot-canary-badge');
   const killBadge = $('mm-pilot-kill-badge');
+
+  if (!data) {
+    statusBadge.className = 'badge badge-error';
+    statusBadge.textContent = 'PILOT: UNAVAILABLE';
+    canaryBadge.className = 'badge';
+    canaryBadge.textContent = 'CANARY: --';
+    killBadge.className = 'badge';
+    killBadge.textContent = 'KILL SWITCH: --';
+    $('mm-resting-orders').textContent = '—';
+    $('mm-resting-sub').textContent = 'Feed unavailable';
+    $('mm-inventory-usd').textContent = '—';
+    $('mm-inventory-sub').textContent = '—';
+    $('mm-realized-pnl').textContent = '—';
+    $('mm-realized-pnl').className = 'card-value';
+    $('mm-selected-count').textContent = '—';
+    setEmpty($('mm-orders-tbody'), 5, 'Telemetry unavailable');
+    setEmpty($('mm-inventory-tbody'), 5, 'Telemetry unavailable');
+    return;
+  }
 
   if (!data.active && data.status === 'inactive') {
     statusBadge.className = 'badge';
@@ -1351,8 +1369,11 @@ function renderMMPilot(data) {
     killBadge.className = 'badge';
     killBadge.textContent = 'KILL SWITCH: --';
     $('mm-resting-orders').textContent = '0';
+    $('mm-resting-sub').textContent = 'Inactive';
     $('mm-inventory-usd').textContent = '$0.00';
+    $('mm-inventory-sub').textContent = '0 contracts';
     $('mm-realized-pnl').textContent = '$0.00';
+    $('mm-realized-pnl').className = 'card-value';
     $('mm-selected-count').textContent = '0';
     setEmpty($('mm-orders-tbody'), 5, 'Pilot inactive');
     setEmpty($('mm-inventory-tbody'), 5, 'Pilot inactive');

@@ -1111,3 +1111,12 @@ class TestMMPilotDashboardIntegration:
         assert "PILOT: STOPPED" in html
         assert "PILOT: STALE" in html
         assert "inventory.net" in html
+
+    def test_dashboard_ui_html_telemetry_failure_and_inactive_reset(self):
+        """Verify dashboard HTML handles telemetry failure and inactive subtitle resets."""
+        from dashboard_ui import get_dashboard_html
+        html = get_dashboard_html()
+        assert "PILOT: UNAVAILABLE" in html
+        assert "Telemetry unavailable" in html
+        assert "Feed unavailable" in html
+        assert "$('mm-inventory-sub').textContent = '0 contracts';" in html

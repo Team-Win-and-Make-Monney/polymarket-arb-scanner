@@ -1299,7 +1299,7 @@ def _scan_frechet_layer1(poly_markets, mode, min_profit, price_cache=None, funne
         return []
 
 
-def _scan_temporal_layer1(kalshi_markets, mode, min_profit, kalshi_client=None, funnel=None) -> list[dict]:
+def _scan_temporal_layer1(kalshi_markets, mode, min_profit, kalshi_client=None, price_cache=None, funnel=None) -> list[dict]:
     """Plan 03 Cross-date temporal arbitrage. Returns [] when the gate is off or there are no markets."""
     if mode not in ("all", "temporal", config.RESEARCH_MODE):
         return []
@@ -1316,7 +1316,13 @@ def _scan_temporal_layer1(kalshi_markets, mode, min_profit, kalshi_client=None, 
             min_violation=getattr(config, "TEMPORAL_MIN_VIOLATION", 0.02),
             funnel=funnel,
         )
-        refined = _refine_temporal_with_clob(cands, min_profit=min_profit, kalshi_client=kalshi_client, funnel=funnel)
+        refined = _refine_temporal_with_clob(
+            cands,
+            min_profit=min_profit,
+            kalshi_client=kalshi_client,
+            price_cache=price_cache,
+            funnel=funnel,
+        )
         _log_research_strategy(mode, "temporal", len(kalshi_markets), len(cands), len(refined))
         return refined
     except Exception as exc:
@@ -2651,6 +2657,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                             args.mode,
                             min_profit,
                             kalshi_client=kalshi_client,
+                            price_cache=price_cache,
                             funnel=_funnel,
                         )
                     )

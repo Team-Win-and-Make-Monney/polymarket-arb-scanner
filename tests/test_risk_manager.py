@@ -188,6 +188,13 @@ class TestOrderBookDepth:
         allowed, reason = rm.check(valid_opportunity, mock_db)
         assert allowed is False
 
+    def test_none_depth_fails_closed_instead_of_raising(self, rm, mock_db, valid_opportunity):
+        valid_opportunity["_clob_depth"] = None
+        allowed, reason = rm.check(valid_opportunity, mock_db)
+        assert allowed is False
+        assert "Insufficient depth" in reason
+        assert rm.calculate_dynamic_size(valid_opportunity) >= 0
+
     def test_high_roi_uses_lower_depth_threshold(self, rm, mock_db, valid_opportunity):
         """High ROI (>5%) opportunities use min_liquidity_high_roi (10) instead of min_liquidity (25)."""
         valid_opportunity["net_profit"] = 0.06  # ROI = 0.06/0.95 = 6.3% > 5%
@@ -324,6 +331,11 @@ class TestClampSize:
     def test_zero_depth_not_used(self, rm):
         # depth=0 means the depth constraint doesn't apply (if depth > 0)
         result = rm.clamp_size(desired_size=5.0, depth=0, balance=100.0)
+        assert result == 5.0
+
+    def test_none_depth_not_used(self, rm):
+        # depth=None should fall back to 0 without raising TypeError
+        result = rm.clamp_size(desired_size=5.0, depth=None, balance=100.0)
         assert result == 5.0
 
     def test_none_balance(self, rm):

@@ -1082,7 +1082,7 @@ def _run_oneshot(args, min_profit, kalshi_client, executor, db, extra_clients=No
         before = len(all_opportunities)
         all_opportunities = [
             opp for opp in all_opportunities
-            if opp.get("_clob_depth", 0) >= args.min_depth
+            if (opp.get("_clob_depth") or 0) >= args.min_depth
         ]
         filtered = before - len(all_opportunities)
         if filtered:
@@ -1360,9 +1360,10 @@ def main():
                  "imbalance", "news-snipe", "correlated", "time-decay",
                  "logical-arb", "whale-copy",
                  "fee-promo", "cross-mm",
-                 "lead-lag-mm", "toxic-flow", "vol-mm", "mm-pilot", "jev-crypto", "frechet", "temporal", "ctf"],
+                 "lead-lag-mm", "toxic-flow", "vol-mm", "mm-pilot", "jev-crypto", "frechet", "temporal", "ctf",
+                 "research"],
         default="all",
-        help="Scan mode: all, binary, negrisk, negrisk-no, cross, kalshi, cross-all, spread, betfair, smarkets, sxbet, matchbook, gemini, ibkr, event, triangular, stale, resolution, convergence, mm, mm-pilot, rewards, limitless-rewards, imbalance, news-snipe, correlated, time-decay, fee-promo, cross-mm, jev-crypto, frechet, temporal, ctf",
+        help="Scan mode: all, binary, negrisk, negrisk-no, cross, kalshi, cross-all, spread, betfair, smarkets, sxbet, matchbook, gemini, ibkr, event, triangular, stale, resolution, convergence, mm, mm-pilot, rewards, limitless-rewards, imbalance, news-snipe, correlated, time-decay, fee-promo, cross-mm, jev-crypto, frechet, temporal, ctf, research (dry-run Kalshi + Fréchet + temporal + CTF)",
     )
     parser.add_argument(
         "--min-profit",
@@ -1477,6 +1478,10 @@ def main():
     dry_run = args.dry_run if args.dry_run is not None else os.getenv("DRY_RUN", "true").lower() == "true"
     exec_mode = args.exec_mode or os.getenv("EXECUTION_MODE", "semi-auto")
     max_trade = args.max_trade or float(os.getenv("MAX_TRADE_SIZE", "5.0"))
+
+    if args.mode == config.RESEARCH_MODE and not (dry_run and config.DRY_RUN and args.continuous):
+        logger.error("--mode research is observational: it requires --continuous and DRY_RUN=true.")
+        sys.exit(2)
 
     logger.info("=" * 80)
     logger.info("POLYMARKET ARBITRAGE SCANNER v2")

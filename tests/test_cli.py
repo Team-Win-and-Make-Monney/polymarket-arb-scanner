@@ -451,6 +451,21 @@ class TestRunOneshotFilteringAndExecution:
     @patch.object(_cli_mod, "dashboard_state")
     @patch.object(_cli_mod, "scan_binary_internal")
     @patch.object(_cli_mod, "fetch_all_markets", return_value=[{"question": "test"}])
+    def test_min_depth_filters_none_depth_opps(self, mock_fetch, mock_scan, mock_dash, mock_display):
+        mock_scan.return_value = [
+            {"type": "BinaryInternal", "net_profit": 0.05, "_clob_depth": None},
+            {"type": "BinaryInternal", "net_profit": 0.08, "_clob_depth": 100},
+        ]
+        args = _make_args(min_depth=50)
+        _cli_mod._run_oneshot(args, 0.01, None, _make_executor(), _make_db())
+        displayed = mock_display.call_args[0][0]
+        assert len(displayed) == 1
+        assert displayed[0]["_clob_depth"] == 100
+
+    @patch.object(_cli_mod, "display_results")
+    @patch.object(_cli_mod, "dashboard_state")
+    @patch.object(_cli_mod, "scan_binary_internal")
+    @patch.object(_cli_mod, "fetch_all_markets", return_value=[{"question": "test"}])
     def test_limit_caps_results(self, mock_fetch, mock_scan, mock_dash, mock_display):
         mock_scan.return_value = [
             {"type": "BinaryInternal", "net_profit": 0.05, "net_roi": 0.05, "_clob_depth": 50},
@@ -615,6 +630,52 @@ class TestMainBranching:
         assert mock_continuous.call_args.args[0].mode == "mm-pilot"
         assert mock_exec_cls.call_args.kwargs["dry_run"] is True
         mock_db.close.assert_called_once()
+
+
+    @patch.object(_cli_mod, "start_dashboard", return_value=None)
+    @patch.object(_cli_mod, "run_continuous")
+    @patch.object(_cli_mod, "_run_oneshot")
+    @patch.object(_cli_mod, "TradeDB")
+    @patch.object(_cli_mod, "setup_logging")
+    @patch.object(_cli_mod, "load_dotenv")
+    def test_research_mode_refuses_live_or_oneshot(
+        self, mock_dotenv, mock_logging, mock_db_cls, mock_oneshot, mock_continuous, mock_dashboard, caplog,
+    ):
+        cases = (
+            (["scanner.py", "--mode", "research", "--dry-run"], "true"),  # one-shot
+            (["scanner.py", "--continuous", "--mode", "research"], "false"),  # live
+            (["scanner.py", "--continuous", "--mode", "research", "--dry-run"], "false"),  # flag with DRY_RUN=false
+        )
+        for argv, dry_env in cases:
+            caplog.clear()
+            with patch("sys.argv", argv), patch.dict(os.environ, {"DRY_RUN": dry_env}), \
+                 patch.object(_cli_mod.config, "DRY_RUN", dry_env == "true"), \
+                 pytest.raises(SystemExit) as exc:
+                _cli_mod.main()
+            assert exc.value.code == 2
+            assert "--mode research is observational" in caplog.text
+        mock_continuous.assert_not_called()
+        mock_oneshot.assert_not_called()
+        mock_db_cls.assert_not_called()
+
+    @patch.object(_cli_mod, "start_dashboard", return_value=None)
+    @patch.object(_cli_mod, "run_continuous")
+    @patch.object(_cli_mod, "_run_oneshot")
+    @patch.object(_cli_mod, "ArbitrageExecutor")
+    @patch.object(_cli_mod, "RiskManager")
+    @patch.object(_cli_mod, "TradeDB")
+    @patch.object(_cli_mod, "setup_logging")
+    @patch.object(_cli_mod, "load_dotenv")
+    def test_research_mode_runs_continuous_dry_run(
+        self, mock_dotenv, mock_logging, mock_db_cls, mock_risk_cls,
+        mock_exec_cls, mock_oneshot, mock_continuous, mock_dashboard,
+    ):
+        with patch("sys.argv", ["scanner.py", "--continuous", "--mode", "research", "--dry-run"]), \
+             patch.object(_cli_mod.config, "DRY_RUN", True):
+            _cli_mod.main()
+        mock_continuous.assert_called_once()
+        assert mock_continuous.call_args.args[0].mode == "research"
+        assert mock_exec_cls.call_args.kwargs["dry_run"] is True
 
 
 # ---------------------------------------------------------------------------

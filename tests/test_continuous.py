@@ -1475,6 +1475,76 @@ class TestFrechetContinuousScan:
         p_ref.assert_called_once()
 
 
+class TestResearchModeLayer1Scans:
+    """--mode research runs Fréchet/temporal/CTF observationally, only while DRY_RUN is on."""
+
+    def _flags_off(self, monkeypatch, dry_run):
+        import config
+        for flag in ("FRECHET_ARB_ENABLED", "TEMPORAL_ARB_ENABLED", "CTF_ENABLED",
+                     "CTF_MERGE_ENABLED", "CTF_MINT_SELL_ENABLED"):
+            monkeypatch.setattr(config, flag, False)
+        monkeypatch.setattr(config, "DRY_RUN", dry_run)
+
+    def test_research_dry_run_dispatches_all_three_with_flags_off(self, monkeypatch):
+        from unittest.mock import patch
+        from continuous import _scan_ctf_layer1, _scan_frechet_layer1, _scan_temporal_layer1
+        self._flags_off(monkeypatch, dry_run=True)
+        with patch("scans.frechet.scan_frechet", return_value=[{"c": 1}]), \
+             patch("scans.frechet._refine_frechet_with_clob", return_value=["frechet"]), \
+             patch("scans.temporal.scan_temporal_arb", return_value=[{"c": 1}]), \
+             patch("scans.temporal._refine_temporal_with_clob", return_value=["temporal"]), \
+             patch("scans.ctf.scan_ctf", return_value=["ctf"]):
+            assert _scan_frechet_layer1([{"title": "m"}], mode="research", min_profit=0.01) == ["frechet"]
+            assert _scan_temporal_layer1([{"ticker": "K"}], mode="research", min_profit=0.01) == ["temporal"]
+            assert _scan_ctf_layer1([{"conditionId": "0x1"}], mode="research", min_profit=0.01) == ["ctf"]
+
+    def test_research_mode_is_inert_when_not_dry_run(self, monkeypatch):
+        from unittest.mock import patch
+        from continuous import _scan_ctf_layer1, _scan_frechet_layer1, _scan_temporal_layer1
+        self._flags_off(monkeypatch, dry_run=False)
+        with patch("scans.frechet.scan_frechet") as p_frechet, \
+             patch("scans.temporal.scan_temporal_arb") as p_temporal, \
+             patch("scans.ctf.scan_ctf") as p_ctf:
+            assert _scan_frechet_layer1([{"title": "m"}], mode="research", min_profit=0.01) == []
+            assert _scan_temporal_layer1([{"ticker": "K"}], mode="research", min_profit=0.01) == []
+            assert _scan_ctf_layer1([{"conditionId": "0x1"}], mode="research", min_profit=0.01) == []
+        p_frechet.assert_not_called()
+        p_temporal.assert_not_called()
+        p_ctf.assert_not_called()
+
+    def test_research_logs_one_line_per_strategy_only_in_research_mode(self, caplog):
+        from continuous import _log_research_strategy
+        with caplog.at_level("INFO", logger="continuous"):
+            _log_research_strategy("research", "frechet", 2000, 3, 1)
+            _log_research_strategy("research", "ctf", 2000, None, 0)
+            _log_research_strategy("all", "frechet", 2000, 3, 1)
+        lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Research ")]
+        assert lines == [
+            "Research frechet: 2000 inputs -> 3 candidates -> 1 surfaced after CLOB refine",
+            "Research ctf: 2000 inputs -> n/a candidates -> 0 surfaced after CLOB refine",
+        ]
+
+    def test_flags_still_gate_all_mode(self, monkeypatch):
+        from continuous import _scan_frechet_layer1, _scan_temporal_layer1
+        self._flags_off(monkeypatch, dry_run=True)
+        assert _scan_frechet_layer1([{"title": "m"}], mode="all", min_profit=0.01) == []
+        assert _scan_temporal_layer1([{"ticker": "K"}], mode="all", min_profit=0.01) == []
+
+    def test_research_empty_inputs_log_strategy_reports(self, monkeypatch, caplog):
+        from continuous import _scan_ctf_layer1, _scan_frechet_layer1, _scan_temporal_layer1
+        self._flags_off(monkeypatch, dry_run=True)
+        with caplog.at_level("INFO", logger="continuous"):
+            assert _scan_frechet_layer1([], mode="research", min_profit=0.01) == []
+            assert _scan_temporal_layer1([], mode="research", min_profit=0.01) == []
+            assert _scan_ctf_layer1([], mode="research", min_profit=0.01) == []
+        lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Research ")]
+        assert lines == [
+            "Research frechet: 0 inputs -> 0 candidates -> 0 surfaced after CLOB refine",
+            "Research temporal: 0 inputs -> 0 candidates -> 0 surfaced after CLOB refine",
+            "Research ctf: 0 inputs -> n/a candidates -> 0 surfaced after CLOB refine",
+        ]
+
+
 class TestTemporalContinuousScan:
     """Test _scan_temporal_layer1 continuous dispatch and gating."""
 
@@ -1718,3 +1788,160 @@ class TestDisputeGateContinuous:
 
         mock_db.upsert_dispute_state.assert_called_once()
         assert mock_executor.risk_manager.uma_state_unavailable is True
+
+
+class TestContinuousDepthFilter:
+    """Verify min_depth filtering in continuous mode handles None and numeric depths."""
+
+    def test_continuous_depth_filter_handles_none_and_numeric_depths(self, monkeypatch):
+        import asyncio
+        import signal as signal_module
+        continuous_module = sys.modules["continuous"]
+
+        captured_signals = {}
+        def capture_sig(sig, handler):
+            if getattr(handler, "__name__", "") == "_signal_handler":
+                captured_signals[sig] = handler
+
+        monkeypatch.setattr(continuous_module.signal, "signal", capture_sig)
+
+        mock_feed = MagicMock()
+        async def mock_feed_run():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                return
+        mock_feed.run = mock_feed_run
+        monkeypatch.setattr(continuous_module, "FeedManager", lambda *a, **kw: mock_feed)
+        monkeypatch.setattr(continuous_module, "reconcile_orphaned_positions", MagicMock())
+        monkeypatch.setattr(continuous_module, "capture_scan_heartbeat", MagicMock())
+        monkeypatch.setattr(continuous_module, "fetch_all_markets", lambda: [{"conditionId": "0x1"}])
+        monkeypatch.setattr(continuous_module, "fetch_events", lambda: [])
+
+        sample_opps = [
+            {"type": "Binary", "market": "M1", "net_profit": 0.05, "total_cost": "$0.95", "_clob_depth": None},
+            {"type": "Binary", "market": "M2", "net_profit": 0.05, "total_cost": "$0.95", "_clob_depth": 10.0},
+            {"type": "Binary", "market": "M3", "net_profit": 0.05, "total_cost": "$0.95", "_clob_depth": 50.0},
+            {"type": "Binary", "market": "M4", "net_profit": 0.05, "total_cost": "$0.95", "_clob_depth": 100.0},
+            {"type": "Binary", "market": "M5", "net_profit": 0.05, "total_cost": "$0.95"},
+        ]
+        monkeypatch.setattr(continuous_module, "scan_binary_internal", lambda *a, **kw: list(sample_opps))
+
+        mock_display = MagicMock()
+        captured_displayed = []
+
+        def on_display(opps, json_flag):
+            captured_displayed.extend(opps)
+            handler = captured_signals[signal_module.SIGTERM]
+            cells = dict(zip(handler.__code__.co_freevars, handler.__closure__ or ()))
+            cells["shutdown_event"].cell_contents.set()
+
+        mock_display.side_effect = on_display
+        monkeypatch.setattr(continuous_module, "display_results", mock_display)
+
+        args = MagicMock()
+        args.mode = "binary"
+        args.interval = 1
+        args.top = 10
+        args.min_depth = 50.0
+        args.max_trade = 10
+        args.exec_mode = "manual"
+        args.limit = None
+        args.json = False
+
+        mock_executor = MagicMock()
+        mock_db = MagicMock()
+
+        continuous_module.run_continuous(
+            args=args,
+            min_profit=0.01,
+            kalshi_client=None,
+            kalshi_api_key_id=None,
+            kalshi_private_key_path=None,
+            executor=mock_executor,
+            db=mock_db,
+            price_cache={},
+        )
+
+        mock_display.assert_called_once()
+        retained_markets = [o["market"] for o in captured_displayed]
+        assert "M3" in retained_markets
+        assert "M4" in retained_markets
+        assert "M1" not in retained_markets
+        assert "M2" not in retained_markets
+        assert "M5" not in retained_markets
+
+    def test_continuous_depth_filter_disabled_when_zero(self, monkeypatch):
+        import asyncio
+        import signal as signal_module
+        continuous_module = sys.modules["continuous"]
+
+        captured_signals = {}
+        def capture_sig(sig, handler):
+            if getattr(handler, "__name__", "") == "_signal_handler":
+                captured_signals[sig] = handler
+
+        monkeypatch.setattr(continuous_module.signal, "signal", capture_sig)
+
+        mock_feed = MagicMock()
+        async def mock_feed_run():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                return
+        mock_feed.run = mock_feed_run
+        monkeypatch.setattr(continuous_module, "FeedManager", lambda *a, **kw: mock_feed)
+        monkeypatch.setattr(continuous_module, "reconcile_orphaned_positions", MagicMock())
+        monkeypatch.setattr(continuous_module, "capture_scan_heartbeat", MagicMock())
+        monkeypatch.setattr(continuous_module, "fetch_all_markets", lambda: [{"conditionId": "0x1"}])
+        monkeypatch.setattr(continuous_module, "fetch_events", lambda: [])
+
+        sample_opps = [
+            {"type": "Binary", "market": "M1", "net_profit": 0.05, "total_cost": "$0.95", "_clob_depth": None},
+            {"type": "Binary", "market": "M2", "net_profit": 0.05, "total_cost": "$0.95", "_clob_depth": 10.0},
+            {"type": "Binary", "market": "M3", "net_profit": 0.05, "total_cost": "$0.95"},
+        ]
+        monkeypatch.setattr(continuous_module, "scan_binary_internal", lambda *a, **kw: list(sample_opps))
+
+        mock_display = MagicMock()
+        captured_displayed = []
+
+        def on_display(opps, json_flag):
+            captured_displayed.extend(opps)
+            handler = captured_signals[signal_module.SIGTERM]
+            cells = dict(zip(handler.__code__.co_freevars, handler.__closure__ or ()))
+            cells["shutdown_event"].cell_contents.set()
+
+        mock_display.side_effect = on_display
+        monkeypatch.setattr(continuous_module, "display_results", mock_display)
+
+        args = MagicMock()
+        args.mode = "binary"
+        args.interval = 1
+        args.top = 10
+        args.min_depth = 0
+        args.max_trade = 10
+        args.exec_mode = "manual"
+        args.limit = None
+        args.json = False
+
+        mock_executor = MagicMock()
+        mock_db = MagicMock()
+
+        continuous_module.run_continuous(
+            args=args,
+            min_profit=0.01,
+            kalshi_client=None,
+            kalshi_api_key_id=None,
+            kalshi_private_key_path=None,
+            executor=mock_executor,
+            db=mock_db,
+            price_cache={},
+        )
+
+        mock_display.assert_called_once()
+        retained_markets = [o["market"] for o in captured_displayed]
+        assert len(retained_markets) == 3
+        assert "M1" in retained_markets
+        assert "M2" in retained_markets
+        assert "M3" in retained_markets

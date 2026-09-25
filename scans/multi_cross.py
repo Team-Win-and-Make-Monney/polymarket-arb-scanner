@@ -23,7 +23,7 @@ from scans.helpers import (
     _days_to_resolution,
     filter_dust,
 )
-from .kalshi import _is_catch_all_label
+from kalshi_completeness import is_catch_all_label as _is_catch_all_label
 
 logger = logging.getLogger(__name__)
 

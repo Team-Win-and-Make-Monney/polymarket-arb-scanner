@@ -201,6 +201,21 @@ class TestMatchOutcomes:
         assert outcomes["Other Party"]["kalshi_market"] is None
         assert outcomes["Other Party"]["best_price"] == 0.20
 
+    def test_is_unnamed_pm_leg_identifies_unnamed_and_placeholder_legs(self):
+        from scans.multi_cross import _is_unnamed_pm_leg
+
+        assert _is_unnamed_pm_leg({"active": False}) is True
+        assert _is_unnamed_pm_leg({"negRiskOther": True}) is True
+        assert _is_unnamed_pm_leg({"groupItemTitle": "Other"}) is True
+        assert _is_unnamed_pm_leg({"groupItemTitle": "Someone else"}) is True
+        # Fallback to question when groupItemTitle is absent or None
+        assert _is_unnamed_pm_leg({"question": "Other"}) is True
+        assert _is_unnamed_pm_leg({"groupItemTitle": None, "question": "Other"}) is True
+        assert _is_unnamed_pm_leg({"groupItemTitle": "", "question": "Someone else"}) is True
+        # Named active legs
+        assert _is_unnamed_pm_leg({"groupItemTitle": "Alice", "active": True}) is False
+        assert _is_unnamed_pm_leg({"question": "Alice", "active": True}) is False
+
 
 # ---------------------------------------------------------------------------
 # Main scan function
@@ -345,6 +360,46 @@ class TestScanMultiCross:
              ]):
             result = scan_multi_cross(
                 [pm_event], kalshi_client=None, min_profit=0.0, kalshi_data=kalshi_data,
+            )
+
+        assert result == []
+
+    def test_scan_multi_cross_drops_baskets_with_unnamed_pm_legs(self):
+        """Even if total cost is low and spread is profitable, a basket containing
+        an unnamed, placeholder, or catch-all Polymarket leg must be dropped."""
+        from scans.multi_cross import scan_multi_cross
+
+        pm_event = {
+            "title": "Who will win the tournament?", "id": "ev-tourney",
+            "markets": [
+                {"groupItemTitle": "Team Alpha", "active": True, "_yes": 0.20},
+                {"groupItemTitle": "Team Beta", "active": True, "_yes": 0.20},
+                {"groupItemTitle": "Other", "active": True, "negRiskOther": True, "_yes": 0.10},
+            ],
+        }
+        kalshi_markets = [
+            {"yes_sub_title": "Team Alpha", "ticker": "K-A", "yes_price": 0.25},
+            {"yes_sub_title": "Team Beta", "ticker": "K-B", "yes_price": 0.25},
+            {"yes_sub_title": "Other", "ticker": "K-O", "yes_price": 0.15},
+        ]
+        kalshi_data = (
+            [{"event_ticker": "EV-1", "mutually_exclusive": True}],
+            {"EV-1": kalshi_markets},
+            {"EV-1": "Who will win the tournament?"},
+        )
+
+        with patch("scans.multi_cross.get_negrisk_events", return_value=[pm_event]), \
+             patch("scans.multi_cross.parse_outcome_prices", side_effect=lambda m: [m["_yes"]]), \
+             patch("scans.multi_cross._within_resolution_window", return_value=True), \
+             patch("scans.multi_cross._days_to_resolution", return_value=30), \
+             patch("scans.multi_cross._extract_token_ids", return_value=["tok"]), \
+             patch("scans.multi_cross._refine_multi_cross_with_clob", side_effect=lambda opps, *a, **kw: opps), \
+             patch("scans.multi_cross.filter_dust", side_effect=lambda opps: opps), \
+             patch("scans.multi_cross._match_events_by_title", return_value=[
+                 (pm_event, "EV-1", kalshi_markets),
+             ]):
+            result = scan_multi_cross(
+                [pm_event], kalshi_client=None, min_profit=0.01, kalshi_data=kalshi_data,
             )
 
         assert result == []

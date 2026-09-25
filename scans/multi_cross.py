@@ -23,7 +23,7 @@ from scans.helpers import (
     _days_to_resolution,
     filter_dust,
 )
-from scans.kalshi import _is_catch_all_label
+from .kalshi import _is_catch_all_label
 
 logger = logging.getLogger(__name__)
 
@@ -62,10 +62,11 @@ def _is_unnamed_pm_leg(market: dict) -> bool:
     Returns:
         True for placeholder, ``negRiskOther`` and bare catch-all legs.
     """
+    label = market.get("groupItemTitle") or market.get("question") or ""
     return (
         market.get("negRiskOther") is True
         or market.get("active") is False
-        or _is_catch_all_label(market.get("groupItemTitle"))
+        or _is_catch_all_label(label)
     )
 
 
@@ -360,6 +361,13 @@ def scan_multi_cross(
 
         # Match individual outcomes
         outcomes = _match_outcomes(pm_markets, kalshi_markets, kalshi_client)
+
+        if any(o.get("pm_market") and _is_unnamed_pm_leg(o["pm_market"]) for o in outcomes):
+            logger.debug(
+                "MultiCross skipped: '%s' contains an unnamed Polymarket leg",
+                pm_event.get("title", "?")[:40],
+            )
+            continue
 
         # Require ALL Polymarket outcomes to be matched — if any outcome is
         # dropped, the total cost is artificially low and produces false arbs

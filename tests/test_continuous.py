@@ -1581,6 +1581,36 @@ class TestTemporalContinuousScan:
         p_scan.assert_called_once()
         p_ref.assert_called_once()
 
+    def test_temporal_forwards_price_cache_to_refine(self, monkeypatch):
+        from unittest.mock import patch
+        import config
+        from continuous import _scan_temporal_layer1
+        monkeypatch.setattr(config, "TEMPORAL_ARB_ENABLED", True)
+        markets = [{"ticker": "KXBTC-26MAR31-T100000"}]
+        mock_cands = [{"type": "TemporalArb", "net_profit": 0.05}]
+        mock_refined = [{"type": "TemporalArb", "net_profit": 0.04}]
+        test_cache = {("kalshi", "KXBTC-26MAR31-T100000"): {"yes_ask": 0.50}}
+
+        with patch("scans.temporal.scan_temporal_arb", return_value=mock_cands) as p_scan, \
+             patch("scans.temporal._refine_temporal_with_clob", return_value=mock_refined) as p_ref:
+            res = _scan_temporal_layer1(
+                markets,
+                mode="all",
+                min_profit=0.01,
+                kalshi_client="dummy_client",
+                price_cache=test_cache,
+            )
+
+        assert res == mock_refined
+        p_scan.assert_called_once()
+        p_ref.assert_called_once_with(
+            mock_cands,
+            min_profit=0.01,
+            kalshi_client="dummy_client",
+            price_cache=test_cache,
+            funnel=None,
+        )
+
 
 # ---------------------------------------------------------------------------
 # CTF Primitives Continuous Integration (Plan 04)

@@ -2,6 +2,7 @@
 
 import os
 import sys
+import time
 from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -165,3 +166,194 @@ class TestScansTemporal:
         refined = _refine_temporal_with_clob([cand], min_profit=0.01, funnel=mock_funnel)
         assert len(refined) == 0
         mock_funnel.record_clob_dropped.assert_called_once_with(1)
+
+    def test_refine_temporal_with_price_cache_avoids_rest_fetch(self) -> None:
+        cand = {
+            "type": "TemporalArb",
+            "_early_ticker": "KXBTC-26MAR31-T100000",
+            "_late_ticker": "KXBTC-26JUN30-T100000",
+            "_sup_market": {},
+            "_sub_market": {},
+            "net_profit": 0.08,
+            "_p_early": 0.65,
+            "_p_late": 0.49,
+        }
+        price_cache = {
+            ("kalshi", "KXBTC-26JUN30-T100000"): {
+                "yes_ask": 0.49,
+                "yes_ask_size": 100,
+                "_ts": time.time(),
+            },
+            ("kalshi", "KXBTC-26MAR31-T100000"): {
+                "no_ask": 0.35,
+                "no_ask_size": 120,
+                "_ts": time.time(),
+            },
+        }
+        mock_client = MagicMock()
+        refined = _refine_temporal_with_clob(
+            [cand],
+            min_profit=0.01,
+            kalshi_client=mock_client,
+            price_cache=price_cache,
+        )
+        assert len(refined) == 1
+        ref = refined[0]
+        assert ref["_kalshi_late_yes"] == 0.49
+        assert ref["_kalshi_early_no"] == 0.35
+        assert ref["_clob_depth"] == 100
+        assert ref["_clob_refined"] is True
+        assert ref.get("_ws_source_late") is True
+        assert ref.get("_ws_source_early") is True
+        mock_client.fetch_order_book.assert_not_called()
+
+    def test_refine_temporal_with_ticker_key_cache(self) -> None:
+        cand = {
+            "type": "TemporalArb",
+            "_early_ticker": "KXBTC-26MAR31-T100000",
+            "_late_ticker": "KXBTC-26JUN30-T100000",
+            "_sup_market": {},
+            "_sub_market": {},
+            "net_profit": 0.08,
+        }
+        price_cache = {
+            "KXBTC-26JUN30-T100000": {
+                "yes_ask": 0.49,
+                "yes_ask_size": 80,
+                "_ts": time.time(),
+            },
+            "KXBTC-26MAR31-T100000": {
+                "no_ask": 0.35,
+                "no_ask_size": 90,
+                "_ts": time.time(),
+            },
+        }
+        mock_client = MagicMock()
+        refined = _refine_temporal_with_clob(
+            [cand],
+            min_profit=0.01,
+            kalshi_client=mock_client,
+            price_cache=price_cache,
+        )
+        assert len(refined) == 1
+        assert refined[0]["_clob_depth"] == 80
+        mock_client.fetch_order_book.assert_not_called()
+
+    def test_refine_temporal_stale_cache_falls_back_to_rest(self) -> None:
+        cand = {
+            "type": "TemporalArb",
+            "_early_ticker": "KXBTC-26MAR31-T100000",
+            "_late_ticker": "KXBTC-26JUN30-T100000",
+            "_sup_market": {},
+            "_sub_market": {},
+            "net_profit": 0.08,
+        }
+        # Stale cache (> 30s)
+        price_cache = {
+            ("kalshi", "KXBTC-26JUN30-T100000"): {
+                "yes_ask": 0.49,
+                "yes_ask_size": 100,
+                "_ts": time.time() - 60,
+            },
+            ("kalshi", "KXBTC-26MAR31-T100000"): {
+                "no_ask": 0.35,
+                "no_ask_size": 120,
+                "_ts": time.time() - 60,
+            },
+        }
+        mock_client = MagicMock()
+        mock_client.fetch_order_book.side_effect = lambda ticker: {
+            "orderbook_fp": {
+                "yes_dollars": [["0.45", "100"]],
+                "no_dollars": [["0.51", "100"]] if "JUN" in ticker else [["0.30", "150"]],
+            }
+        } if "JUN" in ticker else {
+            "orderbook_fp": {
+                "yes_dollars": [["0.65", "120"]],
+                "no_dollars": [["0.30", "150"]],
+            }
+        }
+        refined = _refine_temporal_with_clob(
+            [cand],
+            min_profit=0.01,
+            kalshi_client=mock_client,
+            price_cache=price_cache,
+        )
+        assert len(refined) == 1
+        assert mock_client.fetch_order_book.call_count == 2
+
+    def test_refine_temporal_partial_cache_fetches_missing_ticker_only(self) -> None:
+        cand = {
+            "type": "TemporalArb",
+            "_early_ticker": "KXBTC-26MAR31-T100000",
+            "_late_ticker": "KXBTC-26JUN30-T100000",
+            "_sup_market": {},
+            "_sub_market": {},
+            "net_profit": 0.08,
+        }
+        # Only late ticker is cached
+        price_cache = {
+            ("kalshi", "KXBTC-26JUN30-T100000"): {
+                "yes_ask": 0.49,
+                "yes_ask_size": 100,
+                "_ts": time.time(),
+            },
+        }
+        mock_client = MagicMock()
+        mock_client.fetch_order_book.return_value = {
+            "orderbook_fp": {
+                "yes_dollars": [["0.65", "120"]],
+                "no_dollars": [["0.30", "150"]],
+            }
+        }
+        refined = _refine_temporal_with_clob(
+            [cand],
+            min_profit=0.01,
+            kalshi_client=mock_client,
+            price_cache=price_cache,
+        )
+        assert len(refined) == 1
+        mock_client.fetch_order_book.assert_called_once_with("KXBTC-26MAR31-T100000")
+        assert refined[0]["_kalshi_late_yes"] == 0.49
+        assert refined[0]["_kalshi_early_no"] == 0.35
+
+    def test_refine_temporal_embedded_orderbook_in_cache(self) -> None:
+        cand = {
+            "type": "TemporalArb",
+            "_early_ticker": "KXBTC-26MAR31-T100000",
+            "_late_ticker": "KXBTC-26JUN30-T100000",
+            "_sup_market": {},
+            "_sub_market": {},
+            "net_profit": 0.08,
+        }
+        price_cache = {
+            ("kalshi", "KXBTC-26JUN30-T100000"): {
+                "orderbook": {
+                    "orderbook_fp": {
+                        "yes_dollars": [["0.45", "100"]],
+                        "no_dollars": [["0.51", "100"]],
+                    }
+                },
+                "_ts": time.time(),
+            },
+            ("kalshi", "KXBTC-26MAR31-T100000"): {
+                "orderbook": {
+                    "orderbook_fp": {
+                        "yes_dollars": [["0.65", "120"]],
+                        "no_dollars": [["0.30", "150"]],
+                    }
+                },
+                "_ts": time.time(),
+            },
+        }
+        mock_client = MagicMock()
+        refined = _refine_temporal_with_clob(
+            [cand],
+            min_profit=0.01,
+            kalshi_client=mock_client,
+            price_cache=price_cache,
+        )
+        assert len(refined) == 1
+        assert refined[0]["_kalshi_late_yes"] == 0.49
+        assert refined[0]["_kalshi_early_no"] == 0.35
+        mock_client.fetch_order_book.assert_not_called()

@@ -15,10 +15,11 @@ Risk-free edge = (P(early) - P(late)) - fees.
 from __future__ import annotations
 
 import logging
+import time
 
 from fees import net_profit_frechet_implication
 from kalshi_ticker import find_temporal_pairs
-from scans.helpers import _days_to_resolution
+from scans.helpers import _WS_CACHE_MAX_AGE, _days_to_resolution
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,60 @@ def scan_temporal_arb(
     return candidates
 
 
+def _get_cached_kalshi_quote(ticker: str, price_cache: dict | None) -> dict | None:
+    """Retrieve fresh Kalshi order book / quote data from price_cache if available.
+
+    Args:
+        ticker: Kalshi market ticker.
+        price_cache: Shared WebSocket price cache keyed by (platform, ticker) or ticker.
+
+    Returns:
+        Dict with 'yes_ask', 'yes_ask_size', 'no_ask', 'no_ask_size' if available and fresh,
+        or None.
+    """
+    if not price_cache or not ticker:
+        return None
+    cached = price_cache.get(("kalshi", ticker))
+    if cached is None:
+        cached = price_cache.get(ticker)
+    if not isinstance(cached, dict):
+        return None
+    if cached.get("_stale"):
+        return None
+    now = time.time()
+    ts = cached.get("_ts")
+    if ts is not None and (now - ts > _WS_CACHE_MAX_AGE):
+        return None
+
+    # Check for direct ask fields from normalised WS feeds
+    yes_ask = cached.get("yes_ask")
+    no_ask = cached.get("no_ask")
+    yes_ask_size = cached.get("yes_ask_size")
+    no_ask_size = cached.get("no_ask_size")
+
+    # Fallback to embedded raw orderbook if direct fields missing
+    if yes_ask is None or no_ask is None:
+        raw_book = cached.get("orderbook") or cached.get("book") or cached.get("raw")
+        if raw_book:
+            from kalshi_api import parse_orderbook, best_yes_ask, best_no_ask
+            parsed = parse_orderbook(raw_book)
+            if yes_ask is None:
+                yt = best_yes_ask(parsed)
+                if yt is not None:
+                    yes_ask, yes_ask_size = yt
+            if no_ask is None:
+                nt = best_no_ask(parsed)
+                if nt is not None:
+                    no_ask, no_ask_size = nt
+
+    return {
+        "yes_ask": float(yes_ask) if yes_ask is not None else None,
+        "yes_ask_size": float(yes_ask_size or 0.0),
+        "no_ask": float(no_ask) if no_ask is not None else None,
+        "no_ask_size": float(no_ask_size or 0.0),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Stage 2: CLOB Orderbook Refinement
 # ---------------------------------------------------------------------------
@@ -144,6 +199,7 @@ def _refine_temporal_with_clob(
     candidates: list[dict],
     min_profit: float = 0.01,
     kalshi_client=None,
+    price_cache: dict | None = None,
     funnel=None,
 ) -> list[dict]:
     """Stage 2: Re-check temporal arbitrage candidates using real CLOB order books.
@@ -172,28 +228,44 @@ def _refine_temporal_with_clob(
         late_depth: float = 0.0
         early_depth: float = 0.0
 
+        # Stage 2a: Check live WebSocket price_cache first
+        cached_late = _get_cached_kalshi_quote(late_ticker, price_cache)
+        if cached_late and cached_late.get("yes_ask") is not None:
+            late_yes_ask = cached_late["yes_ask"]
+            late_depth = cached_late["yes_ask_size"]
+            cand["_ws_source_late"] = True
+
+        cached_early = _get_cached_kalshi_quote(early_ticker, price_cache)
+        if cached_early and cached_early.get("no_ask") is not None:
+            early_no_ask = cached_early["no_ask"]
+            early_depth = cached_early["no_ask_size"]
+            cand["_ws_source_early"] = True
+
+        # Stage 2b: Fallback to Kalshi REST API for any un-cached sides
         if kalshi_client:
-            try:
-                book_late = kalshi_client.fetch_order_book(late_ticker)
-                if book_late:
-                    parsed_late = parse_orderbook(book_late)
-                    yes_tup = best_yes_ask(parsed_late)
-                    if yes_tup is not None:
-                        late_yes_ask, late_depth = yes_tup
-            except Exception as e:
-                logger.debug("Failed to fetch Kalshi orderbook for late ticker %s: %s", late_ticker, e)
+            if late_yes_ask is None:
+                try:
+                    book_late = kalshi_client.fetch_order_book(late_ticker)
+                    if book_late:
+                        parsed_late = parse_orderbook(book_late)
+                        yes_tup = best_yes_ask(parsed_late)
+                        if yes_tup is not None:
+                            late_yes_ask, late_depth = yes_tup
+                except Exception as e:
+                    logger.debug("Failed to fetch Kalshi orderbook for late ticker %s: %s", late_ticker, e)
 
-            try:
-                book_early = kalshi_client.fetch_order_book(early_ticker)
-                if book_early:
-                    parsed_early = parse_orderbook(book_early)
-                    no_tup = best_no_ask(parsed_early)
-                    if no_tup is not None:
-                        early_no_ask, early_depth = no_tup
-            except Exception as e:
-                logger.debug("Failed to fetch Kalshi orderbook for early ticker %s: %s", early_ticker, e)
+            if early_no_ask is None:
+                try:
+                    book_early = kalshi_client.fetch_order_book(early_ticker)
+                    if book_early:
+                        parsed_early = parse_orderbook(book_early)
+                        no_tup = best_no_ask(parsed_early)
+                        if no_tup is not None:
+                            early_no_ask, early_depth = no_tup
+                except Exception as e:
+                    logger.debug("Failed to fetch Kalshi orderbook for early ticker %s: %s", early_ticker, e)
 
-        # Fallback to pre-populated book or ask prices in market dict
+        # Stage 2c: Fallback to pre-populated book or ask prices in market dict
         if late_yes_ask is None:
             late_mkt = cand.get("_sup_market", {})
             late_book = late_mkt.get("orderbook")
@@ -250,6 +322,7 @@ def _refine_temporal_with_clob(
         cand["net_profit"] = net_profit
         cand["net_roi"] = result["net_roi"]
         cand["_clob_depth"] = clob_depth
+        cand["_clob_refined"] = True
 
         if funnel:
             funnel.record_surfaced(1)

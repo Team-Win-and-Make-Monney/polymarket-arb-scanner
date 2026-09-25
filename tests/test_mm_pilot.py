@@ -1623,13 +1623,15 @@ class TestMMPilotStatusTelemetry:
         # Core status
         assert "active" in status
         assert status["active"] is True
+        assert status["status"] == "active"
+        assert status["stopped"] is False
         assert status["halted"] is False
         assert status["halt_reason"] == ""
         assert status["markets_halted"] == {}
         # Canary
         assert status["canary_graduated"] is False
         assert status["canary_clean_fills"] == 0
-        assert status["canary_target_fills"] == 50
+        assert status["canary_target_fills"] == live_config().MM_CANARY_FILLS
         # Orders and inventory
         assert status["resting_orders"] == 0
         assert status["orders"] == []
@@ -1681,9 +1683,53 @@ class TestMMPilotStatusTelemetry:
         assert state_file.exists()
         saved = json.loads(state_file.read_text())
         assert saved["active"] is True
+        assert saved["status"] == "active"
+        assert saved["stopped"] is False
         assert saved["halted"] is False
-        assert saved["canary_target_fills"] == 50
+        assert saved["canary_target_fills"] == live_config().MM_CANARY_FILLS
         assert saved["selected_markets"] == [TICKER]
         assert oid in saved["orders"]
         assert "inventory" in saved
         assert "saved_at" in saved
+
+    def test_stop_persists_stopped_state(self, pilot_env, clock, tmp_path):
+        """Calling stop() persists stopped=True, active=False, and status='stopped'."""
+        client = FakeKalshiClient()
+        state_file = tmp_path / "mm_state.json"
+        pilot = build_pilot(clock, client=client, state_path=str(state_file))
+        pilot.update_selection([TICKER])
+        oid = pilot.place_pilot_order(
+            TICKER, "yes", "buy", 4, 0.49, purpose="quote_bid"
+        )
+        assert oid
+
+        # Before stop
+        assert pilot.get_status()["active"] is True
+        assert pilot.get_status()["stopped"] is False
+
+        # Stop pilot
+        pilot.stop()
+
+        status = pilot.get_status()
+        assert status["active"] is False
+        assert status["stopped"] is True
+        assert status["status"] == "stopped"
+
+        assert state_file.exists()
+        saved = json.loads(state_file.read_text())
+        assert saved["active"] is False
+        assert saved["stopped"] is True
+        assert saved["status"] == "stopped"
+
+    def test_canary_target_fills_reflects_config(self, pilot_env, clock, monkeypatch, tmp_path):
+        """Telemetry reflects the configured MM_CANARY_FILLS threshold."""
+        monkeypatch.setattr(live_config(), "MM_CANARY_FILLS", 75)
+        state_file = tmp_path / "mm_state.json"
+        pilot = build_pilot(clock, state_path=str(state_file))
+
+        status = pilot.get_status()
+        assert status["canary_target_fills"] == 75
+
+        pilot._persist_state()
+        saved = json.loads(state_file.read_text())
+        assert saved["canary_target_fills"] == 75

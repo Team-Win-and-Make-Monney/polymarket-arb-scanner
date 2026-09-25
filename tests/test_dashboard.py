@@ -844,11 +844,10 @@ class TestMMPilotDashboardIntegration:
 
     def test_mm_pilot_endpoint_inactive_when_none(self):
         """When no pilot instance or state file exists, /api/mm-pilot returns inactive status."""
-        import dashboard
-        orig_pilot = dashboard.state.mm_pilot
-        orig_path = dashboard.state.mm_pilot_state_path
-        dashboard.state.mm_pilot = None
-        dashboard.state.mm_pilot_state_path = "/nonexistent/path/to/state.json"
+        orig_pilot = state.mm_pilot
+        orig_path = state.mm_pilot_state_path
+        state.mm_pilot = None
+        state.mm_pilot_state_path = "/nonexistent/path/to/state.json"
         server, url = _start_test_server(18850)
         try:
             with patch("config.DASHBOARD_PASS", ""), patch.dict("os.environ", {"MM_STATE_PATH": ""}):
@@ -859,16 +858,17 @@ class TestMMPilotDashboardIntegration:
             assert data["status"] == "inactive"
         finally:
             server.shutdown()
-            dashboard.state.mm_pilot = orig_pilot
-            dashboard.state.mm_pilot_state_path = orig_path
+            state.mm_pilot = orig_pilot
+            state.mm_pilot_state_path = orig_path
 
     def test_mm_pilot_endpoint_from_active_pilot_instance(self):
         """When an in-process pilot instance is set, /api/mm-pilot serves its status."""
-        import dashboard
-        orig_pilot = dashboard.state.mm_pilot
+        orig_pilot = state.mm_pilot
         mock_pilot = MagicMock()
         mock_pilot.get_status.return_value = {
             "active": True,
+            "status": "active",
+            "stopped": False,
             "halted": False,
             "dry_run": True,
             "resting_orders": 2,
@@ -881,7 +881,7 @@ class TestMMPilotDashboardIntegration:
             "canary_graduated": False,
             "kill_switch_enabled": True,
         }
-        dashboard.state.mm_pilot = mock_pilot
+        state.mm_pilot = mock_pilot
         server, url = _start_test_server(18851)
         try:
             with patch("config.DASHBOARD_PASS", ""):
@@ -889,33 +889,38 @@ class TestMMPilotDashboardIntegration:
             assert status == 200
             data = json.loads(body)
             assert data["active"] is True
+            assert data["status"] == "active"
             assert data["source"] == "instance"
             assert data["resting_orders"] == 2
             assert len(data["orders"]) == 2
             assert data["selected_markets"] == ["KXTEST"]
         finally:
             server.shutdown()
-            dashboard.state.mm_pilot = orig_pilot
+            state.mm_pilot = orig_pilot
 
     def test_mm_pilot_endpoint_from_state_file(self, tmp_path):
-        """When an on-disk state file exists, /api/mm-pilot serves its state."""
-        import dashboard
-        orig_pilot = dashboard.state.mm_pilot
-        orig_path = dashboard.state.mm_pilot_state_path
-        dashboard.state.mm_pilot = None
+        """When an on-disk state file exists, /api/mm-pilot normalizes its state."""
+        orig_pilot = state.mm_pilot
+        orig_path = state.mm_pilot_state_path
+        state.mm_pilot = None
 
         state_file = tmp_path / "mm_pilot_state.json"
         state_data = {
             "active": True,
+            "status": "active",
+            "stopped": False,
             "halted": False,
             "dry_run": True,
-            "resting_orders": 1,
-            "orders": {"ord-99": {"ticker": "KXFILE", "side": "yes", "price": 0.50, "count": 5}},
-            "inventory": {"KXFILE": {"net": 5, "avg_cost": 0.50, "usd": 2.50, "realized": 0.0}},
-            "saved_at": 1727280000.0,
+            "orders": {"ord-99": {"ticker": "KXFILE", "side": "yes", "action": "buy", "price": 0.50, "count": 5}},
+            "inventory": {
+                "net": {"KXFILE": 5},
+                "avg": {"KXFILE": 0.50},
+                "realized": {"KXFILE": 1.25},
+            },
+            "saved_at": time.time(),
         }
         state_file.write_text(json.dumps(state_data))
-        dashboard.state.mm_pilot_state_path = str(state_file)
+        state.mm_pilot_state_path = str(state_file)
 
         server, url = _start_test_server(18852)
         try:
@@ -924,12 +929,147 @@ class TestMMPilotDashboardIntegration:
             assert status == 200
             data = json.loads(body)
             assert data["source"] == "file"
+            assert data["active"] is True
+            assert data["status"] == "active"
             assert data["resting_orders"] == 1
-            assert "ord-99" in data["orders"]
+            assert isinstance(data["orders"], list)
+            assert data["orders"][0]["order_id"] == "ord-99"
+            assert data["orders"][0]["ticker"] == "KXFILE"
+            assert data["total_inventory_usd"] == 2.50
+            assert data["realized_pnl"] == 1.25
         finally:
             server.shutdown()
-            dashboard.state.mm_pilot = orig_pilot
-            dashboard.state.mm_pilot_state_path = orig_path
+            state.mm_pilot = orig_pilot
+            state.mm_pilot_state_path = orig_path
+
+    def test_mm_pilot_endpoint_stopped_state_file(self, tmp_path):
+        """Persisted stopped pilot is normalized with active=False, status='stopped'."""
+        orig_pilot = state.mm_pilot
+        orig_path = state.mm_pilot_state_path
+        state.mm_pilot = None
+
+        state_file = tmp_path / "mm_pilot_state.json"
+        state_data = {
+            "active": False,
+            "status": "stopped",
+            "stopped": True,
+            "halted": False,
+            "dry_run": True,
+            "orders": {},
+            "inventory": {"net": {}, "avg": {}, "realized": {}},
+            "saved_at": time.time(),
+        }
+        state_file.write_text(json.dumps(state_data))
+        state.mm_pilot_state_path = str(state_file)
+
+        server, url = _start_test_server(18855)
+        try:
+            with patch("config.DASHBOARD_PASS", ""):
+                status, body, _ = _get(url, "/api/mm-pilot")
+            assert status == 200
+            data = json.loads(body)
+            assert data["source"] == "file"
+            assert data["active"] is False
+            assert data["stopped"] is True
+            assert data["status"] == "stopped"
+        finally:
+            server.shutdown()
+            state.mm_pilot = orig_pilot
+            state.mm_pilot_state_path = orig_path
+
+    def test_mm_pilot_endpoint_stale_state_file(self, tmp_path):
+        """Persisted state file older than 120s is marked active=False, status='stale'."""
+        orig_pilot = state.mm_pilot
+        orig_path = state.mm_pilot_state_path
+        state.mm_pilot = None
+
+        state_file = tmp_path / "mm_pilot_state.json"
+        state_data = {
+            "active": True,
+            "status": "active",
+            "stopped": False,
+            "halted": False,
+            "dry_run": True,
+            "orders": {"ord-old": {"ticker": "KXOLD", "side": "yes", "action": "buy", "price": 0.50, "count": 2}},
+            "inventory": {"net": {}, "avg": {}, "realized": {}},
+            "saved_at": time.time() - 300.0,
+        }
+        state_file.write_text(json.dumps(state_data))
+        state.mm_pilot_state_path = str(state_file)
+
+        server, url = _start_test_server(18856)
+        try:
+            with patch("config.DASHBOARD_PASS", ""):
+                status, body, _ = _get(url, "/api/mm-pilot")
+            assert status == 200
+            data = json.loads(body)
+            assert data["source"] == "file"
+            assert data["active"] is False
+            assert data["status"] == "stale"
+        finally:
+            server.shutdown()
+            state.mm_pilot = orig_pilot
+            state.mm_pilot_state_path = orig_path
+
+    def test_mm_pilot_shutdown_followed_by_dashboard_file_fallback(self, tmp_path):
+        """Pilot shutdown followed by instance clear serves file fallback with stopped status."""
+        orig_pilot = state.mm_pilot
+        orig_path = state.mm_pilot_state_path
+
+        state_file = tmp_path / "mm_pilot_state.json"
+        mock_pilot = MagicMock()
+        mock_pilot.get_status.return_value = {
+            "active": True,
+            "status": "active",
+            "stopped": False,
+            "halted": False,
+            "resting_orders": 1,
+            "orders": [{"order_id": "ord-1", "ticker": "KXTEST", "side": "yes", "action": "buy", "price": 0.50, "count": 5}],
+            "total_inventory_usd": 2.50,
+            "realized_pnl": 0.0,
+            "inventory": {"net": {"KXTEST": 5}, "avg": {"KXTEST": 0.50}, "realized": {}},
+        }
+        state.mm_pilot = mock_pilot
+        state.mm_pilot_state_path = str(state_file)
+
+        server, url = _start_test_server(18857)
+        try:
+            with patch("config.DASHBOARD_PASS", ""):
+                # 1. Live instance
+                status, body, _ = _get(url, "/api/mm-pilot")
+                assert status == 200
+                data = json.loads(body)
+                assert data["source"] == "instance"
+                assert data["active"] is True
+
+                # 2. Pilot shutdown writes state file and clears instance
+                persisted_data = {
+                    "active": False,
+                    "status": "stopped",
+                    "stopped": True,
+                    "halted": False,
+                    "orders": {},
+                    "inventory": {"net": {"KXTEST": 5}, "avg": {"KXTEST": 0.50}, "realized": {"KXTEST": 0.50}},
+                    "saved_at": time.time(),
+                }
+                state_file.write_text(json.dumps(persisted_data))
+                state.mm_pilot = None
+
+                # 3. File fallback reports stopped
+                status, body, _ = _get(url, "/api/mm-pilot")
+                assert status == 200
+                data = json.loads(body)
+                assert data["source"] == "file"
+                assert data["active"] is False
+                assert data["stopped"] is True
+                assert data["status"] == "stopped"
+                assert data["resting_orders"] == 0
+                assert data["total_inventory_usd"] == 2.50
+                assert data["realized_pnl"] == 0.50
+        finally:
+            server.shutdown()
+            state.mm_pilot = orig_pilot
+            state.mm_pilot_state_path = orig_path
 
     def test_mm_pilot_endpoint_requires_auth(self):
         """When DASHBOARD_PASS is set, /api/mm-pilot enforces HTTP Basic Auth."""
@@ -963,3 +1103,11 @@ class TestMMPilotDashboardIntegration:
             assert "resting_orders" in data["mm_pilot"]
         finally:
             server.shutdown()
+
+    def test_dashboard_ui_html_inventory_and_stopped_badges(self):
+        """Verify dashboard HTML contains renderMMPilot with inventory mapping and stopped/stale badges."""
+        from dashboard_ui import get_dashboard_html
+        html = get_dashboard_html()
+        assert "PILOT: STOPPED" in html
+        assert "PILOT: STALE" in html
+        assert "inventory.net" in html

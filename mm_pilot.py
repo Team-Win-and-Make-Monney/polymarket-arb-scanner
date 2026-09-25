@@ -442,6 +442,7 @@ class KalshiMMPilot:
         # Halt state
         self.halted = False           # whole-pilot halt (manual restart)
         self.halt_reason = ""
+        self._stopped = False
         self._market_halted: dict[str, str] = {}     # ticker -> reason
         self._market_halt_times: dict[str, list[float]] = {}
         self._hedge_failures: dict[str, int] = {}    # consecutive, per ticker
@@ -659,18 +660,23 @@ class KalshiMMPilot:
         """
         if self._state_store is None:
             return
+        import config
+        canary_target = getattr(config, "MM_CANARY_FILLS", 10)
         with self._lock:
             orders_snapshot = {oid: dict(info)
                               for oid, info in self._orders.items()}
             selected = sorted(self._selected) if self._selected else []
+        status_val = "halted" if self.halted else ("stopped" if self._stopped else "active")
         state = {
-            "active": not self.halted,
+            "active": (not self.halted) and (not self._stopped),
+            "status": status_val,
+            "stopped": self._stopped,
             "halted": self.halted,
             "halt_reason": self.halt_reason,
             "markets_halted": dict(self._market_halted),
             "canary_graduated": self.canary_graduated,
             "canary_clean_fills": self.canary_clean_fills,
-            "canary_target_fills": 50,
+            "canary_target_fills": canary_target,
             "dry_run": self.dry_run,
             "reconciled": self._reconciled,
             "fills_blind": self._fills_blind,
@@ -2119,6 +2125,8 @@ class KalshiMMPilot:
             )
         logger.info("MM pilot stopped: cancellation_confirmed=%s, "
                     "cancel_attempts=%d", confirmed, cancelled)
+        self._stopped = True
+        self._persist_state()
         with self._decision_lock:
             if self._decision_fh is not None and not self._decision_fh.closed:
                 self._decision_fh.close()
@@ -2126,6 +2134,8 @@ class KalshiMMPilot:
 
     def get_status(self) -> dict:
         """Status snapshot for dashboards / digests."""
+        import config
+        canary_target = getattr(config, "MM_CANARY_FILLS", 10)
         with self._lock:
             orders_count = len(self._orders)
             orders_list = [{"order_id": oid, **info} for oid, info in self._orders.items()]
@@ -2138,14 +2148,17 @@ class KalshiMMPilot:
             except Exception as e:
                 logger.debug("Failed reading kill switch status for telemetry: %s", e)
 
+        status_val = "halted" if self.halted else ("stopped" if self._stopped else "active")
         return {
-            "active": not self.halted,
+            "active": (not self.halted) and (not self._stopped),
+            "status": status_val,
+            "stopped": self._stopped,
             "halted": self.halted,
             "halt_reason": self.halt_reason,
             "markets_halted": dict(self._market_halted),
             "canary_graduated": self.canary_graduated,
             "canary_clean_fills": self.canary_clean_fills,
-            "canary_target_fills": 50,
+            "canary_target_fills": canary_target,
             "resting_orders": orders_count,
             "orders": orders_list,
             "selected_markets": selected,

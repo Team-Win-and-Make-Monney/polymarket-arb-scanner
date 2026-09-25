@@ -124,12 +124,70 @@ def _get_mm_pilot_telemetry() -> dict:
 
     for path in candidate_paths:
         try:
-            if os.path.isfile(path):
-                with open(path, "r", encoding="utf-8") as f:
+            norm_path = os.path.normpath(path)
+            if os.path.isfile(norm_path):
+                with open(norm_path, "r", encoding="utf-8") as f:
                     file_state = json.load(f)
                 if isinstance(file_state, dict):
+                    # Normalize orders dict to list
+                    raw_orders = file_state.get("orders")
+                    if isinstance(raw_orders, dict):
+                        file_state["orders"] = [
+                            {"order_id": oid, **info}
+                            for oid, info in raw_orders.items()
+                            if isinstance(info, dict)
+                        ]
+                        file_state["resting_orders"] = len(file_state["orders"])
+                    elif isinstance(raw_orders, list):
+                        file_state["resting_orders"] = len(raw_orders)
+                    else:
+                        file_state["orders"] = []
+                        file_state["resting_orders"] = 0
+
+                    # Derive inventory totals from snapshot if not directly provided
+                    inv = file_state.get("inventory")
+                    if isinstance(inv, dict):
+                        net_map = inv.get("net", {}) if isinstance(inv.get("net"), dict) else {}
+                        avg_map = inv.get("avg", {}) if isinstance(inv.get("avg"), dict) else {}
+                        realized_map = inv.get("realized", {}) if isinstance(inv.get("realized"), dict) else {}
+                        if "total_inventory_usd" not in file_state:
+                            file_state["total_inventory_usd"] = sum(
+                                abs(cnt) * avg_map.get(tk, 0.0)
+                                for tk, cnt in net_map.items()
+                                if isinstance(cnt, (int, float))
+                            )
+                        if "realized_pnl" not in file_state:
+                            file_state["realized_pnl"] = sum(
+                                val for val in realized_map.values()
+                                if isinstance(val, (int, float))
+                            )
+                    else:
+                        file_state.setdefault("total_inventory_usd", 0.0)
+                        file_state.setdefault("realized_pnl", 0.0)
+
+                    # Freshness and explicit lifecycle status check
+                    saved_at = file_state.get("saved_at")
+                    is_stopped = file_state.get("stopped", False)
+                    is_halted = file_state.get("halted", False)
+                    now = time.time()
+
+                    if is_stopped:
+                        file_state["active"] = False
+                        file_state["status"] = "stopped"
+                    elif is_halted:
+                        file_state["active"] = False
+                        file_state["status"] = "halted"
+                    elif saved_at and (now - saved_at > 120.0):
+                        file_state["active"] = False
+                        file_state["status"] = "stale"
+                    elif file_state.get("active", False):
+                        file_state["status"] = "active"
+                    else:
+                        file_state["active"] = False
+                        file_state["status"] = "inactive"
+
                     file_state["source"] = "file"
-                    file_state["path"] = path
+                    file_state["path"] = norm_path
                     return file_state
         except Exception as e:
             logger.debug("Error reading mm_pilot state from %s: %s", path, e)

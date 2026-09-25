@@ -1359,8 +1359,14 @@ function renderMMPilot(data) {
     return;
   }
 
-  // Active or halted pilot
-  if (data.halted) {
+  // Active, halted, stopped, or stale pilot
+  if (data.status === 'stopped' || data.stopped) {
+    statusBadge.className = 'badge';
+    statusBadge.textContent = 'PILOT: STOPPED';
+  } else if (data.status === 'stale') {
+    statusBadge.className = 'badge badge-error';
+    statusBadge.textContent = 'PILOT: STALE';
+  } else if (data.halted) {
     statusBadge.className = 'badge badge-error';
     statusBadge.textContent = 'PILOT: HALTED' + (data.halt_reason ? ' (' + data.halt_reason + ')' : '');
   } else if (data.dry_run) {
@@ -1376,7 +1382,7 @@ function renderMMPilot(data) {
     canaryBadge.textContent = 'CANARY: GRADUATED';
   } else {
     canaryBadge.className = 'badge badge-dry';
-    canaryBadge.textContent = 'CANARY: ' + (data.canary_clean_fills || 0) + '/' + (data.canary_target_fills || 50);
+    canaryBadge.textContent = 'CANARY: ' + (data.canary_clean_fills || 0) + '/' + (data.canary_target_fills || 10);
   }
 
   if (data.kill_switch_enabled === true) {
@@ -1407,7 +1413,7 @@ function renderMMPilot(data) {
 
   // Orders table
   const ordersTbody = $('mm-orders-tbody');
-  const orders = data.orders || [];
+  const orders = Array.isArray(data.orders) ? data.orders : [];
   if (orders.length === 0) {
     setEmpty(ordersTbody, 5, 'No resting orders');
   } else {
@@ -1426,18 +1432,37 @@ function renderMMPilot(data) {
   // Inventory table
   const invTbody = $('mm-inventory-tbody');
   const inventory = data.inventory || {};
-  const invTickers = Object.keys(inventory);
-  if (invTickers.length === 0) {
+  let tickers = [];
+  let getNet, getAvg, getUsd, getRealized;
+
+  if (inventory.net && typeof inventory.net === 'object') {
+    const netMap = inventory.net || {};
+    const avgMap = inventory.avg || {};
+    const realizedMap = inventory.realized || {};
+    tickers = Array.from(new Set([...Object.keys(netMap), ...Object.keys(avgMap), ...Object.keys(realizedMap)])).sort();
+    getNet = t => netMap[t] || 0;
+    getAvg = t => avgMap[t] || 0;
+    getUsd = t => Math.abs(netMap[t] || 0) * (avgMap[t] || 0);
+    getRealized = t => realizedMap[t] || 0;
+  } else {
+    tickers = Object.keys(inventory).sort();
+    getNet = t => (inventory[t] && inventory[t].net) || 0;
+    getAvg = t => (inventory[t] && (inventory[t].avg_cost || inventory[t].avg)) || 0;
+    getUsd = t => (inventory[t] && (inventory[t].usd != null ? inventory[t].usd : Math.abs(getNet(t)) * getAvg(t))) || 0;
+    getRealized = t => (inventory[t] && inventory[t].realized) || 0;
+  }
+
+  if (tickers.length === 0) {
     setEmpty(invTbody, 5, 'Flat inventory');
+    $('mm-inventory-sub').textContent = '0 contracts';
   } else {
     let totalContracts = 0;
-    const rows = invTickers.map(t => {
-      const pos = inventory[t] || {};
-      const net = pos.net || 0;
+    const rows = tickers.map(t => {
+      const net = getNet(t);
       totalContracts += Math.abs(net);
-      const avg = pos.avg_cost || 0;
-      const usd = pos.usd || 0;
-      const rPnl = pos.realized || 0;
+      const avg = getAvg(t);
+      const usd = getUsd(t);
+      const rPnl = getRealized(t);
       const tr = document.createElement('tr');
       tr.appendChild(makeCell(t));
       tr.appendChild(makeCell(net, { className: 'mono right' }));

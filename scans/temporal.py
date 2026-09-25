@@ -15,6 +15,7 @@ Risk-free edge = (P(early) - P(late)) - fees.
 from __future__ import annotations
 
 import logging
+import math
 import time
 
 from fees import net_profit_frechet_implication
@@ -169,14 +170,14 @@ def _get_cached_kalshi_quote(ticker: str, price_cache: dict | None) -> dict | No
             f = float(v)
         except (TypeError, ValueError):
             return None
-        return f if 0.0 <= f <= 1.0 else None
+        return f if math.isfinite(f) and 0.0 <= f <= 1.0 else None
 
     def _safe_size(value: object) -> float:
         if value is None or isinstance(value, (bool, dict, list, tuple)):
             return 0.0
         try:
             s = float(value)
-            return s if s > 0.0 else 0.0
+            return s if s > 0.0 and math.isfinite(s) else 0.0
         except (TypeError, ValueError):
             return 0.0
 

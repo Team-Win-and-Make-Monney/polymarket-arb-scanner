@@ -414,16 +414,16 @@ class TestScansTemporal:
             "_sub_market": {},
             "net_profit": 0.08,
         }
-        # Non-numeric or non-scalar sizes must become 0.0 without raising
+        # Non-numeric, non-scalar, or infinite sizes must become 0.0 without raising or producing inf depth
         price_cache = {
             ("kalshi", "KXBTC-26JUN30-T100000"): {
                 "yes_ask": 0.49,
-                "yes_ask_size": "unparseable_size",
+                "yes_ask_size": "Infinity",
                 "_ts": time.time(),
             },
             ("kalshi", "KXBTC-26MAR31-T100000"): {
                 "no_ask": 0.35,
-                "no_ask_size": {"nested": "dict"},
+                "no_ask_size": float("inf"),
                 "_ts": time.time(),
             },
         }
@@ -438,4 +438,26 @@ class TestScansTemporal:
         assert refined[0]["_kalshi_late_yes"] == 0.49
         assert refined[0]["_kalshi_early_no"] == 0.35
         assert refined[0]["_clob_depth"] == 0.0
+
+        # Also test non-scalar/unparseable types
+        price_cache_unparseable = {
+            ("kalshi", "KXBTC-26JUN30-T100000"): {
+                "yes_ask": 0.49,
+                "yes_ask_size": "unparseable_size",
+                "_ts": time.time(),
+            },
+            ("kalshi", "KXBTC-26MAR31-T100000"): {
+                "no_ask": 0.35,
+                "no_ask_size": {"nested": "dict"},
+                "_ts": time.time(),
+            },
+        }
+        refined2 = _refine_temporal_with_clob(
+            [cand],
+            min_profit=0.01,
+            kalshi_client=mock_client,
+            price_cache=price_cache_unparseable,
+        )
+        assert len(refined2) == 1
+        assert refined2[0]["_clob_depth"] == 0.0
         mock_client.fetch_order_book.assert_not_called()

@@ -654,14 +654,16 @@ class FeedManager:
                 bids = event.get("bids", [])
                 if asks and isinstance(asks, list):
                     try:
-                        normalised["best_ask"] = float(asks[0].get("price", 0))
-                        normalised["best_ask_size"] = float(asks[0].get("size", 0))
+                        best_ask_entry = min(asks, key=lambda x: float(x.get("price", 0)))
+                        normalised["best_ask"] = float(best_ask_entry.get("price", 0))
+                        normalised["best_ask_size"] = float(best_ask_entry.get("size", 0))
                     except (ValueError, TypeError, IndexError):
                         pass
                 if bids and isinstance(bids, list):
                     try:
-                        normalised["best_bid"] = float(bids[0].get("price", 0))
-                        normalised["best_bid_size"] = float(bids[0].get("size", 0))
+                        best_bid_entry = max(bids, key=lambda x: float(x.get("price", 0)))
+                        normalised["best_bid"] = float(best_bid_entry.get("price", 0))
+                        normalised["best_bid_size"] = float(best_bid_entry.get("size", 0))
                     except (ValueError, TypeError, IndexError):
                         pass
                 self.on_price_update("polymarket", asset_id, normalised)

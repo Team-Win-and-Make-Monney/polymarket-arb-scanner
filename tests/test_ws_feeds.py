@@ -243,6 +243,38 @@ class TestHandlePolymarketMessage:
 
         cb.assert_not_called()
 
+    def test_book_event_extracts_lowest_ask_and_highest_bid(self):
+        """Verify best_ask selects min ask price and best_bid selects max bid price regardless of array order."""
+        cb = MagicMock()
+        fm = _make_feed(cb)
+
+        # Polymarket sends asks descending (highest to lowest) and bids ascending (lowest to highest)
+        event = {
+            "event_type": "book",
+            "asset_id": "token_poly_book",
+            "asks": [
+                {"price": "0.65", "size": "100"},
+                {"price": "0.55", "size": "200"},
+                {"price": "0.48", "size": "300"},  # Lowest ask (best)
+            ],
+            "bids": [
+                {"price": "0.35", "size": "150"},
+                {"price": "0.42", "size": "250"},
+                {"price": "0.46", "size": "350"},  # Highest bid (best)
+            ],
+        }
+        fm._handle_polymarket_message([event])
+
+        cb.assert_called_once()
+        args = cb.call_args[0]
+        assert args[0] == "polymarket"
+        assert args[1] == "token_poly_book"
+        data = args[2]
+        assert data["best_ask"] == 0.48
+        assert data["best_ask_size"] == 300.0
+        assert data["best_bid"] == 0.46
+        assert data["best_bid_size"] == 350.0
+
 
 # ---------------------------------------------------------------------------
 # Reconnect backoff constants

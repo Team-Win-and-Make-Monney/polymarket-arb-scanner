@@ -285,7 +285,25 @@ def scan_ctf(
         condition_id = m.get("conditionId") or m.get("condition_id") or market_key
 
         cached_yes, cached_no = _get_cached_ws_book(token_ids, price_cache)
-        if cached_yes and cached_no:
+        ws_quotes_complete = bool(
+            cached_yes
+            and cached_no
+            and (
+                not enable_merge
+                or (
+                    cached_yes.get("best_ask") is not None
+                    and cached_no.get("best_ask") is not None
+                )
+            )
+            and (
+                not enable_mint
+                or (
+                    cached_yes.get("best_bid") is not None
+                    and cached_no.get("best_bid") is not None
+                )
+            )
+        )
+        if ws_quotes_complete:
             yes_ask = cached_yes.get("best_ask")
             no_ask = cached_no.get("best_ask")
             yes_bid = cached_yes.get("best_bid")

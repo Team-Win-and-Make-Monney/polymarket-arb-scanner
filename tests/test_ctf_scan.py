@@ -316,3 +316,48 @@ class TestCTFScan:
         opps = ctf_mod.scan_ctf([market], min_profit=0.005, price_cache=price_cache)
         # Should be empty because mid-prices (0.50 + 0.50 = 1.0) do not yield arb and cache was stale
         assert len(opps) == 0
+
+    @patch("scans.ctf._fetch_clob_for_market")
+    def test_scan_ctf_incomplete_ws_quotes_falls_back_to_mid_prices(self, mock_fetch_clob) -> None:
+        """Verify incomplete WS quotes fall back to REST mid-prices rather than dropping candidate."""
+        mock_fetch_clob.side_effect = lambda m, c=None: (
+            m,
+            {
+                "yes_ask": 0.43, "yes_ask_size": 100,
+                "no_ask": 0.47, "no_ask_size": 100,
+                "yes_bid": 0.41, "yes_bid_size": 100,
+                "no_bid": 0.45, "no_bid_size": 100,
+            },
+        )
+        import time
+        from datetime import datetime, timezone, timedelta
+        future_date = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+
+        # Market has profitable mid-prices: 0.42 + 0.46 = 0.88 (< 1.0)
+        market = {
+            "id": "13",
+            "conditionId": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "question": "Will candidate C win?",
+            "outcomes": '["Yes", "No"]',
+            "outcomePrices": '["0.42", "0.46"]',
+            "clobTokenIds": '["tok_yes_4", "tok_no_4"]',
+            "endDateIso": future_date,
+            "volume": "100000",
+        }
+
+        # Cache has YES ask, but NO ask is missing (incomplete for merge)
+        now = time.time()
+        price_cache = {
+            ("polymarket", "tok_yes_4"): {
+                "best_ask": 0.44, "best_ask_size": 100, "_ts": now,
+            },
+            ("polymarket", "tok_no_4"): {
+                # missing best_ask
+                "best_bid": 0.40, "best_bid_size": 100, "_ts": now,
+            },
+        }
+
+        opps = ctf_mod.scan_ctf([market], min_profit=0.005, price_cache=price_cache, enable_merge=True, enable_mint=False)
+        assert len(opps) == 1
+        assert opps[0]["type"] == "CTFMerge"
+        assert opps[0]["net_profit"] > 0.005

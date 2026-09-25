@@ -281,7 +281,9 @@ def _refine_frechet_with_clob(
 
             depth_b = sup_clob.get("yes_ask_size") or sup_clob.get("yes_depth") or 0.0
             depth_a = sub_clob.get("no_ask_size") or sub_clob.get("no_depth") or 0.0
-            exec_depth = min(depth_b, depth_a) if (depth_b > 0 and depth_a > 0) else None
+            # Unknown depth is 0, never None: every consumer (priority sort, --min-depth,
+            # RiskManager depth gate) compares it numerically, and 0 fails closed.
+            exec_depth = min(depth_b, depth_a) if (depth_b > 0 and depth_a > 0) else 0.0
 
             opp_copy = dict(opp)
             opp_copy["_p_a"] = p_a_implied

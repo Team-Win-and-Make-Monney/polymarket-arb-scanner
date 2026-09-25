@@ -713,6 +713,7 @@ CTF_CONVERT_ENABLED = _env_bool("CTF_CONVERT_ENABLED", "false")
 CTF_MIN_PROFIT = _env_float("CTF_MIN_PROFIT", "0.005")
 CTF_MAX_TRADE_SIZE = _env_float("CTF_MAX_TRADE_SIZE", "25.0")
 CTF_GAS_ESTIMATE = _env_non_negative_float("CTF_GAS_ESTIMATE", "0.01")
+CTF_MAX_RESOLUTION_DAYS = _env_int("CTF_MAX_RESOLUTION_DAYS", "0")
 CONDITIONAL_TOKENS_ADDRESS = os.getenv("CONDITIONAL_TOKENS_ADDRESS", "0x4d97dcd9" "7ec945f40cf65f87097ace5ea0476045")
 NEG_RISK_ADAPTER_ADDRESS = os.getenv("NEG_RISK_ADAPTER_ADDRESS", "0xd91e80cf2e7be2e162c6513ced06f1dd0da35296")
 COLLATERAL_TOKEN_ADDRESS = os.getenv("COLLATERAL_TOKEN_ADDRESS", "0xc011a7e1" "2a19f7b1f670d46f03b03f3342e82dfb")
@@ -1577,6 +1578,10 @@ def validate_config() -> list[str]:
             raise ConfigError(
                 f"NEG_RISK_ADAPTER_ADDRESS must be a valid non-zero 20-byte hexadecimal address when CTF_CONVERT_ENABLED=true, got {NEG_RISK_ADAPTER_ADDRESS!r}"
             )
+    if CTF_MAX_RESOLUTION_DAYS < 0:
+        raise ConfigError(
+            f"CTF_MAX_RESOLUTION_DAYS={CTF_MAX_RESOLUTION_DAYS} must be >= 0"
+        )
 
     # --- Strategy-specific validation (Phase 8) ---
 

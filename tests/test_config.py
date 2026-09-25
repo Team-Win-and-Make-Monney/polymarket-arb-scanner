@@ -654,6 +654,21 @@ class TestCTFConfig:
         cfg = _reload_config()
         assert cfg.CTF_GAS_ESTIMATE == 0.025
 
+    def test_ctf_max_resolution_days_defaults_to_zero(self):
+        cfg = _reload_config()
+        assert cfg.CTF_MAX_RESOLUTION_DAYS == 0
+
+    def test_ctf_max_resolution_days_env_override(self, monkeypatch):
+        monkeypatch.setenv("CTF_MAX_RESOLUTION_DAYS", "14")
+        cfg = _reload_config()
+        assert cfg.CTF_MAX_RESOLUTION_DAYS == 14
+
+    def test_ctf_max_resolution_days_rejects_negative(self, monkeypatch):
+        cfg = _reload_config()
+        monkeypatch.setattr(cfg, "CTF_MAX_RESOLUTION_DAYS", -1)
+        with pytest.raises(cfg.ConfigError, match="CTF_MAX_RESOLUTION_DAYS=-1 must be >= 0"):
+            cfg.validate_config()
+
     @pytest.mark.parametrize("dry_run", [True, False])
     @pytest.mark.parametrize("bad_addr", ["", "invalid_hex", "0x1234", "0x" + "0" * 40])
     def test_ctf_address_validation_rejects_invalid_addresses(self, monkeypatch, tmp_path, dry_run, bad_addr):

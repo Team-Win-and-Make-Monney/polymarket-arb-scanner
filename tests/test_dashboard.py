@@ -1034,12 +1034,23 @@ class TestMMPilotDashboardIntegration:
         server, url = _start_test_server(18858)
         try:
             with patch("config.DASHBOARD_PASS", ""):
+                # 1. Nonnumeric saved_at
                 status, body, _ = _get(url, "/api/mm-pilot")
-            assert status == 200
-            data = json.loads(body)
-            assert data["source"] == "file"
-            assert data["active"] is False
-            assert data["status"] == "stale"
+                assert status == 200
+                data = json.loads(body)
+                assert data["source"] == "file"
+                assert data["active"] is False
+                assert data["status"] == "stale"
+
+                # 2. Missing saved_at field
+                del state_data["saved_at"]
+                state_file.write_text(json.dumps(state_data))
+                status, body, _ = _get(url, "/api/mm-pilot")
+                assert status == 200
+                data = json.loads(body)
+                assert data["source"] == "file"
+                assert data["active"] is False
+                assert data["status"] == "stale"
         finally:
             server.shutdown()
             state.mm_pilot = orig_pilot

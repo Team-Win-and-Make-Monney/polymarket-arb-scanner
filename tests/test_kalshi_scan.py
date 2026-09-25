@@ -603,8 +603,8 @@ class TestScanKalshiMultiCategoricalCompleteness:
         "Someone else", "Anyone else", "Field", "The Field", "None of the above",
     ])
     def test_catch_all_labels_recognized(self, label):
-        from scans.kalshi import _is_catch_all_label
-        assert _is_catch_all_label(label) is True
+        from kalshi_completeness import is_catch_all_label
+        assert is_catch_all_label(label) is True
 
     @pytest.mark.parametrize("label", [
         "No other person",  # KXNEXTSTATE-29: the no-appointee leg
@@ -616,5 +616,5 @@ class TestScanKalshiMultiCategoricalCompleteness:
         "nobody", "No one", "None", "Tie", "", None,
     ])
     def test_non_catch_all_labels_rejected(self, label):
-        from scans.kalshi import _is_catch_all_label
-        assert _is_catch_all_label(label) is False
+        from kalshi_completeness import is_catch_all_label
+        assert is_catch_all_label(label) is False

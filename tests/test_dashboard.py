@@ -1011,6 +1011,40 @@ class TestMMPilotDashboardIntegration:
             state.mm_pilot = orig_pilot
             state.mm_pilot_state_path = orig_path
 
+    def test_mm_pilot_endpoint_nonnumeric_saved_at_treated_as_stale(self, tmp_path):
+        """Persisted state file with nonnumeric or missing saved_at is treated as stale."""
+        orig_pilot = state.mm_pilot
+        orig_path = state.mm_pilot_state_path
+        state.mm_pilot = None
+
+        state_file = tmp_path / "mm_pilot_state.json"
+        state_data = {
+            "active": True,
+            "status": "active",
+            "stopped": False,
+            "halted": False,
+            "dry_run": True,
+            "orders": {},
+            "inventory": {"net": {}, "avg": {}, "realized": {}},
+            "saved_at": "not-a-number",
+        }
+        state_file.write_text(json.dumps(state_data))
+        state.mm_pilot_state_path = str(state_file)
+
+        server, url = _start_test_server(18858)
+        try:
+            with patch("config.DASHBOARD_PASS", ""):
+                status, body, _ = _get(url, "/api/mm-pilot")
+            assert status == 200
+            data = json.loads(body)
+            assert data["source"] == "file"
+            assert data["active"] is False
+            assert data["status"] == "stale"
+        finally:
+            server.shutdown()
+            state.mm_pilot = orig_pilot
+            state.mm_pilot_state_path = orig_path
+
     def test_mm_pilot_shutdown_followed_by_dashboard_file_fallback(self, tmp_path):
         """Pilot shutdown followed by instance clear serves file fallback with stopped status."""
         orig_pilot = state.mm_pilot

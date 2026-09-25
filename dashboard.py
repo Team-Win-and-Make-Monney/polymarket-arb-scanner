@@ -177,7 +177,7 @@ def _get_mm_pilot_telemetry() -> dict:
                     elif is_halted:
                         file_state["active"] = False
                         file_state["status"] = "halted"
-                    elif saved_at and (now - saved_at > 120.0):
+                    elif not isinstance(saved_at, (int, float)) or (now - saved_at > 120.0):
                         file_state["active"] = False
                         file_state["status"] = "stale"
                     elif file_state.get("active", False):

@@ -1734,3 +1734,101 @@ class TestMMPilotStatusTelemetry:
         pilot._persist_state()
         saved = json.loads(state_file.read_text())
         assert saved["canary_target_fills"] == 75
+
+
+class TestMMPilotLIPYieldTracker:
+    def test_update_selection_registers_lip_program_metadata(self, pilot_env, clock):
+        pilot = build_pilot(clock)
+        items = [
+            {
+                "ticker": TICKER,
+                "pool_dollars": 5000.0,
+                "category": "Economics",
+                "discount_factor_bps": 9500,
+                "program_end": "2026-10-01T00:00:00Z",
+            }
+        ]
+        pilot.update_selection(items)
+        assert pilot._selected == {TICKER}
+        prog = pilot._lip_tracker._programs.get(TICKER)
+        assert prog is not None
+        assert prog["pool_dollars"] == 5000.0
+        assert prog["discount_factor"] == 0.95
+        assert prog["category"] == "Economics"
+
+    def test_refresh_market_records_lip_snapshot(self, pilot_env, clock):
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        pilot._lip_tracker.set_market_program(TICKER, pool_dollars=1000.0)
+
+        placed = pilot.refresh_market(TICKER)
+        assert len(placed) >= 1
+        stat = pilot._lip_tracker._stats.get(TICKER)
+        assert stat is not None
+        assert stat["snapshots_count"] == 1
+        assert stat["last_our_score"] > 0
+        assert stat["last_qualifying_share"] > 0
+
+    def test_get_status_contains_lip_rewards_and_blended_apr(self, pilot_env, clock):
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        pilot._lip_tracker.set_market_program(TICKER, pool_dollars=1000.0)
+
+        pilot.refresh_market(TICKER)
+        status = pilot.get_status()
+        assert "lip_rewards" in status
+        lip = status["lip_rewards"]
+        assert "total_estimated_reward_usd" in lip
+        assert "estimated_daily_rate_usd" in lip
+        assert "blended_apr_pct" in lip
+        assert "by_ticker" in lip
+        assert TICKER in lip["by_ticker"]
+        ticker_stat = lip["by_ticker"][TICKER]
+        assert ticker_stat["pool_dollars"] == 1000.0
+        assert ticker_stat["qualifying_share_pct"] > 0
+        assert ticker_stat["daily_rate_usd"] > 0
+
+    def test_lip_tracker_state_persistence_and_restore(self, pilot_env, clock, tmp_path):
+        state_file = tmp_path / "mm_state_lip.json"
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client, state_path=str(state_file), selection=[TICKER])
+        pilot._lip_tracker.set_market_program(TICKER, pool_dollars=2500.0, discount_factor=0.92)
+        pilot.refresh_market(TICKER)
+        pilot._persist_state()
+
+        assert state_file.exists()
+        saved = json.loads(state_file.read_text())
+        assert "lip_tracker" in saved
+        assert TICKER in saved["lip_tracker"]["programs"]
+        assert saved["lip_tracker"]["programs"][TICKER]["pool_dollars"] == 2500.0
+        assert "lip_rewards" in saved
+        assert saved["lip_rewards"]["by_ticker"][TICKER]["pool_dollars"] == 2500.0
+
+        # Restart simulation
+        pilot2 = build_pilot(clock, client=client, state_path=str(state_file))
+        assert TICKER in pilot2._lip_tracker._programs
+        prog2 = pilot2._lip_tracker._programs[TICKER]
+        assert prog2["pool_dollars"] == 2500.0
+        assert prog2["discount_factor"] == 0.92
+        assert pilot2._lip_tracker._stats[TICKER]["snapshots_count"] == 1
+
+    def test_reconcile_does_not_overwrite_lip_tracker(self, pilot_env, clock, tmp_path):
+        state_file = tmp_path / "mm_state_lip_reconcile.json"
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client, state_path=str(state_file), selection=[TICKER])
+        pilot._lip_tracker.set_market_program(TICKER, pool_dollars=1000.0)
+        pilot.refresh_market(TICKER)
+        pilot._persist_state()
+
+        # Simulate newer snapshot accrued in memory
+        pilot._lip_tracker.record_snapshot(
+            TICKER,
+            [{"purpose": "quote_bid", "side": "yes", "action": "buy", "price": 0.50, "count": 50}],
+            None,
+            now=200.0,
+        )
+        assert pilot._lip_tracker._stats[TICKER]["snapshots_count"] == 2
+
+        # Reconcile again — must not reload/overwrite newer LIP tracker state
+        pilot.reconcile()
+        assert pilot._lip_tracker._stats[TICKER]["snapshots_count"] == 2

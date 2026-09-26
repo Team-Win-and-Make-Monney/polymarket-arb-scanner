@@ -1683,11 +1683,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                 from scans.lip_select import select_lip_markets
 
                 def _mm_pilot_selection():
-                    markets = select_lip_markets(kalshi_client) or []
-                    return [
-                        m.get("ticker", "") if isinstance(m, dict) else str(m)
-                        for m in markets
-                    ]
+                    return select_lip_markets(kalshi_client) or []
             except ImportError:
                 logger.warning(
                     "MM pilot: scans.lip_select not available (PR #43 not "

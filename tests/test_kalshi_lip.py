@@ -9,9 +9,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from kalshi_lip import (  # noqa: E402
     KalshiLipScorer,
+    LIPScoreTracker,
     MAX_TARGET_SIZE,
     MIN_TARGET_SIZE,
     distance_multiplier,
+    extract_book_levels,
     qualifying_share,
     reference_price,
     snapshot_score,
@@ -176,3 +178,251 @@ class TestPublishedReferencePrice:
         share, reason = qualifying_share(levels, 200, 0.5, 0.50, 200)
         assert reason is None
         assert share is not None
+
+
+class TestExtractBookLevels:
+    def test_extract_from_orderbook_fp(self):
+        raw = {
+            "orderbook_fp": {
+                "yes_dollars": [["0.45", "100"], ["0.44", "200"]],
+                "no_dollars": [["0.45", "150"]],  # NO bid at 0.45 is YES ask at 0.55
+            }
+        }
+        bids, asks = extract_book_levels(raw)
+        assert bids == [(0.45, 100.0), (0.44, 200.0)]
+        assert asks == [(0.55, 150.0)]
+
+    def test_extract_from_legacy_orderbook(self):
+        raw = {
+            "orderbook": {
+                "yes": [[45, 100], [44, 200]],
+                "no": [[45, 150]],
+            }
+        }
+        bids, asks = extract_book_levels(raw)
+        assert bids == [(0.45, 100.0), (0.44, 200.0)]
+        assert asks == [(0.55, 150.0)]
+
+    def test_extract_from_top_of_book(self):
+        book = {
+            "yes_bid": (0.45, 100.0),
+            "yes_ask": (0.55, 150.0),
+        }
+        bids, asks = extract_book_levels(book)
+        assert bids == [(0.45, 100.0)]
+        assert asks == [(0.55, 150.0)]
+
+    def test_extract_empty_or_none(self):
+        assert extract_book_levels(None) == ([], [])
+        assert extract_book_levels({}) == ([], [])
+        assert extract_book_levels("bad_input") == ([], [])
+
+
+class TestLIPScoreTracker:
+    def test_set_market_program_defaults_and_bounds(self):
+        tracker = LIPScoreTracker()
+        tracker.set_market_program("TEST-TICKER", pool_dollars=-50, discount_factor=1.5, target_size=50)
+        prog = tracker._programs["TEST-TICKER"]
+        assert prog["pool_dollars"] == 0.0
+        assert prog["discount_factor"] == 1.0
+        assert prog["target_size"] == MIN_TARGET_SIZE
+
+    def test_record_snapshot_single_order(self):
+        tracker = LIPScoreTracker()
+        tracker.set_market_program("TEST-TICKER", pool_dollars=700.0, discount_factor=0.95, target_size=500.0)
+
+        book = {
+            "yes_bid": (0.48, 100.0),
+            "yes_ask": (0.52, 100.0),
+            "raw": {
+                "orderbook_fp": {
+                    "yes_dollars": [["0.48", "100"]],
+                    "no_dollars": [["0.48", "100"]],  # ask at 0.52
+                }
+            },
+        }
+        # Place our resting quote at touch
+        our_orders = [
+            {"purpose": "quote_bid", "side": "yes", "action": "buy", "price": 0.48, "count": 100},
+            {"purpose": "quote_ask", "side": "no", "action": "buy", "price": 0.48, "count": 100},
+        ]
+        result = tracker.record_snapshot("TEST-TICKER", our_orders, book, now=1000.0, is_dry_run=True)
+        assert result["ticker"] == "TEST-TICKER"
+        assert result["our_score"] == pytest.approx(200.0)
+        # Total market score = competitors (200) + ours (200) = 400
+        assert result["total_market_score"] == pytest.approx(400.0)
+        assert result["qualifying_share"] == pytest.approx(0.50)
+        assert result["reward_delta"] > 0
+
+    def test_record_snapshot_solo_quoter_gets_100_percent_share(self):
+        tracker = LIPScoreTracker()
+        tracker.set_market_program("TEST-TICKER", pool_dollars=1000.0)
+        book = {"yes_bid": None, "yes_ask": None, "raw": {}}
+        our_orders = [
+            {"purpose": "quote_bid", "side": "yes", "action": "buy", "price": 0.50, "count": 100},
+        ]
+        result = tracker.record_snapshot("TEST-TICKER", our_orders, book, now=1000.0, is_dry_run=True)
+        assert result["qualifying_share"] == 1.0
+
+    def test_record_snapshot_no_orders_gets_zero_share(self):
+        tracker = LIPScoreTracker()
+        tracker.set_market_program("TEST-TICKER", pool_dollars=1000.0)
+        book = {
+            "yes_bid": (0.45, 100.0),
+            "yes_ask": (0.55, 100.0),
+        }
+        result = tracker.record_snapshot("TEST-TICKER", [], book, now=1000.0)
+        assert result["our_score"] == 0.0
+        assert result["qualifying_share"] == 0.0
+        assert result["reward_delta"] == 0.0
+
+    def test_accrual_across_time_and_metrics(self):
+        t0 = 1000.0
+        tracker = LIPScoreTracker(time_fn=lambda: t0)
+        # Weekly pool = $604.80 -> $0.001 / second
+        tracker.set_market_program("TEST-TICKER", pool_dollars=604.80, discount_factor=1.0, target_size=1000.0)
+
+        book = {"yes_bid": None, "yes_ask": None, "raw": {}}
+        our_orders = [{"purpose": "quote_bid", "side": "yes", "action": "buy", "price": 0.50, "count": 100}]
+
+        # Snapshot 1 at t0 (initial snapshot elapsed = 1.0s)
+        r1 = tracker.record_snapshot("TEST-TICKER", our_orders, book, now=t0)
+        assert r1["reward_delta"] == pytest.approx(0.001, rel=1e-3)
+
+        # Snapshot 2 at t0 + 10s (elapsed = 10s)
+        r2 = tracker.record_snapshot("TEST-TICKER", our_orders, book, now=t0 + 10.0)
+        assert r2["reward_delta"] == pytest.approx(0.010, rel=1e-3)
+        assert r2["accumulated_reward_usd"] == pytest.approx(0.011, rel=1e-3)
+
+        metrics = tracker.get_metrics(
+            capital_deployed_by_ticker={"TEST-TICKER": 100.0},
+            realized_pnl_by_ticker={"TEST-TICKER": 5.0},
+        )
+        assert metrics["total_estimated_reward_usd"] == pytest.approx(0.011, rel=1e-3)
+        assert "TEST-TICKER" in metrics["by_ticker"]
+        t_meta = metrics["by_ticker"]["TEST-TICKER"]
+        assert t_meta["pool_dollars"] == 604.80
+        assert t_meta["qualifying_share_pct"] == 100.0
+        assert t_meta["daily_rate_usd"] == pytest.approx(86.40, rel=1e-2)
+        assert t_meta["weekly_rate_usd"] == pytest.approx(604.80, rel=1e-2)
+        assert t_meta["lip_apr_pct"] > 0
+        assert metrics["blended_apr_pct"] > 0
+
+    def test_to_and_from_dict_roundtrip(self):
+        tracker = LIPScoreTracker()
+        tracker.set_market_program("TICKER-1", pool_dollars=500.0, discount_factor=0.92, target_size=600.0)
+        tracker.record_snapshot("TICKER-1", [{"purpose": "quote_bid", "side": "yes", "action": "buy", "price": 0.50, "count": 50}], None, now=100.0)
+
+        state = tracker.to_dict()
+        assert "programs" in state
+        assert "stats" in state
+        assert "TICKER-1" in state["programs"]
+
+        new_tracker = LIPScoreTracker()
+        new_tracker.from_dict(state)
+        assert "TICKER-1" in new_tracker._programs
+        assert new_tracker._programs["TICKER-1"]["pool_dollars"] == 500.0
+        assert new_tracker._stats["TICKER-1"]["snapshots_count"] == 1
+
+    def test_record_snapshot_program_end_clamping(self):
+        tracker = LIPScoreTracker()
+        orders = [{"purpose": "quote_bid", "side": "yes", "action": "buy", "price": 0.50, "count": 50}]
+
+        # 1. Initial snapshot on-time (future expiry) -> credits default 1.0s
+        tracker.set_market_program("T-ONTIME", program_end=150.0, pool_dollars=604.80)
+        res1 = tracker.record_snapshot("T-ONTIME", orders, None, now=100.0)
+        assert tracker._stats["T-ONTIME"]["uptime_seconds"] == 1.0
+        assert res1["reward_delta"] > 0
+
+        # On-time subsequent snapshot at 110.0 -> credits 10.0s
+        res2 = tracker.record_snapshot("T-ONTIME", orders, None, now=110.0)
+        assert tracker._stats["T-ONTIME"]["uptime_seconds"] == 11.0
+        assert res2["reward_delta"] == pytest.approx(10.0 * (604.80 / 604800.0), rel=1e-3)
+
+        # 2. Partially post-expiry subsequent snapshot
+        tracker.set_market_program("T-PARTIAL", program_end=104.0, pool_dollars=604.80)
+        tracker.record_snapshot("T-PARTIAL", orders, None, now=100.0)  # last_t = 100.0
+        res_part = tracker.record_snapshot("T-PARTIAL", orders, None, now=110.0)
+        # Interval is [100.0, 110.0], end_ts=104.0 -> credited time is 4.0s
+        assert tracker._stats["T-PARTIAL"]["uptime_seconds"] == 5.0  # 1.0 initial + 4.0
+        assert res_part["reward_delta"] == pytest.approx(4.0 * (604.80 / 604800.0), rel=1e-3)
+
+        # 3. Fully post-expiry subsequent snapshot
+        # Next snapshot at 120.0 with end_ts=104.0 (credited_start = 110.0 >= 104.0) -> credits 0.0s
+        res_full = tracker.record_snapshot("T-PARTIAL", orders, None, now=120.0)
+        assert tracker._stats["T-PARTIAL"]["uptime_seconds"] == 5.0
+        assert res_full["reward_delta"] == 0.0
+
+        # 4. Initial snapshot partially post-expiry
+        tracker.set_market_program("T-INIT-PARTIAL", program_end=99.6, pool_dollars=604.80)
+        res_init_part = tracker.record_snapshot("T-INIT-PARTIAL", orders, None, now=100.0)
+        # Interval is [99.0, 100.0], end_ts=99.6 -> credited time is 0.6s
+        assert tracker._stats["T-INIT-PARTIAL"]["uptime_seconds"] == pytest.approx(0.6, abs=1e-5)
+        assert res_init_part["reward_delta"] == pytest.approx(0.6 * (604.80 / 604800.0), rel=1e-3)
+
+        # 5. Initial snapshot fully post-expiry
+        tracker.set_market_program("T-INIT-EXP", program_end=98.0, pool_dollars=604.80)
+        res_init_exp = tracker.record_snapshot("T-INIT-EXP", orders, None, now=100.0)
+        # Interval is [99.0, 100.0], end_ts=98.0 -> credited time is 0.0s
+        assert tracker._stats["T-INIT-EXP"]["uptime_seconds"] == 0.0
+        assert res_init_exp["reward_delta"] == 0.0
+
+        # 6. Gap exceeding 60-second cap after expiry
+        tracker.set_market_program("T-CAP-EXP", program_end=20.0, pool_dollars=604.80)
+        tracker.record_snapshot("T-CAP-EXP", orders, None, now=0.0)  # last_t = 0.0
+        # now=100.0 -> raw elapsed 100.0 capped to 60.0. Credited window is [40.0, 100.0].
+        # Since program_end=20.0 <= 40.0, credited elapsed is 0.0s.
+        res_cap = tracker.record_snapshot("T-CAP-EXP", orders, None, now=100.0)
+        assert tracker._stats["T-CAP-EXP"]["uptime_seconds"] == 1.0  # only initial 1.0s
+        assert res_cap["reward_delta"] == 0.0
+
+    def test_from_dict_malformed_and_resilient(self):
+        tracker = LIPScoreTracker()
+        malformed = {
+            "programs": {
+                "CORRUPT-1": {
+                    "pool_dollars": "not-a-number",
+                    "discount_factor": -5.0,
+                    "target_size": "99999999",
+                    "program_end": {"invalid": "object"},
+                    "category": 12345,
+                },
+                "NON-DICT": "string-value",
+            },
+            "stats": {
+                "CORRUPT-1": {
+                    "accumulated_score": "invalid",
+                    "uptime_seconds": None,
+                    "snapshots_count": -5,
+                    "last_snapshot_time": "bad-timestamp",
+                    "accumulated_reward_usd": "abc",
+                },
+                "NON-DICT-STAT": 999,
+            },
+        }
+
+        # from_dict must not raise
+        tracker.from_dict(malformed)
+
+        # Check coerced programs
+        prog = tracker._programs["CORRUPT-1"]
+        assert prog["pool_dollars"] == tracker.DEFAULT_POOL_DOLLARS
+        assert prog["discount_factor"] == 0.0
+        assert prog["target_size"] == 20000  # MAX_TARGET_SIZE
+        assert prog["program_end"] is None
+        assert prog["category"] == "12345"
+
+        # Check coerced stats
+        stat = tracker._stats["CORRUPT-1"]
+        assert stat["accumulated_score"] == 0.0
+        assert stat["uptime_seconds"] == 0.0
+        assert stat["snapshots_count"] == 0
+        assert stat["last_snapshot_time"] is None
+        assert stat["accumulated_reward_usd"] == 0.0
+
+        # Verify subsequent snapshot and metrics calculations succeed
+        orders = [{"purpose": "quote_bid", "side": "yes", "action": "buy", "price": 0.50, "count": 50}]
+        snap = tracker.record_snapshot("CORRUPT-1", orders, None, now=100.0)
+        assert snap["reward_delta"] >= 0.0
+        metrics = tracker.get_metrics()
+        assert "CORRUPT-1" in metrics["by_ticker"]

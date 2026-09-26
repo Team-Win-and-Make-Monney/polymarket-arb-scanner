@@ -418,7 +418,7 @@ class FixedQuoteEngine:
         self._bid, self._ask = bid, ask
 
     def calculate_quotes(self, mid_price, inventory=0.0, max_inventory=0.0,
-                         volatility=0.0, market_key=""):
+                         volatility=0.0, market_key="", **kwargs):
         return {"bid": self._bid, "ask": self._ask,
                 "spread": self._ask - self._bid, "skew": 0.0,
                 "mid": mid_price}

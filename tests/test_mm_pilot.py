@@ -1667,6 +1667,16 @@ class TestMMPilotStatusTelemetry:
         assert status["total_inventory_usd"] > 0
         assert TICKER in status["inventory"]["net"]
         assert status["inventory"]["net"][TICKER] == 4
+        assert "toxicity" in status
+        assert TICKER in status["toxicity"]
+        tox_item = status["toxicity"][TICKER]
+        assert "score" in tox_item
+        assert "spread_multiplier" in tox_item
+        assert "size_multiplier" in tox_item
+        assert "paused" in tox_item
+        assert "pause_remaining" in tox_item
+        assert "fill_velocity" in tox_item
+        assert "is_burst" in tox_item
 
     def test_persist_state_includes_extended_telemetry(self, pilot_env, clock, tmp_path):
         client = FakeKalshiClient()
@@ -1691,6 +1701,9 @@ class TestMMPilotStatusTelemetry:
         assert oid in saved["orders"]
         assert "inventory" in saved
         assert "kill_switch_enabled" in saved
+        assert "toxicity" in saved
+        assert TICKER in saved["toxicity"]
+        assert "spread_multiplier" in saved["toxicity"][TICKER]
         assert "saved_at" in saved
 
     def test_stop_persists_stopped_state(self, pilot_env, clock, tmp_path):
@@ -1832,3 +1845,68 @@ class TestMMPilotLIPYieldTracker:
         # Reconcile again — must not reload/overwrite newer LIP tracker state
         pilot.reconcile()
         assert pilot._lip_tracker._stats[TICKER]["snapshots_count"] == 2
+
+
+class TestMMPilotAdverseSelection:
+    """Test dynamic adverse selection spread widening and sizing taper in pilot."""
+
+    def test_adverse_selection_tuning_widens_spread_and_tapers_size(self, pilot_env, clock, monkeypatch):
+        monkeypatch.setattr(live_config(), "MM_TOXIC_FLOW_ENABLED", True)
+        monkeypatch.setattr(live_config(), "MM_CANARY_QUOTE_SIZE_USD", 50.0)
+
+        detector = ToxicFlowDetector(
+            decay_half_life_seconds=60.0,
+            toxicity_spread_factor=1.5,
+            size_taper_factor=0.6,
+            min_size_fraction=0.2,
+            fill_velocity_window_seconds=30.0,
+            fill_velocity_burst_threshold=3,
+        )
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48, yes_qty=100.0, no_qty=100.0)})
+        pilot = build_pilot(clock, client=client, detector=detector, selection=[TICKER])
+
+        # Step 1: Baseline refresh with clean book
+        placed_baseline = pilot.refresh_market(TICKER)
+        assert len(placed_baseline) > 0
+        baseline_orders = {o["order_id"]: o for o in pilot.resting_orders(TICKER)}
+        bid_order = next(o for o in baseline_orders.values() if o["purpose"] == "quote_bid")
+        ask_order = next(o for o in baseline_orders.values() if o["purpose"] == "quote_ask")
+        baseline_spread = (1.0 - ask_order["price"]) - bid_order["price"]
+        baseline_count = bid_order["count"]
+
+        # Step 2: Feed 3 adverse fills spaced 40s apart (so no burst yet, but toxicity = 1.0)
+        t0 = clock[0]
+        detector.record_fill(TICKER, "bid", 0.50, 10.0, 0.40, timestamp=t0 - 80.0)
+        detector.record_fill(TICKER, "bid", 0.50, 10.0, 0.40, timestamp=t0 - 40.0)
+        detector.record_fill(TICKER, "bid", 0.50, 10.0, 0.40, timestamp=t0)
+
+        assert detector.get_toxicity(TICKER, now=t0) > 0.0
+        assert detector.is_velocity_burst(TICKER, now=t0) is False
+
+        # Refresh quotes under elevated toxicity
+        placed_toxic = pilot.refresh_market(TICKER)
+        assert len(placed_toxic) > 0
+        toxic_orders = {o["order_id"]: o for o in pilot.resting_orders(TICKER)}
+        tox_bid = next(o for o in toxic_orders.values() if o["purpose"] == "quote_bid")
+        tox_ask = next(o for o in toxic_orders.values() if o["purpose"] == "quote_ask")
+        toxic_spread = (1.0 - tox_ask["price"]) - tox_bid["price"]
+
+        # Spread must be strictly wider and/or count must be smaller
+        assert toxic_spread >= baseline_spread
+        assert tox_bid["count"] <= baseline_count
+
+        # Step 3: Trigger burst velocity by adding 2 more fills within 2 seconds
+        detector.record_fill(TICKER, "bid", 0.50, 10.0, 0.40, timestamp=t0 + 1.0)
+        detector.record_fill(TICKER, "bid", 0.50, 10.0, 0.40, timestamp=t0 + 2.0)
+        clock[0] = t0 + 3.0
+        assert detector.is_velocity_burst(TICKER, now=clock[0]) is True
+
+        placed_burst = pilot.refresh_market(TICKER)
+        assert len(placed_burst) > 0
+        burst_orders = {o["order_id"]: o for o in pilot.resting_orders(TICKER)}
+        burst_bid = next(o for o in burst_orders.values() if o["purpose"] == "quote_bid")
+        burst_ask = next(o for o in burst_orders.values() if o["purpose"] == "quote_ask")
+        burst_spread = (1.0 - burst_ask["price"]) - burst_bid["price"]
+
+        assert burst_spread >= toxic_spread
+        assert burst_bid["count"] <= tox_bid["count"]

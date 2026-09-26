@@ -130,6 +130,8 @@ class QuoteEngine:
         max_inventory: float = DEFAULT_MAX_INVENTORY,
         volatility: float = 0.0,
         market_key: str = "",
+        toxicity: float | None = None,
+        toxicity_spread_multiplier: float | None = None,
     ) -> dict:
         """Calculate bid and ask prices.
 
@@ -142,9 +144,12 @@ class QuoteEngine:
                 ``MM_VOLATILITY_ADJUSTED_ENABLED`` is true, the VolatilityTracker
                 singleton multiplies the half-spread by
                 ``get_spread_multiplier(market_key)``.
+            toxicity: Optional toxicity probability (0-1). Widens spread.
+            toxicity_spread_multiplier: Optional explicit spread multiplier from toxicity.
 
         Returns:
-            Dict with ``bid``, ``ask``, ``spread``, ``skew``.
+            Dict with ``bid``, ``ask``, ``spread``, ``skew``, ``mid``,
+            and ``toxicity_spread_multiplier``.
         """
         half_spread = self.min_spread / 2
 
@@ -157,6 +162,22 @@ class QuoteEngine:
                 half_spread = half_spread * multiplier
             except Exception:
                 pass
+
+        # Adverse Selection / Toxicity hook — widen spread when informed flow is active
+        tox_mult = 1.0
+        if toxicity_spread_multiplier is not None and toxicity_spread_multiplier > 0:
+            tox_mult = float(toxicity_spread_multiplier)
+        elif market_key:
+            try:
+                tox_mult = get_toxic_flow_detector().get_spread_multiplier(market_key)
+            except Exception:
+                tox_mult = 1.0
+        elif toxicity is not None and toxicity > 0:
+            from config import MM_TOXIC_SPREAD_FACTOR
+            tox_mult = 1.0 + (float(toxicity) * MM_TOXIC_SPREAD_FACTOR)
+
+        if tox_mult > 1.0:
+            half_spread = half_spread * tox_mult
 
         # Volatility adjustment: wider spread in volatile markets
         vol_adj = volatility * 0.5  # 10% vol -> 5 cent wider spread
@@ -189,6 +210,7 @@ class QuoteEngine:
             "spread": round(ask - bid, 4),
             "skew": round(skew, 4),
             "mid": round(mid_price, 4),
+            "toxicity_spread_multiplier": round(tox_mult, 2),
         }
 
 
@@ -1470,15 +1492,36 @@ class ToxicFlowDetector:
         self,
         lookback_trades: int = 20,
         toxicity_threshold: float = 0.60,
+        decay_half_life_seconds: float = 60.0,
+        toxicity_spread_factor: float = 1.5,
+        size_taper_factor: float = 0.8,
+        min_size_fraction: float = 0.2,
+        fill_velocity_window_seconds: float = 30.0,
+        fill_velocity_burst_threshold: int = 3,
+        time_fn=time.time,
     ):
         """Initialize the toxic flow detector.
 
         Args:
             lookback_trades: Number of recent trades to analyze.
             toxicity_threshold: Threshold above which to pause (0-1).
+            decay_half_life_seconds: Half-life in seconds for exponential decay of fills.
+            toxicity_spread_factor: Scaling factor for spread widening (default 1.5).
+            size_taper_factor: Scaling factor for quote size reduction (default 0.8).
+            min_size_fraction: Minimum quote size floor fraction (default 0.2).
+            fill_velocity_window_seconds: Sliding window for burst detection (default 30s).
+            fill_velocity_burst_threshold: Fill count in window triggering burst penalty.
+            time_fn: Clock function for deterministic testing.
         """
         self.lookback_trades = lookback_trades
         self.toxicity_threshold = toxicity_threshold
+        self.decay_half_life_seconds = decay_half_life_seconds
+        self.toxicity_spread_factor = toxicity_spread_factor
+        self.size_taper_factor = size_taper_factor
+        self.min_size_fraction = min_size_fraction
+        self.fill_velocity_window_seconds = fill_velocity_window_seconds
+        self.fill_velocity_burst_threshold = fill_velocity_burst_threshold
+        self._time_fn = time_fn
         self._fills: dict[str, list[dict]] = {}
         self._pause_until: dict[str, float] = {}
         self._pause_reasons: dict[str, str] = {}
@@ -1491,6 +1534,7 @@ class ToxicFlowDetector:
         price: float,
         size: float,
         mid_at_fill: float,
+        timestamp: float | None = None,
     ) -> None:
         """Record a fill for toxicity analysis.
 
@@ -1500,8 +1544,9 @@ class ToxicFlowDetector:
             price: Fill price.
             size: Fill size in dollars.
             mid_at_fill: Mid price at time of fill.
+            timestamp: Optional fill timestamp (defaults to time_fn()).
         """
-        now = time.time()
+        now = timestamp if timestamp is not None else self._time_fn()
         with self._lock:
             if market_key not in self._fills:
                 self._fills[market_key] = []
@@ -1523,27 +1568,152 @@ class ToxicFlowDetector:
 
             self._fills[market_key] = self._fills[market_key][-self.lookback_trades:]
 
-    def get_toxicity(self, market_key: str) -> float:
-        """Calculate toxicity ratio for a market.
+    def get_toxicity(self, market_key: str, now: float | None = None) -> float:
+        """Calculate time-decayed toxicity ratio for a market.
 
-        Toxicity = (adverse fills) / (total fills)
+        Toxicity = (weighted adverse fills) / (total weighted fills)
+        where each fill is weighted by exponential decay with half-life
+        `decay_half_life_seconds`.
 
         Returns:
             Toxicity ratio (0-1). Higher = more informed flow.
         """
+        now_val = now if now is not None else self._time_fn()
         with self._lock:
             fills = self._fills.get(market_key, [])
             if len(fills) < 3:
                 return 0.0
 
-            adverse_count = sum(1 for f in fills if f["adverse"])
-            return adverse_count / len(fills)
+            if self.decay_half_life_seconds and self.decay_half_life_seconds > 0:
+                weighted_adverse = 0.0
+                weighted_total = 0.0
+                for f in fills:
+                    dt = max(0.0, now_val - float(f.get("timestamp", now_val)))
+                    weight = 2.0 ** (-dt / self.decay_half_life_seconds)
+                    weighted_total += weight
+                    if f.get("adverse"):
+                        weighted_adverse += weight
 
-    def should_pause(self, market_key: str) -> bool:
+                if weighted_total <= 0.0:
+                    return 0.0
+                return round(min(1.0, weighted_adverse / weighted_total), 4)
+
+            adverse_count = sum(1 for f in fills if f.get("adverse"))
+            return round(adverse_count / len(fills), 4)
+
+    def get_fill_velocity(
+        self,
+        market_key: str,
+        window_seconds: float | None = None,
+        now: float | None = None,
+    ) -> int:
+        """Count fills that occurred within the trailing window."""
+        window = (
+            window_seconds
+            if window_seconds is not None
+            else self.fill_velocity_window_seconds
+        )
+        now_val = now if now is not None else self._time_fn()
+        with self._lock:
+            fills = self._fills.get(market_key, [])
+            if not fills or window <= 0:
+                return 0
+            cutoff = now_val - window
+            return sum(1 for f in fills if f.get("timestamp", 0) >= cutoff)
+
+    def is_velocity_burst(
+        self,
+        market_key: str,
+        window_seconds: float | None = None,
+        burst_threshold: int | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """Check if recent fill rate constitutes an adverse velocity burst."""
+        threshold = (
+            burst_threshold
+            if burst_threshold is not None
+            else self.fill_velocity_burst_threshold
+        )
+        return self.get_fill_velocity(market_key, window_seconds=window_seconds, now=now) >= threshold
+
+    def get_spread_multiplier(
+        self,
+        market_key: str,
+        toxicity_spread_factor: float | None = None,
+        now: float | None = None,
+    ) -> float:
+        """Calculate dynamic quote spread multiplier based on toxicity and fill velocity.
+
+        Multiplier = 1.0 + (toxicity * factor) (+ 0.5 burst if velocity spikes).
+
+        Returns:
+            Spread multiplier (>= 1.0).
+        """
+        from config import MM_TOXIC_FLOW_ENABLED
+
+        if not MM_TOXIC_FLOW_ENABLED:
+            return 1.0
+
+        factor = (
+            toxicity_spread_factor
+            if toxicity_spread_factor is not None
+            else self.toxicity_spread_factor
+        )
+        toxicity = self.get_toxicity(market_key, now=now)
+        burst = self.is_velocity_burst(market_key, now=now)
+
+        mult = 1.0
+        if toxicity > 0:
+            mult += toxicity * factor
+        if burst:
+            mult += 0.5  # Widen extra 50% on aggressive sweeps
+
+        return round(max(1.0, mult), 2)
+
+    def get_size_multiplier(
+        self,
+        market_key: str,
+        size_taper_factor: float | None = None,
+        min_size_fraction: float | None = None,
+        now: float | None = None,
+    ) -> float:
+        """Calculate dynamic quote size multiplier based on toxicity and fill velocity.
+
+        Reduces quote sizes as informed flow probability rises or burst sweeps occur.
+
+        Returns:
+            Size multiplier in [min_size_fraction, 1.0].
+        """
+        from config import MM_TOXIC_FLOW_ENABLED
+
+        if not MM_TOXIC_FLOW_ENABLED:
+            return 1.0
+
+        taper = (
+            size_taper_factor
+            if size_taper_factor is not None
+            else self.size_taper_factor
+        )
+        min_frac = (
+            min_size_fraction
+            if min_size_fraction is not None
+            else self.min_size_fraction
+        )
+        toxicity = self.get_toxicity(market_key, now=now)
+        burst = self.is_velocity_burst(market_key, now=now)
+
+        size_mult = max(min_frac, 1.0 - (toxicity * taper))
+        if burst:
+            size_mult = max(min_frac, size_mult * 0.5)
+
+        return round(size_mult, 2)
+
+    def should_pause(self, market_key: str, now: float | None = None) -> bool:
         """Check if quoting should be paused due to toxic flow.
 
         Args:
             market_key: Market identifier.
+            now: Optional timestamp.
 
         Returns:
             True if quoting should be paused.
@@ -1553,11 +1723,12 @@ class ToxicFlowDetector:
         if not MM_TOXIC_FLOW_ENABLED:
             return False
 
+        now_val = now if now is not None else self._time_fn()
         with self._lock:
-            if self._pause_until.get(market_key, 0) > time.time():
+            if self._pause_until.get(market_key, 0) > now_val:
                 return True
 
-        toxicity = self.get_toxicity(market_key)
+        toxicity = self.get_toxicity(market_key, now=now_val)
         return toxicity >= self.toxicity_threshold
 
     def trigger_pause(
@@ -1565,6 +1736,7 @@ class ToxicFlowDetector:
         market_key: str,
         pause_seconds: float | None = None,
         reason: str = "",
+        now: float | None = None,
     ) -> None:
         """Trigger a quoting pause for a market.
 
@@ -1572,13 +1744,15 @@ class ToxicFlowDetector:
             market_key: Market identifier.
             pause_seconds: Duration of pause (default from config).
             reason: Optional human/system reason for the pause.
+            now: Optional timestamp.
         """
         from config import MM_TOXIC_FLOW_PAUSE_SECONDS
 
         pause_seconds = pause_seconds or MM_TOXIC_FLOW_PAUSE_SECONDS
-        toxicity = self.get_toxicity(market_key)
+        now_val = now if now is not None else self._time_fn()
+        toxicity = self.get_toxicity(market_key, now=now_val)
         with self._lock:
-            self._pause_until[market_key] = time.time() + pause_seconds
+            self._pause_until[market_key] = now_val + pause_seconds
             if reason:
                 self._pause_reasons[market_key] = reason
         logger.warning(
@@ -1586,10 +1760,11 @@ class ToxicFlowDetector:
             market_key, toxicity * 100, f" [{reason}]" if reason else "", pause_seconds,
         )
 
-    def get_pause_remaining(self, market_key: str) -> float:
+    def get_pause_remaining(self, market_key: str, now: float | None = None) -> float:
         """Get remaining pause time in seconds."""
+        now_val = now if now is not None else self._time_fn()
         with self._lock:
-            return max(0, self._pause_until.get(market_key, 0) - time.time())
+            return max(0.0, self._pause_until.get(market_key, 0) - now_val)
 
     def get_pause_reason(self, market_key: str) -> str:
         """Get pause reason if set, or empty string."""
@@ -1694,8 +1869,22 @@ def get_toxic_flow_detector() -> ToxicFlowDetector:
     """Get or create the module-level ToxicFlowDetector."""
     global _toxic_flow_detector
     if _toxic_flow_detector is None:
-        from config import MM_TOXIC_FLOW_THRESHOLD
+        from config import (
+            MM_TOXIC_FLOW_THRESHOLD,
+            MM_TOXIC_FLOW_HALF_LIFE_SECONDS,
+            MM_TOXIC_SPREAD_FACTOR,
+            MM_TOXIC_SIZE_TAPER_FACTOR,
+            MM_TOXIC_MIN_SIZE_FRACTION,
+            MM_FILL_VELOCITY_WINDOW_SECONDS,
+            MM_FILL_VELOCITY_BURST_THRESHOLD,
+        )
         _toxic_flow_detector = ToxicFlowDetector(
             toxicity_threshold=MM_TOXIC_FLOW_THRESHOLD,
+            decay_half_life_seconds=MM_TOXIC_FLOW_HALF_LIFE_SECONDS,
+            toxicity_spread_factor=MM_TOXIC_SPREAD_FACTOR,
+            size_taper_factor=MM_TOXIC_SIZE_TAPER_FACTOR,
+            min_size_fraction=MM_TOXIC_MIN_SIZE_FRACTION,
+            fill_velocity_window_seconds=MM_FILL_VELOCITY_WINDOW_SECONDS,
+            fill_velocity_burst_threshold=MM_FILL_VELOCITY_BURST_THRESHOLD,
         )
     return _toxic_flow_detector

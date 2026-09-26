@@ -729,6 +729,23 @@ class KalshiMMPilot:
             except Exception as e:
                 logger.debug("Failed serializing LIP rewards for persistence: %s", e)
 
+        toxicity_data = {}
+        if hasattr(self, "_toxic") and self._toxic is not None:
+            try:
+                now_ts = self._time_fn()
+                for ticker in self.pilot_tickers():
+                    toxicity_data[ticker] = {
+                        "score": round(self._toxic.get_toxicity(ticker, now=now_ts), 4),
+                        "spread_multiplier": self._toxic.get_spread_multiplier(ticker, now=now_ts),
+                        "size_multiplier": self._toxic.get_size_multiplier(ticker, now=now_ts),
+                        "paused": self._toxic.should_pause(ticker, now=now_ts),
+                        "pause_remaining": round(self._toxic.get_pause_remaining(ticker, now=now_ts), 2),
+                        "fill_velocity": self._toxic.get_fill_velocity(ticker, now=now_ts),
+                        "is_burst": self._toxic.is_velocity_burst(ticker, now=now_ts),
+                    }
+            except Exception as e:
+                logger.debug("Failed serializing toxicity metrics for persistence: %s", e)
+
         state = {
             "active": (not self.halted) and (not self._stopped),
             "status": status_val,
@@ -749,6 +766,7 @@ class KalshiMMPilot:
             "inventory": self.inventory.snapshot(),
             "lip_tracker": lip_tracker_data,
             "lip_rewards": lip_rewards_data,
+            "toxicity": toxicity_data,
             "seen_fill_ids": list(self._seen_fill_ids.keys())[-200:],
             "saved_at": self._time_fn(),
         }
@@ -1519,12 +1537,35 @@ class KalshiMMPilot:
 
         book = self._book(ticker)
         mid = book["mid"]
-        quotes = self._quote_engine.calculate_quotes(
-            mid,
-            inventory=self.inventory.net_usd(ticker),
-            max_inventory=config.MM_MAX_INVENTORY_USD,
-            market_key=ticker,  # G9: volatility widening hook
-        )
+
+        # Adverse selection & toxicity tuning
+        tox_score = 0.0
+        tox_spread_mult = 1.0
+        tox_size_mult = 1.0
+        now_ts = self._time_fn()
+        if hasattr(self, "_toxic") and self._toxic is not None:
+            try:
+                tox_score = self._toxic.get_toxicity(ticker, now=now_ts)
+                tox_spread_mult = self._toxic.get_spread_multiplier(ticker, now=now_ts)
+                tox_size_mult = self._toxic.get_size_multiplier(ticker, now=now_ts)
+            except Exception:
+                logger.debug("MM pilot toxicity metrics lookup failed for %s", ticker, exc_info=True)
+
+        try:
+            quotes = self._quote_engine.calculate_quotes(
+                mid,
+                inventory=self.inventory.net_usd(ticker),
+                max_inventory=config.MM_MAX_INVENTORY_USD,
+                market_key=ticker,  # G9: volatility widening hook
+                toxicity_spread_multiplier=tox_spread_mult,
+            )
+        except TypeError:
+            quotes = self._quote_engine.calculate_quotes(
+                mid,
+                inventory=self.inventory.net_usd(ticker),
+                max_inventory=config.MM_MAX_INVENTORY_USD,
+                market_key=ticker,
+            )
         bid = self._round_tick(quotes["bid"])
         ask = self._round_tick(quotes["ask"])
 
@@ -1564,13 +1605,20 @@ class KalshiMMPilot:
                 return 0
             count = int(size_usd / price)
             depth_cap = int(config.MM_MAX_BOOK_DEPTH_FRACTION * best[1])
-            return min(count, depth_cap)
+            base_count = min(count, depth_cap)
+            return int(base_count * tox_size_mult)
 
         # Our bid = buy YES at `bid`; same side of the book = resting YES bids.
         bid_count = 0 if skip_bid else _sized_count(bid, book.get("yes_bid"))
         # Our ask = buy NO at (1 - ask); same side = resting NO bids.
         no_price = self._round_tick(1.0 - ask)
         ask_count = 0 if skip_ask else _sized_count(no_price, book.get("no_bid"))
+        self._write_decision(
+            "G7_adverse_selection_tuning",
+            ticker,
+            True,
+            f"toxicity={tox_score:.4f} spread_mult={tox_spread_mult:.2f} size_mult={tox_size_mult:.2f}",
+        )
         self._write_decision("G11_depth_sizing", ticker,
                              bid_count >= 1 or ask_count >= 1,
                              f"bid_count={bid_count} ask_count={ask_count}")
@@ -1829,8 +1877,14 @@ class KalshiMMPilot:
         if not is_hedge:
             quote_side = "bid" if purpose == "quote_bid" else "ask"
             try:
-                self._toxic.record_fill(event.ticker, quote_side, event.price,
-                                        notional, event.mid_at_detect)
+                self._toxic.record_fill(
+                    event.ticker,
+                    quote_side,
+                    event.price,
+                    notional,
+                    event.mid_at_detect,
+                    timestamp=event.created_ts or detect_wall,
+                )
                 if (self._toxic.get_toxicity(event.ticker)
                         >= config.MM_TOXIC_FLOW_THRESHOLD):
                     self._toxic.trigger_pause(event.ticker)
@@ -2251,6 +2305,23 @@ class KalshiMMPilot:
             except Exception as e:
                 logger.debug("Failed computing LIP metrics for status telemetry: %s", e)
 
+        toxicity_by_ticker = {}
+        if hasattr(self, "_toxic") and self._toxic is not None:
+            try:
+                now_ts = self._time_fn()
+                for ticker in self.pilot_tickers():
+                    toxicity_by_ticker[ticker] = {
+                        "score": round(self._toxic.get_toxicity(ticker, now=now_ts), 4),
+                        "spread_multiplier": self._toxic.get_spread_multiplier(ticker, now=now_ts),
+                        "size_multiplier": self._toxic.get_size_multiplier(ticker, now=now_ts),
+                        "paused": self._toxic.should_pause(ticker, now=now_ts),
+                        "pause_remaining": round(self._toxic.get_pause_remaining(ticker, now=now_ts), 2),
+                        "fill_velocity": self._toxic.get_fill_velocity(ticker, now=now_ts),
+                        "is_burst": self._toxic.is_velocity_burst(ticker, now=now_ts),
+                    }
+            except Exception as e:
+                logger.debug("Failed computing toxicity telemetry for status: %s", e)
+
         status_val = "halted" if self.halted else ("stopped" if self._stopped else "active")
         return {
             "active": (not self.halted) and (not self._stopped),
@@ -2269,6 +2340,7 @@ class KalshiMMPilot:
             "realized_pnl": self.inventory.realized_pnl_total(),
             "inventory": self.inventory.snapshot(),
             "lip_rewards": lip_rewards,
+            "toxicity": toxicity_by_ticker,
             "dry_run": self.dry_run,
             "reconciled": self._reconciled,
             "fills_blind": self._fills_blind,

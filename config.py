@@ -764,10 +764,16 @@ LEAD_LAG_MM_ENABLED = _env_bool("LEAD_LAG_MM_ENABLED", "false")
 LEAD_LAG_MIN_DELAY_MS = _env_float("LEAD_LAG_MIN_DELAY_MS", "500.0")
 LEAD_LAG_PLATFORMS = os.getenv("LEAD_LAG_PLATFORMS", "polymarket,kalshi")
 
-# #38: Toxic Flow Detection — detect adverse selection, pause quoting
+# #38: Toxic Flow Detection & Adverse Selection Tuning
 MM_TOXIC_FLOW_ENABLED = _env_bool("MM_TOXIC_FLOW_ENABLED", "false")
 MM_TOXIC_FLOW_THRESHOLD = _env_float("MM_TOXIC_FLOW_THRESHOLD", "0.60")
 MM_TOXIC_FLOW_PAUSE_SECONDS = _env_float("MM_TOXIC_FLOW_PAUSE_SECONDS", "60.0")
+MM_TOXIC_FLOW_HALF_LIFE_SECONDS = _env_float("MM_TOXIC_FLOW_HALF_LIFE_SECONDS", "60.0")
+MM_TOXIC_SPREAD_FACTOR = _env_float("MM_TOXIC_SPREAD_FACTOR", "1.5")
+MM_TOXIC_SIZE_TAPER_FACTOR = _env_float("MM_TOXIC_SIZE_TAPER_FACTOR", "0.8")
+MM_TOXIC_MIN_SIZE_FRACTION = _env_float("MM_TOXIC_MIN_SIZE_FRACTION", "0.2")
+MM_FILL_VELOCITY_WINDOW_SECONDS = _env_float("MM_FILL_VELOCITY_WINDOW_SECONDS", "30.0")
+MM_FILL_VELOCITY_BURST_THRESHOLD = _env_int("MM_FILL_VELOCITY_BURST_THRESHOLD", "3")
 
 # ---------------------------------------------------------------------------
 # Kalshi reward-MM pilot (plan 10 — docs/plans/10-mm-pilot-prep.md).

@@ -1587,6 +1587,38 @@ class TestToxicityFailClosed:
         assert TICKER in pilot._market_halted
         assert "toxicity accounting failed" in pilot._market_halted[TICKER]
 
+    def test_refresh_market_fails_closed_when_toxicity_lookup_raises(self, pilot_env, clock, monkeypatch):
+        monkeypatch.setattr(live_config(), "MM_TOXIC_FLOW_ENABLED", True)
+
+        class RaisingMultiplierToxic(ToxicFlowDetector):
+            def get_spread_multiplier(self, *args, **kwargs):
+                raise RuntimeError("spread multiplier lookup crashed")
+
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48)})
+        pilot = build_pilot(clock, client=client, detector=RaisingMultiplierToxic(), selection=[TICKER])
+        oid = pilot.place_pilot_order(TICKER, "yes", "buy", 4, 0.49, purpose="quote_bid")
+
+        placed = pilot.refresh_market(TICKER)
+        assert placed == []
+        assert oid in client.cancelled
+        assert pilot.resting_orders(TICKER) == []
+
+    def test_sized_count_preserves_minimum_quote_floor(self, pilot_env, clock, monkeypatch):
+        monkeypatch.setattr(live_config(), "MM_TOXIC_FLOW_ENABLED", True)
+        detector = ToxicFlowDetector(min_size_fraction=0.2, size_taper_factor=0.8)
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48, yes_qty=10.0, no_qty=10.0)})
+        pilot = build_pilot(clock, client=client, detector=detector, selection=[TICKER])
+        # 2 adverse fills and 3 favorable fills -> toxicity = 0.40 (< 0.60 pause threshold)
+        detector.record_fill(TICKER, "bid", 0.50, 10.0, 0.40)
+        detector.record_fill(TICKER, "bid", 0.50, 10.0, 0.40)
+        detector.record_fill(TICKER, "bid", 0.50, 10.0, 0.60)
+        detector.record_fill(TICKER, "bid", 0.50, 10.0, 0.60)
+        detector.record_fill(TICKER, "bid", 0.50, 10.0, 0.60)
+        placed = pilot.refresh_market(TICKER)
+        assert len(placed) > 0
+        orders = pilot.resting_orders(TICKER)
+        assert all(o["count"] >= 1 for o in orders)
+
 
 class TestShutdownCancellation:
     def test_stop_without_client_confirms_when_no_orders_remain(self, clock):

@@ -1543,13 +1543,17 @@ class KalshiMMPilot:
         tox_spread_mult = 1.0
         tox_size_mult = 1.0
         now_ts = self._time_fn()
-        if hasattr(self, "_toxic") and self._toxic is not None:
+        if (config.MM_TOXIC_FLOW_ENABLED
+                and hasattr(self, "_toxic") and self._toxic is not None):
             try:
                 tox_score = self._toxic.get_toxicity(ticker, now=now_ts)
                 tox_spread_mult = self._toxic.get_spread_multiplier(ticker, now=now_ts)
                 tox_size_mult = self._toxic.get_size_multiplier(ticker, now=now_ts)
             except Exception:
-                logger.debug("MM pilot toxicity metrics lookup failed for %s", ticker, exc_info=True)
+                logger.exception("MM pilot toxicity metrics lookup failed for %s", ticker)
+                self.pull_market(ticker, "toxicity_state_unavailable")
+                self._record_lip_snapshot(ticker)
+                return []
 
         try:
             quotes = self._quote_engine.calculate_quotes(
@@ -1606,7 +1610,9 @@ class KalshiMMPilot:
             count = int(size_usd / price)
             depth_cap = int(config.MM_MAX_BOOK_DEPTH_FRACTION * best[1])
             base_count = min(count, depth_cap)
-            return int(base_count * tox_size_mult)
+            if base_count <= 0:
+                return 0
+            return max(1, int(base_count * tox_size_mult))
 
         # Our bid = buy YES at `bid`; same side of the book = resting YES bids.
         bid_count = 0 if skip_bid else _sized_count(bid, book.get("yes_bid"))

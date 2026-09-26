@@ -323,3 +323,106 @@ class TestLIPScoreTracker:
         assert "TICKER-1" in new_tracker._programs
         assert new_tracker._programs["TICKER-1"]["pool_dollars"] == 500.0
         assert new_tracker._stats["TICKER-1"]["snapshots_count"] == 1
+
+    def test_record_snapshot_program_end_clamping(self):
+        tracker = LIPScoreTracker()
+        orders = [{"purpose": "quote_bid", "side": "yes", "action": "buy", "price": 0.50, "count": 50}]
+
+        # 1. Initial snapshot on-time (future expiry) -> credits default 1.0s
+        tracker.set_market_program("T-ONTIME", program_end=150.0, pool_dollars=604.80)
+        res1 = tracker.record_snapshot("T-ONTIME", orders, None, now=100.0)
+        assert tracker._stats["T-ONTIME"]["uptime_seconds"] == 1.0
+        assert res1["reward_delta"] > 0
+
+        # On-time subsequent snapshot at 110.0 -> credits 10.0s
+        res2 = tracker.record_snapshot("T-ONTIME", orders, None, now=110.0)
+        assert tracker._stats["T-ONTIME"]["uptime_seconds"] == 11.0
+        assert res2["reward_delta"] == pytest.approx(10.0 * (604.80 / 604800.0), rel=1e-3)
+
+        # 2. Partially post-expiry subsequent snapshot
+        tracker.set_market_program("T-PARTIAL", program_end=104.0, pool_dollars=604.80)
+        tracker.record_snapshot("T-PARTIAL", orders, None, now=100.0)  # last_t = 100.0
+        res_part = tracker.record_snapshot("T-PARTIAL", orders, None, now=110.0)
+        # Interval is [100.0, 110.0], end_ts=104.0 -> credited time is 4.0s
+        assert tracker._stats["T-PARTIAL"]["uptime_seconds"] == 5.0  # 1.0 initial + 4.0
+        assert res_part["reward_delta"] == pytest.approx(4.0 * (604.80 / 604800.0), rel=1e-3)
+
+        # 3. Fully post-expiry subsequent snapshot
+        # Next snapshot at 120.0 with end_ts=104.0 (credited_start = 110.0 >= 104.0) -> credits 0.0s
+        res_full = tracker.record_snapshot("T-PARTIAL", orders, None, now=120.0)
+        assert tracker._stats["T-PARTIAL"]["uptime_seconds"] == 5.0
+        assert res_full["reward_delta"] == 0.0
+
+        # 4. Initial snapshot partially post-expiry
+        tracker.set_market_program("T-INIT-PARTIAL", program_end=99.6, pool_dollars=604.80)
+        res_init_part = tracker.record_snapshot("T-INIT-PARTIAL", orders, None, now=100.0)
+        # Interval is [99.0, 100.0], end_ts=99.6 -> credited time is 0.6s
+        assert tracker._stats["T-INIT-PARTIAL"]["uptime_seconds"] == pytest.approx(0.6, abs=1e-5)
+        assert res_init_part["reward_delta"] == pytest.approx(0.6 * (604.80 / 604800.0), rel=1e-3)
+
+        # 5. Initial snapshot fully post-expiry
+        tracker.set_market_program("T-INIT-EXP", program_end=98.0, pool_dollars=604.80)
+        res_init_exp = tracker.record_snapshot("T-INIT-EXP", orders, None, now=100.0)
+        # Interval is [99.0, 100.0], end_ts=98.0 -> credited time is 0.0s
+        assert tracker._stats["T-INIT-EXP"]["uptime_seconds"] == 0.0
+        assert res_init_exp["reward_delta"] == 0.0
+
+        # 6. Gap exceeding 60-second cap after expiry
+        tracker.set_market_program("T-CAP-EXP", program_end=20.0, pool_dollars=604.80)
+        tracker.record_snapshot("T-CAP-EXP", orders, None, now=0.0)  # last_t = 0.0
+        # now=100.0 -> raw elapsed 100.0 capped to 60.0. Credited window is [40.0, 100.0].
+        # Since program_end=20.0 <= 40.0, credited elapsed is 0.0s.
+        res_cap = tracker.record_snapshot("T-CAP-EXP", orders, None, now=100.0)
+        assert tracker._stats["T-CAP-EXP"]["uptime_seconds"] == 1.0  # only initial 1.0s
+        assert res_cap["reward_delta"] == 0.0
+
+    def test_from_dict_malformed_and_resilient(self):
+        tracker = LIPScoreTracker()
+        malformed = {
+            "programs": {
+                "CORRUPT-1": {
+                    "pool_dollars": "not-a-number",
+                    "discount_factor": -5.0,
+                    "target_size": "99999999",
+                    "program_end": {"invalid": "object"},
+                    "category": 12345,
+                },
+                "NON-DICT": "string-value",
+            },
+            "stats": {
+                "CORRUPT-1": {
+                    "accumulated_score": "invalid",
+                    "uptime_seconds": None,
+                    "snapshots_count": -5,
+                    "last_snapshot_time": "bad-timestamp",
+                    "accumulated_reward_usd": "abc",
+                },
+                "NON-DICT-STAT": 999,
+            },
+        }
+
+        # from_dict must not raise
+        tracker.from_dict(malformed)
+
+        # Check coerced programs
+        prog = tracker._programs["CORRUPT-1"]
+        assert prog["pool_dollars"] == tracker.DEFAULT_POOL_DOLLARS
+        assert prog["discount_factor"] == 0.0
+        assert prog["target_size"] == 20000  # MAX_TARGET_SIZE
+        assert prog["program_end"] is None
+        assert prog["category"] == "12345"
+
+        # Check coerced stats
+        stat = tracker._stats["CORRUPT-1"]
+        assert stat["accumulated_score"] == 0.0
+        assert stat["uptime_seconds"] == 0.0
+        assert stat["snapshots_count"] == 0
+        assert stat["last_snapshot_time"] is None
+        assert stat["accumulated_reward_usd"] == 0.0
+
+        # Verify subsequent snapshot and metrics calculations succeed
+        orders = [{"purpose": "quote_bid", "side": "yes", "action": "buy", "price": 0.50, "count": 50}]
+        snap = tracker.record_snapshot("CORRUPT-1", orders, None, now=100.0)
+        assert snap["reward_delta"] >= 0.0
+        metrics = tracker.get_metrics()
+        assert "CORRUPT-1" in metrics["by_ticker"]

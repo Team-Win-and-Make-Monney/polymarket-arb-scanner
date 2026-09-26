@@ -943,11 +943,7 @@ class KalshiMMPilot:
                 self._last_fill_ts = max(self._last_fill_ts,
                                          float(persisted["last_fill_ts"]))
 
-        if persisted and isinstance(persisted, dict) and hasattr(self, "_lip_tracker"):
-            if "lip_tracker" in persisted:
-                self._lip_tracker.from_dict(persisted["lip_tracker"])
-            elif "lip_rewards" in persisted and isinstance(persisted["lip_rewards"], dict) and "stats" in persisted["lip_rewards"]:
-                self._lip_tracker.from_dict(persisted["lip_rewards"])
+        # LIP tracker state is restored once in __init__.
 
         self._reconciled = True
         logger.info("MM pilot reconciled at startup: %d ticker(s) with "

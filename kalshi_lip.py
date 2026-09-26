@@ -19,6 +19,7 @@ mirrors the published formula to estimate accrual locally.
 
 from __future__ import annotations
 
+from datetime import datetime
 import math
 import threading
 
@@ -496,6 +497,25 @@ class LIPScoreTracker:
                 elapsed = 1.0
             else:
                 elapsed = max(0.0, min(60.0, now_val - last_t))
+
+            program_end = prog.get("program_end")
+            if program_end:
+                try:
+                    if isinstance(program_end, (int, float)):
+                        end_ts = float(program_end)
+                    else:
+                        end_ts = datetime.fromisoformat(
+                            str(program_end).replace("Z", "+00:00")
+                        ).timestamp()
+                except (AttributeError, TypeError, ValueError, OverflowError):
+                    end_ts = None
+                if end_ts is not None:
+                    credited_start = now_val - elapsed
+                    elapsed = max(
+                        0.0,
+                        min(elapsed, end_ts - credited_start),
+                    )
+
             stat["last_snapshot_time"] = now_val
 
             target_size = prog["target_size"]
@@ -706,9 +726,71 @@ class LIPScoreTracker:
         with self._lock:
             programs = data.get("programs") or {}
             stats = data.get("stats") or {}
-            for ticker, p in programs.items():
-                if isinstance(p, dict):
-                    self._programs[ticker] = dict(p)
-            for ticker, s in stats.items():
-                if isinstance(s, dict):
-                    self._stats[ticker] = dict(s)
+
+            def as_float(value, default):
+                try:
+                    val = float(value)
+                    return val if math.isfinite(val) else default
+                except (TypeError, ValueError):
+                    return default
+
+            def as_int(value, default):
+                try:
+                    val = int(float(value))
+                    return val
+                except (TypeError, ValueError):
+                    return default
+
+            if isinstance(programs, dict):
+                for ticker, p in programs.items():
+                    if isinstance(p, dict):
+                        merged = {
+                            "pool_dollars": self.DEFAULT_POOL_DOLLARS,
+                            "discount_factor": self.DEFAULT_DISCOUNT_FACTOR,
+                            "target_size": self.DEFAULT_TARGET_SIZE,
+                            "program_end": None,
+                            "category": None,
+                        }
+                        merged.update(p)
+                        merged["pool_dollars"] = max(
+                            0.0, as_float(merged["pool_dollars"], self.DEFAULT_POOL_DOLLARS)
+                        )
+                        merged["discount_factor"] = max(
+                            0.0,
+                            min(1.0, as_float(merged["discount_factor"], self.DEFAULT_DISCOUNT_FACTOR)),
+                        )
+                        merged["target_size"] = max(
+                            MIN_TARGET_SIZE,
+                            min(MAX_TARGET_SIZE, as_float(merged["target_size"], self.DEFAULT_TARGET_SIZE)),
+                        )
+                        if merged.get("program_end") is not None and not isinstance(
+                            merged["program_end"], (str, int, float)
+                        ):
+                            merged["program_end"] = None
+                        if merged.get("category") is not None and not isinstance(
+                            merged["category"], str
+                        ):
+                            merged["category"] = str(merged["category"])
+                        self._programs[str(ticker)] = merged
+
+            if isinstance(stats, dict):
+                for ticker, s in stats.items():
+                    if isinstance(s, dict):
+                        merged = self._empty_stat()
+                        merged.update(s)
+                        for key in (
+                            "accumulated_score",
+                            "market_accumulated_score",
+                            "uptime_seconds",
+                            "last_qualifying_share",
+                            "last_our_score",
+                            "last_market_score",
+                            "accumulated_reward_usd",
+                        ):
+                            merged[key] = as_float(merged[key], self._empty_stat()[key])
+                        merged["snapshots_count"] = max(0, as_int(merged["snapshots_count"], 0))
+                        if merged["last_snapshot_time"] is not None:
+                            merged["last_snapshot_time"] = as_float(
+                                merged["last_snapshot_time"], None
+                            )
+                        self._stats[str(ticker)] = merged

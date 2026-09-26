@@ -1811,3 +1811,24 @@ class TestMMPilotLIPYieldTracker:
         assert prog2["pool_dollars"] == 2500.0
         assert prog2["discount_factor"] == 0.92
         assert pilot2._lip_tracker._stats[TICKER]["snapshots_count"] == 1
+
+    def test_reconcile_does_not_overwrite_lip_tracker(self, pilot_env, clock, tmp_path):
+        state_file = tmp_path / "mm_state_lip_reconcile.json"
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client, state_path=str(state_file), selection=[TICKER])
+        pilot._lip_tracker.set_market_program(TICKER, pool_dollars=1000.0)
+        pilot.refresh_market(TICKER)
+        pilot._persist_state()
+
+        # Simulate newer snapshot accrued in memory
+        pilot._lip_tracker.record_snapshot(
+            TICKER,
+            [{"purpose": "quote_bid", "side": "yes", "action": "buy", "price": 0.50, "count": 50}],
+            None,
+            now=200.0,
+        )
+        assert pilot._lip_tracker._stats[TICKER]["snapshots_count"] == 2
+
+        # Reconcile again — must not reload/overwrite newer LIP tracker state
+        pilot.reconcile()
+        assert pilot._lip_tracker._stats[TICKER]["snapshots_count"] == 2

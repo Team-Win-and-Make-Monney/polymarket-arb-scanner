@@ -811,6 +811,12 @@ MM_BOOK_MAX_STALE_SECONDS = _env_float("MM_BOOK_MAX_STALE_SECONDS", "30.0")
 MM_VOL_PULL_MULTIPLIER = _env_float("MM_VOL_PULL_MULTIPLIER", "2.5")
 MM_MAX_BOOK_DEPTH_FRACTION = _env_float("MM_MAX_BOOK_DEPTH_FRACTION", "0.25")
 
+# LIP Target Size Balancer — dynamically size quoting volume to marginal LIP target
+MM_LIP_BALANCER_ENABLED = _env_bool("MM_LIP_BALANCER_ENABLED", "true")
+MM_LIP_BALANCER_MAX_SHARE = _env_float("MM_LIP_BALANCER_MAX_SHARE", "0.25")
+MM_LIP_BALANCER_SCALE_UP = _env_bool("MM_LIP_BALANCER_SCALE_UP", "true")
+MM_LIP_BALANCER_MIN_EFFICIENCY = _env_float("MM_LIP_BALANCER_MIN_EFFICIENCY", "0.50")
+
 # Kill switch / control plane (spec section 7). Fail closed: a cache older
 # than MM_CONTROLS_MAX_STALE_SECONDS means unknown operator intent = off.
 MM_CONTROLS_POLL_SECONDS = _env_float("MM_CONTROLS_POLL_SECONDS", "60.0")
@@ -1402,6 +1408,14 @@ def validate_config() -> list[str]:
         raise ConfigError(
             f"MM_MAX_BOOK_DEPTH_FRACTION={MM_MAX_BOOK_DEPTH_FRACTION} "
             f"must be in (0, 1]")
+    if not (0 < MM_LIP_BALANCER_MAX_SHARE <= 1):
+        raise ConfigError(
+            f"MM_LIP_BALANCER_MAX_SHARE={MM_LIP_BALANCER_MAX_SHARE} "
+            f"must be in (0, 1]")
+    if not (0 <= MM_LIP_BALANCER_MIN_EFFICIENCY <= 1):
+        raise ConfigError(
+            f"MM_LIP_BALANCER_MIN_EFFICIENCY={MM_LIP_BALANCER_MIN_EFFICIENCY} "
+            f"must be in [0, 1]")
 
     # --- Non-negative checks ---
     _non_negative = {

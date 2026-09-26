@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from kalshi_lip import (  # noqa: E402
     KalshiLipScorer,
     LIPScoreTracker,
+    LIPTargetSizeBalancer,
     MAX_TARGET_SIZE,
     MIN_TARGET_SIZE,
     distance_multiplier,
@@ -426,3 +427,277 @@ class TestLIPScoreTracker:
         assert snap["reward_delta"] >= 0.0
         metrics = tracker.get_metrics()
         assert "CORRUPT-1" in metrics["by_ticker"]
+
+
+class TestLIPTargetSizeBalancer:
+    def test_disabled_balancer_returns_base_count(self):
+        res = LIPTargetSizeBalancer.calculate_balanced_size(
+            side="bid",
+            price=0.50,
+            book=None,
+            base_count=25,
+            target_size=500,
+            enabled=False,
+        )
+        assert res["balanced_count"] == 25
+        assert res["reason"] == "disabled"
+        assert res["scaled_up"] is False
+
+    def test_invalid_inputs_return_zero(self):
+        # base_count <= 0
+        res = LIPTargetSizeBalancer.calculate_balanced_size(
+            side="bid", price=0.50, book=None, base_count=0, target_size=500
+        )
+        assert res["balanced_count"] == 0
+        assert res["reason"] == "non_positive_base_or_invalid_price"
+
+        # price <= 0
+        res = LIPTargetSizeBalancer.calculate_balanced_size(
+            side="bid", price=0.0, book=None, base_count=10, target_size=500
+        )
+        assert res["balanced_count"] == 0
+
+        # price >= 1.0
+        res = LIPTargetSizeBalancer.calculate_balanced_size(
+            side="bid", price=1.0, book=None, base_count=10, target_size=500
+        )
+        assert res["balanced_count"] == 0
+
+    def test_zero_marginal_headroom_clamps_to_one(self):
+        # target_size = 200, but competitors already rest 250 contracts ahead at 0.51
+        book = {
+            "orderbook_fp": {
+                "yes_dollars": [["0.51", "250.0"], ["0.50", "100.0"]],
+                "no_dollars": [],
+            }
+        }
+        res = LIPTargetSizeBalancer.calculate_balanced_size(
+            side="bid",
+            price=0.50,
+            book=book,
+            base_count=20,
+            target_size=200,
+        )
+        assert res["d_better"] == 250.0
+        assert res["marginal_headroom"] == 0.0
+        assert res["balanced_count"] == 1
+        assert res["clamped_headroom"] is True
+        assert res["reason"] == "zero_headroom"
+
+    def test_scale_down_in_low_target_market(self):
+        # target_size = 100, max_share = 0.25 -> qualifying_cap = 25
+        # base_count = 80 -> should scale down to 25
+        book = {
+            "orderbook_fp": {
+                "yes_dollars": [["0.50", "20.0"]],
+                "no_dollars": [],
+            }
+        }
+        res = LIPTargetSizeBalancer.calculate_balanced_size(
+            side="bid",
+            price=0.50,
+            book=book,
+            base_count=80,
+            target_size=100,
+            max_share=0.25,
+            scale_up=True,
+        )
+        assert res["qualifying_cap"] == 25.0
+        assert res["balanced_count"] == 25
+        assert res["scaled_up"] is False
+        assert res["reason"] == "scaled_down"
+
+    def test_scale_up_in_high_target_market(self):
+        # target_size = 1000, max_share = 0.25 -> qualifying_cap = 250
+        # base_count = 20, efficiency = 1.0 (at touch) -> should scale up to 250
+        book = {
+            "orderbook_fp": {
+                "yes_dollars": [["0.50", "1000.0"]],
+                "no_dollars": [],
+            }
+        }
+        res = LIPTargetSizeBalancer.calculate_balanced_size(
+            side="bid",
+            price=0.50,
+            book=book,
+            base_count=20,
+            target_size=1000,
+            max_share=0.25,
+            scale_up=True,
+            min_efficiency=0.50,
+        )
+        assert res["qualifying_cap"] == 250.0
+        assert res["balanced_count"] == 250
+        assert res["scaled_up"] is True
+        assert res["reason"] == "scaled_up"
+
+    def test_scale_up_bounded_by_depth_cap(self):
+        # target_size = 1000, qualifying_cap = 250, but depth_cap = 60
+        book = {
+            "orderbook_fp": {
+                "yes_dollars": [["0.50", "240.0"]],
+                "no_dollars": [],
+            }
+        }
+        res = LIPTargetSizeBalancer.calculate_balanced_size(
+            side="bid",
+            price=0.50,
+            book=book,
+            base_count=20,
+            target_size=1000,
+            depth_cap=60,
+            max_share=0.25,
+            scale_up=True,
+        )
+        assert res["balanced_count"] == 60
+        assert res["scaled_up"] is True
+
+    def test_scale_up_bounded_by_inventory_headroom(self):
+        # target_size = 1000, qualifying_cap = 250, depth_cap = 500, but inventory_headroom = 45
+        book = {
+            "orderbook_fp": {
+                "yes_dollars": [["0.50", "2000.0"]],
+                "no_dollars": [],
+            }
+        }
+        res = LIPTargetSizeBalancer.calculate_balanced_size(
+            side="bid",
+            price=0.50,
+            book=book,
+            base_count=20,
+            target_size=1000,
+            inventory_headroom=45,
+            depth_cap=500,
+            max_share=0.25,
+            scale_up=True,
+        )
+        assert res["balanced_count"] == 45
+        assert res["scaled_up"] is True
+
+    def test_low_efficiency_prevents_scale_up(self):
+        # Quote at 0.45, best price at 0.50 (5 ticks away), discount_factor = 0.80
+        # efficiency = 0.80**5 = 0.32768 < min_efficiency 0.50
+        book = {
+            "orderbook_fp": {
+                "yes_dollars": [["0.50", "50.0"]],
+                "no_dollars": [],
+            }
+        }
+        res = LIPTargetSizeBalancer.calculate_balanced_size(
+            side="bid",
+            price=0.45,
+            best_price=0.50,
+            book=book,
+            base_count=20,
+            target_size=1000,
+            discount_factor=0.80,
+            scale_up=True,
+            min_efficiency=0.50,
+        )
+        assert res["efficiency"] < 0.50
+        # Does not scale up past base_count
+        assert res["balanced_count"] == 20
+        assert res["scaled_up"] is False
+        assert res["reason"] == "efficiency_limited"
+
+    def test_scale_up_disabled_flag(self):
+        # scale_up = False: base_count 20 does not scale up to qualifying_cap 250
+        book = {
+            "orderbook_fp": {
+                "yes_dollars": [["0.50", "100.0"]],
+                "no_dollars": [],
+            }
+        }
+        res = LIPTargetSizeBalancer.calculate_balanced_size(
+            side="bid",
+            price=0.50,
+            book=book,
+            base_count=20,
+            target_size=1000,
+            scale_up=False,
+        )
+        assert res["balanced_count"] == 20
+        assert res["scaled_up"] is False
+
+    def test_ask_side_extracts_no_levels(self):
+        # Ask side uses NO resting bids
+        book = {
+            "orderbook_fp": {
+                "yes_dollars": [["0.48", "100.0"]],
+                "no_dollars": [["0.52", "80.0"], ["0.51", "120.0"]],
+            }
+        }
+        # Quoting NO at 0.51: NO order at 0.52 is strictly better (d_better = 80)
+        res = LIPTargetSizeBalancer.calculate_balanced_size(
+            side="ask",
+            price=0.51,
+            book=book,
+            base_count=20,
+            target_size=200,
+            max_share=0.5,
+            scale_up=True,
+        )
+        assert res["d_better"] == 80.0
+        assert res["marginal_headroom"] == 120.0
+        assert res["qualifying_cap"] == 100.0
+        assert res["balanced_count"] == 100
+        assert res["scaled_up"] is True
+
+    def test_extract_side_levels_formats(self):
+        # Legacy cent orderbook
+        legacy_book = {
+            "orderbook": {
+                "yes": [[48, 150]],
+                "no": [[52, 200]],
+            }
+        }
+        assert LIPTargetSizeBalancer.extract_side_levels(legacy_book, "bid") == [(0.48, 150.0)]
+        assert LIPTargetSizeBalancer.extract_side_levels(legacy_book, "ask") == [(0.52, 200.0)]
+
+        # Top-of-book fallback
+        tob_book = {
+            "yes_bid": (0.47, 50.0),
+            "no_bid": (0.53, 75.0),
+        }
+        assert LIPTargetSizeBalancer.extract_side_levels(tob_book, "bid") == [(0.47, 50.0)]
+        assert LIPTargetSizeBalancer.extract_side_levels(tob_book, "ask") == [(0.53, 75.0)]
+
+        # Empty / None
+        assert LIPTargetSizeBalancer.extract_side_levels(None, "bid") == []
+        assert LIPTargetSizeBalancer.extract_side_levels({}, "ask") == []
+
+
+class TestLIPScoreTrackerBalancerIntegration:
+    def test_get_target_size_and_discount_factor(self):
+        tracker = LIPScoreTracker()
+        # Default before registration
+        assert tracker.get_target_size("MKT-DEFAULT") == LIPScoreTracker.DEFAULT_TARGET_SIZE
+        assert tracker.get_discount_factor("MKT-DEFAULT") == LIPScoreTracker.DEFAULT_DISCOUNT_FACTOR
+
+        # Registered market
+        tracker.set_market_program("MKT-1", target_size=800, discount_factor=0.90)
+        assert tracker.get_target_size("MKT-1") == 800.0
+        assert tracker.get_discount_factor("MKT-1") == 0.90
+
+    def test_balance_quote_size_delegation(self):
+        tracker = LIPScoreTracker()
+        tracker.set_market_program("MKT-BIG", target_size=1200, discount_factor=0.95)
+        book = {
+            "orderbook_fp": {
+                "yes_dollars": [["0.50", "500.0"]],
+                "no_dollars": [],
+            }
+        }
+        res = tracker.balance_quote_size(
+            ticker="MKT-BIG",
+            side="bid",
+            price=0.50,
+            book=book,
+            base_count=20,
+            depth_cap=150,
+            max_share=0.25,
+            scale_up=True,
+        )
+        assert res["target_size"] == 1200.0
+        assert res["qualifying_cap"] == 300.0
+        assert res["balanced_count"] == 150  # capped by depth_cap

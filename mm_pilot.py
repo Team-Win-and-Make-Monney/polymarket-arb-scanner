@@ -545,6 +545,7 @@ class KalshiMMPilot:
                             self._lip_tracker.set_market_program(
                                 ticker=ticker,
                                 pool_dollars=float(item.get("pool_dollars", 0.0) or 0.0),
+                                target_size=item.get("target_size") or item.get("target_size_fp"),
                                 program_end=item.get("program_end"),
                                 category=item.get("category"),
                                 discount_factor_bps=item.get("discount_factor_bps"),
@@ -766,6 +767,12 @@ class KalshiMMPilot:
             "inventory": self.inventory.snapshot(),
             "lip_tracker": lip_tracker_data,
             "lip_rewards": lip_rewards_data,
+            "lip_balancer": {
+                "enabled": getattr(config, "MM_LIP_BALANCER_ENABLED", True),
+                "max_share": getattr(config, "MM_LIP_BALANCER_MAX_SHARE", 0.25),
+                "scale_up": getattr(config, "MM_LIP_BALANCER_SCALE_UP", True),
+                "min_efficiency": getattr(config, "MM_LIP_BALANCER_MIN_EFFICIENCY", 0.50),
+            },
             "toxicity": toxicity_data,
             "seen_fill_ids": list(self._seen_fill_ids.keys())[-200:],
             "saved_at": self._time_fn(),
@@ -1602,28 +1609,94 @@ class KalshiMMPilot:
         # Fail closed when depth is unknown: a side with no resting size to
         # measure against must be skipped, never fall through to full
         # notional sizing (that would defeat the entire depth cap).
-        def _sized_count(price: float, best: tuple | None) -> int:
+        # G11 depth sizing & LIP target balancer:
+        # Quote count is balanced against marginal LIP target size capacity and
+        # constrained by:
+        # 1. fraction of same-side best size (MM_MAX_BOOK_DEPTH_FRACTION)
+        # 2. available inventory headroom
+        # 3. adverse selection toxicity size multiplier
+        def _sized_count(price: float, best: tuple | None, side: str = "bid") -> tuple[int, dict]:
             if price <= 0:
-                return 0
+                return 0, {}
             if best is None:
-                return 0
+                return 0, {}
             count = int(size_usd / price)
             depth_cap = int(config.MM_MAX_BOOK_DEPTH_FRACTION * best[1])
             base_count = min(count, depth_cap)
             if base_count <= 0:
-                return 0
-            return max(1, int(base_count * tox_size_mult))
+                return 0, {}
+
+            # Calculate available inventory headroom for this order
+            net_ct = self.inventory.net_contracts(ticker)
+            net_usd = abs(self.inventory.net_usd(ticker))
+            signed_unit = 1 if str(side).lower() in ("bid", "yes") else -1
+            is_accumulating = (net_ct == 0) or (abs(net_ct + signed_unit) > abs(net_ct))
+
+            if is_accumulating:
+                inv_ct_headroom = max(0, config.MM_MAX_INVENTORY_CONTRACTS - abs(net_ct))
+                inv_usd_headroom = int(max(0.0, config.MM_MAX_INVENTORY_USD - net_usd) / price)
+                inv_tot_headroom = int(max(0.0, config.MM_MAX_TOTAL_INVENTORY_USD - self.inventory.total_net_usd()) / price)
+                gross_avail = config.MM_MAX_GROSS_PER_MARKET_USD - (abs(self.inventory.net_usd(ticker)) + self._resting_notional(ticker))
+                gross_headroom = int(max(0.0, gross_avail) / price)
+                inv_headroom = min(inv_ct_headroom, inv_usd_headroom, inv_tot_headroom, gross_headroom)
+            else:
+                # Reducing orders work off inventory and are capped by held inventory
+                inv_headroom = max(0, abs(net_ct))
+
+            lip_info: dict = {}
+            if hasattr(self, "_lip_tracker") and self._lip_tracker is not None:
+                try:
+                    has_ts = bool(getattr(self._lip_tracker, "has_target_size", lambda t: False)(ticker))
+                    scale_up_allowed = (
+                        getattr(config, "MM_LIP_BALANCER_SCALE_UP", True)
+                        and self.canary_graduated
+                        and has_ts
+                    )
+                    lip_info = self._lip_tracker.balance_quote_size(
+                        ticker=ticker,
+                        side=side,
+                        price=price,
+                        book=book,
+                        base_count=base_count,
+                        depth_cap=depth_cap,
+                        best_price=float(best[0]),
+                        inventory_headroom=inv_headroom,
+                        enabled=getattr(config, "MM_LIP_BALANCER_ENABLED", True),
+                        max_share=getattr(config, "MM_LIP_BALANCER_MAX_SHARE", 0.25),
+                        scale_up=scale_up_allowed,
+                        min_efficiency=getattr(config, "MM_LIP_BALANCER_MIN_EFFICIENCY", 0.50),
+                    )
+                    balanced_base = lip_info.get("balanced_count", base_count)
+                except Exception as exc:
+                    logger.debug("LIP balancer calculation failed on %s: %s", ticker, exc)
+                    balanced_base = min(base_count, inv_headroom)
+            else:
+                balanced_base = min(base_count, inv_headroom)
+
+            if balanced_base <= 0:
+                return 0, lip_info
+            final_count = max(1, int(balanced_base * tox_size_mult))
+            return final_count, lip_info
 
         # Our bid = buy YES at `bid`; same side of the book = resting YES bids.
-        bid_count = 0 if skip_bid else _sized_count(bid, book.get("yes_bid"))
+        bid_count, bid_lip = (0, {}) if skip_bid else _sized_count(bid, book.get("yes_bid"), side="bid")
         # Our ask = buy NO at (1 - ask); same side = resting NO bids.
         no_price = self._round_tick(1.0 - ask)
-        ask_count = 0 if skip_ask else _sized_count(no_price, book.get("no_bid"))
+        ask_count, ask_lip = (0, {}) if skip_ask else _sized_count(no_price, book.get("no_bid"), side="ask")
         self._write_decision(
             "G7_adverse_selection_tuning",
             ticker,
             True,
             f"toxicity={tox_score:.4f} spread_mult={tox_spread_mult:.2f} size_mult={tox_size_mult:.2f}",
+        )
+        self._write_decision(
+            "G11b_lip_target_balancer",
+            ticker,
+            True,
+            f"bid_size={bid_count} (target={bid_lip.get('target_size')} headroom={bid_lip.get('marginal_headroom')} "
+            f"cap={bid_lip.get('qualifying_cap')} reason={bid_lip.get('reason')}) "
+            f"ask_size={ask_count} (target={ask_lip.get('target_size')} headroom={ask_lip.get('marginal_headroom')} "
+            f"cap={ask_lip.get('qualifying_cap')} reason={ask_lip.get('reason')})",
         )
         self._write_decision("G11_depth_sizing", ticker,
                              bid_count >= 1 or ask_count >= 1,
@@ -2346,6 +2419,12 @@ class KalshiMMPilot:
             "realized_pnl": self.inventory.realized_pnl_total(),
             "inventory": self.inventory.snapshot(),
             "lip_rewards": lip_rewards,
+            "lip_balancer": {
+                "enabled": getattr(config, "MM_LIP_BALANCER_ENABLED", True),
+                "max_share": getattr(config, "MM_LIP_BALANCER_MAX_SHARE", 0.25),
+                "scale_up": getattr(config, "MM_LIP_BALANCER_SCALE_UP", True),
+                "min_efficiency": getattr(config, "MM_LIP_BALANCER_MIN_EFFICIENCY", 0.50),
+            },
             "toxicity": toxicity_by_ticker,
             "dry_run": self.dry_run,
             "reconciled": self._reconciled,

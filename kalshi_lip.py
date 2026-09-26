@@ -29,6 +29,8 @@ KALSHI_TICK = 0.01
 # Program bounds on Target Size, per the LIP help article.
 MIN_TARGET_SIZE = 100
 MAX_TARGET_SIZE = 20000
+DEFAULT_TARGET_SIZE = 500.0
+DEFAULT_DISCOUNT_FACTOR = 0.95
 
 
 def _normalized_levels(levels: list[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -392,6 +394,161 @@ def extract_book_levels(book: dict | None) -> tuple[list[tuple[float, float]], l
     return bids, asks
 
 
+class LIPTargetSizeBalancer:
+    """Balances quoting size against Kalshi LIP marginal target capacity.
+
+    Calculates the qualifying headroom on a given side of the orderbook,
+    ensuring quotes do not over-allocate capital beyond what earns LIP rewards,
+    while scaling up quote size when high-target reward pools offer profitable
+    qualifying capacity.
+    """
+
+    @staticmethod
+    def extract_side_levels(book: dict | None, side: str) -> list[tuple[float, float]]:
+        """Extract same-side resting bids for 'bid' (YES bids) or 'ask'/'no' (NO bids).
+
+        Returns [(price, size), ...] where price is in dollars for that side.
+        """
+        if not book or not isinstance(book, dict):
+            return []
+
+        raw = book.get("raw")
+        target_dict = raw if isinstance(raw, dict) else book
+
+        side_lower = str(side).lower()
+        is_bid = side_lower in ("bid", "yes")
+
+        fp = target_dict.get("orderbook_fp")
+        if isinstance(fp, dict):
+            raw_levels = fp.get("yes_dollars" if is_bid else "no_dollars") or []
+            return _normalized_levels([(float(r[0]), float(r[1])) for r in raw_levels if len(r) >= 2])
+
+        legacy = target_dict.get("orderbook")
+        if isinstance(legacy, dict):
+            raw_levels = legacy.get("yes" if is_bid else "no") or []
+            return _normalized_levels([(float(r[0]) / 100.0, float(r[1])) for r in raw_levels if len(r) >= 2])
+
+        # Top-of-book levels fallback
+        fallback_key = "yes_bid" if is_bid else "no_bid"
+        if fallback_key in book and book[fallback_key]:
+            try:
+                px = float(book[fallback_key][0])
+                qty = float(book[fallback_key][1])
+                return _normalized_levels([(px, qty)])
+            except (TypeError, ValueError, IndexError):
+                pass
+
+        return []
+
+    @classmethod
+    def calculate_balanced_size(
+        cls,
+        side: str,
+        price: float,
+        book: dict | None,
+        base_count: int,
+        target_size: float = DEFAULT_TARGET_SIZE,
+        discount_factor: float = DEFAULT_DISCOUNT_FACTOR,
+        depth_cap: int | None = None,
+        best_price: float | None = None,
+        max_share: float = 0.25,
+        scale_up: bool = True,
+        min_efficiency: float = 0.50,
+        inventory_headroom: int | None = None,
+        enabled: bool = True,
+    ) -> dict:
+        """Calculate balanced quote count against marginal LIP target size headroom."""
+        if not enabled:
+            return {
+                "balanced_count": base_count,
+                "target_size": target_size,
+                "marginal_headroom": target_size,
+                "qualifying_cap": target_size,
+                "d_better": 0.0,
+                "efficiency": 1.0,
+                "scaled_up": False,
+                "clamped_headroom": False,
+                "reason": "disabled",
+            }
+
+        if base_count <= 0 or price <= 0.0 or price >= 1.0:
+            return {
+                "balanced_count": 0,
+                "target_size": target_size,
+                "marginal_headroom": 0.0,
+                "qualifying_cap": 0.0,
+                "d_better": 0.0,
+                "efficiency": 0.0,
+                "scaled_up": False,
+                "clamped_headroom": False,
+                "reason": "non_positive_base_or_invalid_price",
+            }
+
+        ts = max(MIN_TARGET_SIZE, min(MAX_TARGET_SIZE, float(target_size)))
+        df = max(0.0, min(1.0, float(discount_factor)))
+        share_frac = max(0.0, min(1.0, float(max_share)))
+
+        levels = cls.extract_side_levels(book, side)
+
+        # Sum resting size strictly better than our price
+        d_better = sum(qty for px, qty in levels if px > price + 1e-6)
+
+        marginal_headroom = max(0.0, ts - d_better)
+
+        # Reference price for distance discount
+        if best_price is not None:
+            ref_px = float(best_price)
+        elif levels:
+            ref_px = max(px for px, _ in levels)
+        else:
+            ref_px = price
+
+        if price <= ref_px:
+            efficiency = distance_multiplier(price, ref_px, df, KALSHI_TICK)
+        else:
+            efficiency = 1.0
+
+        if marginal_headroom <= 0.0:
+            candidate = min(base_count, 1)
+            clamped = True
+            scaled = False
+            reason = "zero_headroom"
+        else:
+            qualifying_cap = min(marginal_headroom, ts * share_frac)
+            desired_count = max(1, int(round(qualifying_cap)))
+            clamped = False
+            if scale_up and efficiency >= min_efficiency:
+                candidate = desired_count
+                scaled = candidate > base_count
+                reason = "scaled_up" if scaled else ("scaled_down" if candidate < base_count else "balanced")
+            else:
+                candidate = min(base_count, desired_count)
+                scaled = False
+                reason = "capped_headroom" if candidate < base_count else "efficiency_limited"
+
+        # Apply depth cap if provided
+        if depth_cap is not None:
+            candidate = min(candidate, max(0, depth_cap))
+
+        # Apply inventory headroom if provided
+        if inventory_headroom is not None:
+            candidate = min(candidate, max(0, inventory_headroom))
+
+        final_count = max(0, candidate)
+
+        return {
+            "balanced_count": final_count,
+            "target_size": ts,
+            "marginal_headroom": round(marginal_headroom, 2),
+            "qualifying_cap": round(min(marginal_headroom, ts * share_frac), 2),
+            "d_better": round(d_better, 2),
+            "efficiency": round(efficiency, 4),
+            "scaled_up": scaled,
+            "clamped_headroom": clamped,
+            "reason": reason,
+        }
+
+
 class LIPScoreTracker:
     """Real-time reward accrual and blended yield tracker for Kalshi LIP market making.
 
@@ -442,20 +599,86 @@ class LIPScoreTracker:
                 if discount_factor is not None
                 else existing.get("discount_factor", self.DEFAULT_DISCOUNT_FACTOR)
             )
-            ts = (
-                max(MIN_TARGET_SIZE, min(MAX_TARGET_SIZE, float(target_size)))
-                if target_size is not None
-                else existing.get("target_size", self.DEFAULT_TARGET_SIZE)
-            )
+            ts_known = False
+            if target_size is not None:
+                try:
+                    ts_float = float(target_size)
+                    if math.isfinite(ts_float) and ts_float > 0:
+                        ts = max(MIN_TARGET_SIZE, min(MAX_TARGET_SIZE, ts_float))
+                        ts_known = True
+                    else:
+                        ts = existing.get("target_size", self.DEFAULT_TARGET_SIZE)
+                except (TypeError, ValueError):
+                    ts = existing.get("target_size", self.DEFAULT_TARGET_SIZE)
+            else:
+                ts = existing.get("target_size", self.DEFAULT_TARGET_SIZE)
+
             self._programs[ticker] = {
                 "pool_dollars": pool,
                 "discount_factor": df,
                 "target_size": ts,
+                "target_size_known": ts_known,
                 "program_end": program_end or existing.get("program_end"),
                 "category": category or existing.get("category"),
             }
             if ticker not in self._stats:
                 self._stats[ticker] = self._empty_stat()
+
+    def has_target_size(self, ticker: str) -> bool:
+        """Return True if ticker has an explicitly registered target size from program metadata."""
+        with self._lock:
+            prog = self._programs.get(ticker)
+            return bool(prog and prog.get("target_size_known"))
+
+    def get_target_size(self, ticker: str) -> float:
+        """Return registered target size for ticker, or DEFAULT_TARGET_SIZE."""
+        with self._lock:
+            prog = self._programs.get(ticker)
+            if prog and prog.get("target_size") is not None:
+                return float(prog["target_size"])
+            return self.DEFAULT_TARGET_SIZE
+
+    def get_discount_factor(self, ticker: str) -> float:
+        """Return registered discount factor for ticker, or DEFAULT_DISCOUNT_FACTOR."""
+        with self._lock:
+            prog = self._programs.get(ticker)
+            if prog and prog.get("discount_factor") is not None:
+                return float(prog["discount_factor"])
+            return self.DEFAULT_DISCOUNT_FACTOR
+
+    def balance_quote_size(
+        self,
+        ticker: str,
+        side: str,
+        price: float,
+        book: dict | None,
+        base_count: int,
+        depth_cap: int | None = None,
+        best_price: float | None = None,
+        inventory_headroom: int | None = None,
+        enabled: bool = True,
+        max_share: float = 0.25,
+        scale_up: bool = True,
+        min_efficiency: float = 0.50,
+    ) -> dict:
+        """Balance quote size for a market using registered LIP program parameters."""
+        target_size = self.get_target_size(ticker)
+        discount_factor = self.get_discount_factor(ticker)
+        return LIPTargetSizeBalancer.calculate_balanced_size(
+            side=side,
+            price=price,
+            book=book,
+            base_count=base_count,
+            target_size=target_size,
+            discount_factor=discount_factor,
+            depth_cap=depth_cap,
+            best_price=best_price,
+            max_share=max_share,
+            scale_up=scale_up,
+            min_efficiency=min_efficiency,
+            inventory_headroom=inventory_headroom,
+            enabled=enabled,
+        )
 
     def _empty_stat(self) -> dict:
         return {
@@ -748,10 +971,20 @@ class LIPScoreTracker:
                             "pool_dollars": self.DEFAULT_POOL_DOLLARS,
                             "discount_factor": self.DEFAULT_DISCOUNT_FACTOR,
                             "target_size": self.DEFAULT_TARGET_SIZE,
+                            "target_size_known": False,
                             "program_end": None,
                             "category": None,
                         }
                         merged.update(p)
+                        ts_raw = merged.get("target_size")
+                        is_valid_ts = False
+                        if ts_raw is not None:
+                            try:
+                                ts_val = float(ts_raw)
+                                is_valid_ts = math.isfinite(ts_val) and ts_val > 0
+                            except (TypeError, ValueError):
+                                is_valid_ts = False
+                        merged["target_size_known"] = bool(merged.get("target_size_known", False)) and is_valid_ts
                         merged["pool_dollars"] = max(
                             0.0, as_float(merged["pool_dollars"], self.DEFAULT_POOL_DOLLARS)
                         )

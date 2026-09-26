@@ -1942,3 +1942,131 @@ class TestMMPilotAdverseSelection:
 
         assert burst_spread >= toxic_spread
         assert burst_bid["count"] <= tox_bid["count"]
+
+
+class TestMMPilotLIPBalancer:
+    """Test dynamic LIP target size balancer integration in mm_pilot."""
+
+    def test_refresh_market_records_balancer_decision(self, pilot_env, clock):
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48, yes_qty=100.0, no_qty=100.0)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        pilot.update_selection([{
+            "ticker": TICKER,
+            "pool_dollars": 500.0,
+            "target_size": 1000.0,
+            "discount_factor_bps": 9500,
+        }])
+        placed = pilot.refresh_market(TICKER)
+        assert len(placed) > 0
+        decisions = [d for d in pilot._decisions if d.get("gate") == "G11b_lip_target_balancer"]
+        assert len(decisions) == 1
+        d = decisions[0]
+        assert d["decision"] == "pass"
+        assert "bid_size=" in d["reason"]
+        assert "target=1000" in d["reason"]
+        assert "headroom=" in d["reason"]
+
+    def test_canary_mode_does_not_scale_up_quote_size(self, pilot_env, clock, monkeypatch):
+        # Canary quote size is $2.00, at price 0.48 -> base_count = 4 contracts
+        # Even with target_size = 2000, canary mode must not scale up past canary base size
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48, yes_qty=1000.0, no_qty=1000.0)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        pilot.update_selection([{
+            "ticker": TICKER,
+            "pool_dollars": 1000.0,
+            "target_size": 2000.0,
+            "discount_factor_bps": 9800,
+        }])
+        assert pilot.canary_graduated is False
+        placed = pilot.refresh_market(TICKER)
+        assert len(placed) > 0
+        orders = {o["purpose"]: o for o in pilot.resting_orders(TICKER)}
+        # Canary size: count should be <= 4 (not scaled up to 25% of 2000 = 500)
+        assert orders["quote_bid"]["count"] <= 4
+
+    def test_graduated_mode_scales_up_quote_size_with_high_target(self, pilot_env, clock, monkeypatch):
+        # Graduate the canary
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48, yes_qty=1000.0, no_qty=1000.0)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        pilot.update_selection([{
+            "ticker": TICKER,
+            "pool_dollars": 2000.0,
+            "target_size": 2000.0,
+            "discount_factor_bps": 9800,
+        }])
+        pilot.canary_graduated = True
+
+        placed = pilot.refresh_market(TICKER)
+        assert len(placed) > 0
+        orders = {o["purpose"]: o for o in pilot.resting_orders(TICKER)}
+        # With target_size = 2000, max_share = 0.25 -> qualifying_cap = 500
+        # depth_cap = 0.25 * 1000 = 250
+        # inventory_headroom = (100 / 0.48) = 208 contracts
+        # Sizing should scale up to ~208 (inventory headroom), far above standard $10 notional (20 contracts)
+        assert orders["quote_bid"]["count"] > 50
+
+    def test_low_target_market_scales_down_quote_size(self, pilot_env, clock, monkeypatch):
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48, yes_qty=100.0, no_qty=100.0)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        # target_size = 100, max_share = 0.05 -> qualifying_cap = 5 contracts
+        monkeypatch.setattr(live_config(), "MM_LIP_BALANCER_MAX_SHARE", 0.05)
+        pilot.update_selection([{
+            "ticker": TICKER,
+            "pool_dollars": 50.0,
+            "target_size": 100.0,
+            "discount_factor_bps": 9500,
+        }])
+        pilot.canary_graduated = True
+
+        placed = pilot.refresh_market(TICKER)
+        assert len(placed) > 0
+        orders = {o["purpose"]: o for o in pilot.resting_orders(TICKER)}
+        # Standard $10 notional / 0.48 = 20 contracts.
+        # But target_size * 0.05 = 5 contracts -> scales down to 5 contracts!
+        assert orders["quote_bid"]["count"] == 5
+
+    def test_status_and_persisted_state_contain_lip_balancer_telemetry(self, pilot_env, clock, tmp_path):
+        from mm_pilot import PilotStateStore
+        state_file = str(tmp_path / "pilot_state.json")
+        store = PilotStateStore(state_file)
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48, yes_qty=100.0, no_qty=100.0)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER], state_path=state_file)
+        pilot.update_selection([{
+            "ticker": TICKER,
+            "pool_dollars": 100.0,
+            "target_size": 500.0,
+        }])
+
+        # get_status
+        status = pilot.get_status()
+        assert "lip_balancer" in status
+        balancer_status = status["lip_balancer"]
+        assert balancer_status["enabled"] is True
+        assert balancer_status["max_share"] == 0.25
+        assert balancer_status["scale_up"] is True
+        assert balancer_status["min_efficiency"] == 0.50
+
+        # persist_state
+        pilot._persist_state()
+        persisted = store.load()
+        assert persisted is not None
+        assert "lip_balancer" in persisted
+        assert persisted["lip_balancer"]["enabled"] is True
+
+    def test_graduated_mode_without_known_target_size_does_not_scale_up(self, pilot_env, clock):
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48, yes_qty=1000.0, no_qty=1000.0)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        # Update selection with NO target_size (omitted from program metadata)
+        pilot.update_selection([{
+            "ticker": TICKER,
+            "pool_dollars": 2000.0,
+        }])
+        pilot.canary_graduated = True
+
+        placed = pilot.refresh_market(TICKER)
+        assert len(placed) > 0
+        orders = {o["purpose"]: o for o in pilot.resting_orders(TICKER)}
+        # Base count is $10 / 0.48 = 20 contracts.
+        # Even though graduated and book depth is huge (1000), scale-up is prohibited
+        # because target_size is not explicitly known.
+        assert orders["quote_bid"]["count"] == 20

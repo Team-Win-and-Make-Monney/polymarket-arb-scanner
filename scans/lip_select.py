@@ -106,10 +106,17 @@ def select_lip_markets(kalshi_client, kalshi_data: tuple | None = None,
         ticker = p.get("market_ticker")
         if not ticker:
             continue
+        raw_target_size = p.get("target_size_fp") or p.get("target_size")
+        try:
+            target_size_val = float(raw_target_size) if raw_target_size is not None else None
+        except (TypeError, ValueError):
+            target_size_val = None
+
         if ticker not in pools:
             pools[ticker] = {
                 "pool_dollars": 0.0,
                 "discount_factor_bps": p.get("discount_factor_bps"),
+                "target_size": target_size_val,
                 "program_end": p.get("end_date"),
             }
         else:
@@ -120,6 +127,8 @@ def select_lip_markets(kalshi_client, kalshi_data: tuple | None = None,
                 if isinstance(value, (int, float))
             ]
             entry["discount_factor_bps"] = max(discounts) if discounts else None
+            if entry.get("target_size") is None and target_size_val is not None:
+                entry["target_size"] = target_size_val
         entry = pools[ticker]
         entry["pool_dollars"] += p.get("period_reward_dollars", 0.0)
 
@@ -172,6 +181,7 @@ def select_lip_markets(kalshi_client, kalshi_data: tuple | None = None,
             "pool_dollars": round(pool["pool_dollars"], 2),
             "category": category,
             "mid": mid,
+            "target_size": pool.get("target_size"),
             "discount_factor_bps": pool["discount_factor_bps"],
             "program_end": pool["program_end"],
             "market_close_hours": round(close_hours, 1) if close_hours is not None else None,

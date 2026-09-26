@@ -1646,7 +1646,12 @@ class KalshiMMPilot:
             lip_info: dict = {}
             if hasattr(self, "_lip_tracker") and self._lip_tracker is not None:
                 try:
-                    scale_up_allowed = getattr(config, "MM_LIP_BALANCER_SCALE_UP", True) and self.canary_graduated
+                    has_ts = bool(getattr(self._lip_tracker, "has_target_size", lambda t: False)(ticker))
+                    scale_up_allowed = (
+                        getattr(config, "MM_LIP_BALANCER_SCALE_UP", True)
+                        and self.canary_graduated
+                        and has_ts
+                    )
                     lip_info = self._lip_tracker.balance_quote_size(
                         ticker=ticker,
                         side=side,

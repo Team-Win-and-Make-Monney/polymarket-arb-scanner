@@ -608,11 +608,18 @@ class LIPScoreTracker:
                 "pool_dollars": pool,
                 "discount_factor": df,
                 "target_size": ts,
+                "target_size_known": target_size is not None,
                 "program_end": program_end or existing.get("program_end"),
                 "category": category or existing.get("category"),
             }
             if ticker not in self._stats:
                 self._stats[ticker] = self._empty_stat()
+
+    def has_target_size(self, ticker: str) -> bool:
+        """Return True if ticker has an explicitly registered target size from program metadata."""
+        with self._lock:
+            prog = self._programs.get(ticker)
+            return bool(prog and prog.get("target_size_known"))
 
     def get_target_size(self, ticker: str) -> float:
         """Return registered target size for ticker, or DEFAULT_TARGET_SIZE."""
@@ -955,10 +962,12 @@ class LIPScoreTracker:
                             "pool_dollars": self.DEFAULT_POOL_DOLLARS,
                             "discount_factor": self.DEFAULT_DISCOUNT_FACTOR,
                             "target_size": self.DEFAULT_TARGET_SIZE,
+                            "target_size_known": False,
                             "program_end": None,
                             "category": None,
                         }
                         merged.update(p)
+                        merged["target_size_known"] = bool(merged.get("target_size_known", False))
                         merged["pool_dollars"] = max(
                             0.0, as_float(merged["pool_dollars"], self.DEFAULT_POOL_DOLLARS)
                         )

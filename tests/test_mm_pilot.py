@@ -2052,3 +2052,21 @@ class TestMMPilotLIPBalancer:
         assert persisted is not None
         assert "lip_balancer" in persisted
         assert persisted["lip_balancer"]["enabled"] is True
+
+    def test_graduated_mode_without_known_target_size_does_not_scale_up(self, pilot_env, clock):
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48, yes_qty=1000.0, no_qty=1000.0)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        # Update selection with NO target_size (omitted from program metadata)
+        pilot.update_selection([{
+            "ticker": TICKER,
+            "pool_dollars": 2000.0,
+        }])
+        pilot.canary_graduated = True
+
+        placed = pilot.refresh_market(TICKER)
+        assert len(placed) > 0
+        orders = {o["purpose"]: o for o in pilot.resting_orders(TICKER)}
+        # Base count is $10 / 0.48 = 20 contracts.
+        # Even though graduated and book depth is huge (1000), scale-up is prohibited
+        # because target_size is not explicitly known.
+        assert orders["quote_bid"]["count"] <= 21

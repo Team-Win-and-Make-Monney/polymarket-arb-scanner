@@ -701,3 +701,24 @@ class TestLIPScoreTrackerBalancerIntegration:
         assert res["target_size"] == 1200.0
         assert res["qualifying_cap"] == 300.0
         assert res["balanced_count"] == 150  # capped by depth_cap
+
+    def test_has_target_size_provenance(self):
+        tracker = LIPScoreTracker()
+        assert not tracker.has_target_size("MKT-NONE")
+
+        # Explicit target size sets target_size_known=True
+        tracker.set_market_program("MKT-1", target_size=1000.0)
+        assert tracker.has_target_size("MKT-1")
+
+        # Subsequent update omitting target_size clears provenance
+        tracker.set_market_program("MKT-1", pool_dollars=2000.0, target_size=None)
+        assert not tracker.has_target_size("MKT-1")
+
+        # Serialization preserves provenance
+        tracker.set_market_program("MKT-PERSIST", target_size=750.0)
+        assert tracker.has_target_size("MKT-PERSIST")
+        data = tracker.to_dict()
+        restored = LIPScoreTracker()
+        restored.from_dict(data)
+        assert restored.has_target_size("MKT-PERSIST")
+        assert not restored.has_target_size("MKT-1")

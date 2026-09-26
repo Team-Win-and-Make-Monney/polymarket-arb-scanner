@@ -1196,3 +1196,51 @@ class TestMMPilotDashboardIntegration:
         assert "Telemetry unavailable" in html
         assert "Feed unavailable" in html
         assert "$('mm-inventory-sub').textContent = '0 contracts';" in html
+
+    def test_mm_pilot_endpoint_includes_lip_rewards(self):
+        """Verify /api/mm-pilot and /status include lip_rewards telemetry."""
+        orig_pilot = state.mm_pilot
+        mock_pilot = MagicMock()
+        mock_pilot.get_status.return_value = {
+            "active": True,
+            "status": "active",
+            "halted": False,
+            "resting_orders": 2,
+            "orders": [],
+            "total_inventory_usd": 15.0,
+            "realized_pnl": 1.25,
+            "lip_rewards": {
+                "total_estimated_reward_usd": 12.34,
+                "estimated_daily_rate_usd": 4.56,
+                "blended_apr_pct": 28.5,
+                "by_ticker": {},
+            },
+        }
+        state.mm_pilot = mock_pilot
+
+        server, url = _start_test_server(18861)
+        try:
+            with patch("config.DASHBOARD_PASS", ""):
+                status, body, _ = _get(url, "/api/mm-pilot")
+                assert status == 200
+                data = json.loads(body)
+                assert data["lip_rewards"]["total_estimated_reward_usd"] == 12.34
+                assert data["lip_rewards"]["blended_apr_pct"] == 28.5
+
+                status, body, _ = _get(url, "/status")
+                assert status == 200
+                data = json.loads(body)
+                assert data["mm_pilot"]["lip_rewards"]["total_estimated_reward_usd"] == 12.34
+        finally:
+            server.shutdown()
+            state.mm_pilot = orig_pilot
+
+    def test_dashboard_ui_html_lip_rewards_and_blended_yield(self):
+        """Verify dashboard HTML includes LIP Rewards and Blended Yield KPI tiles and rendering."""
+        from dashboard_ui import get_dashboard_html
+        html = get_dashboard_html()
+        assert 'id="mm-lip-rewards"' in html
+        assert 'id="mm-blended-apr"' in html
+        assert 'Run rate: ' in html
+        assert 'data.lip_rewards' in html
+        assert "$('mm-lip-rewards').textContent" in html

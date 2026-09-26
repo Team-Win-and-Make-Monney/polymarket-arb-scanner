@@ -344,3 +344,371 @@ class KalshiLipScorer:
             return 0.0
         share = min(1.0, participation_share)
         return max(0.0, share * reward_pool)
+
+
+# ---------------------------------------------------------------------------
+# LIPScoreTracker (continuous real-time accrual & yield estimation)
+# ---------------------------------------------------------------------------
+
+
+def extract_book_levels(book: dict | None) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """Extract (yes_bids, yes_asks) as [(price, size), ...] from a book dict.
+
+    Accepts raw Kalshi API responses, parsed orderbooks, or mm_pilot book cache dicts.
+    """
+    if not book or not isinstance(book, dict):
+        return [], []
+
+    raw = book.get("raw")
+    if isinstance(raw, dict):
+        book = raw
+
+    # Current schema: orderbook_fp with dollar strings
+    fp = book.get("orderbook_fp")
+    if isinstance(fp, dict):
+        bids_raw = fp.get("yes_dollars") or []
+        no_raw = fp.get("no_dollars") or []
+        bids = _normalized_levels([(float(r[0]), float(r[1])) for r in bids_raw if len(r) >= 2])
+        asks = _normalized_levels([(round(1.0 - float(r[0]), 4), float(r[1])) for r in no_raw if len(r) >= 2])
+        return bids, asks
+
+    # Legacy schema: orderbook with cent integers
+    legacy = book.get("orderbook")
+    if isinstance(legacy, dict):
+        bids_raw = legacy.get("yes") or []
+        no_raw = legacy.get("no") or []
+        bids = _normalized_levels([(float(r[0]) / 100.0, float(r[1])) for r in bids_raw if len(r) >= 2])
+        asks = _normalized_levels([(round(1.0 - float(r[0]) / 100.0, 4), float(r[1])) for r in no_raw if len(r) >= 2])
+        return bids, asks
+
+    # Top-of-book levels fallback
+    bids: list[tuple[float, float]] = []
+    asks: list[tuple[float, float]] = []
+    if "yes_bid" in book and book["yes_bid"]:
+        bids.append((float(book["yes_bid"][0]), float(book["yes_bid"][1])))
+    if "yes_ask" in book and book["yes_ask"]:
+        asks.append((float(book["yes_ask"][0]), float(book["yes_ask"][1])))
+    return bids, asks
+
+
+class LIPScoreTracker:
+    """Real-time reward accrual and blended yield tracker for Kalshi LIP market making.
+
+    Thread-safe. Tracks snapshot scores, qualifying share against book depth,
+    time-weighted reward accruals, and blended APR (LIP incentive yield + trading PnL).
+    """
+
+    DEFAULT_TARGET_SIZE: float = 500.0
+    DEFAULT_DISCOUNT_FACTOR: float = 0.95
+    DEFAULT_POOL_DOLLARS: float = 100.0
+    PERIOD_SECONDS: float = 7.0 * 86400.0  # standard weekly LIP pool duration (seconds)
+
+    def __init__(self, time_fn=None):
+        import time
+
+        self._time_fn = time_fn or time.time
+        self._lock = threading.RLock()
+        self._programs: dict[str, dict] = {}
+        self._stats: dict[str, dict] = {}
+
+    def set_market_program(
+        self,
+        ticker: str,
+        pool_dollars: float | None = None,
+        discount_factor: float | None = None,
+        target_size: float | None = None,
+        program_end: str | None = None,
+        category: str | None = None,
+        discount_factor_bps: float | None = None,
+    ) -> None:
+        """Register or update LIP pool parameters for a market ticker."""
+        if not ticker:
+            return
+        if discount_factor is None and discount_factor_bps is not None:
+            try:
+                discount_factor = float(discount_factor_bps) / 10000.0
+            except (TypeError, ValueError):
+                pass
+        with self._lock:
+            existing = self._programs.get(ticker, {})
+            pool = (
+                max(0.0, float(pool_dollars))
+                if pool_dollars is not None
+                else existing.get("pool_dollars", self.DEFAULT_POOL_DOLLARS)
+            )
+            df = (
+                max(0.0, min(1.0, float(discount_factor)))
+                if discount_factor is not None
+                else existing.get("discount_factor", self.DEFAULT_DISCOUNT_FACTOR)
+            )
+            ts = (
+                max(MIN_TARGET_SIZE, min(MAX_TARGET_SIZE, float(target_size)))
+                if target_size is not None
+                else existing.get("target_size", self.DEFAULT_TARGET_SIZE)
+            )
+            self._programs[ticker] = {
+                "pool_dollars": pool,
+                "discount_factor": df,
+                "target_size": ts,
+                "program_end": program_end or existing.get("program_end"),
+                "category": category or existing.get("category"),
+            }
+            if ticker not in self._stats:
+                self._stats[ticker] = self._empty_stat()
+
+    def _empty_stat(self) -> dict:
+        return {
+            "accumulated_score": 0.0,
+            "market_accumulated_score": 0.0,
+            "uptime_seconds": 0.0,
+            "snapshots_count": 0,
+            "last_snapshot_time": None,
+            "last_qualifying_share": 0.0,
+            "last_our_score": 0.0,
+            "last_market_score": 0.0,
+            "accumulated_reward_usd": 0.0,
+        }
+
+    def record_snapshot(
+        self,
+        ticker: str,
+        our_orders: list[dict],
+        book: dict | None,
+        now: float | None = None,
+        is_dry_run: bool = True,
+    ) -> dict:
+        """Score one snapshot for a market and update running reward accrual."""
+        if not ticker:
+            return {}
+
+        now_val = now if now is not None else self._time_fn()
+
+        with self._lock:
+            if ticker not in self._programs:
+                self.set_market_program(ticker)
+            prog = self._programs[ticker]
+            if ticker not in self._stats:
+                self._stats[ticker] = self._empty_stat()
+            stat = self._stats[ticker]
+
+            last_t = stat["last_snapshot_time"]
+            if last_t is None:
+                elapsed = 1.0
+            else:
+                elapsed = max(0.0, min(60.0, now_val - last_t))
+            stat["last_snapshot_time"] = now_val
+
+            target_size = prog["target_size"]
+            discount_factor = prog["discount_factor"]
+            pool_dollars = prog["pool_dollars"]
+
+            # Parse best bid & ask
+            best_bid = None
+            best_ask = None
+            if book:
+                if book.get("yes_bid"):
+                    best_bid = float(book["yes_bid"][0])
+                if book.get("yes_ask"):
+                    best_ask = float(book["yes_ask"][0])
+                mid = book.get("mid")
+                if best_bid is None and mid is not None:
+                    best_bid = max(0.01, round(mid - KALSHI_TICK, 2))
+                if best_ask is None and mid is not None:
+                    best_ask = min(0.99, round(mid + KALSHI_TICK, 2))
+
+            # Normalize our resting orders
+            parsed_orders: list[dict] = []
+            for o in our_orders:
+                try:
+                    price = float(o.get("price", 0.0))
+                    size = float(o.get("count") or o.get("size", 0.0))
+                    side = str(o.get("side", "")).lower()
+                    action = str(o.get("action", "")).lower()
+                    purpose = str(o.get("purpose", "")).lower()
+                except (TypeError, ValueError):
+                    continue
+
+                if purpose == "quote_bid" or (side == "yes" and action == "buy"):
+                    mapped_side = "bid"
+                    mapped_price = price
+                elif purpose == "quote_ask" or (side == "no" and action == "buy"):
+                    mapped_side = "ask"
+                    mapped_price = round(1.0 - price, 2)
+                elif side == "yes" and action == "sell":
+                    mapped_side = "ask"
+                    mapped_price = price
+                else:
+                    continue
+
+                if size > 0 and 0 < mapped_price < 1:
+                    parsed_orders.append({"side": mapped_side, "price": mapped_price, "size": size})
+
+            if best_bid is None and parsed_orders:
+                bids_only = [o["price"] for o in parsed_orders if o["side"] == "bid"]
+                if bids_only:
+                    best_bid = max(bids_only)
+            if best_ask is None and parsed_orders:
+                asks_only = [o["price"] for o in parsed_orders if o["side"] == "ask"]
+                if asks_only:
+                    best_ask = min(asks_only)
+
+            our_score = snapshot_score(
+                parsed_orders, best_bid, best_ask, target_size, discount_factor
+            )
+
+            # Compute market depth score
+            market_bids, market_asks = extract_book_levels(book)
+            market_bid_score = (
+                _side_snapshot_score(
+                    [{"price": p, "size": s} for p, s in market_bids],
+                    best_bid,
+                    target_size,
+                    discount_factor,
+                )
+                if best_bid is not None
+                else 0.0
+            )
+            market_ask_score = (
+                _side_snapshot_score(
+                    [{"price": p, "size": s} for p, s in market_asks],
+                    best_ask,
+                    target_size,
+                    discount_factor,
+                )
+                if best_ask is not None
+                else 0.0
+            )
+            competitor_score = market_bid_score + market_ask_score
+
+            if is_dry_run:
+                total_market_score = competitor_score + our_score
+            else:
+                total_market_score = max(our_score, competitor_score)
+
+            if total_market_score > 0:
+                qualifying_share = min(1.0, our_score / total_market_score)
+            else:
+                qualifying_share = 1.0 if our_score > 0 else 0.0
+
+            pool_rate_per_sec = pool_dollars / self.PERIOD_SECONDS if self.PERIOD_SECONDS > 0 else 0.0
+            reward_delta = qualifying_share * pool_rate_per_sec * elapsed
+
+            stat["accumulated_score"] += our_score
+            stat["market_accumulated_score"] += total_market_score
+            stat["uptime_seconds"] += elapsed
+            stat["snapshots_count"] += 1
+            stat["last_qualifying_share"] = qualifying_share
+            stat["last_our_score"] = our_score
+            stat["last_market_score"] = total_market_score
+            stat["accumulated_reward_usd"] += reward_delta
+
+            return {
+                "ticker": ticker,
+                "our_score": round(our_score, 4),
+                "total_market_score": round(total_market_score, 4),
+                "qualifying_share": round(qualifying_share, 4),
+                "reward_delta": round(reward_delta, 6),
+                "accumulated_reward_usd": round(stat["accumulated_reward_usd"], 4),
+            }
+
+    def get_metrics(
+        self,
+        capital_deployed_by_ticker: dict[str, float] | None = None,
+        realized_pnl_by_ticker: dict[str, float] | None = None,
+    ) -> dict:
+        """Compile aggregated and per-ticker LIP yield metrics."""
+        capital_map = capital_deployed_by_ticker or {}
+        pnl_map = realized_pnl_by_ticker or {}
+
+        with self._lock:
+            by_ticker = {}
+            total_reward_usd = 0.0
+            total_daily_usd = 0.0
+            total_weekly_usd = 0.0
+            total_capital = 0.0
+            total_annualized_lip = 0.0
+            total_annualized_pnl = 0.0
+
+            for ticker, stat in self._stats.items():
+                prog = self._programs.get(ticker, {})
+                pool = prog.get("pool_dollars", self.DEFAULT_POOL_DOLLARS)
+                share = stat.get("last_qualifying_share", 0.0)
+                reward_acc = stat.get("accumulated_reward_usd", 0.0)
+                uptime = stat.get("uptime_seconds", 0.0)
+
+                # Run rates (7 days pool basis = 168 hours)
+                hourly_rate = share * (pool / 168.0) if pool > 0 else 0.0
+                daily_rate = hourly_rate * 24.0
+                weekly_rate = hourly_rate * 168.0
+
+                capital = max(10.0, float(capital_map.get(ticker, 50.0)))
+                annualized_lip = daily_rate * 365.0
+                lip_apr = (annualized_lip / capital) * 100.0
+
+                pnl = float(pnl_map.get(ticker, 0.0))
+                if uptime >= 60.0:
+                    annualized_pnl = (pnl / (uptime / 86400.0)) * 365.0
+                    spread_apr = (annualized_pnl / capital) * 100.0
+                else:
+                    annualized_pnl = 0.0
+                    spread_apr = 0.0
+
+                blended_apr = lip_apr + spread_apr
+
+                total_reward_usd += reward_acc
+                total_daily_usd += daily_rate
+                total_weekly_usd += weekly_rate
+                total_capital += capital
+                total_annualized_lip += annualized_lip
+                total_annualized_pnl += annualized_pnl
+
+                by_ticker[ticker] = {
+                    "pool_dollars": round(pool, 2),
+                    "qualifying_share_pct": round(share * 100.0, 2),
+                    "accumulated_reward_usd": round(reward_acc, 4),
+                    "daily_rate_usd": round(daily_rate, 2),
+                    "weekly_rate_usd": round(weekly_rate, 2),
+                    "capital_usd": round(capital, 2),
+                    "lip_apr_pct": round(lip_apr, 2),
+                    "spread_pnl_usd": round(pnl, 2),
+                    "blended_apr_pct": round(blended_apr, 2),
+                    "uptime_seconds": round(uptime, 1),
+                    "snapshots_count": stat.get("snapshots_count", 0),
+                }
+
+            blended_apr_overall = (
+                round(((total_annualized_lip + total_annualized_pnl) / total_capital) * 100.0, 2)
+                if total_capital > 0
+                else 0.0
+            )
+
+            return {
+                "total_estimated_reward_usd": round(total_reward_usd, 4),
+                "estimated_daily_rate_usd": round(total_daily_usd, 2),
+                "estimated_weekly_rate_usd": round(total_weekly_usd, 2),
+                "total_capital_deployed_usd": round(total_capital, 2),
+                "blended_apr_pct": blended_apr_overall,
+                "by_ticker": by_ticker,
+            }
+
+    def to_dict(self) -> dict:
+        """Export state for JSON serialization."""
+        with self._lock:
+            return {
+                "programs": dict(self._programs),
+                "stats": {k: dict(v) for k, v in self._stats.items()},
+            }
+
+    def from_dict(self, data: dict) -> None:
+        """Restore state from persisted JSON."""
+        if not data or not isinstance(data, dict):
+            return
+        with self._lock:
+            programs = data.get("programs") or {}
+            stats = data.get("stats") or {}
+            for ticker, p in programs.items():
+                if isinstance(p, dict):
+                    self._programs[ticker] = dict(p)
+            for ticker, s in stats.items():
+                if isinstance(s, dict):
+                    self._stats[ticker] = dict(s)

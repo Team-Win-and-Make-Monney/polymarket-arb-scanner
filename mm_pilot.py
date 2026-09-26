@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from url_guard import assert_public_url
+from kalshi_lip import LIPScoreTracker
 
 logger = logging.getLogger(__name__)
 
@@ -470,6 +471,18 @@ class KalshiMMPilot:
         self._decision_lock = threading.Lock()
         self._loop_error_streak = 0
 
+        self._lip_tracker = LIPScoreTracker(time_fn=self._time_fn)
+        if self._state_store is not None:
+            try:
+                persisted = self._state_store.load()
+                if persisted and isinstance(persisted, dict):
+                    if "lip_tracker" in persisted:
+                        self._lip_tracker.from_dict(persisted["lip_tracker"])
+                    elif "lip_rewards" in persisted and isinstance(persisted["lip_rewards"], dict) and "stats" in persisted["lip_rewards"]:
+                        self._lip_tracker.from_dict(persisted["lip_rewards"])
+            except Exception:
+                logger.debug("MM pilot: could not restore LIP tracker state from store", exc_info=True)
+
     # -- audit -------------------------------------------------------------
 
     def _write_decision(self, gate: str, ticker: str, allowed: bool,
@@ -514,10 +527,35 @@ class KalshiMMPilot:
 
     # -- selection / book state --------------------------------------------
 
-    def update_selection(self, tickers: list[str]) -> None:
-        """Install the latest ``select_lip_markets`` output (gate G4 input)."""
+    def update_selection(self, items: list[str] | list[dict]) -> None:
+        """Install the latest ``select_lip_markets`` output (gate G4 input).
+
+        Accepts either ticker strings or market dicts with LIP pool metadata.
+        When market dicts are provided, registers each market's incentive
+        program with the LIP reward tracker.
+        """
+        selected_tickers: set[str] = set()
+        for item in items or []:
+            if isinstance(item, dict):
+                ticker = item.get("ticker", "")
+                if ticker:
+                    selected_tickers.add(ticker)
+                    if hasattr(self, "_lip_tracker"):
+                        try:
+                            self._lip_tracker.set_market_program(
+                                ticker=ticker,
+                                pool_dollars=float(item.get("pool_dollars", 0.0) or 0.0),
+                                program_end=item.get("program_end"),
+                                category=item.get("category"),
+                                discount_factor_bps=item.get("discount_factor_bps"),
+                            )
+                        except Exception as exc:
+                            logger.debug("Failed setting market program for %s: %s", ticker, exc)
+            elif item:
+                selected_tickers.add(str(item))
+
         with self._lock:
-            self._selected = {t for t in tickers if t}
+            self._selected = selected_tickers
 
     def pilot_tickers(self) -> list[str]:
         """Markets the pilot currently owns: selected + carrying state."""
@@ -674,6 +712,23 @@ class KalshiMMPilot:
             except Exception as e:
                 logger.debug("Failed reading kill switch status for persistence: %s", e)
 
+        lip_tracker_data = {}
+        lip_rewards_data = {}
+        if hasattr(self, "_lip_tracker"):
+            try:
+                lip_tracker_data = self._lip_tracker.to_dict()
+                capital_by_ticker = {}
+                pnl_by_ticker = self.inventory.snapshot().get("realized", {})
+                for ticker in self.pilot_tickers():
+                    capital = abs(self.inventory.net_usd(ticker)) + self._resting_notional(ticker)
+                    capital_by_ticker[ticker] = max(10.0, capital)
+                lip_rewards_data = self._lip_tracker.get_metrics(
+                    capital_deployed_by_ticker=capital_by_ticker,
+                    realized_pnl_by_ticker=pnl_by_ticker,
+                )
+            except Exception as e:
+                logger.debug("Failed serializing LIP rewards for persistence: %s", e)
+
         state = {
             "active": (not self.halted) and (not self._stopped),
             "status": status_val,
@@ -692,6 +747,8 @@ class KalshiMMPilot:
             "orders": orders_snapshot,
             "selected_markets": selected,
             "inventory": self.inventory.snapshot(),
+            "lip_tracker": lip_tracker_data,
+            "lip_rewards": lip_rewards_data,
             "seen_fill_ids": list(self._seen_fill_ids.keys())[-200:],
             "saved_at": self._time_fn(),
         }
@@ -885,6 +942,12 @@ class KalshiMMPilot:
             elif persisted and persisted.get("last_fill_ts"):
                 self._last_fill_ts = max(self._last_fill_ts,
                                          float(persisted["last_fill_ts"]))
+
+        if persisted and isinstance(persisted, dict) and hasattr(self, "_lip_tracker"):
+            if "lip_tracker" in persisted:
+                self._lip_tracker.from_dict(persisted["lip_tracker"])
+            elif "lip_rewards" in persisted and isinstance(persisted["lip_rewards"], dict) and "stats" in persisted["lip_rewards"]:
+                self._lip_tracker.from_dict(persisted["lip_rewards"])
 
         self._reconciled = True
         logger.info("MM pilot reconciled at startup: %d ticker(s) with "
@@ -1418,6 +1481,23 @@ class KalshiMMPilot:
     def _round_tick(price: float) -> float:
         return round(round(price / KALSHI_TICK) * KALSHI_TICK, 2)
 
+    def _record_lip_snapshot(self, ticker: str) -> None:
+        """Record an LIP scoring snapshot for ticker if lip tracker is enabled."""
+        if not hasattr(self, "_lip_tracker") or not ticker:
+            return
+        try:
+            book = self._book(ticker)
+            orders = self.resting_orders(ticker)
+            self._lip_tracker.record_snapshot(
+                ticker=ticker,
+                our_orders=orders,
+                book=book,
+                now=self._time_fn(),
+                is_dry_run=self.dry_run,
+            )
+        except Exception:
+            logger.debug("LIP snapshot record failed for %s", ticker, exc_info=True)
+
     def refresh_market(self, ticker: str) -> list[str]:
         """Gate chain -> quotes -> choke point -> cancel/replace GTC orders.
 
@@ -1435,8 +1515,10 @@ class KalshiMMPilot:
         if plan["action"] in ("pull", "halted"):
             if plan["action"] == "pull":
                 self.pull_market(ticker, plan["reason"])
+            self._record_lip_snapshot(ticker)
             return []
         if plan["action"] == "skip":
+            self._record_lip_snapshot(ticker)
             return []
 
         book = self._book(ticker)
@@ -1504,6 +1586,7 @@ class KalshiMMPilot:
                     logger.warning("MM pilot quote refresh aborted on %s: "
                                    "existing order %s is still live",
                                    ticker, order["order_id"])
+                    self._record_lip_snapshot(ticker)
                     return []
 
         placed: list[str] = []
@@ -1519,6 +1602,7 @@ class KalshiMMPilot:
                                          purpose="quote_ask")
             if oid:
                 placed.append(oid)
+        self._record_lip_snapshot(ticker)
         return placed
 
     def refresh_all(self) -> list[str]:
@@ -2156,6 +2240,21 @@ class KalshiMMPilot:
             except Exception as e:
                 logger.debug("Failed reading kill switch status for telemetry: %s", e)
 
+        lip_rewards = {}
+        if hasattr(self, "_lip_tracker"):
+            try:
+                capital_by_ticker = {}
+                pnl_by_ticker = self.inventory.snapshot().get("realized", {})
+                for ticker in self.pilot_tickers():
+                    capital = abs(self.inventory.net_usd(ticker)) + self._resting_notional(ticker)
+                    capital_by_ticker[ticker] = max(10.0, capital)
+                lip_rewards = self._lip_tracker.get_metrics(
+                    capital_deployed_by_ticker=capital_by_ticker,
+                    realized_pnl_by_ticker=pnl_by_ticker,
+                )
+            except Exception as e:
+                logger.debug("Failed computing LIP metrics for status telemetry: %s", e)
+
         status_val = "halted" if self.halted else ("stopped" if self._stopped else "active")
         return {
             "active": (not self.halted) and (not self._stopped),
@@ -2173,6 +2272,7 @@ class KalshiMMPilot:
             "total_inventory_usd": self.inventory.total_net_usd(),
             "realized_pnl": self.inventory.realized_pnl_total(),
             "inventory": self.inventory.snapshot(),
+            "lip_rewards": lip_rewards,
             "dry_run": self.dry_run,
             "reconciled": self._reconciled,
             "fills_blind": self._fills_blind,

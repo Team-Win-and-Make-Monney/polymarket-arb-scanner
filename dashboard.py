@@ -189,6 +189,7 @@ def _get_mm_pilot_telemetry() -> dict:
                         file_state["active"] = False
                         file_state["status"] = "inactive"
 
+                    file_state.setdefault("lip_rewards", {})
                     file_state["source"] = "file"
                     file_state["path"] = norm_path
                     return file_state
@@ -199,6 +200,7 @@ def _get_mm_pilot_telemetry() -> dict:
         "active": False,
         "status": "inactive",
         "message": "Kalshi MM Pilot not active (no running instance or state file)",
+        "lip_rewards": {},
     }
 
 
@@ -290,6 +292,7 @@ class _DashboardState:
                 "resting_orders": mm_pilot_telemetry.get("resting_orders", 0),
                 "total_inventory_usd": mm_pilot_telemetry.get("total_inventory_usd", 0.0),
                 "realized_pnl": mm_pilot_telemetry.get("realized_pnl", 0.0),
+                "lip_rewards": mm_pilot_telemetry.get("lip_rewards", {}),
             },
         }
 

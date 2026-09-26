@@ -575,6 +575,16 @@ a:hover { text-decoration: underline; }
           <div class="card-value" id="mm-selected-count">0</div>
           <div class="card-sub" id="mm-selected-sub">LIP targets</div>
         </div>
+        <div class="card" style="padding:10px 14px;">
+          <div class="card-label">LIP Rewards (Est)</div>
+          <div class="card-value" id="mm-lip-rewards">$0.00</div>
+          <div class="card-sub" id="mm-lip-sub">Run rate: $0.00/d</div>
+        </div>
+        <div class="card" style="padding:10px 14px;">
+          <div class="card-label">Blended Yield</div>
+          <div class="card-value" id="mm-blended-apr">0.0%</div>
+          <div class="card-sub" id="mm-blended-sub">LIP + Spread APR</div>
+        </div>
       </div>
 
       <div class="grid-2">
@@ -1356,6 +1366,13 @@ function renderMMPilot(data) {
     $('mm-realized-pnl').textContent = '—';
     $('mm-realized-pnl').className = 'card-value';
     $('mm-selected-count').textContent = '—';
+    if ($('mm-lip-rewards')) $('mm-lip-rewards').textContent = '—';
+    if ($('mm-lip-sub')) $('mm-lip-sub').textContent = '—';
+    if ($('mm-blended-apr')) {
+      $('mm-blended-apr').textContent = '—';
+      $('mm-blended-apr').className = 'card-value';
+    }
+    if ($('mm-blended-sub')) $('mm-blended-sub').textContent = '—';
     setEmpty($('mm-orders-tbody'), 5, 'Telemetry unavailable');
     setEmpty($('mm-inventory-tbody'), 5, 'Telemetry unavailable');
     return;
@@ -1375,6 +1392,13 @@ function renderMMPilot(data) {
     $('mm-realized-pnl').textContent = '$0.00';
     $('mm-realized-pnl').className = 'card-value';
     $('mm-selected-count').textContent = '0';
+    if ($('mm-lip-rewards')) $('mm-lip-rewards').textContent = '$0.00';
+    if ($('mm-lip-sub')) $('mm-lip-sub').textContent = 'Run rate: $0.00/d';
+    if ($('mm-blended-apr')) {
+      $('mm-blended-apr').textContent = '0.0%';
+      $('mm-blended-apr').className = 'card-value';
+    }
+    if ($('mm-blended-sub')) $('mm-blended-sub').textContent = 'LIP + Spread APR';
     setEmpty($('mm-orders-tbody'), 5, 'Pilot inactive');
     setEmpty($('mm-inventory-tbody'), 5, 'Pilot inactive');
     return;
@@ -1434,6 +1458,27 @@ function renderMMPilot(data) {
 
   const selectedCount = data.selected_markets ? data.selected_markets.length : 0;
   $('mm-selected-count').textContent = selectedCount;
+
+  // LIP Rewards & Blended Yield
+  const lip = data.lip_rewards || {};
+  const estRewards = lip.total_estimated_reward_usd || 0.0;
+  const dailyRate = lip.estimated_daily_rate_usd || 0.0;
+  const blendedApr = lip.blended_apr_pct || 0.0;
+  const weeklyRate = lip.estimated_weekly_rate_usd || 0.0;
+
+  if ($('mm-lip-rewards')) {
+    $('mm-lip-rewards').textContent = fmtUSD(estRewards);
+  }
+  if ($('mm-lip-sub')) {
+    $('mm-lip-sub').textContent = 'Run rate: ' + fmtUSD(dailyRate) + '/d';
+  }
+  if ($('mm-blended-apr')) {
+    $('mm-blended-apr').textContent = (blendedApr > 0 ? '+' : '') + blendedApr.toFixed(1) + '%';
+    $('mm-blended-apr').className = 'card-value ' + (blendedApr > 0 ? 'positive' : (blendedApr < 0 ? 'negative' : ''));
+  }
+  if ($('mm-blended-sub')) {
+    $('mm-blended-sub').textContent = fmtUSD(weeklyRate) + '/wk pool rate';
+  }
 
   // Orders table
   const ordersTbody = $('mm-orders-tbody');

@@ -2069,4 +2069,4 @@ class TestMMPilotLIPBalancer:
         # Base count is $10 / 0.48 = 20 contracts.
         # Even though graduated and book depth is huge (1000), scale-up is prohibited
         # because target_size is not explicitly known.
-        assert orders["quote_bid"]["count"] <= 21
+        assert orders["quote_bid"]["count"] == 20

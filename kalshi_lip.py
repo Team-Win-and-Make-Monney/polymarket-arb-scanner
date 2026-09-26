@@ -599,16 +599,25 @@ class LIPScoreTracker:
                 if discount_factor is not None
                 else existing.get("discount_factor", self.DEFAULT_DISCOUNT_FACTOR)
             )
-            ts = (
-                max(MIN_TARGET_SIZE, min(MAX_TARGET_SIZE, float(target_size)))
-                if target_size is not None
-                else existing.get("target_size", self.DEFAULT_TARGET_SIZE)
-            )
+            ts_known = False
+            if target_size is not None:
+                try:
+                    ts_float = float(target_size)
+                    if math.isfinite(ts_float) and ts_float > 0:
+                        ts = max(MIN_TARGET_SIZE, min(MAX_TARGET_SIZE, ts_float))
+                        ts_known = True
+                    else:
+                        ts = existing.get("target_size", self.DEFAULT_TARGET_SIZE)
+                except (TypeError, ValueError):
+                    ts = existing.get("target_size", self.DEFAULT_TARGET_SIZE)
+            else:
+                ts = existing.get("target_size", self.DEFAULT_TARGET_SIZE)
+
             self._programs[ticker] = {
                 "pool_dollars": pool,
                 "discount_factor": df,
                 "target_size": ts,
-                "target_size_known": target_size is not None,
+                "target_size_known": ts_known,
                 "program_end": program_end or existing.get("program_end"),
                 "category": category or existing.get("category"),
             }
@@ -967,7 +976,15 @@ class LIPScoreTracker:
                             "category": None,
                         }
                         merged.update(p)
-                        merged["target_size_known"] = bool(merged.get("target_size_known", False))
+                        ts_raw = merged.get("target_size")
+                        is_valid_ts = False
+                        if ts_raw is not None:
+                            try:
+                                ts_val = float(ts_raw)
+                                is_valid_ts = math.isfinite(ts_val) and ts_val > 0
+                            except (TypeError, ValueError):
+                                is_valid_ts = False
+                        merged["target_size_known"] = bool(merged.get("target_size_known", False)) and is_valid_ts
                         merged["pool_dollars"] = max(
                             0.0, as_float(merged["pool_dollars"], self.DEFAULT_POOL_DOLLARS)
                         )

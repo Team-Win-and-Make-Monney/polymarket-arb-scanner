@@ -722,3 +722,11 @@ class TestLIPScoreTrackerBalancerIntegration:
         restored.from_dict(data)
         assert restored.has_target_size("MKT-PERSIST")
         assert not restored.has_target_size("MKT-1")
+
+    def test_has_target_size_invalid_values(self):
+        import math
+        tracker = LIPScoreTracker()
+        for idx, invalid_ts in enumerate([0, 0.0, -100, -1.0, float("nan"), float("inf"), float("-inf"), "not_a_num"]):
+            ticker = f"MKT-INV-{idx}"
+            tracker.set_market_program(ticker, target_size=invalid_ts)
+            assert not tracker.has_target_size(ticker), f"Expected False for {invalid_ts}"

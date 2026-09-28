@@ -144,6 +144,7 @@ class TestCrossScanWSOrderbook:
 
         # PM_YES (0.41) + K_NO (1 - 0.40 = 0.60 -> total 1.01, profit < 0)
         # PM_NO (0.59) + K_YES (1 - 0.49 = 0.51 -> total 1.10, profit < 0)
+        assert opps == []
         # Let's verify mock_pm_rest and mock_k_rest were not called during refinement
         mock_pm_rest.assert_not_called()
         mock_k_rest.assert_not_called()

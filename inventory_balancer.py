@@ -348,7 +348,7 @@ class InventoryBalancer:
                 continue
 
             # Size the rebalancing trade
-            max_qty_by_cost = max_cost / ask_price if ask_price > 0 else 0.0
+            max_qty_by_cost = max_cost / ask_price
             order_qty = min(needed_contracts, max_qty_by_cost)
             if depth > 0:
                 order_qty = min(order_qty, depth)

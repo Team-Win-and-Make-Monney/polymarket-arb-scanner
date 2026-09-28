@@ -12,6 +12,11 @@ logger = logging.getLogger(__name__)
 class PartialFillHedger:
     """Attempts to sell filled legs to recover capital after partial fills."""
 
+    feed_manager = None
+    price_cache = None
+    _ws_book_hits = 0
+    _rest_book_fetches = 0
+
     def __init__(
         self,
         pm_trader=None,
@@ -24,6 +29,8 @@ class PartialFillHedger:
         ibkr_client=None,
         limitless_client=None,
         db: TradeDB = None,
+        price_cache: dict | None = None,
+        feed_manager = None,
     ):
         self.pm_trader = pm_trader
         self.kalshi_client = kalshi_client
@@ -36,6 +43,82 @@ class PartialFillHedger:
         self.limitless_client = limitless_client
         # Note: IBKR accepted for test coverage but cannot hedge (BUY-only platform)
         self.db = db
+        self.price_cache = price_cache
+        self.feed_manager = feed_manager
+        self._ws_book_hits = 0
+        self._rest_book_fetches = 0
+
+    def get_orderbook_telemetry(self) -> dict:
+        """Return counts of orderbooks sourced from WebSocket cache vs REST."""
+        return {
+            "ws_hits": getattr(self, "_ws_book_hits", 0),
+            "rest_fetches": getattr(self, "_rest_book_fetches", 0),
+        }
+
+    def _get_orderbook(self, platform: str, key: str) -> tuple[dict | None, str]:
+        """Fetch orderbook from WebSocket feed if fresh, falling back to REST.
+
+        Returns:
+            (orderbook_dict, source) where source is 'ws' or 'rest' (or 'none').
+        """
+        import sys
+        _cfg = sys.modules.get("config")
+        ws_enabled = getattr(_cfg, "WS_ORDERBOOK_STREAMING_ENABLED", True) if _cfg else True
+        max_age = getattr(_cfg, "WS_ORDERBOOK_MAX_AGE_SECONDS", 15.0) if _cfg else 15.0
+
+        platform_lower = str(platform).lower()
+
+        # 1. Try WebSocket orderbook if enabled
+        if ws_enabled:
+            # Check feed_manager first
+            feed_mgr = getattr(self, "feed_manager", None)
+            if feed_mgr is not None and hasattr(feed_mgr, "get_orderbook"):
+                book, age = feed_mgr.get_orderbook(platform_lower, key)
+                if book is not None and age is not None and age <= max_age:
+                    self._ws_book_hits = getattr(self, "_ws_book_hits", 0) + 1
+                    return book, "ws"
+
+            # Check price_cache
+            pc = getattr(self, "price_cache", None)
+            if pc is not None:
+                entry = pc.get((platform_lower, key))
+                if isinstance(entry, dict):
+                    ts = entry.get("_ts", 0)
+                    if (time.time() - ts) <= max_age:
+                        if platform_lower == "kalshi":
+                            ob = entry.get("orderbook")
+                            if isinstance(ob, dict) and ("yes" in ob or "no" in ob):
+                                self._ws_book_hits = getattr(self, "_ws_book_hits", 0) + 1
+                                return {"orderbook": ob}, "ws"
+                        elif platform_lower == "polymarket":
+                            ob = entry.get("orderbook")
+                            if isinstance(ob, dict) and ("bids" in ob or "asks" in ob):
+                                self._ws_book_hits = getattr(self, "_ws_book_hits", 0) + 1
+                                return ob, "ws"
+
+        # 2. Fall back to REST
+        if platform_lower == "kalshi":
+            kalshi_client = getattr(self, "kalshi_client", None)
+            if not kalshi_client:
+                return None, "none"
+            try:
+                self._rest_book_fetches = getattr(self, "_rest_book_fetches", 0) + 1
+                book = kalshi_client.fetch_order_book(key)
+                return book, "rest"
+            except Exception as exc:
+                logger.warning("REST Kalshi book fetch failed for %s: %s", key, exc)
+                return None, "none"
+        elif platform_lower == "polymarket":
+            try:
+                from polymarket_api import fetch_order_book
+                self._rest_book_fetches = getattr(self, "_rest_book_fetches", 0) + 1
+                book = fetch_order_book(key)
+                return book, "rest"
+            except Exception as exc:
+                logger.warning("REST Polymarket book fetch failed for %s: %s", key, exc)
+                return None, "none"
+
+        return None, "none"
 
     def queue_hedge(
         self,
@@ -154,8 +237,8 @@ class PartialFillHedger:
         """
         if not self.pm_trader:
             return False, "rejected"
-        from polymarket_api import fetch_order_book, get_best_bid_ask
-        book = fetch_order_book(token_id)
+        from polymarket_api import get_best_bid_ask
+        book, source = self._get_orderbook("polymarket", token_id)
         if not book:
             return False, "rejected"
         ba = get_best_bid_ask(book)
@@ -239,7 +322,7 @@ class PartialFillHedger:
         if not live_kalshi_submit_allowed(ticker, reducing=True):
             logger.warning("Kalshi hedge blocked by live policy: %s", ticker)
             return False
-        book = self.kalshi_client.fetch_order_book(ticker)
+        book, source = self._get_orderbook("kalshi", ticker)
         if not book:
             return False
         # Selling our YES position requires hitting the best YES bid (and

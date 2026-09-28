@@ -1963,6 +1963,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
             gemini_client=extra_clients.get("gemini"),
             limitless_client=extra_clients.get("limitless"),
             db=db,
+            price_cache=price_cache,
         )
 
     # Initialize snapshot recorder for backtesting data collection
@@ -2068,6 +2069,10 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
         kalshi_private_key_path=kalshi_private_key_path,
         kalshi_private_key_base64=kalshi_private_key_base64,
     )
+    if executor is not None:
+        executor.feed_manager = feed_manager
+    if hedger is not None:
+        hedger.feed_manager = feed_manager
 
     async def _priority_consumer():
         """Drain the priority queue, executing WS-triggered opps in priority order.

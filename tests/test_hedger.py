@@ -3,6 +3,7 @@
 import pytest
 from unittest.mock import MagicMock, patch
 import logging
+import time
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -1072,3 +1073,177 @@ class TestLimitlessHedge:
                 mock_pm.place_order.assert_called_once()
                 mock_limitless.get_order_book.assert_not_called()
                 mock_limitless.place_order.assert_not_called()
+
+
+class TestHedgerWebSocketOrderbookStreaming:
+    """Verify PartialFillHedger uses fresh WebSocket orderbooks and falls back to REST."""
+
+    def test_polymarket_hedge_uses_feed_manager_orderbook(self, PartialFillHedger, db):
+        mock_pm = MagicMock()
+        mock_pm.place_order.return_value = {"success": True, "orderID": "pm_h1"}
+        mock_pm.get_order_status.return_value = {"status": "matched"}
+
+        mock_feed = MagicMock()
+        mock_feed.get_orderbook.return_value = (
+            {
+                "bids": [{"price": "0.48", "size": "100"}],
+                "asks": [{"price": "0.52", "size": "100"}],
+            },
+            2.0,  # 2.0s old < 15.0s
+        )
+
+        hedger = PartialFillHedger(pm_trader=mock_pm, db=db, feed_manager=mock_feed)
+
+        with patch("polymarket_api.fetch_order_book") as mock_fetch:
+            success, state = hedger._hedge_polymarket("tok_pm_1", fill_price=0.50, size=10.0, max_loss=0.05, side="SELL")
+            assert success is True
+            assert state == "filled"
+            mock_fetch.assert_not_called()
+            mock_pm.place_order.assert_called_once_with(
+                token_id="tok_pm_1", side="SELL", price=0.48, size=10.0, order_type="FOK"
+            )
+            telem = hedger.get_orderbook_telemetry()
+            assert telem["ws_hits"] == 1
+            assert telem["rest_fetches"] == 0
+
+    def test_polymarket_hedge_uses_price_cache_orderbook(self, PartialFillHedger, db):
+        mock_pm = MagicMock()
+        mock_pm.place_order.return_value = {"success": True, "orderID": "pm_h2"}
+        mock_pm.get_order_status.return_value = {"status": "filled"}
+
+        price_cache = {
+            ("polymarket", "tok_pm_2"): {
+                "_ts": time.time(),
+                "orderbook": {
+                    "bids": [{"price": "0.49", "size": "50"}],
+                    "asks": [{"price": "0.51", "size": "50"}],
+                },
+            }
+        }
+        hedger = PartialFillHedger(pm_trader=mock_pm, db=db, price_cache=price_cache)
+
+        with patch("polymarket_api.fetch_order_book") as mock_fetch:
+            success, state = hedger._hedge_polymarket("tok_pm_2", fill_price=0.50, size=5.0, max_loss=0.05, side="SELL")
+            assert success is True
+            mock_fetch.assert_not_called()
+            mock_pm.place_order.assert_called_once_with(
+                token_id="tok_pm_2", side="SELL", price=0.49, size=5.0, order_type="FOK"
+            )
+            assert hedger.get_orderbook_telemetry()["ws_hits"] == 1
+
+    def test_polymarket_hedge_falls_back_to_rest_when_ws_stale(self, PartialFillHedger, db):
+        mock_pm = MagicMock()
+        mock_pm.place_order.return_value = {"success": True, "orderID": "pm_h3"}
+        mock_pm.get_order_status.return_value = {"status": "filled"}
+
+        price_cache = {
+            ("polymarket", "tok_pm_3"): {
+                "_ts": time.time() - 30.0,  # 30s > 15s stale
+                "orderbook": {
+                    "bids": [{"price": "0.49", "size": "50"}],
+                    "asks": [{"price": "0.51", "size": "50"}],
+                },
+            }
+        }
+        hedger = PartialFillHedger(pm_trader=mock_pm, db=db, price_cache=price_cache)
+
+        with patch("polymarket_api.fetch_order_book") as mock_fetch:
+            mock_fetch.return_value = {
+                "bids": [{"price": "0.47", "size": "100"}],
+                "asks": [{"price": "0.53", "size": "100"}],
+            }
+            success, state = hedger._hedge_polymarket("tok_pm_3", fill_price=0.50, size=5.0, max_loss=0.05, side="SELL")
+            assert success is True
+            mock_fetch.assert_called_once_with("tok_pm_3")
+            telem = hedger.get_orderbook_telemetry()
+            assert telem["ws_hits"] == 0
+            assert telem["rest_fetches"] == 1
+
+    def test_polymarket_hedge_falls_back_to_rest_when_streaming_disabled(self, PartialFillHedger, db, monkeypatch):
+        import config
+        monkeypatch.setattr(config, "WS_ORDERBOOK_STREAMING_ENABLED", False)
+
+        mock_pm = MagicMock()
+        mock_pm.place_order.return_value = {"success": True, "orderID": "pm_h4"}
+        mock_pm.get_order_status.return_value = {"status": "filled"}
+
+        price_cache = {
+            ("polymarket", "tok_pm_4"): {
+                "_ts": time.time(),
+                "orderbook": {
+                    "bids": [{"price": "0.49", "size": "50"}],
+                    "asks": [{"price": "0.51", "size": "50"}],
+                },
+            }
+        }
+        hedger = PartialFillHedger(pm_trader=mock_pm, db=db, price_cache=price_cache)
+
+        with patch("polymarket_api.fetch_order_book") as mock_fetch:
+            mock_fetch.return_value = {
+                "bids": [{"price": "0.46", "size": "100"}],
+                "asks": [{"price": "0.54", "size": "100"}],
+            }
+            success, state = hedger._hedge_polymarket("tok_pm_4", fill_price=0.50, size=5.0, max_loss=0.05, side="SELL")
+            assert success is True
+            mock_fetch.assert_called_once_with("tok_pm_4")
+            assert hedger.get_orderbook_telemetry()["rest_fetches"] == 1
+
+    def test_kalshi_hedge_uses_feed_manager_orderbook(self, PartialFillHedger, db, real_kalshi_api):
+        mock_kalshi = MagicMock()
+        mock_kalshi.place_order.return_value = {"order_id": "k_h1"}
+
+        mock_feed = MagicMock()
+        mock_feed.get_orderbook.return_value = (
+            {
+                "orderbook": {
+                    "yes": [[48, 100]],
+                    "no": [[50, 100]],
+                }
+            },
+            1.5,
+        )
+
+        hedger = PartialFillHedger(kalshi_client=mock_kalshi, db=db, feed_manager=mock_feed)
+
+        with patch("kalshi_policy.live_kalshi_submit_allowed", return_value=True):
+            res = hedger._hedge_kalshi("KXTEST-A", fill_price=0.50, size=10.0, max_loss=0.05, side="yes", action="sell")
+            assert res is True
+            mock_kalshi.fetch_order_book.assert_not_called()
+            mock_kalshi.place_order.assert_called_once()
+            call_kwargs = mock_kalshi.place_order.call_args[1]
+            assert call_kwargs["ticker"] == "KXTEST-A"
+            assert call_kwargs["price_dollars"] == 0.48
+            telem = hedger.get_orderbook_telemetry()
+            assert telem["ws_hits"] == 1
+            assert telem["rest_fetches"] == 0
+
+    def test_kalshi_hedge_falls_back_to_rest_when_ws_stale(self, PartialFillHedger, db, real_kalshi_api):
+        mock_kalshi = MagicMock()
+        mock_kalshi.place_order.return_value = {"order_id": "k_h2"}
+        mock_kalshi.fetch_order_book.return_value = {
+            "orderbook": {
+                "yes": [[47, 50]],
+                "no": [[51, 50]],
+            }
+        }
+
+        mock_feed = MagicMock()
+        mock_feed.get_orderbook.return_value = (
+            {
+                "orderbook": {
+                    "yes": [[48, 100]],
+                    "no": [[50, 100]],
+                }
+            },
+            25.0,  # 25s > 15s stale
+        )
+
+        hedger = PartialFillHedger(kalshi_client=mock_kalshi, db=db, feed_manager=mock_feed)
+
+        with patch("kalshi_policy.live_kalshi_submit_allowed", return_value=True):
+            res = hedger._hedge_kalshi("KXTEST-A", fill_price=0.50, size=10.0, max_loss=0.05, side="yes", action="sell")
+            assert res is True
+            mock_kalshi.fetch_order_book.assert_called_once_with("KXTEST-A")
+            telem = hedger.get_orderbook_telemetry()
+            assert telem["ws_hits"] == 0
+            assert telem["rest_fetches"] == 1

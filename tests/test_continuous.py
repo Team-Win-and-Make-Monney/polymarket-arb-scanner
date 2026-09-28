@@ -2046,3 +2046,68 @@ class TestContinuousKalshiWSOrderbookRouting:
         _route_kalshi_ws_to_mm_pilot(mock_pilot, "kalshi", "KXTEST", data, tracking_price=0.50)
         mock_pilot.update_book_from_ws.assert_called_once()
         mock_pilot.on_ws_price.assert_called_once()
+
+
+class TestContinuousWSOrderbookStreamingWiring:
+    """Verify continuous mode wires price_cache to hedger and feed_manager to executor & hedger."""
+
+    def test_wiring_price_cache_and_feed_manager(self, monkeypatch):
+        continuous_module = sys.modules["continuous"]
+        from hedger import PartialFillHedger
+
+        args = MagicMock()
+        args.interval = None
+        args.mode = "all"
+        args.limit = 10
+        args.min_depth = 0
+        args.min_confidence = 0.5
+        args.json = False
+        args.dry_run = True
+        args.exec_mode = "semi-auto"
+        args.max_trade = 5.0
+        args.dashboard_port = None
+
+        captured_hedger_kwargs = {}
+        captured_hedger_instances = []
+        original_hedger_init = PartialFillHedger.__init__
+
+        def fake_hedger_init(self, *args, **kwargs):
+            captured_hedger_kwargs.update(kwargs)
+            captured_hedger_instances.append(self)
+            original_hedger_init(self, *args, **kwargs)
+
+        monkeypatch.setattr(PartialFillHedger, "__init__", fake_hedger_init)
+
+        mock_feed_mgr = MagicMock()
+        monkeypatch.setattr(continuous_module, "FeedManager", lambda **kwargs: mock_feed_mgr)
+
+        class _StopSentinel(Exception):
+            pass
+
+        def fake_asyncio_run(coro):
+            coro.close()
+            raise _StopSentinel()
+
+        monkeypatch.setattr(continuous_module.asyncio, "run", fake_asyncio_run)
+
+        test_price_cache = {("polymarket", "tok1"): {"price": 0.5}}
+        mock_executor = MagicMock()
+
+        with pytest.raises(_StopSentinel), \
+             patch("continuous.CONFIG_HEDGE_ENABLED", True):
+            continuous_module.run_continuous(
+                args=args,
+                min_profit=0.01,
+                kalshi_client=None,
+                kalshi_api_key_id=None,
+                kalshi_private_key_path=None,
+                executor=mock_executor,
+                db=MagicMock(),
+                price_cache=test_price_cache,
+                extra_clients={},
+            )
+
+        assert captured_hedger_kwargs.get("price_cache") is test_price_cache
+        assert mock_executor.feed_manager is mock_feed_mgr
+        assert len(captured_hedger_instances) >= 1
+        assert captured_hedger_instances[0].feed_manager is mock_feed_mgr

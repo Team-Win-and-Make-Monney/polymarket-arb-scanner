@@ -1794,11 +1794,17 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
 
         # Plan 10: feed the Kalshi MM pilot's book freshness + VolatilityTracker
         # with orderbook_delta ticks for subscribed pilot tickers.
-        if _mm_pilot and platform == "kalshi" and tracking_price is not None:
-            try:
-                _mm_pilot.on_ws_price(ticker, tracking_price)
-            except Exception as exc:
-                logger.debug("MM pilot WS feed failed: %s", exc)
+        if _mm_pilot and platform == "kalshi":
+            if data.get("orderbook"):
+                try:
+                    _mm_pilot.update_book_from_ws(ticker, {"orderbook": data["orderbook"]})
+                except Exception as exc:
+                    logger.debug("MM pilot WS orderbook update failed: %s", exc)
+            elif tracking_price is not None:
+                try:
+                    _mm_pilot.on_ws_price(ticker, tracking_price)
+                except Exception as exc:
+                    logger.debug("MM pilot WS feed failed: %s", exc)
 
         # Sprint 3: Feed VolatilityTracker + LeadLagMM with per-tick prices
         _feed_sprint3_trackers(platform, ticker, data)

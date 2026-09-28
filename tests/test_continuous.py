@@ -1975,3 +1975,22 @@ class TestContinuousDepthFilter:
         assert "M1" in retained_markets
         assert "M2" in retained_markets
         assert "M3" in retained_markets
+
+
+class TestContinuousKalshiWSOrderbookRouting:
+    def test_routing_prefers_ws_orderbook_over_mid_scalar(self):
+        """Verify on_price_update prioritizes streaming orderbooks for MM pilot."""
+        src_path = os.path.join(os.path.dirname(__file__), "..", "continuous.py")
+        with open(src_path, encoding="utf-8") as fh:
+            source = fh.read()
+
+        marker = "# Plan 10: feed the Kalshi MM pilot's book freshness"
+        assert marker in source
+        start = source.index(marker)
+        end = source.index("# Sprint 3: Feed VolatilityTracker", start)
+        block = source[start:end]
+
+        assert 'if data.get("orderbook"):' in block
+        assert '_mm_pilot.update_book_from_ws(ticker, {"orderbook": data["orderbook"]})' in block
+        assert 'elif tracking_price is not None:' in block
+        assert '_mm_pilot.on_ws_price(ticker, tracking_price)' in block

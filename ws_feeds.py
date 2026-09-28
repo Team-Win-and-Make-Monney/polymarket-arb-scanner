@@ -314,6 +314,18 @@ class FeedManager:
         last_msg_time = self._last_message_time.get(platform, 0)
         return (time.time() - last_msg_time) <= threshold_seconds
 
+    def get_kalshi_orderbook(self, ticker: str) -> dict | None:
+        """Return the reconstructed Kalshi orderbook for ticker in standard format."""
+        book = self._kalshi_books.get(ticker)
+        if book is None:
+            return None
+        return {
+            "orderbook": {
+                "yes": [[p, q] for p, q in sorted(book.get("yes", {}).items())],
+                "no": [[p, q] for p, q in sorted(book.get("no", {}).items())],
+            }
+        }
+
     def stop(self):
         """Signal feeds to stop."""
         self._running = False
@@ -508,6 +520,12 @@ class FeedManager:
                 else:
                     normalised[f"{side}_ask"] = None
                     normalised[f"{side}_ask_size"] = 0
+
+            if book is not None:
+                normalised["orderbook"] = {
+                    "yes": [[p, q] for p, q in sorted(book.get("yes", {}).items())],
+                    "no": [[p, q] for p, q in sorted(book.get("no", {}).items())],
+                }
 
             self._last_message_time["kalshi"] = time.time()
             self.on_price_update("kalshi", ticker, normalised)

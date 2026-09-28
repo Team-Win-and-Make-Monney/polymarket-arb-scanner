@@ -2499,3 +2499,108 @@ class TestMMPilotInventorySkewQuoting:
         # BUT pilot._get_cross_venue_skew excludes Kalshi, so cv_delta is STILL 30 (no double counting!)
         skew_after = pilot._get_cross_venue_skew(TICKER)
         assert skew_after["delta_net"] == 30.0
+
+
+class TestMMPilotPortfolioMarginGuard:
+    """Tests for portfolio-level capital and margin utilization guard."""
+
+    def test_total_resting_notional_across_markets(self, pilot_env, clock):
+        """total_resting_notional correctly sums order notional across multiple markets."""
+        client = FakeKalshiClient(books={"TICKER_A": make_book(), "TICKER_B": make_book()})
+        pilot = build_pilot(clock, client=client, selection=["TICKER_A", "TICKER_B"])
+        # Place orders in two distinct tickers
+        pilot.place_pilot_order("TICKER_A", side="yes", action="buy", count=20, price=0.40, purpose="quote_bid")
+        pilot.place_pilot_order("TICKER_B", side="no", action="buy", count=30, price=0.50, purpose="quote_ask")
+
+        # TICKER_A notional: 20 * 0.40 = $8.00
+        # TICKER_B notional: 30 * 0.50 = $15.00
+        # Total: $23.00
+        assert pilot._resting_notional("TICKER_A") == 8.0
+        assert pilot._resting_notional("TICKER_B") == 15.0
+        assert pilot.total_resting_notional() == 23.0
+
+    def test_get_portfolio_margin_metrics(self, pilot_env, clock):
+        """get_portfolio_margin_metrics returns complete aggregate exposure and utilization."""
+        client = FakeKalshiClient(books={"TICKER_A": make_book()})
+        pilot = build_pilot(clock, client=client, selection=["TICKER_A"])
+        # Give TICKER_A inventory
+        pilot.inventory.apply_fill("TICKER_A", side="yes", action="buy", count=50, yes_price=0.50)
+        # Place a resting order
+        pilot.place_pilot_order("TICKER_A", side="no", action="buy", count=20, price=0.40, purpose="quote_ask")
+
+        metrics = pilot.get_portfolio_margin_metrics()
+        # Inventory: 50 * 0.50 = $25.00
+        # Resting: 20 * 0.40 = $8.00
+        # Total: $33.00
+        assert metrics["total_inventory_notional"] == 25.0
+        assert metrics["total_resting_notional"] == 8.0
+        assert metrics["total_notional"] == 33.0
+        assert metrics["is_over_cap"] is False
+        assert metrics["cap_breached_reason"] == "ok"
+        assert metrics["active_market_count"] == 1
+
+    def test_g10c_gate_halts_flat_market_when_cap_breached(self, pilot_env, clock, monkeypatch):
+        """G10c halts quote placement on flat markets when portfolio notional cap is reached."""
+        import config
+        monkeypatch.setattr(config, "MM_MAX_PORTFOLIO_NOTIONAL_USD", 50.0)
+
+        client = FakeKalshiClient(books={"TICKER_A": make_book(), "TICKER_B": make_book()})
+        pilot = build_pilot(clock, client=client, selection=["TICKER_A", "TICKER_B"])
+        # Fill TICKER_A with $60 of inventory (exceeding $50 cap)
+        pilot.inventory.apply_fill("TICKER_A", side="yes", action="buy", count=120, yes_price=0.50)
+
+        # TICKER_B is flat
+        res = pilot._evaluate_gates("TICKER_B")
+        assert res["action"] == "skip"
+        assert "portfolio_notional_cap" in res["reason"]
+
+    def test_g10c_gate_allows_reducing_quotes_when_cap_breached(self, pilot_env, clock, monkeypatch):
+        """G10c restricts already-skewed markets to reducing-only quotes when cap is reached."""
+        import config
+        monkeypatch.setattr(config, "MM_MAX_PORTFOLIO_NOTIONAL_USD", 50.0)
+
+        client = FakeKalshiClient(books={"TICKER_A": make_book()})
+        pilot = build_pilot(clock, client=client, selection=["TICKER_A"])
+        # Fill TICKER_A with $60 of long YES inventory
+        pilot.inventory.apply_fill("TICKER_A", side="yes", action="buy", count=120, yes_price=0.50)
+
+        res = pilot._evaluate_gates("TICKER_A")
+        assert res["action"] == "quote"
+        # Long YES can only place ask (sell YES / buy NO) to reduce exposure
+        assert res["one_side"] == "ask_only"
+
+    def test_refresh_market_clamps_accumulating_quote_size_to_headroom(self, pilot_env, clock, monkeypatch):
+        """refresh_market scales accumulating order size down to fit remaining portfolio headroom."""
+        import config
+        monkeypatch.setattr(config, "MM_MAX_PORTFOLIO_NOTIONAL_USD", 50.0)
+        monkeypatch.setattr(config, "MM_QUOTE_SIZE_USD", 30.0)  # wants $30 quotes
+
+        client = FakeKalshiClient(books={
+            TICKER: make_book(yes_bid=0.48, no_bid=0.48),
+            "OTHER": make_book(),
+        })
+        pilot = build_pilot(clock, client=client, selection=["OTHER", TICKER])
+        pilot.canary_graduated = True
+
+        # Populate $40 of inventory in other market
+        pilot.inventory.apply_fill("OTHER", side="yes", action="buy", count=80, yes_price=0.50)
+
+        # Remaining portfolio headroom = $50 - $40 = $10
+        # QuoteEngine wants count for $30 quote @ 0.50 = 60 contracts
+        # But headroom allows only $10 / 0.50 = 20 contracts!
+        pilot.refresh_market(TICKER)
+        orders = {o["purpose"]: o for o in pilot.resting_orders(TICKER)}
+        assert "quote_bid" in orders
+        # Max contracts placed must be capped by $10 headroom / 0.49 price = 20 contracts
+        assert orders["quote_bid"]["count"] <= 21
+        assert orders["quote_bid"]["count"] * orders["quote_bid"]["price"] <= 11.0
+
+    def test_get_status_reports_portfolio_margin_metrics(self, pilot_env, clock):
+        """get_status includes portfolio_margin metrics dictionary."""
+        pilot = build_pilot(clock, selection=[TICKER])
+        status = pilot.get_status()
+        assert "portfolio_margin" in status
+        pm = status["portfolio_margin"]
+        assert "total_notional" in pm
+        assert "margin_utilization" in pm
+        assert "is_over_cap" in pm

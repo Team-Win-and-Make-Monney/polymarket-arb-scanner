@@ -839,6 +839,12 @@ MM_SKEW_SPREAD_FACTOR = _env_float("MM_SKEW_SPREAD_FACTOR", "1.0")
 MM_SKEW_SPREAD_MAX_MULTIPLIER = _env_float("MM_SKEW_SPREAD_MAX_MULTIPLIER", "3.0")
 MM_CROSS_VENUE_SKEW_ENABLED = _env_bool("MM_CROSS_VENUE_SKEW_ENABLED", "true")
 
+# Portfolio-Level Margin & Aggregate Exposure Guard
+MM_PORTFOLIO_GUARD_ENABLED = _env_bool("MM_PORTFOLIO_GUARD_ENABLED", "true")
+MM_MAX_PORTFOLIO_NOTIONAL_USD = _env_float("MM_MAX_PORTFOLIO_NOTIONAL_USD", "500.0")
+MM_MAX_PORTFOLIO_MARGIN_UTILIZATION = _env_float("MM_MAX_PORTFOLIO_MARGIN_UTILIZATION", "0.80")
+
+
 # Kill switch / control plane (spec section 7). Fail closed: a cache older
 # than MM_CONTROLS_MAX_STALE_SECONDS means unknown operator intent = off.
 MM_CONTROLS_POLL_SECONDS = _env_float("MM_CONTROLS_POLL_SECONDS", "60.0")
@@ -1418,6 +1424,7 @@ def validate_config() -> list[str]:
         "CTF_MAX_TRADE_SIZE": CTF_MAX_TRADE_SIZE,
         "INVENTORY_MAX_DELTA_CONTRACTS": INVENTORY_MAX_DELTA_CONTRACTS,
         "INVENTORY_REBALANCE_MAX_COST": INVENTORY_REBALANCE_MAX_COST,
+        "MM_MAX_PORTFOLIO_NOTIONAL_USD": MM_MAX_PORTFOLIO_NOTIONAL_USD,
     }
     for name, val in _positive.items():
         if not math.isfinite(val) or val <= 0:
@@ -1434,6 +1441,11 @@ def validate_config() -> list[str]:
     if not (0 < INVENTORY_REBALANCE_MIN_IMBALANCE_RATIO <= 1):
         raise ConfigError(
             f"INVENTORY_REBALANCE_MIN_IMBALANCE_RATIO={INVENTORY_REBALANCE_MIN_IMBALANCE_RATIO} must be in (0, 1]")
+
+    if not (0 < MM_MAX_PORTFOLIO_MARGIN_UTILIZATION <= 1):
+        raise ConfigError(
+            f"MM_MAX_PORTFOLIO_MARGIN_UTILIZATION={MM_MAX_PORTFOLIO_MARGIN_UTILIZATION} must be in (0, 1]")
+
 
 
     # Plan 10 non-negative keys (zero is a valid value for these)

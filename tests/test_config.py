@@ -255,6 +255,23 @@ class TestValidateConfig:
         assert cfg.WS_ORDERBOOK_STREAMING_ENABLED is True
         assert cfg.WS_ORDERBOOK_MAX_AGE_SECONDS == 15.0
 
+    def test_mm_skew_spread_config_defaults(self):
+        cfg = _reload_config()
+        assert cfg.MM_SKEW_SPREAD_ENABLED is True
+        assert cfg.MM_SKEW_SPREAD_FACTOR == 1.0
+        assert cfg.MM_SKEW_SPREAD_MAX_MULTIPLIER == 3.0
+        assert cfg.MM_CROSS_VENUE_SKEW_ENABLED is True
+
+    def test_mm_skew_spread_config_validation(self, monkeypatch):
+        monkeypatch.setenv("MM_SKEW_SPREAD_FACTOR", "-0.1")
+        with pytest.raises(ValueError, match="MM_SKEW_SPREAD_FACTOR.*must be >= 0"):
+            _reload_config()
+
+        monkeypatch.setenv("MM_SKEW_SPREAD_FACTOR", "1.0")
+        monkeypatch.setenv("MM_SKEW_SPREAD_MAX_MULTIPLIER", "0.5")
+        with pytest.raises(ValueError, match="MM_SKEW_SPREAD_MAX_MULTIPLIER.*must be >= 1.0"):
+            _reload_config()
+
     @pytest.mark.parametrize("name,value", [
         ("LIP_MIN_POOL", "-0.01"),
         ("LIP_MAX_MARKETS", "0"),

@@ -399,6 +399,7 @@ class KalshiMMPilot:
         time_fn=time.time,
         mono_fn=time.monotonic,
         state_path: str | None = STATE_PATH,
+        inventory_balancer=None,
     ):
         import config
         from market_maker import (QuoteEngine, get_toxic_flow_detector,
@@ -417,6 +418,17 @@ class KalshiMMPilot:
         # (NTP, DST, frozen clocks) must not defeat or false-trigger ceilings.
         self._mono_fn = mono_fn
         self.dry_run = config.DRY_RUN if dry_run is None else dry_run
+
+        if inventory_balancer is not None:
+            self._inventory_balancer = inventory_balancer
+        elif getattr(config, "MM_CROSS_VENUE_SKEW_ENABLED", True):
+            try:
+                from inventory_balancer import get_inventory_balancer
+                self._inventory_balancer = get_inventory_balancer()
+            except Exception:
+                self._inventory_balancer = None
+        else:
+            self._inventory_balancer = None
 
         # Pilot-owned hedger over the choke-point proxy (spec section 4).
         from hedger import PartialFillHedger
@@ -571,6 +583,47 @@ class KalshiMMPilot:
             tickers.update(info["ticker"] for info in self._orders.values())
         tickers.update(self.inventory.tickers_with_inventory())
         return sorted(tickers)
+
+    def _get_cross_venue_skew(self, ticker: str) -> dict:
+        """Query cross-venue delta tracking and skew metrics from InventoryBalancer.
+
+        Note: Excludes the pilot's own Kalshi platform holdings so that
+        the external venue delta is not double-counted with local Kalshi inventory.
+        """
+        import config
+        if not getattr(config, "MM_CROSS_VENUE_SKEW_ENABLED", True):
+            return {"delta_net": 0.0, "imbalance_ratio": 0.0, "is_imbalanced": False}
+        if not hasattr(self, "_inventory_balancer") or self._inventory_balancer is None:
+            return {"delta_net": 0.0, "imbalance_ratio": 0.0, "is_imbalanced": False}
+        try:
+            info = self._inventory_balancer.get_market_delta(ticker)
+            if info:
+                breakdown = info.get("platform_breakdown") or {}
+                # Exclude kalshi platform to get pure external venue delta without double counting
+                non_kalshi_yes = sum(
+                    float(outs.get("yes", 0.0) or 0.0)
+                    for plat, outs in breakdown.items()
+                    if str(plat).lower() != "kalshi"
+                )
+                non_kalshi_no = sum(
+                    float(outs.get("no", 0.0) or 0.0)
+                    for plat, outs in breakdown.items()
+                    if str(plat).lower() != "kalshi"
+                )
+                cv_delta = non_kalshi_yes - non_kalshi_no
+                cv_total = non_kalshi_yes + non_kalshi_no
+                cv_ratio = (abs(cv_delta) / cv_total) if cv_total > 0 else 0.0
+                max_delta = getattr(self._inventory_balancer, "max_delta_contracts", 50.0)
+                max_imb = getattr(self._inventory_balancer, "max_imbalance_ratio", 0.70)
+                is_cv_imbalanced = abs(cv_delta) >= max_delta and cv_ratio >= max_imb
+                return {
+                    "delta_net": cv_delta,
+                    "imbalance_ratio": cv_ratio,
+                    "is_imbalanced": is_cv_imbalanced,
+                }
+        except Exception as exc:
+            logger.debug("Failed querying cross-venue skew for %s: %s", ticker, exc)
+        return {"delta_net": 0.0, "imbalance_ratio": 0.0, "is_imbalanced": False}
 
     def update_book(self, ticker: str, raw_book: dict | None, source: str = "rest") -> None:
         """Cache a fresh order book snapshot for a pilot market.
@@ -799,6 +852,12 @@ class KalshiMMPilot:
                 "max_age_seconds": getattr(config, "MM_WS_BOOK_MAX_AGE_SECONDS", 15.0),
                 "ws_updates_count": self._ws_book_updates,
                 "rest_fetches_count": self._rest_book_fetches,
+            },
+            "inventory_skew": {
+                "enabled": getattr(config, "MM_SKEW_SPREAD_ENABLED", True),
+                "cross_venue_enabled": getattr(config, "MM_CROSS_VENUE_SKEW_ENABLED", True),
+                "factor": getattr(config, "MM_SKEW_SPREAD_FACTOR", 1.0),
+                "max_multiplier": getattr(config, "MM_SKEW_SPREAD_MAX_MULTIPLIER", 3.0),
             },
             "toxicity": toxicity_data,
             "seen_fill_ids": list(self._seen_fill_ids.keys())[-200:],
@@ -1490,6 +1549,12 @@ class KalshiMMPilot:
                            abs(net_usd) >= config.MM_MAX_INVENTORY_USD)
         if over_per_market:
             one_side = "ask_only" if net_ct > 0 else "bid_only"
+
+        # Cross-venue inventory delta check: enforce one-side quoting when imbalanced
+        cv_skew = self._get_cross_venue_skew(ticker)
+        if cv_skew.get("is_imbalanced") and one_side is None:
+            cv_d = cv_skew.get("delta_net", 0.0)
+            one_side = "ask_only" if cv_d > 0 else "bid_only"
         total = self.inventory.total_net_usd()
         if total >= config.MM_MAX_TOTAL_INVENTORY_USD:
             # Stop the accumulating side in EVERY market; a flat market has
@@ -1652,21 +1717,52 @@ class KalshiMMPilot:
                 self._record_lip_snapshot(ticker)
                 return []
 
+        # Inventory skew calculation combining local inventory and cross-venue delta
+        local_usd = self.inventory.net_usd(ticker)
+        local_ratio = (local_usd / config.MM_MAX_INVENTORY_USD) if config.MM_MAX_INVENTORY_USD > 0 else 0.0
+        cv_skew = self._get_cross_venue_skew(ticker)
+        cv_delta = float(cv_skew.get("delta_net", 0.0) or 0.0)
+        cv_ratio = (cv_delta / config.INVENTORY_MAX_DELTA_CONTRACTS) if config.INVENTORY_MAX_DELTA_CONTRACTS > 0 else 0.0
+        combined_ratio = max(abs(local_ratio), abs(cv_ratio))
+
+        skew_spread_mult = 1.0
+        if getattr(config, "MM_SKEW_SPREAD_ENABLED", True) and combined_ratio > 0:
+            skew_factor = getattr(config, "MM_SKEW_SPREAD_FACTOR", 1.0)
+            max_skew_mult = getattr(config, "MM_SKEW_SPREAD_MAX_MULTIPLIER", 3.0)
+            skew_spread_mult = min(max_skew_mult, 1.0 + (combined_ratio * skew_factor))
+
+        if getattr(config, "MM_CROSS_VENUE_SKEW_ENABLED", True):
+            cv_usd = cv_delta * mid
+            combined_inv = local_usd + cv_usd
+            effective_inv = max(-config.MM_MAX_INVENTORY_USD, min(config.MM_MAX_INVENTORY_USD, combined_inv))
+        else:
+            effective_inv = local_usd
+
         try:
             quotes = self._quote_engine.calculate_quotes(
                 mid,
-                inventory=self.inventory.net_usd(ticker),
+                inventory=effective_inv,
                 max_inventory=config.MM_MAX_INVENTORY_USD,
                 market_key=ticker,  # G9: volatility widening hook
                 toxicity_spread_multiplier=tox_spread_mult,
+                skew_spread_multiplier=skew_spread_mult,
             )
         except TypeError:
-            quotes = self._quote_engine.calculate_quotes(
-                mid,
-                inventory=self.inventory.net_usd(ticker),
-                max_inventory=config.MM_MAX_INVENTORY_USD,
-                market_key=ticker,
-            )
+            try:
+                quotes = self._quote_engine.calculate_quotes(
+                    mid,
+                    inventory=effective_inv,
+                    max_inventory=config.MM_MAX_INVENTORY_USD,
+                    market_key=ticker,
+                    toxicity_spread_multiplier=tox_spread_mult,
+                )
+            except TypeError:
+                quotes = self._quote_engine.calculate_quotes(
+                    mid,
+                    inventory=effective_inv,
+                    max_inventory=config.MM_MAX_INVENTORY_USD,
+                    market_key=ticker,
+                )
         bid = self._round_tick(quotes["bid"])
         ask = self._round_tick(quotes["ask"])
 
@@ -1720,7 +1816,9 @@ class KalshiMMPilot:
             net_ct = self.inventory.net_contracts(ticker)
             net_usd = abs(self.inventory.net_usd(ticker))
             signed_unit = 1 if str(side).lower() in ("bid", "yes") else -1
-            is_accumulating = (net_ct == 0) or (abs(net_ct + signed_unit) > abs(net_ct))
+
+            comb_ct = net_ct + cv_delta if getattr(config, "MM_CROSS_VENUE_SKEW_ENABLED", True) else net_ct
+            is_accumulating = (comb_ct == 0) or (abs(comb_ct + signed_unit) > abs(comb_ct))
 
             if is_accumulating:
                 inv_ct_headroom = max(0, config.MM_MAX_INVENTORY_CONTRACTS - abs(net_ct))
@@ -1729,9 +1827,12 @@ class KalshiMMPilot:
                 gross_avail = config.MM_MAX_GROSS_PER_MARKET_USD - (abs(self.inventory.net_usd(ticker)) + self._resting_notional(ticker))
                 gross_headroom = int(max(0.0, gross_avail) / price)
                 inv_headroom = min(inv_ct_headroom, inv_usd_headroom, inv_tot_headroom, gross_headroom)
+                if getattr(config, "MM_CROSS_VENUE_SKEW_ENABLED", True) and abs(cv_delta) > 0:
+                    cv_headroom = max(0, int(config.INVENTORY_MAX_DELTA_CONTRACTS - abs(cv_delta)))
+                    inv_headroom = min(inv_headroom, cv_headroom)
             else:
                 # Reducing orders work off inventory and are capped by held inventory
-                inv_headroom = max(0, abs(net_ct))
+                inv_headroom = max(0, abs(comb_ct))
 
             lip_info: dict = {}
             if hasattr(self, "_lip_tracker") and self._lip_tracker is not None:
@@ -1763,6 +1864,10 @@ class KalshiMMPilot:
             else:
                 balanced_base = min(base_count, inv_headroom)
 
+            if is_accumulating and combined_ratio > 0 and balanced_base > 0:
+                skew_size_taper = max(0.2, 1.0 - (combined_ratio * 0.5))
+                balanced_base = max(1, int(balanced_base * skew_size_taper))
+
             if balanced_base <= 0:
                 return 0, lip_info
             final_count = max(1, int(balanced_base * tox_size_mult))
@@ -1778,6 +1883,12 @@ class KalshiMMPilot:
             ticker,
             True,
             f"toxicity={tox_score:.4f} spread_mult={tox_spread_mult:.2f} size_mult={tox_size_mult:.2f}",
+        )
+        self._write_decision(
+            "G7b_inventory_skew_widening",
+            ticker,
+            True,
+            f"local_usd={local_usd:.2f} cv_delta={cv_delta:.1f} skew_ratio={combined_ratio:.2f} skew_spread_mult={skew_spread_mult:.2f}",
         )
         self._write_decision(
             "G11b_lip_target_balancer",
@@ -2014,6 +2125,17 @@ class KalshiMMPilot:
         # 1. Inventory update (signed dollar delta / avg-cost accounting).
         self.inventory.apply_fill(event.ticker, event.side, event.action,
                                   event.count, event.price)
+        if hasattr(self, "_inventory_balancer") and self._inventory_balancer is not None:
+            try:
+                self._inventory_balancer.update_position(
+                    market_key=event.ticker,
+                    platform="kalshi",
+                    outcome=event.side,
+                    side=event.action,
+                    size=event.count,
+                )
+            except Exception as exc:
+                logger.debug("Failed updating inventory balancer for fill on %s: %s", event.ticker, exc)
 
         # Trade log: strategy-tagged from trade one (operating rule 5).
         self._log_fill(event)
@@ -2520,6 +2642,12 @@ class KalshiMMPilot:
                 "max_age_seconds": getattr(config, "MM_WS_BOOK_MAX_AGE_SECONDS", 15.0),
                 "ws_updates_count": self._ws_book_updates,
                 "rest_fetches_count": self._rest_book_fetches,
+            },
+            "inventory_skew": {
+                "enabled": getattr(config, "MM_SKEW_SPREAD_ENABLED", True),
+                "cross_venue_enabled": getattr(config, "MM_CROSS_VENUE_SKEW_ENABLED", True),
+                "factor": getattr(config, "MM_SKEW_SPREAD_FACTOR", 1.0),
+                "max_multiplier": getattr(config, "MM_SKEW_SPREAD_MAX_MULTIPLIER", 3.0),
             },
             "toxicity": toxicity_by_ticker,
             "dry_run": self.dry_run,

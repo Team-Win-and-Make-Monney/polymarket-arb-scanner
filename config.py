@@ -829,6 +829,12 @@ MM_LIP_BALANCER_MIN_EFFICIENCY = _env_float("MM_LIP_BALANCER_MIN_EFFICIENCY", "0
 MM_WS_ORDERBOOK_STREAMING_ENABLED = _env_bool("MM_WS_ORDERBOOK_STREAMING_ENABLED", "true")
 MM_WS_BOOK_MAX_AGE_SECONDS = _env_float("MM_WS_BOOK_MAX_AGE_SECONDS", "15.0")
 
+# Inventory Skew Quoting & Spread Widening
+MM_SKEW_SPREAD_ENABLED = _env_bool("MM_SKEW_SPREAD_ENABLED", "true")
+MM_SKEW_SPREAD_FACTOR = _env_float("MM_SKEW_SPREAD_FACTOR", "1.0")
+MM_SKEW_SPREAD_MAX_MULTIPLIER = _env_float("MM_SKEW_SPREAD_MAX_MULTIPLIER", "3.0")
+MM_CROSS_VENUE_SKEW_ENABLED = _env_bool("MM_CROSS_VENUE_SKEW_ENABLED", "true")
+
 # Kill switch / control plane (spec section 7). Fail closed: a cache older
 # than MM_CONTROLS_MAX_STALE_SECONDS means unknown operator intent = off.
 MM_CONTROLS_POLL_SECONDS = _env_float("MM_CONTROLS_POLL_SECONDS", "60.0")
@@ -1440,6 +1446,12 @@ def validate_config() -> list[str]:
         raise ConfigError(
             f"MM_LIP_BALANCER_MIN_EFFICIENCY={MM_LIP_BALANCER_MIN_EFFICIENCY} "
             f"must be in [0, 1]")
+    if MM_SKEW_SPREAD_FACTOR < 0:
+        raise ConfigError(
+            f"MM_SKEW_SPREAD_FACTOR={MM_SKEW_SPREAD_FACTOR} must be >= 0")
+    if MM_SKEW_SPREAD_MAX_MULTIPLIER < 1.0:
+        raise ConfigError(
+            f"MM_SKEW_SPREAD_MAX_MULTIPLIER={MM_SKEW_SPREAD_MAX_MULTIPLIER} must be >= 1.0")
 
     # --- Non-negative checks ---
     _non_negative = {

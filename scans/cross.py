@@ -65,8 +65,9 @@ for _i, _pa in enumerate(_ALL_PLATFORMS):
 
 def _refine_cross_with_clob(opportunities: list[dict], markets_by_key: dict, min_profit: float,
                             price_cache: dict | None = None,
-                            funnel=None) -> list[dict]:
-    """Stage 2: Re-check cross-platform candidates using CLOB ask prices for Polymarket side."""
+                            funnel=None,
+                            feed_manager=None) -> list[dict]:
+    """Stage 2: Re-check cross-platform candidates using CLOB ask prices for Polymarket and Kalshi sides."""
     if not opportunities:
         return opportunities
 
@@ -83,8 +84,12 @@ def _refine_cross_with_clob(opportunities: list[dict], markets_by_key: dict, min
     clob_results = {}
     if fetch_tasks:
         with ThreadPoolExecutor(max_workers=4) as pool:
-            futures = {pool.submit(_fetch_clob_for_market, m, price_cache): mk
-                       for mk, m in fetch_tasks.items()}
+            if feed_manager is not None:
+                futures = {pool.submit(_fetch_clob_for_market, m, price_cache, feed_manager): mk
+                           for mk, m in fetch_tasks.items()}
+            else:
+                futures = {pool.submit(_fetch_clob_for_market, m, price_cache): mk
+                           for mk, m in fetch_tasks.items()}
             for future in as_completed(futures):
                 mk = futures[future]
                 try:
@@ -135,6 +140,42 @@ def _refine_cross_with_clob(opportunities: list[dict], markets_by_key: dict, min
             if funnel:
                 funnel.record_clob_dropped(1)
             continue
+
+        # In-memory Kalshi WebSocket orderbook check
+        k_ticker = opp.get("_kalshi_ticker")
+        k_depth = None
+        if feed_manager and k_ticker:
+            k_book, k_age = feed_manager.get_orderbook("kalshi", k_ticker)
+            if k_book and k_age is not None and k_age <= 15.0:
+                try:
+                    from kalshi_api import parse_orderbook, best_yes_ask, best_no_ask
+                    parsed = parse_orderbook(k_book)
+                    y_ask = best_yes_ask(parsed)
+                    n_ask = best_no_ask(parsed)
+                    if y_ask is not None and n_ask is not None:
+                        ky, kn = round(y_ask[0], 4), round(n_ask[0], 4)
+                        if opp.get("_inverted"):
+                            ky, kn = kn, ky
+                        opp["_kalshi_yes"] = ky
+                        opp["_kalshi_no"] = kn
+                        k_depth = min(int(y_ask[1]), int(n_ask[1]))
+                except Exception as exc:
+                    logger.debug("Failed parsing WS orderbook for %s: %s", k_ticker, exc)
+        elif price_cache and k_ticker:
+            import time
+            cached_k = price_cache.get(("kalshi", k_ticker))
+            if cached_k and (time.time() - cached_k.get("_ts", 0)) <= 15.0:
+                if cached_k.get("yes_ask") is not None and cached_k.get("no_ask") is not None:
+                    ky, kn = round(cached_k["yes_ask"], 4), round(cached_k["no_ask"], 4)
+                    if opp.get("_inverted"):
+                        ky, kn = kn, ky
+                    opp["_kalshi_yes"] = ky
+                    opp["_kalshi_no"] = kn
+                    y_sz = cached_k.get("yes_ask_size")
+                    n_sz = cached_k.get("no_ask_size")
+                    if y_sz is not None and n_sz is not None:
+                        k_depth = min(int(y_sz), int(n_sz))
+
         k_yes = opp.get("_kalshi_yes")
         k_no = opp.get("_kalshi_no")
 
@@ -161,7 +202,10 @@ def _refine_cross_with_clob(opportunities: list[dict], markets_by_key: dict, min
             opp["fees"] = f"${best['fees']:.4f}"
             opp["net_profit"] = best["net_profit"]
             opp["net_roi"] = f"{best['net_profit'] / total_cost * 100:.2f}%"
-            opp["_clob_depth"] = min(pm_yes_depth or 0, pm_no_depth or 0)
+            combined_depth = min(pm_yes_depth or 0, pm_no_depth or 0)
+            if k_depth is not None:
+                combined_depth = min(combined_depth, k_depth)
+            opp["_clob_depth"] = combined_depth
             if partial:
                 opp["_partial_clob"] = True
             if JEV_CROSS_EQUIVALENCE_ENABLED:
@@ -245,6 +289,7 @@ def scan_cross_platform(
     kalshi_events_preloaded: list[dict] | None = None,
     price_cache: dict | None = None,
     funnel=None,
+    feed_manager=None,
 ) -> list[dict]:
     """Scan for cross-platform arbitrage between Polymarket and Kalshi."""
     if funnel is None:
@@ -397,7 +442,9 @@ def scan_cross_platform(
         funnel.record_clob_evaluated(len(opportunities))
 
     # Stage 2: Refine with CLOB ask prices
-    opportunities = _refine_cross_with_clob(opportunities, markets_by_key, min_profit, price_cache=price_cache, funnel=funnel)
+    opportunities = _refine_cross_with_clob(opportunities, markets_by_key, min_profit,
+                                            price_cache=price_cache, funnel=funnel,
+                                            feed_manager=feed_manager)
 
     # Attach fee path hints — scan-time metadata for executor re-validation
     for opp in opportunities:

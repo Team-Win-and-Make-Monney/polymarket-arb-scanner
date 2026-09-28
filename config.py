@@ -370,6 +370,14 @@ CROSS_MM_MAX_INVENTORY = _env_float("CROSS_MM_MAX_INVENTORY", "200.0")
 CROSS_MM_QUOTE_SIZE = _env_float("CROSS_MM_QUOTE_SIZE", "5.0")
 CROSS_MM_PLATFORMS = os.getenv("CROSS_MM_PLATFORMS", "polymarket,kalshi")
 
+# Cross-venue delta-neutral inventory balancer.
+# Tracks inventory delta across Polymarket and Kalshi and generates
+# rebalancing proposals to maintain delta-neutral positions (|Delta| -> 0).
+INVENTORY_BALANCER_ENABLED = _env_bool("INVENTORY_BALANCER_ENABLED", "true")
+INVENTORY_MAX_DELTA_CONTRACTS = _env_float("INVENTORY_MAX_DELTA_CONTRACTS", "50.0")
+INVENTORY_MAX_IMBALANCE_RATIO = _env_float("INVENTORY_MAX_IMBALANCE_RATIO", "0.5")
+INVENTORY_REBALANCE_MAX_COST = _env_float("INVENTORY_REBALANCE_MAX_COST", "25.0")
+
 # Fee promotional arbitrage (Strategy #9).
 # When enabled, cross-platform near-misses (within PROMO_NEAR_MISS_BAND of
 # MIN_NET_ROI) are captured into NearMissCache and re-scored when fee rates
@@ -1398,10 +1406,16 @@ def validate_config() -> list[str]:
         "MM_WS_BOOK_MAX_AGE_SECONDS": MM_WS_BOOK_MAX_AGE_SECONDS,
         "WS_ORDERBOOK_MAX_AGE_SECONDS": WS_ORDERBOOK_MAX_AGE_SECONDS,
         "CTF_MAX_TRADE_SIZE": CTF_MAX_TRADE_SIZE,
+        "INVENTORY_MAX_DELTA_CONTRACTS": INVENTORY_MAX_DELTA_CONTRACTS,
+        "INVENTORY_REBALANCE_MAX_COST": INVENTORY_REBALANCE_MAX_COST,
     }
     for name, val in _positive.items():
         if not math.isfinite(val) or val <= 0:
             raise ConfigError(f"{name}={val} must be > 0")
+
+    if not (0 < INVENTORY_MAX_IMBALANCE_RATIO <= 1):
+        raise ConfigError(
+            f"INVENTORY_MAX_IMBALANCE_RATIO={INVENTORY_MAX_IMBALANCE_RATIO} must be in (0, 1]")
 
     # Plan 10 non-negative keys (zero is a valid value for these)
     if MM_INVENTORY_TARGET_USD < 0:

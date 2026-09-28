@@ -1504,7 +1504,9 @@ def main():
         "reentry_improvement_threshold": CONFIG_REENTRY_IMPROVEMENT_THRESHOLD,
         "dispute_gate_enabled": config.DISPUTE_GATE_ENABLED,
     }
-    risk_manager = RiskManager(risk_config)
+    from inventory_balancer import InventoryBalancer
+    inventory_balancer = InventoryBalancer()
+    risk_manager = RiskManager(risk_config, inventory_balancer=inventory_balancer)
 
     # Initialize platform clients
     kalshi_client = None

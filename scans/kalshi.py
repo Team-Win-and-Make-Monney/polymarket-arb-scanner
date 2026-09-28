@@ -116,6 +116,8 @@ def scan_kalshi_binary(
     min_profit: float,
     kalshi_data: tuple | None = None,
     funnel=None,
+    price_cache: dict | None = None,
+    feed_manager=None,
 ) -> list[dict]:
     """Scan for Kalshi binary arbitrage (YES + NO < $1.00 on same market)."""
     if funnel is None:
@@ -148,7 +150,28 @@ def scan_kalshi_binary(
             if not _within_resolution_window(km, platform="kalshi"):
                 filtered_resolution += 1
                 continue
-            yes_price, no_price = kalshi_client.get_market_price(km)
+            ticker = km.get("ticker", "")
+            yes_price, no_price = None, None
+            if feed_manager and ticker:
+                book, age = feed_manager.get_orderbook("kalshi", ticker)
+                if book and age is not None and age <= 15.0:
+                    try:
+                        from kalshi_api import parse_orderbook, best_yes_ask, best_no_ask
+                        parsed = parse_orderbook(book)
+                        y_ask = best_yes_ask(parsed)
+                        n_ask = best_no_ask(parsed)
+                        if y_ask is not None and n_ask is not None:
+                            yes_price, no_price = y_ask[0], n_ask[0]
+                    except Exception as e:
+                        logger.debug("Failed parsing WS orderbook for %s: %s", ticker, e)
+            if (yes_price is None or no_price is None) and price_cache and ticker:
+                cached = price_cache.get(("kalshi", ticker))
+                if cached and (time.time() - cached.get("_ts", 0)) <= 15.0:
+                    if cached.get("yes_ask") is not None and cached.get("no_ask") is not None:
+                        yes_price = cached["yes_ask"]
+                        no_price = cached["no_ask"]
+            if yes_price is None or no_price is None:
+                yes_price, no_price = kalshi_client.get_market_price(km)
             if yes_price is None or no_price is None:
                 continue
             if yes_price <= 0.001 or no_price <= 0.001:
@@ -156,7 +179,6 @@ def scan_kalshi_binary(
 
             result = net_profit_kalshi_binary(yes_price, no_price)
             if result["net_profit"] >= min_profit:
-                ticker = km.get("ticker", "")
                 total_cost = yes_price + no_price
                 opportunities.append({
                     "type": "KalshiBinary",
@@ -191,6 +213,25 @@ def scan_kalshi_binary(
             ticker = opp.get("_kalshi_ticker", "")
             if not ticker:
                 return opp, 0
+            if feed_manager:
+                book, age = feed_manager.get_orderbook("kalshi", ticker)
+                if book and age is not None and age <= 15.0:
+                    try:
+                        from kalshi_api import parse_orderbook, best_yes_ask, best_no_ask
+                        parsed = parse_orderbook(book)
+                        y_ask = best_yes_ask(parsed)
+                        n_ask = best_no_ask(parsed)
+                        if y_ask is not None and n_ask is not None:
+                            return opp, min(int(y_ask[1]), int(n_ask[1]))
+                    except Exception as e:
+                        logger.debug("Failed parsing WS depth for %s: %s", ticker, e)
+            if price_cache:
+                cached = price_cache.get(("kalshi", ticker))
+                if cached and (time.time() - cached.get("_ts", 0)) <= 15.0:
+                    y_sz = cached.get("yes_ask_size")
+                    n_sz = cached.get("no_ask_size")
+                    if y_sz is not None and n_sz is not None:
+                        return opp, min(int(y_sz), int(n_sz))
             depth = kalshi_client.get_order_book_depth(ticker)
             if depth:
                 return opp, min(depth.get("yes_ask_size", 0), depth.get("no_ask_size", 0))
@@ -212,6 +253,8 @@ def scan_kalshi_multi(
     min_profit: float,
     kalshi_data: tuple | None = None,
     funnel=None,
+    price_cache: dict | None = None,
+    feed_manager=None,
 ) -> list[dict]:
     """Scan for Kalshi multi-outcome arbitrage (sum of YES prices < $1.00 across event)."""
     if funnel is None:
@@ -383,14 +426,35 @@ def scan_kalshi_multi(
         def _fetch_multi_depth(opp):
             min_d = float("inf")
             for ticker in opp.get("_kalshi_tickers", []):
-                if ticker:
+                if not ticker:
+                    continue
+                d = None
+                if feed_manager:
+                    book, age = feed_manager.get_orderbook("kalshi", ticker)
+                    if book and age is not None and age <= 15.0:
+                        try:
+                            from kalshi_api import parse_orderbook, best_yes_ask
+                            parsed = parse_orderbook(book)
+                            y_ask = best_yes_ask(parsed)
+                            if y_ask is not None:
+                                d = int(y_ask[1])
+                        except Exception as e:
+                            logger.debug("Failed parsing WS depth for multi %s: %s", ticker, e)
+                if d is None and price_cache:
+                    cached = price_cache.get(("kalshi", ticker))
+                    if cached and (time.time() - cached.get("_ts", 0)) <= 15.0:
+                        y_sz = cached.get("yes_ask_size")
+                        if y_sz is not None:
+                            d = int(y_sz)
+                if d is None:
                     depth = kalshi_client.get_order_book_depth(ticker)
                     if depth:
                         d = depth.get("yes_ask_size", 0)
-                        min_d = min(min_d, d)
                     else:
-                        min_d = 0
-                        break
+                        d = 0
+                min_d = min(min_d, d)
+                if min_d == 0:
+                    break
             return opp, min_d if min_d != float("inf") else 0
 
         with ThreadPoolExecutor(max_workers=8) as pool:

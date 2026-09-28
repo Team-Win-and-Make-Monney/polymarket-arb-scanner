@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 class RiskManager:
     """Pure gate: returns (allowed, reason) for each opportunity."""
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, inventory_balancer=None):
         self.base_trade_size = config.get("base_trade_size", 5.0)
         self.max_trade_size = config.get("max_trade_size", 25.0)
         self.daily_loss_limit = config.get("daily_loss_limit", 25.0)
@@ -21,6 +21,8 @@ class RiskManager:
         # MM-specific limits
         self.mm_max_inventory_per_market = config.get("mm_max_inventory", 50.0)
         self.mm_max_total_exposure = config.get("mm_max_total_exposure", 500.0)
+        # Inventory balancer for cross-venue delta tracking
+        self.inventory_balancer = inventory_balancer
         # Daily trade limit (0 = unlimited)
         self.max_daily_trades = config.get("max_daily_trades", 0)
         self.dispute_gate_enabled = config.get("dispute_gate_enabled", False)
@@ -152,6 +154,24 @@ class RiskManager:
             inventory = opportunity.get("_inventory", 0)
             if abs(inventory) >= self.mm_max_inventory_per_market:
                 return False, f"MM inventory limit reached ({abs(inventory):.0f} >= {self.mm_max_inventory_per_market:.0f})"
+
+        # 7b. Cross-venue inventory delta skew check
+        if self.inventory_balancer and getattr(self.inventory_balancer, "enabled", True):
+            market_key = (
+                opportunity.get("_market_key")
+                or opportunity.get("_condition_id")
+                or opportunity.get("_kalshi_ticker")
+                or opportunity.get("market", "")
+            )
+            outcome = (opportunity.get("_outcome") or opportunity.get("outcome") or "").lower()
+            side = (opportunity.get("_side") or opportunity.get("side") or "buy").lower()
+            size = float(opportunity.get("_size") or opportunity.get("size") or self.base_trade_size)
+            if outcome in ("yes", "no"):
+                allowed, reason = self.inventory_balancer.check_trade_skew(
+                    market_key, outcome, side, size
+                )
+                if not allowed:
+                    return False, reason
 
         # 8. UMA dispute gate — block resolution-held Polymarket arbs on disputed markets
         base_opp_type = opp_type.split("(")[0]

@@ -2611,7 +2611,6 @@ class TestMMPilotPortfolioMarginGuard:
         # QuoteEngine wants count for $30 quote @ 0.50 = 60 contracts
         # Headroom allows only $10 total across competing quotes when flat
         pilot.refresh_market(TICKER)
-        orders = {o["purpose"]: o for o in pilot.resting_orders(TICKER)}
         # Total portfolio notional (inventory + resting orders) must be <= $50 cap
         total_portfolio_exposure = pilot.inventory.total_net_usd() + pilot.total_resting_notional()
         assert total_portfolio_exposure <= 50.0

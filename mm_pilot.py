@@ -758,6 +758,60 @@ class KalshiMMPilot:
                        for info in self._orders.values()
                        if info["ticker"] == ticker)
 
+    def total_resting_notional(self) -> float:
+        """Total dollar value across all resting quote orders in all markets."""
+        with self._lock:
+            return sum(info["count"] * info["price"] for info in self._orders.values())
+
+    def get_portfolio_margin_metrics(self) -> dict:
+        """Calculate aggregate portfolio margin and exposure metrics across all markets."""
+        import config
+        resting_notional = self.total_resting_notional()
+        inventory_notional = self.inventory.total_net_usd()
+        total_notional = resting_notional + inventory_notional
+        max_notional = getattr(config, "MM_MAX_PORTFOLIO_NOTIONAL_USD", 500.0)
+        bankroll = getattr(config, "MM_PILOT_BANKROLL_USD", 2000.0)
+
+        avail_balance = None
+        if self._client is not None and hasattr(self._client, "get_balance"):
+            try:
+                avail_balance = self._client.get_balance()
+            except Exception as e:
+                logger.debug("Failed to query Kalshi balance: %s", e)
+
+        base_capital = avail_balance if (avail_balance is not None and avail_balance > 0) else bankroll
+        margin_utilization = total_notional / base_capital if base_capital > 0 else 1.0
+        max_utilization = getattr(config, "MM_MAX_PORTFOLIO_MARGIN_UTILIZATION", 0.80)
+
+        is_over_notional = total_notional >= max_notional
+        is_over_margin = margin_utilization >= max_utilization
+        is_over_cap = is_over_notional or is_over_margin
+
+        cap_reason = "ok"
+        if is_over_notional:
+            cap_reason = f"portfolio_notional_cap ({total_notional:.2f} >= {max_notional:.2f})"
+        elif is_over_margin:
+            cap_reason = f"portfolio_margin_cap ({margin_utilization:.1%} >= {max_utilization:.1%})"
+
+        with self._lock:
+            active_tickers = set(self.inventory.tickers_with_inventory()) | {
+                info["ticker"] for info in self._orders.values()
+            }
+
+        return {
+            "total_resting_notional": round(resting_notional, 2),
+            "total_inventory_notional": round(inventory_notional, 2),
+            "total_notional": round(total_notional, 2),
+            "max_notional": round(max_notional, 2),
+            "base_capital": round(base_capital, 2),
+            "margin_utilization": round(margin_utilization, 4),
+            "max_utilization": round(max_utilization, 4),
+            "is_over_cap": is_over_cap,
+            "cap_breached_reason": cap_reason,
+            "active_market_count": len(active_tickers),
+        }
+
+
     # -- restart persistence / startup reconciliation (finding #4) -----------
 
     def _persist_state(self) -> None:
@@ -1175,6 +1229,18 @@ class KalshiMMPilot:
             if (self.inventory.total_net_usd() + notional
                     > config.MM_MAX_TOTAL_INVENTORY_USD):
                 return GateResult(False, "total_inventory_cap")
+        # 6b. Portfolio-level margin & aggregate exposure guard
+        if getattr(config, "MM_PORTFOLIO_GUARD_ENABLED", True) and not derived_reducing:
+            p_metrics = self.get_portfolio_margin_metrics()
+            max_p_notional = getattr(config, "MM_MAX_PORTFOLIO_NOTIONAL_USD", 500.0)
+            if p_metrics["total_notional"] + notional > max_p_notional:
+                return GateResult(False, "portfolio_notional_cap_exceeded")
+
+            base_capital = p_metrics.get("base_capital", getattr(config, "MM_PILOT_BANKROLL_USD", 2000.0))
+            max_util = getattr(config, "MM_MAX_PORTFOLIO_MARGIN_UTILIZATION", 0.80)
+            projected_util = (p_metrics["total_notional"] + notional) / base_capital if base_capital > 0 else 1.0
+            if projected_util > max_util:
+                return GateResult(False, "portfolio_margin_cap_exceeded")
         # 7. Gross cap: inventory at cost + resting quote notional + this order
         gross = net_usd + self._resting_notional(ticker) + notional
         if gross > config.MM_MAX_GROSS_PER_MARKET_USD:
@@ -1584,7 +1650,29 @@ class KalshiMMPilot:
                  f"one_side={one_side or 'none'}")
         if no_new_quotes:
             return {"action": "skip", "reason": "gross_cap"}
+
+        # G10c portfolio margin & aggregate exposure guard
+        if getattr(config, "MM_PORTFOLIO_GUARD_ENABLED", True):
+            portfolio_metrics = self.get_portfolio_margin_metrics()
+            if portfolio_metrics["is_over_cap"]:
+                cap_reason = portfolio_metrics["cap_breached_reason"]
+                gate("G10c_portfolio_margin_cap", False, cap_reason)
+                # Restrict to reducing quotes only when portfolio is at/over cap
+                if net_ct > 0:
+                    one_side = "ask_only"
+                elif net_ct < 0:
+                    one_side = "bid_only"
+                else:
+                    return {"action": "pull", "reason": cap_reason}
+            else:
+                gate(
+                    "G10c_portfolio_margin_cap",
+                    True,
+                    f"notional={portfolio_metrics['total_notional']:.1f}/{portfolio_metrics['max_notional']:.1f} util={portfolio_metrics['margin_utilization']:.1%}",
+                )
+
         return {"action": "quote", "reason": "ok", "one_side": one_side}
+
 
     # -- quoting ---------------------------------------------------------------
 
@@ -1902,6 +1990,40 @@ class KalshiMMPilot:
         self._write_decision("G11_depth_sizing", ticker,
                              bid_count >= 1 or ask_count >= 1,
                              f"bid_count={bid_count} ask_count={ask_count}")
+
+        # G10c portfolio margin guard: clamp accumulating quote sizes to remaining portfolio headroom
+        if getattr(config, "MM_PORTFOLIO_GUARD_ENABLED", True):
+            p_metrics = self.get_portfolio_margin_metrics()
+            existing_resting_ticker = self._resting_notional(ticker)
+            eff_current_notional = max(0.0, p_metrics["total_notional"] - existing_resting_ticker)
+            base_capital = p_metrics.get("base_capital", getattr(config, "MM_PILOT_BANKROLL_USD", 2000.0))
+            max_margin_notional = base_capital * p_metrics.get("max_utilization", 0.80)
+            margin_headroom_usd = max(0.0, max_margin_notional - eff_current_notional)
+            headroom_usd = max(0.0, min(p_metrics["max_notional"] - eff_current_notional, margin_headroom_usd))
+
+            cur_net_ct = self.inventory.net_contracts(ticker)
+            # When flat, both bid and ask accumulate, so they compete for headroom
+            if cur_net_ct == 0 and bid_count > 0 and ask_count > 0:
+                half_headroom = headroom_usd / 2.0
+                max_bid_ct_by_headroom = int(half_headroom / bid) if bid > 0 else 0
+                max_ask_ct_by_headroom = int(half_headroom / no_price) if no_price > 0 else 0
+                bid_count = min(bid_count, max_bid_ct_by_headroom)
+                ask_count = min(ask_count, max_ask_ct_by_headroom)
+            else:
+                if bid_count > 0 and (cur_net_ct >= 0):
+                    max_bid_ct_by_headroom = int(headroom_usd / bid) if bid > 0 else 0
+                    bid_count = min(bid_count, max_bid_ct_by_headroom)
+                if ask_count > 0 and (cur_net_ct <= 0):
+                    max_ask_ct_by_headroom = int(headroom_usd / no_price) if no_price > 0 else 0
+                    ask_count = min(ask_count, max_ask_ct_by_headroom)
+
+            self._write_decision(
+                "G10c_portfolio_margin_guard",
+                ticker,
+                bid_count > 0 or ask_count > 0,
+                f"total_notional={p_metrics['total_notional']:.1f} headroom={headroom_usd:.1f} util={p_metrics['margin_utilization']:.1%}",
+            )
+
 
         # Cancel/replace: pull existing quote orders, then place fresh GTC.
         for order in self.resting_orders(ticker):
@@ -2649,7 +2771,9 @@ class KalshiMMPilot:
                 "factor": getattr(config, "MM_SKEW_SPREAD_FACTOR", 1.0),
                 "max_multiplier": getattr(config, "MM_SKEW_SPREAD_MAX_MULTIPLIER", 3.0),
             },
+            "portfolio_margin": self.get_portfolio_margin_metrics(),
             "toxicity": toxicity_by_ticker,
+
             "dry_run": self.dry_run,
             "reconciled": self._reconciled,
             "fills_blind": self._fills_blind,

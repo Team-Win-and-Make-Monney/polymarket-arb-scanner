@@ -665,6 +665,8 @@ class KalshiMMPilot:
         """
         if self._client is None:
             return True
+        with self._lock:
+            self._rest_book_fetches += 1
         try:
             raw_book = self._client.fetch_order_book(ticker)
         except Exception:
@@ -1451,7 +1453,12 @@ class KalshiMMPilot:
         # looks fresh from WS. Failing here (before refresh_market reaches
         # G11/G12) is what makes that guarantee airtight.
         levels_age = self._time_fn() - book.get("levels_updated_at", 0.0)
-        g6b = levels_age <= config.MM_BOOK_MAX_STALE_SECONDS
+        max_levels_age = (
+            getattr(config, "MM_WS_BOOK_MAX_AGE_SECONDS", 15.0)
+            if book.get("source") == "ws"
+            else config.MM_BOOK_MAX_STALE_SECONDS
+        )
+        g6b = levels_age <= max_levels_age
         if not gate("G6b_book_levels_staleness", g6b,
                     "ok" if g6b else "book_levels_stale"):
             return {"action": "pull", "reason": "book_levels_stale"}
@@ -1574,24 +1581,48 @@ class KalshiMMPilot:
             else:
                 gate_reason = "levels_stale"
 
-        if need_rest and self._client is not None:
-            try:
-                self.update_book(ticker, self._client.fetch_order_book(ticker), source="rest")
-            except Exception:
-                logger.exception("MM pilot book fetch failed for %s", ticker)
+        if need_rest:
+            rest_ok = False
+            if self._client is not None:
+                try:
+                    raw_book = self._client.fetch_order_book(ticker)
+                    if raw_book:
+                        self.update_book(ticker, raw_book, source="rest")
+                        refreshed = self._book(ticker)
+                        rest_ok = (
+                            refreshed is not None
+                            and refreshed.get("source") == "rest"
+                        )
+                except Exception:
+                    logger.exception("MM pilot book fetch failed for %s", ticker)
 
-        self._write_decision(
-            "G10b_book_source",
-            ticker,
-            allowed=not need_rest,
-            reason=gate_reason,
-            source="ws" if not need_rest else "rest",
-            levels_age=levels_age,
-            ws_streaming_enabled=ws_streaming_enabled,
-            max_age_seconds=max_ws_age,
-        )
+            self._write_decision(
+                "G10b_book_source",
+                ticker,
+                allowed=False,
+                reason=gate_reason,
+                source="rest",
+                levels_age=levels_age,
+                ws_streaming_enabled=ws_streaming_enabled,
+                max_age_seconds=max_ws_age,
+            )
+
+        else:
+            self._write_decision(
+                "G10b_book_source",
+                ticker,
+                allowed=True,
+                reason=gate_reason,
+                source="ws",
+                levels_age=levels_age,
+                ws_streaming_enabled=ws_streaming_enabled,
+                max_age_seconds=max_ws_age,
+            )
 
         plan = self._evaluate_gates(ticker)
+        if need_rest and not rest_ok and plan["action"] == "quote":
+            plan = {"action": "pull", "reason": "book_refresh_failed"}
+
         if plan["action"] in ("pull", "halted"):
             if plan["action"] == "pull":
                 self.pull_market(ticker, plan["reason"])

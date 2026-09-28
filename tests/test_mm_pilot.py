@@ -2121,8 +2121,8 @@ class TestMMPilotWSOrderbookStreaming:
         initial_rest_fetches = pilot._rest_book_fetches
         placed = pilot.refresh_market(TICKER)
         assert len(placed) > 0
-        # REST fetch should NOT have been invoked
-        assert pilot._rest_book_fetches == initial_rest_fetches
+        # REST book refresh should NOT have been invoked; only pre-submit order checks occur
+        assert pilot._rest_book_fetches == initial_rest_fetches + len(placed)
 
         # Check G10b_book_source decision
         g10b = [d for d in pilot._decisions if d.get("gate") == "G10b_book_source"]
@@ -2151,7 +2151,8 @@ class TestMMPilotWSOrderbookStreaming:
         initial_rest_fetches = pilot._rest_book_fetches
         placed = pilot.refresh_market(TICKER)
         assert len(placed) > 0
-        assert pilot._rest_book_fetches == initial_rest_fetches + 1
+        # 1 REST book refresh + pre-submit order checks
+        assert pilot._rest_book_fetches == initial_rest_fetches + 1 + len(placed)
 
         # Check G10b_book_source decision
         g10b = [d for d in pilot._decisions if d.get("gate") == "G10b_book_source"]
@@ -2183,7 +2184,8 @@ class TestMMPilotWSOrderbookStreaming:
         initial_rest_fetches = pilot._rest_book_fetches
         placed = pilot.refresh_market(TICKER)
         assert len(placed) > 0
-        assert pilot._rest_book_fetches == initial_rest_fetches + 1
+        # 1 REST book refresh + pre-submit order checks
+        assert pilot._rest_book_fetches == initial_rest_fetches + 1 + len(placed)
 
         g10b = [d for d in pilot._decisions if d.get("gate") == "G10b_book_source"]
         assert len(g10b) > 0
@@ -2200,7 +2202,8 @@ class TestMMPilotWSOrderbookStreaming:
         initial_rest_fetches = pilot._rest_book_fetches
         placed = pilot.refresh_market(TICKER)
         assert len(placed) > 0
-        assert pilot._rest_book_fetches == initial_rest_fetches + 1
+        # 1 REST book refresh + pre-submit order checks
+        assert pilot._rest_book_fetches == initial_rest_fetches + 1 + len(placed)
 
         g10b = [d for d in pilot._decisions if d.get("gate") == "G10b_book_source"]
         assert len(g10b) > 0
@@ -2238,3 +2241,32 @@ class TestMMPilotWSOrderbookStreaming:
         pilot2 = build_pilot(clock, selection=[TICKER], state_path=state_file)
         assert pilot2._ws_book_updates == 42
         assert pilot2._rest_book_fetches == 7
+
+    def test_would_cross_increments_rest_book_fetches(self, pilot_env, clock):
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        initial_fetches = pilot._rest_book_fetches
+        pilot._would_cross(TICKER, "yes", "buy", 0.40)
+        assert pilot._rest_book_fetches == initial_fetches + 1
+
+    def test_refresh_market_fails_closed_when_rest_fallback_fails(self, pilot_env, clock):
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        # Place a resting order first with valid book
+        pilot.update_book(TICKER, make_book(), source="rest")
+        pilot.place_pilot_order(TICKER, "yes", "buy", 10, 0.45, purpose="quote_bid")
+        assert len(pilot.resting_orders(TICKER)) == 1
+
+        # Simulate REST fetch failure when refresh_market falls back to REST
+        client.books = {}
+
+        # Advance clock to make levels stale, triggering need_rest
+        clock[0] += 60.0
+        placed = pilot.refresh_market(TICKER)
+        assert placed == []
+        assert len(pilot.resting_orders(TICKER)) == 0
+
+    def test_refresh_market_fails_closed_when_client_is_none_and_rest_needed(self, pilot_env, clock):
+        pilot = build_pilot(clock, client=None, selection=[TICKER])
+        placed = pilot.refresh_market(TICKER)
+        assert placed == []

@@ -1978,19 +1978,71 @@ class TestContinuousDepthFilter:
 
 
 class TestContinuousKalshiWSOrderbookRouting:
-    def test_routing_prefers_ws_orderbook_over_mid_scalar(self):
-        """Verify on_price_update prioritizes streaming orderbooks for MM pilot."""
-        src_path = os.path.join(os.path.dirname(__file__), "..", "continuous.py")
-        with open(src_path, encoding="utf-8") as fh:
-            source = fh.read()
+    def test_routing_prefers_ws_orderbook_when_both_sides_present(self):
+        """Verify complete two-sided orderbook updates book and does not touch on_ws_price."""
+        from continuous import _route_kalshi_ws_to_mm_pilot
+        mock_pilot = MagicMock()
+        data = {
+            "orderbook": {"yes": [[48, 50]], "no": [[48, 50]]},
+            "yes_ask": 0.52,
+            "no_ask": 0.52,
+        }
+        _route_kalshi_ws_to_mm_pilot(mock_pilot, "kalshi", "KXTEST", data, tracking_price=0.50)
 
-        marker = "# Plan 10: feed the Kalshi MM pilot's book freshness"
-        assert marker in source
-        start = source.index(marker)
-        end = source.index("# Sprint 3: Feed VolatilityTracker", start)
-        block = source[start:end]
+        mock_pilot.update_book_from_ws.assert_called_once_with("KXTEST", {"orderbook": data["orderbook"]})
+        mock_pilot.on_ws_price.assert_not_called()
 
-        assert 'if data.get("orderbook"):' in block
-        assert '_mm_pilot.update_book_from_ws(ticker, {"orderbook": data["orderbook"]})' in block
-        assert 'elif tracking_price is not None:' in block
-        assert '_mm_pilot.on_ws_price(ticker, tracking_price)' in block
+    def test_routing_feeds_scalar_mid_when_orderbook_one_sided(self):
+        """Verify one-sided orderbook updates book AND preserves scalar mid-price."""
+        from continuous import _route_kalshi_ws_to_mm_pilot
+        mock_pilot = MagicMock()
+        data = {
+            "orderbook": {"yes": [[48, 50]], "no": []},
+            "yes_ask": None,
+            "no_ask": 0.52,
+        }
+        _route_kalshi_ws_to_mm_pilot(mock_pilot, "kalshi", "KXTEST", data, tracking_price=0.48)
+
+        mock_pilot.update_book_from_ws.assert_called_once_with("KXTEST", {"orderbook": data["orderbook"]})
+        mock_pilot.on_ws_price.assert_called_once_with("KXTEST", 0.48)
+
+    def test_routing_falls_back_to_scalar_when_no_orderbook(self):
+        """Verify tick without orderbook falls back to on_ws_price."""
+        from continuous import _route_kalshi_ws_to_mm_pilot
+        mock_pilot = MagicMock()
+        data = {"price": 0.51}
+        _route_kalshi_ws_to_mm_pilot(mock_pilot, "kalshi", "KXTEST", data, tracking_price=0.51)
+
+        mock_pilot.update_book_from_ws.assert_not_called()
+        mock_pilot.on_ws_price.assert_called_once_with("KXTEST", 0.51)
+
+    def test_routing_ignores_non_kalshi_platform(self):
+        """Verify non-Kalshi updates never route to the Kalshi MM pilot."""
+        from continuous import _route_kalshi_ws_to_mm_pilot
+        mock_pilot = MagicMock()
+        data = {
+            "orderbook": {"yes": [[48, 50]], "no": [[48, 50]]},
+            "yes_ask": 0.52,
+            "no_ask": 0.52,
+        }
+        _route_kalshi_ws_to_mm_pilot(mock_pilot, "polymarket", "POLY-1", data, tracking_price=0.50)
+
+        mock_pilot.update_book_from_ws.assert_not_called()
+        mock_pilot.on_ws_price.assert_not_called()
+
+    def test_routing_tolerates_pilot_exceptions_gracefully(self):
+        """Verify pilot exceptions are caught and do not disrupt WS event loop."""
+        from continuous import _route_kalshi_ws_to_mm_pilot
+        mock_pilot = MagicMock()
+        mock_pilot.update_book_from_ws.side_effect = RuntimeError("book parse error")
+        mock_pilot.on_ws_price.side_effect = RuntimeError("mid update error")
+
+        data = {
+            "orderbook": {"yes": []},
+            "yes_ask": None,
+            "no_ask": None,
+        }
+        # Should not raise
+        _route_kalshi_ws_to_mm_pilot(mock_pilot, "kalshi", "KXTEST", data, tracking_price=0.50)
+        mock_pilot.update_book_from_ws.assert_called_once()
+        mock_pilot.on_ws_price.assert_called_once()

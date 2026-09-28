@@ -1395,7 +1395,7 @@ def validate_config() -> list[str]:
         "CTF_MAX_TRADE_SIZE": CTF_MAX_TRADE_SIZE,
     }
     for name, val in _positive.items():
-        if val <= 0:
+        if not math.isfinite(val) or val <= 0:
             raise ConfigError(f"{name}={val} must be > 0")
 
     # Plan 10 non-negative keys (zero is a valid value for these)

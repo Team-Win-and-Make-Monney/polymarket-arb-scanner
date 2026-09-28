@@ -60,6 +60,8 @@ class InventoryBalancer:
         self._positions: dict[str, dict[str, dict[str, float]]] = {}
         # Ticker-to-canonical-key alias mapping (e.g. Kalshi ticker -> market_key)
         self._ticker_map: dict[str, str] = {}
+        # Track market keys populated by sync_from_db to preserve pilot-only positions
+        self._db_synced_markets: set[str] = set()
         self._lock = threading.Lock()
 
     def register_ticker_alias(self, ticker: str, market_key: str) -> None:
@@ -81,9 +83,10 @@ class InventoryBalancer:
                 return key
             if key in self._ticker_map:
                 return self._ticker_map[key]
-            # Try case-insensitive or partial match across existing keys
+            # Try exact case-insensitive match across existing keys
+            key_lower = key.lower()
             for mk in self._positions:
-                if key.lower() == mk.lower() or key in mk:
+                if key_lower == mk.lower():
                     return mk
             return key
 
@@ -192,7 +195,13 @@ class InventoryBalancer:
             synced_count += 1
 
         with self._lock:
-            self._positions = new_positions
+            # Remove previously DB-synced markets that are no longer open in DB
+            for old_m in self._db_synced_markets - set(new_positions.keys()):
+                self._positions.pop(old_m, None)
+            # Update DB positions while preserving in-memory positions for non-DB markets
+            for m_key, plat_map in new_positions.items():
+                self._positions[m_key] = plat_map
+            self._db_synced_markets = set(new_positions.keys())
 
         return synced_count
 

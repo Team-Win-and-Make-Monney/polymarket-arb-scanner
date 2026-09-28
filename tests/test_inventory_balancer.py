@@ -373,3 +373,36 @@ class TestInventoryBalancerSkewMetricsAndSingleton:
         b3 = get_inventory_balancer()
         assert b3 is not b1
         reset_inventory_balancer()
+
+    def test_sync_from_db_preserves_non_db_pilot_positions(self):
+        from unittest.mock import MagicMock
+        balancer = InventoryBalancer()
+        # Direct fill recorded from pilot
+        balancer.update_position("pilot_ticker", "kalshi", "yes", "buy", 20.0)
+
+        # Mock DB with positions for another market
+        mock_db = MagicMock()
+        mock_db.get_open_positions.return_value = [
+            {"opportunity_id": 101, "market_identifier": "db_market", "platform": "cross"},
+        ]
+        mock_db.get_trades_for_opportunity.return_value = [
+            {"platform": "polymarket", "side": "buy", "outcome": "yes", "size": 50.0, "status": "filled"},
+        ]
+
+        synced = balancer.sync_from_db(mock_db)
+        assert synced == 1
+        # DB position is tracked
+        assert balancer.get_delta("db_market") == 50.0
+        # Pilot position is preserved and not discarded!
+        assert balancer.get_delta("pilot_ticker") == 20.0
+
+    def test_resolve_market_key_avoids_substring_false_positives(self):
+        balancer = InventoryBalancer()
+        balancer.update_position("KXHIGHNY-26SEP28-T75", "kalshi", "yes", "buy", 10.0)
+
+        # Exact match
+        assert balancer._resolve_market_key("KXHIGHNY-26SEP28-T75") == "KXHIGHNY-26SEP28-T75"
+        # Exact case-insensitive match
+        assert balancer._resolve_market_key("kxhighny-26sep28-t75") == "KXHIGHNY-26SEP28-T75"
+        # Substring "KX" should NOT falsely match "KXHIGHNY-26SEP28-T75"
+        assert balancer._resolve_market_key("KX") == "KX"

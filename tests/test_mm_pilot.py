@@ -2459,7 +2459,7 @@ class TestMMPilotInventorySkewQuoting:
         client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48)})
         pilot = build_pilot(clock, client=client, selection=[TICKER], inventory_balancer=balancer)
 
-        placed = pilot.refresh_market(TICKER)
+        pilot.refresh_market(TICKER)
         orders = {o["purpose"]: o for o in pilot.resting_orders(TICKER)}
         # Bid order (accumulating side) had cv_headroom = 0 and balanced_base = 0; must not place 1 contract
         assert "quote_bid" not in orders

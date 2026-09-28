@@ -2,14 +2,13 @@
 
 import sys
 import os
-import math
 from unittest.mock import MagicMock, patch
 import pytest
 
 # Add project root to sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import ConfigError, validate_config
+import config as cfg
 from inventory_balancer import InventoryBalancer
 from risk_manager import RiskManager
 
@@ -27,7 +26,6 @@ class TestInventoryBalancerConfig:
 
     def test_validate_config_rejects_non_positive_max_delta(self):
         """validate_config rejects INVENTORY_MAX_DELTA_CONTRACTS <= 0."""
-        import config as cfg
         with patch.object(cfg, "INVENTORY_MAX_DELTA_CONTRACTS", 0.0):
             with pytest.raises(cfg.ConfigError, match="INVENTORY_MAX_DELTA_CONTRACTS=0.0 must be > 0"):
                 cfg.validate_config()
@@ -38,7 +36,6 @@ class TestInventoryBalancerConfig:
 
     def test_validate_config_rejects_invalid_imbalance_ratio(self):
         """validate_config rejects INVENTORY_MAX_IMBALANCE_RATIO <= 0 or > 1."""
-        import config as cfg
         with patch.object(cfg, "INVENTORY_MAX_IMBALANCE_RATIO", 0.0):
             with pytest.raises(cfg.ConfigError, match="must be in \\(0, 1\\]"):
                 cfg.validate_config()
@@ -53,7 +50,6 @@ class TestInventoryBalancerConfig:
 
     def test_validate_config_rejects_non_positive_max_cost(self):
         """validate_config rejects INVENTORY_REBALANCE_MAX_COST <= 0."""
-        import config as cfg
         with patch.object(cfg, "INVENTORY_REBALANCE_MAX_COST", 0.0):
             with pytest.raises(cfg.ConfigError, match="INVENTORY_REBALANCE_MAX_COST=0.0 must be > 0"):
                 cfg.validate_config()

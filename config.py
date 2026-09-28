@@ -844,6 +844,13 @@ MM_PORTFOLIO_GUARD_ENABLED = _env_bool("MM_PORTFOLIO_GUARD_ENABLED", "true")
 MM_MAX_PORTFOLIO_NOTIONAL_USD = _env_float("MM_MAX_PORTFOLIO_NOTIONAL_USD", "500.0")
 MM_MAX_PORTFOLIO_MARGIN_UTILIZATION = _env_float("MM_MAX_PORTFOLIO_MARGIN_UTILIZATION", "0.80")
 
+# Dynamic Market Selection for MM Pilot via LIP Rewards & Volume
+MM_DYNAMIC_SELECTION_ENABLED = _env_bool("MM_DYNAMIC_SELECTION_ENABLED", "true")
+MM_SELECTION_REFRESH_INTERVAL_SEC = _env_float("MM_SELECTION_REFRESH_INTERVAL_SEC", "1800.0")
+MM_MIN_24H_VOLUME = _env_float("MM_MIN_24H_VOLUME", "0.0")
+MM_MAX_SPREAD_CENTS = _env_float("MM_MAX_SPREAD_CENTS", "0.0")
+MM_VOLUME_WEIGHT = _env_float("MM_VOLUME_WEIGHT", "0.20")
+
 
 # Kill switch / control plane (spec section 7). Fail closed: a cache older
 # than MM_CONTROLS_MAX_STALE_SECONDS means unknown operator intent = off.
@@ -1445,6 +1452,22 @@ def validate_config() -> list[str]:
     if not (0 < MM_MAX_PORTFOLIO_MARGIN_UTILIZATION <= 1):
         raise ConfigError(
             f"MM_MAX_PORTFOLIO_MARGIN_UTILIZATION={MM_MAX_PORTFOLIO_MARGIN_UTILIZATION} must be in (0, 1]")
+
+    if MM_SELECTION_REFRESH_INTERVAL_SEC < 10.0:
+        raise ConfigError(
+            f"MM_SELECTION_REFRESH_INTERVAL_SEC={MM_SELECTION_REFRESH_INTERVAL_SEC} must be >= 10.0")
+
+    if MM_MIN_24H_VOLUME < 0:
+        raise ConfigError(
+            f"MM_MIN_24H_VOLUME={MM_MIN_24H_VOLUME} must be >= 0")
+
+    if MM_MAX_SPREAD_CENTS < 0:
+        raise ConfigError(
+            f"MM_MAX_SPREAD_CENTS={MM_MAX_SPREAD_CENTS} must be >= 0")
+
+    if MM_VOLUME_WEIGHT < 0:
+        raise ConfigError(
+            f"MM_VOLUME_WEIGHT={MM_VOLUME_WEIGHT} must be >= 0")
 
 
 

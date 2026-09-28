@@ -2069,8 +2069,14 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
         kalshi_private_key_path=kalshi_private_key_path,
         kalshi_private_key_base64=kalshi_private_key_base64,
     )
+    # Initialize cross-venue delta-neutral inventory balancer
+    from inventory_balancer import InventoryBalancer
+    inventory_balancer = InventoryBalancer()
+
     if executor is not None:
         executor.feed_manager = feed_manager
+        if hasattr(executor, "risk") and executor.risk is not None:
+            executor.risk.inventory_balancer = inventory_balancer
     if hedger is not None:
         hedger.feed_manager = feed_manager
 
@@ -2324,19 +2330,21 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                         if args.mode in ("all", "binary") and poly_markets:
                             scan_futures["binary"] = pool.submit(
                                 scan_binary_internal, poly_markets, min_profit,
-                                price_cache=price_cache)
+                                price_cache=price_cache, feed_manager=feed_manager)
                         if args.mode in ("all", "negrisk") and poly_events:
                             scan_futures["negrisk"] = pool.submit(
                                 scan_negrisk_internal, poly_events, min_profit,
-                                price_cache=price_cache)
+                                price_cache=price_cache, feed_manager=feed_manager)
                         if args.mode in ("all", "kalshi", config.RESEARCH_MODE) and kalshi_client:
                             scan_futures["kalshi_binary"] = pool.submit(
-                                scan_kalshi_binary, kalshi_client, min_profit, kalshi_data=kalshi_data)
+                                scan_kalshi_binary, kalshi_client, min_profit, kalshi_data=kalshi_data,
+                                price_cache=price_cache, feed_manager=feed_manager)
                             # KalshiMulti kill-switch: disable for thin multi-outcome markets
                             # that cause Fill-or-Kill partial fills (no exit liquidity for hedge)
                             if config.KALSHI_MULTI_ENABLED:
                                 scan_futures["kalshi_multi"] = pool.submit(
-                                    scan_kalshi_multi, kalshi_client, min_profit, kalshi_data=kalshi_data)
+                                    scan_kalshi_multi, kalshi_client, min_profit, kalshi_data=kalshi_data,
+                                    price_cache=price_cache, feed_manager=feed_manager)
 
                         for key, future in scan_futures.items():
                             try:
@@ -2374,6 +2382,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                         min_confidence=args.min_confidence,
                         kalshi_events_preloaded=kalshi_events_preloaded,
                         price_cache=price_cache,
+                        feed_manager=feed_manager,
                     )
                     all_opportunities.extend(cross_opps)
 
@@ -2886,6 +2895,24 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                             executor, all_opportunities, notifier, scan_count)
                     except Exception as exc:
                         logger.debug("Rebalancing check failed: %s", exc)
+
+                # Cross-venue delta-neutral inventory balance evaluation
+                if inventory_balancer and inventory_balancer.enabled and executor and hasattr(executor, "db"):
+                    try:
+                        inventory_balancer.sync_from_db(executor.db)
+                        imbalances = inventory_balancer.get_imbalances()
+                        if imbalances:
+                            logger.info("InventoryBalancer detected %d imbalanced markets", len(imbalances))
+                            proposals = inventory_balancer.generate_rebalancing_proposals(
+                                imbalances,
+                                feed_manager=feed_manager,
+                                price_cache=price_cache,
+                                kalshi_client=kalshi_client,
+                            )
+                            for prop in proposals:
+                                logger.info("Inventory Rebalance Proposal: %s", prop.get("reason"))
+                    except Exception as exc:
+                        logger.debug("InventoryBalancer evaluation failed: %s", exc)
 
                 # Apply filters
                 _pre_depth_count = len(all_opportunities)

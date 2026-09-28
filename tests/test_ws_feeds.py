@@ -486,3 +486,51 @@ class TestKalshiOrderbookSemantics:
         payload = cb.call_args[0][2]
         assert payload["yes_ask"] is None
         assert payload["no_ask"] is None
+
+    def test_snapshot_attaches_reconstructed_orderbook(self):
+        cb = MagicMock()
+        fm = _make_feed(cb)
+        fm._handle_kalshi_message(self.SNAPSHOT)
+
+        payload = cb.call_args[0][2]
+        assert "orderbook" in payload
+        assert payload["orderbook"] == {
+            "yes": [[30, 10], [40, 20]],
+            "no": [[45, 50], [55, 80]],
+        }
+
+    def test_delta_updates_reconstructed_orderbook(self):
+        cb = MagicMock()
+        fm = _make_feed(cb)
+        fm._handle_kalshi_message(self.SNAPSHOT)
+        cb.reset_mock()
+
+        # Update level
+        fm._handle_kalshi_message({
+            "type": "orderbook_delta",
+            "msg": {"market_ticker": "KXTEST-A", "side": "yes", "price": 45, "delta": 25},
+        })
+        payload = cb.call_args[0][2]
+        assert payload["orderbook"]["yes"] == [[30, 10], [40, 20], [45, 25]]
+
+        # Delete level
+        fm._handle_kalshi_message({
+            "type": "orderbook_delta",
+            "msg": {"market_ticker": "KXTEST-A", "side": "yes", "price": 45, "delta": -25},
+        })
+        payload = cb.call_args[0][2]
+        assert payload["orderbook"]["yes"] == [[30, 10], [40, 20]]
+
+    def test_get_kalshi_orderbook(self):
+        cb = MagicMock()
+        fm = _make_feed(cb)
+        assert fm.get_kalshi_orderbook("KXTEST-A") is None
+
+        fm._handle_kalshi_message(self.SNAPSHOT)
+        ob = fm.get_kalshi_orderbook("KXTEST-A")
+        assert ob == {
+            "orderbook": {
+                "yes": [[30, 10], [40, 20]],
+                "no": [[45, 50], [55, 80]],
+            }
+        }

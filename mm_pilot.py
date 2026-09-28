@@ -472,10 +472,16 @@ class KalshiMMPilot:
         self._loop_error_streak = 0
 
         self._lip_tracker = LIPScoreTracker(time_fn=self._time_fn)
+        self._ws_book_updates: int = 0
+        self._rest_book_fetches: int = 0
         if self._state_store is not None:
             try:
                 persisted = self._state_store.load()
                 if persisted and isinstance(persisted, dict):
+                    if "ws_orderbook_streaming" in persisted and isinstance(persisted["ws_orderbook_streaming"], dict):
+                        ws_meta = persisted["ws_orderbook_streaming"]
+                        self._ws_book_updates = int(ws_meta.get("ws_updates_count", 0))
+                        self._rest_book_fetches = int(ws_meta.get("rest_fetches_count", 0))
                     if "lip_tracker" in persisted:
                         self._lip_tracker.from_dict(persisted["lip_tracker"])
                     elif "lip_rewards" in persisted and isinstance(persisted["lip_rewards"], dict) and "stats" in persisted["lip_rewards"]:
@@ -566,8 +572,14 @@ class KalshiMMPilot:
         tickers.update(self.inventory.tickers_with_inventory())
         return sorted(tickers)
 
-    def update_book(self, ticker: str, raw_book: dict | None) -> None:
-        """Cache a fresh order book snapshot for a pilot market."""
+    def update_book(self, ticker: str, raw_book: dict | None, source: str = "rest") -> None:
+        """Cache a fresh order book snapshot for a pilot market.
+
+        Args:
+            ticker: Market ticker.
+            raw_book: Raw orderbook payload (REST response or WS reconstructed book).
+            source: 'rest' for HTTP GET /orderbook, 'ws' for WebSocket streaming.
+        """
         from kalshi_api import (parse_orderbook, best_yes_bid, best_no_bid,
                                 best_yes_ask)
         if not raw_book:
@@ -588,19 +600,26 @@ class KalshiMMPilot:
                 "no_bid": no_bid,        # (price, qty) | None
                 "yes_ask": yes_ask,      # (price, qty) | None
                 "updated_at": now,
-                # Distinct from `updated_at`: only a REST book fetch (this
-                # method) refreshes actual resting-order levels. WS mid
-                # ticks (on_ws_price) refresh `updated_at` far more often
-                # without carrying any level data — G11/G12 must never
-                # judge levels fresh just because the price looked fresh.
+                # Refreshed on both REST and WS orderbook updates because both
+                # carry full resting-order levels. WS mid ticks (on_ws_price)
+                # do not update this timestamp.
                 "levels_updated_at": now,
+                "source": source,
             }
+            if source == "ws":
+                self._ws_book_updates += 1
+            else:
+                self._rest_book_fetches += 1
         if mid is not None:
             try:
                 self._vol.record_price(ticker, mid)
             except Exception as exc:
                 logger.debug("MM pilot vol record failed (book) for %s "
                              "mid=%.4f: %s", ticker, mid, exc)
+
+    def update_book_from_ws(self, ticker: str, raw_book: dict | None) -> None:
+        """Update book from WebSocket streaming orderbook."""
+        self.update_book(ticker, raw_book, source="ws")
 
     def on_ws_price(self, ticker: str, yes_price: float) -> None:
         """Mid update from the orderbook_delta WS channel (freshness only).
@@ -646,6 +665,8 @@ class KalshiMMPilot:
         """
         if self._client is None:
             return True
+        with self._lock:
+            self._rest_book_fetches += 1
         try:
             raw_book = self._client.fetch_order_book(ticker)
         except Exception:
@@ -772,6 +793,12 @@ class KalshiMMPilot:
                 "max_share": getattr(config, "MM_LIP_BALANCER_MAX_SHARE", 0.25),
                 "scale_up": getattr(config, "MM_LIP_BALANCER_SCALE_UP", True),
                 "min_efficiency": getattr(config, "MM_LIP_BALANCER_MIN_EFFICIENCY", 0.50),
+            },
+            "ws_orderbook_streaming": {
+                "enabled": getattr(config, "MM_WS_ORDERBOOK_STREAMING_ENABLED", True),
+                "max_age_seconds": getattr(config, "MM_WS_BOOK_MAX_AGE_SECONDS", 15.0),
+                "ws_updates_count": self._ws_book_updates,
+                "rest_fetches_count": self._rest_book_fetches,
             },
             "toxicity": toxicity_data,
             "seen_fill_ids": list(self._seen_fill_ids.keys())[-200:],
@@ -1426,7 +1453,12 @@ class KalshiMMPilot:
         # looks fresh from WS. Failing here (before refresh_market reaches
         # G11/G12) is what makes that guarantee airtight.
         levels_age = self._time_fn() - book.get("levels_updated_at", 0.0)
-        g6b = levels_age <= config.MM_BOOK_MAX_STALE_SECONDS
+        max_levels_age = (
+            getattr(config, "MM_WS_BOOK_MAX_AGE_SECONDS", 15.0)
+            if book.get("source") == "ws"
+            else config.MM_BOOK_MAX_STALE_SECONDS
+        )
+        g6b = levels_age <= max_levels_age
         if not gate("G6b_book_levels_staleness", g6b,
                     "ok" if g6b else "book_levels_stale"):
             return {"action": "pull", "reason": "book_levels_stale"}
@@ -1526,13 +1558,71 @@ class KalshiMMPilot:
         """
         import config
 
-        if self._client is not None:
-            try:
-                self.update_book(ticker, self._client.fetch_order_book(ticker))
-            except Exception:
-                logger.exception("MM pilot book fetch failed for %s", ticker)
+        now = self._time_fn()
+        book = self._book(ticker)
+        need_rest = True
+        levels_age = None
+        ws_streaming_enabled = getattr(config, "MM_WS_ORDERBOOK_STREAMING_ENABLED", True)
+        max_ws_age = getattr(config, "MM_WS_BOOK_MAX_AGE_SECONDS", 15.0)
+
+        if not ws_streaming_enabled:
+            gate_reason = "streaming_disabled"
+        elif book is None:
+            gate_reason = "book_missing"
+        elif book.get("source") != "ws":
+            gate_reason = "source_not_ws"
+        elif book.get("levels_updated_at") is None:
+            gate_reason = "levels_never_updated"
+        else:
+            levels_age = now - book["levels_updated_at"]
+            if levels_age <= max_ws_age:
+                need_rest = False
+                gate_reason = "ws_orderbook_fresh"
+            else:
+                gate_reason = "levels_stale"
+
+        if need_rest:
+            rest_ok = False
+            if self._client is not None:
+                try:
+                    raw_book = self._client.fetch_order_book(ticker)
+                    if raw_book:
+                        self.update_book(ticker, raw_book, source="rest")
+                        refreshed = self._book(ticker)
+                        rest_ok = (
+                            refreshed is not None
+                            and refreshed.get("source") == "rest"
+                        )
+                except Exception:
+                    logger.exception("MM pilot book fetch failed for %s", ticker)
+
+            self._write_decision(
+                "G10b_book_source",
+                ticker,
+                allowed=False,
+                reason=gate_reason,
+                source="rest",
+                levels_age=levels_age,
+                ws_streaming_enabled=ws_streaming_enabled,
+                max_age_seconds=max_ws_age,
+            )
+
+        else:
+            self._write_decision(
+                "G10b_book_source",
+                ticker,
+                allowed=True,
+                reason=gate_reason,
+                source="ws",
+                levels_age=levels_age,
+                ws_streaming_enabled=ws_streaming_enabled,
+                max_age_seconds=max_ws_age,
+            )
 
         plan = self._evaluate_gates(ticker)
+        if need_rest and not rest_ok and plan["action"] == "quote":
+            plan = {"action": "pull", "reason": "book_refresh_failed"}
+
         if plan["action"] in ("pull", "halted"):
             if plan["action"] == "pull":
                 self.pull_market(ticker, plan["reason"])
@@ -2424,6 +2514,12 @@ class KalshiMMPilot:
                 "max_share": getattr(config, "MM_LIP_BALANCER_MAX_SHARE", 0.25),
                 "scale_up": getattr(config, "MM_LIP_BALANCER_SCALE_UP", True),
                 "min_efficiency": getattr(config, "MM_LIP_BALANCER_MIN_EFFICIENCY", 0.50),
+            },
+            "ws_orderbook_streaming": {
+                "enabled": getattr(config, "MM_WS_ORDERBOOK_STREAMING_ENABLED", True),
+                "max_age_seconds": getattr(config, "MM_WS_BOOK_MAX_AGE_SECONDS", 15.0),
+                "ws_updates_count": self._ws_book_updates,
+                "rest_fetches_count": self._rest_book_fetches,
             },
             "toxicity": toxicity_by_ticker,
             "dry_run": self.dry_run,

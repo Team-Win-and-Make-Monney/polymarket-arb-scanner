@@ -239,6 +239,36 @@ def _ws_opportunity_probability(opp: dict, platform: str, entry: dict | None) ->
     return _cache_probability(entry, "yes_ask", "yes_price", "yes", "price")
 
 
+def _route_kalshi_ws_to_mm_pilot(pilot, platform: str, ticker: str, data: dict,
+                                 tracking_price: float | None) -> None:
+    """Route Kalshi WebSocket streaming updates to the MM pilot.
+
+    Prioritizes full streaming orderbooks when available. If the streaming
+    orderbook is one-sided (lacks either yes_ask or no_ask) and a tracking
+    mid-price is available, also invokes on_ws_price to ensure the midpoint
+    is populated. If no orderbook is present, falls back to scalar mid ticks.
+    """
+    if not pilot or platform != "kalshi":
+        return
+    if data.get("orderbook"):
+        try:
+            pilot.update_book_from_ws(ticker, {"orderbook": data["orderbook"]})
+        except Exception as exc:
+            logger.debug("MM pilot WS orderbook update failed: %s", exc)
+        if (tracking_price is not None
+                and (data.get("yes_ask") is None
+                     or data.get("no_ask") is None)):
+            try:
+                pilot.on_ws_price(ticker, tracking_price)
+            except Exception as exc:
+                logger.debug("MM pilot WS feed failed: %s", exc)
+    elif tracking_price is not None:
+        try:
+            pilot.on_ws_price(ticker, tracking_price)
+        except Exception as exc:
+            logger.debug("MM pilot WS feed failed: %s", exc)
+
+
 class _WSTriggerDeduper:
     """Thread-safe short cooldown for identical WS-triggered opportunities."""
 
@@ -1794,11 +1824,7 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
 
         # Plan 10: feed the Kalshi MM pilot's book freshness + VolatilityTracker
         # with orderbook_delta ticks for subscribed pilot tickers.
-        if _mm_pilot and platform == "kalshi" and tracking_price is not None:
-            try:
-                _mm_pilot.on_ws_price(ticker, tracking_price)
-            except Exception as exc:
-                logger.debug("MM pilot WS feed failed: %s", exc)
+        _route_kalshi_ws_to_mm_pilot(_mm_pilot, platform, ticker, data, tracking_price)
 
         # Sprint 3: Feed VolatilityTracker + LeadLagMM with per-tick prices
         _feed_sprint3_trackers(platform, ticker, data)

@@ -2070,3 +2070,203 @@ class TestMMPilotLIPBalancer:
         # Even though graduated and book depth is huge (1000), scale-up is prohibited
         # because target_size is not explicitly known.
         assert orders["quote_bid"]["count"] == 20
+
+
+# ---------------------------------------------------------------------------
+# Sub-minute WebSocket Orderbook Streaming (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+class TestMMPilotWSOrderbookStreaming:
+    def test_update_book_from_ws_updates_levels_and_counters(self, pilot_env, clock):
+        pilot = build_pilot(clock, selection=[TICKER])
+        assert pilot._ws_book_updates == 0
+        assert pilot._rest_book_fetches == 0
+
+        ws_book = {
+            "orderbook": {
+                "yes": [[48, 50]],
+                "no": [[48, 50]],
+            }
+        }
+        pilot.update_book_from_ws(TICKER, ws_book)
+        assert pilot._ws_book_updates == 1
+        assert pilot._rest_book_fetches == 0
+
+        book = pilot._book(TICKER)
+        assert book is not None
+        assert book["source"] == "ws"
+        assert book["mid"] == pytest.approx(0.50)
+        assert book["yes_bid"] == (0.48, 50.0)
+        assert book["no_bid"] == (0.48, 50.0)
+        assert book["yes_ask"] == (pytest.approx(0.52), 50.0)
+        assert book["levels_updated_at"] == clock[0]
+        assert book["updated_at"] == clock[0]
+
+    def test_refresh_market_uses_fresh_ws_levels_skipping_rest(self, pilot_env, clock):
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        ws_book = {
+            "orderbook": {
+                "yes": [[48, 50]],
+                "no": [[48, 50]],
+            }
+        }
+        clock[0] = 1000.0
+        pilot.update_book_from_ws(TICKER, ws_book)
+        assert pilot._ws_book_updates == 1
+
+        # Advance 5 seconds (< 15.0s max age)
+        clock[0] = 1005.0
+        initial_rest_fetches = pilot._rest_book_fetches
+        placed = pilot.refresh_market(TICKER)
+        assert len(placed) > 0
+        # REST book refresh should NOT have been invoked; only pre-submit order checks occur
+        assert pilot._rest_book_fetches == initial_rest_fetches + len(placed)
+
+        # Check G10b_book_source decision
+        g10b = [d for d in pilot._decisions if d.get("gate") == "G10b_book_source"]
+        assert len(g10b) > 0
+        latest = g10b[-1]
+        assert latest["decision"] == "pass"
+        assert latest["reason"] == "ws_orderbook_fresh"
+        assert latest["source"] == "ws"
+        assert latest["levels_age"] == pytest.approx(5.0)
+
+    def test_refresh_market_falls_back_to_rest_when_levels_stale(self, pilot_env, clock):
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        # Prime WS book at t=1000
+        clock[0] = 1000.0
+        ws_book = {
+            "orderbook": {
+                "yes": [[48, 50]],
+                "no": [[48, 50]],
+            }
+        }
+        pilot.update_book_from_ws(TICKER, ws_book)
+
+        # Advance 20s (> 15.0s max age)
+        clock[0] = 1020.0
+        initial_rest_fetches = pilot._rest_book_fetches
+        placed = pilot.refresh_market(TICKER)
+        assert len(placed) > 0
+        # 1 REST book refresh + pre-submit order checks
+        assert pilot._rest_book_fetches == initial_rest_fetches + 1 + len(placed)
+
+        # Check G10b_book_source decision
+        g10b = [d for d in pilot._decisions if d.get("gate") == "G10b_book_source"]
+        assert len(g10b) > 0
+        latest = g10b[-1]
+        assert latest["decision"] == "fail"
+        assert latest["reason"] == "levels_stale"
+        assert latest["source"] == "rest"
+        assert latest["levels_age"] == pytest.approx(20.0)
+
+    def test_refresh_market_calls_rest_when_streaming_disabled(self, pilot_env, clock, monkeypatch):
+        import config
+        monkeypatch.setattr(config, "MM_WS_ORDERBOOK_STREAMING_ENABLED", False)
+
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+
+        # Fresh WS book 2 seconds ago
+        clock[0] = 1000.0
+        ws_book = {
+            "orderbook": {
+                "yes": [[48, 50]],
+                "no": [[48, 50]],
+            }
+        }
+        pilot.update_book_from_ws(TICKER, ws_book)
+
+        clock[0] = 1002.0
+        initial_rest_fetches = pilot._rest_book_fetches
+        placed = pilot.refresh_market(TICKER)
+        assert len(placed) > 0
+        # 1 REST book refresh + pre-submit order checks
+        assert pilot._rest_book_fetches == initial_rest_fetches + 1 + len(placed)
+
+        g10b = [d for d in pilot._decisions if d.get("gate") == "G10b_book_source"]
+        assert len(g10b) > 0
+        latest = g10b[-1]
+        assert latest["decision"] == "fail"
+        assert latest["reason"] == "streaming_disabled"
+        assert latest["source"] == "rest"
+
+    def test_refresh_market_calls_rest_when_book_missing(self, pilot_env, clock):
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        pilot._books.clear()
+
+        initial_rest_fetches = pilot._rest_book_fetches
+        placed = pilot.refresh_market(TICKER)
+        assert len(placed) > 0
+        # 1 REST book refresh + pre-submit order checks
+        assert pilot._rest_book_fetches == initial_rest_fetches + 1 + len(placed)
+
+        g10b = [d for d in pilot._decisions if d.get("gate") == "G10b_book_source"]
+        assert len(g10b) > 0
+        latest = g10b[-1]
+        assert latest["decision"] == "fail"
+        assert latest["reason"] == "book_missing"
+        assert latest["source"] == "rest"
+
+    def test_status_and_persisted_state_contain_ws_orderbook_telemetry(self, pilot_env, clock, tmp_path):
+        import config
+        state_file = str(tmp_path / "pilot_state.json")
+        pilot = build_pilot(clock, selection=[TICKER], state_path=state_file)
+
+        pilot._ws_book_updates = 42
+        pilot._rest_book_fetches = 7
+
+        # get_status
+        status = pilot.get_status()
+        assert "ws_orderbook_streaming" in status
+        ws_status = status["ws_orderbook_streaming"]
+        assert ws_status["enabled"] is True
+        assert ws_status["max_age_seconds"] == getattr(config, "MM_WS_BOOK_MAX_AGE_SECONDS", 15.0)
+        assert ws_status["ws_updates_count"] == 42
+        assert ws_status["rest_fetches_count"] == 7
+
+        # persist_state
+        pilot._persist_state()
+        persisted = pilot._state_store.load()
+        assert persisted is not None
+        assert "ws_orderbook_streaming" in persisted
+        assert persisted["ws_orderbook_streaming"]["ws_updates_count"] == 42
+        assert persisted["ws_orderbook_streaming"]["rest_fetches_count"] == 7
+
+        # state restore in new pilot instance
+        pilot2 = build_pilot(clock, selection=[TICKER], state_path=state_file)
+        assert pilot2._ws_book_updates == 42
+        assert pilot2._rest_book_fetches == 7
+
+    def test_would_cross_increments_rest_book_fetches(self, pilot_env, clock):
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        initial_fetches = pilot._rest_book_fetches
+        pilot._would_cross(TICKER, "yes", "buy", 0.40)
+        assert pilot._rest_book_fetches == initial_fetches + 1
+
+    def test_refresh_market_fails_closed_when_rest_fallback_fails(self, pilot_env, clock):
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        # Place a resting order first with valid book
+        pilot.update_book(TICKER, make_book(), source="rest")
+        pilot.place_pilot_order(TICKER, "yes", "buy", 10, 0.45, purpose="quote_bid")
+        assert len(pilot.resting_orders(TICKER)) == 1
+
+        # Simulate REST fetch failure when refresh_market falls back to REST
+        client.books = {}
+
+        # Advance clock to make levels stale, triggering need_rest
+        clock[0] += 60.0
+        placed = pilot.refresh_market(TICKER)
+        assert placed == []
+        assert len(pilot.resting_orders(TICKER)) == 0
+
+    def test_refresh_market_fails_closed_when_client_is_none_and_rest_needed(self, pilot_env, clock):
+        pilot = build_pilot(clock, client=None, selection=[TICKER])
+        placed = pilot.refresh_market(TICKER)
+        assert placed == []

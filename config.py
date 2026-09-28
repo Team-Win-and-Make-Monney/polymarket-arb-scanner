@@ -817,6 +817,10 @@ MM_LIP_BALANCER_MAX_SHARE = _env_float("MM_LIP_BALANCER_MAX_SHARE", "0.25")
 MM_LIP_BALANCER_SCALE_UP = _env_bool("MM_LIP_BALANCER_SCALE_UP", "true")
 MM_LIP_BALANCER_MIN_EFFICIENCY = _env_float("MM_LIP_BALANCER_MIN_EFFICIENCY", "0.50")
 
+# Sub-minute WebSocket Orderbook Streaming for MM Pilot
+MM_WS_ORDERBOOK_STREAMING_ENABLED = _env_bool("MM_WS_ORDERBOOK_STREAMING_ENABLED", "true")
+MM_WS_BOOK_MAX_AGE_SECONDS = _env_float("MM_WS_BOOK_MAX_AGE_SECONDS", "15.0")
+
 # Kill switch / control plane (spec section 7). Fail closed: a cache older
 # than MM_CONTROLS_MAX_STALE_SECONDS means unknown operator intent = off.
 MM_CONTROLS_POLL_SECONDS = _env_float("MM_CONTROLS_POLL_SECONDS", "60.0")
@@ -1387,10 +1391,11 @@ def validate_config() -> list[str]:
         "MM_CANARY_QUOTE_SIZE_USD": MM_CANARY_QUOTE_SIZE_USD,
         "MM_CANARY_MAX_LOSS_USD": MM_CANARY_MAX_LOSS_USD,
         "MM_CANARY_MIN_HOURS": MM_CANARY_MIN_HOURS,
+        "MM_WS_BOOK_MAX_AGE_SECONDS": MM_WS_BOOK_MAX_AGE_SECONDS,
         "CTF_MAX_TRADE_SIZE": CTF_MAX_TRADE_SIZE,
     }
     for name, val in _positive.items():
-        if val <= 0:
+        if not math.isfinite(val) or val <= 0:
             raise ConfigError(f"{name}={val} must be > 0")
 
     # Plan 10 non-negative keys (zero is a valid value for these)

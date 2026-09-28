@@ -773,9 +773,9 @@ class KalshiMMPilot:
         bankroll = getattr(config, "MM_PILOT_BANKROLL_USD", 2000.0)
 
         avail_balance = None
-        if hasattr(self, "client") and self.client and hasattr(self.client, "get_balance"):
+        if self._client is not None and hasattr(self._client, "get_balance"):
             try:
-                avail_balance = self.client.get_balance()
+                avail_balance = self._client.get_balance()
             except Exception as e:
                 logger.debug("Failed to query Kalshi balance: %s", e)
 
@@ -1229,6 +1229,18 @@ class KalshiMMPilot:
             if (self.inventory.total_net_usd() + notional
                     > config.MM_MAX_TOTAL_INVENTORY_USD):
                 return GateResult(False, "total_inventory_cap")
+        # 6b. Portfolio-level margin & aggregate exposure guard
+        if getattr(config, "MM_PORTFOLIO_GUARD_ENABLED", True) and not derived_reducing:
+            p_metrics = self.get_portfolio_margin_metrics()
+            max_p_notional = getattr(config, "MM_MAX_PORTFOLIO_NOTIONAL_USD", 500.0)
+            if p_metrics["total_notional"] + notional > max_p_notional:
+                return GateResult(False, "portfolio_notional_cap_exceeded")
+
+            base_capital = p_metrics.get("base_capital", getattr(config, "MM_PILOT_BANKROLL_USD", 2000.0))
+            max_util = getattr(config, "MM_MAX_PORTFOLIO_MARGIN_UTILIZATION", 0.80)
+            projected_util = (p_metrics["total_notional"] + notional) / base_capital if base_capital > 0 else 1.0
+            if projected_util > max_util:
+                return GateResult(False, "portfolio_margin_cap_exceeded")
         # 7. Gross cap: inventory at cost + resting quote notional + this order
         gross = net_usd + self._resting_notional(ticker) + notional
         if gross > config.MM_MAX_GROSS_PER_MARKET_USD:
@@ -1651,7 +1663,7 @@ class KalshiMMPilot:
                 elif net_ct < 0:
                     one_side = "bid_only"
                 else:
-                    return {"action": "skip", "reason": cap_reason}
+                    return {"action": "pull", "reason": cap_reason}
             else:
                 gate(
                     "G10c_portfolio_margin_cap",
@@ -1984,16 +1996,26 @@ class KalshiMMPilot:
             p_metrics = self.get_portfolio_margin_metrics()
             existing_resting_ticker = self._resting_notional(ticker)
             eff_current_notional = max(0.0, p_metrics["total_notional"] - existing_resting_ticker)
-            headroom_usd = max(0.0, p_metrics["max_notional"] - eff_current_notional)
+            base_capital = p_metrics.get("base_capital", getattr(config, "MM_PILOT_BANKROLL_USD", 2000.0))
+            max_margin_notional = base_capital * p_metrics.get("max_utilization", 0.80)
+            margin_headroom_usd = max(0.0, max_margin_notional - eff_current_notional)
+            headroom_usd = max(0.0, min(p_metrics["max_notional"] - eff_current_notional, margin_headroom_usd))
 
             cur_net_ct = self.inventory.net_contracts(ticker)
-            # Cap accumulating side by headroom_usd
-            if bid_count > 0 and (cur_net_ct >= 0):
-                max_bid_ct_by_headroom = int(headroom_usd / bid) if bid > 0 else 0
+            # When flat, both bid and ask accumulate, so they compete for headroom
+            if cur_net_ct == 0 and bid_count > 0 and ask_count > 0:
+                half_headroom = headroom_usd / 2.0
+                max_bid_ct_by_headroom = int(half_headroom / bid) if bid > 0 else 0
+                max_ask_ct_by_headroom = int(half_headroom / no_price) if no_price > 0 else 0
                 bid_count = min(bid_count, max_bid_ct_by_headroom)
-            if ask_count > 0 and (cur_net_ct <= 0):
-                max_ask_ct_by_headroom = int(headroom_usd / no_price) if no_price > 0 else 0
                 ask_count = min(ask_count, max_ask_ct_by_headroom)
+            else:
+                if bid_count > 0 and (cur_net_ct >= 0):
+                    max_bid_ct_by_headroom = int(headroom_usd / bid) if bid > 0 else 0
+                    bid_count = min(bid_count, max_bid_ct_by_headroom)
+                if ask_count > 0 and (cur_net_ct <= 0):
+                    max_ask_ct_by_headroom = int(headroom_usd / no_price) if no_price > 0 else 0
+                    ask_count = min(ask_count, max_ask_ct_by_headroom)
 
             self._write_decision(
                 "G10c_portfolio_margin_guard",

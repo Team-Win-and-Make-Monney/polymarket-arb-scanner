@@ -119,6 +119,9 @@ class FakeKalshiClient:
             raise RuntimeError("fake get_open_orders failure")
         return list(self.open_orders_script)
 
+    def get_balance(self):
+        return self.balance
+
 
 class RecordingHedger:
     """Stub hedge executor: records calls, scripted success."""
@@ -2540,7 +2543,7 @@ class TestMMPilotPortfolioMarginGuard:
         assert metrics["active_market_count"] == 1
 
     def test_g10c_gate_halts_flat_market_when_cap_breached(self, pilot_env, clock, monkeypatch):
-        """G10c halts quote placement on flat markets when portfolio notional cap is reached."""
+        """G10c pulls quotes on flat markets when portfolio notional cap is reached."""
         import config
         monkeypatch.setattr(config, "MM_MAX_PORTFOLIO_NOTIONAL_USD", 50.0)
 
@@ -2551,8 +2554,27 @@ class TestMMPilotPortfolioMarginGuard:
 
         # TICKER_B is flat
         res = pilot._evaluate_gates("TICKER_B")
-        assert res["action"] == "skip"
+        assert res["action"] == "pull"
         assert "portfolio_notional_cap" in res["reason"]
+
+    def test_g10c_pulls_resting_quotes_on_flat_market_at_cap(self, pilot_env, clock, monkeypatch):
+        """refresh_market pulls existing quotes on flat market when portfolio cap is breached."""
+        import config
+        monkeypatch.setattr(config, "MM_MAX_PORTFOLIO_NOTIONAL_USD", 50.0)
+
+        client = FakeKalshiClient(books={"TICKER_A": make_book(), "TICKER_B": make_book()})
+        pilot = build_pilot(clock, client=client, selection=["TICKER_A", "TICKER_B"])
+        # Place resting quote on flat market TICKER_B before cap is breached
+        pilot.place_pilot_order("TICKER_B", side="yes", action="buy", count=10, price=0.40, purpose="quote_bid")
+        assert len(pilot.resting_orders("TICKER_B")) == 1
+
+        # Breach portfolio cap via TICKER_A
+        pilot.inventory.apply_fill("TICKER_A", side="yes", action="buy", count=120, yes_price=0.50)
+
+        # Refresh TICKER_B: must pull resting orders and return empty placed list
+        placed = pilot.refresh_market("TICKER_B")
+        assert placed == []
+        assert len(pilot.resting_orders("TICKER_B")) == 0
 
     def test_g10c_gate_allows_reducing_quotes_when_cap_breached(self, pilot_env, clock, monkeypatch):
         """G10c restricts already-skewed markets to reducing-only quotes when cap is reached."""
@@ -2570,7 +2592,7 @@ class TestMMPilotPortfolioMarginGuard:
         assert res["one_side"] == "ask_only"
 
     def test_refresh_market_clamps_accumulating_quote_size_to_headroom(self, pilot_env, clock, monkeypatch):
-        """refresh_market scales accumulating order size down to fit remaining portfolio headroom."""
+        """refresh_market scales accumulating order size down so total exposure remains within cap."""
         import config
         monkeypatch.setattr(config, "MM_MAX_PORTFOLIO_NOTIONAL_USD", 50.0)
         monkeypatch.setattr(config, "MM_QUOTE_SIZE_USD", 30.0)  # wants $30 quotes
@@ -2587,13 +2609,56 @@ class TestMMPilotPortfolioMarginGuard:
 
         # Remaining portfolio headroom = $50 - $40 = $10
         # QuoteEngine wants count for $30 quote @ 0.50 = 60 contracts
-        # But headroom allows only $10 / 0.50 = 20 contracts!
+        # Headroom allows only $10 total across competing quotes when flat
         pilot.refresh_market(TICKER)
         orders = {o["purpose"]: o for o in pilot.resting_orders(TICKER)}
-        assert "quote_bid" in orders
-        # Max contracts placed must be capped by $10 headroom / 0.49 price = 20 contracts
-        assert orders["quote_bid"]["count"] <= 21
-        assert orders["quote_bid"]["count"] * orders["quote_bid"]["price"] <= 11.0
+        # Total portfolio notional (inventory + resting orders) must be <= $50 cap
+        total_portfolio_exposure = pilot.inventory.total_net_usd() + pilot.total_resting_notional()
+        assert total_portfolio_exposure <= 50.0
+        # Resting orders on TICKER must not exceed the $10 available headroom
+        ticker_resting = pilot._resting_notional(TICKER)
+        assert ticker_resting <= 10.0
+
+    def test_get_portfolio_margin_metrics_uses_client_balance(self, pilot_env, clock):
+        """get_portfolio_margin_metrics uses venue balance when available below bankroll."""
+        client = FakeKalshiClient(books={"TICKER_A": make_book()})
+        client.balance = 100.0  # Venue balance is $100 (< default bankroll $2000)
+        pilot = build_pilot(clock, client=client, selection=["TICKER_A"])
+        pilot.inventory.apply_fill("TICKER_A", side="yes", action="buy", count=100, yes_price=0.50)  # $50 notional
+        metrics = pilot.get_portfolio_margin_metrics()
+        assert metrics["base_capital"] == 100.0
+        # 50 / 100 = 0.50 margin utilization
+        assert metrics["margin_utilization"] == pytest.approx(0.50)
+
+    def test_authorize_order_enforces_portfolio_limits_and_consecutive_placements(self, pilot_env, clock, monkeypatch):
+        """authorize_order rejects orders exceeding portfolio caps and blocks consecutive placements."""
+        import config
+        monkeypatch.setattr(config, "MM_MAX_PORTFOLIO_NOTIONAL_USD", 50.0)
+        client = FakeKalshiClient(books={"TICKER_A": make_book(), "TICKER_B": make_book()})
+        pilot = build_pilot(clock, client=client, selection=["TICKER_A", "TICKER_B"])
+
+        # Current exposure: 0. Remaining headroom: $50
+        # First order: $30 notional (60 contracts @ 0.50) -> should be allowed
+        res1 = pilot.authorize_order("TICKER_A", side="yes", action="buy", count=60, price=0.50)
+        assert res1.allowed is True
+        oid1 = pilot.place_pilot_order("TICKER_A", side="yes", action="buy", count=60, price=0.50, purpose="quote_bid")
+        assert oid1 is not None
+
+        # Now resting notional is $30. Remaining headroom: $20
+        # Second order on TICKER_B: $25 notional (50 contracts @ 0.50) -> exceeds $20 headroom!
+        res2 = pilot.authorize_order("TICKER_B", side="yes", action="buy", count=50, price=0.50)
+        assert res2.allowed is False
+        assert res2.reason == "portfolio_notional_cap_exceeded"
+
+        # Third order on TICKER_B: $15 notional (30 contracts @ 0.50) -> within $20 headroom!
+        res3 = pilot.authorize_order("TICKER_B", side="yes", action="buy", count=30, price=0.50)
+        assert res3.allowed is True
+
+        # Now fill TICKER_A with long YES inventory, making it skewed
+        pilot.inventory.apply_fill("TICKER_A", side="yes", action="buy", count=60, yes_price=0.50)
+        # Even if over cap, reducing order (selling YES) is allowed
+        res_red = pilot.authorize_order("TICKER_A", side="yes", action="sell", count=20, price=0.50, reducing=True)
+        assert res_red.allowed is True
 
     def test_get_status_reports_portfolio_margin_metrics(self, pilot_env, clock):
         """get_status includes portfolio_margin metrics dictionary."""

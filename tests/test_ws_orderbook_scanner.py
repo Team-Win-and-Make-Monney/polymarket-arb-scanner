@@ -88,7 +88,7 @@ class TestCrossScanWSOrderbook:
             "conditionId": "poly_cond1",
             "outcomes": ["Yes", "No"],
             "clobTokenIds": ["tok_y", "tok_n"],
-            "outcomePrices": ["0.40", "0.60"],
+            "outcomePrices": ["0.35", "0.65"],
             "volume": 5000,
         }
         kalshi_market = {
@@ -105,21 +105,21 @@ class TestCrossScanWSOrderbook:
 
         mock_kalshi_client = MagicMock()
         mock_kalshi_client.fetch_all_events.return_value = [kalshi_event]
-        mock_kalshi_client.get_market_price.return_value = (0.42, 0.54)
+        mock_kalshi_client.get_market_price.return_value = (0.40, 0.45)
 
         mock_feed = MagicMock()
-        # Polymarket book: yes_ask = 0.41, size 80; no_ask = 0.59, size 90
+        # Polymarket book: yes_ask = 0.35, size 80; no_ask = 0.65, size 90
         mock_feed.get_polymarket_orderbook.side_effect = lambda tok: {
-            "tok_y": {"asks": [{"price": 0.41, "size": 80}], "bids": [{"price": 0.39, "size": 50}]},
-            "tok_n": {"asks": [{"price": 0.59, "size": 90}], "bids": [{"price": 0.57, "size": 50}]},
+            "tok_y": {"asks": [{"price": 0.35, "size": 80}], "bids": [{"price": 0.33, "size": 50}]},
+            "tok_n": {"asks": [{"price": 0.65, "size": 90}], "bids": [{"price": 0.63, "size": 50}]},
         }.get(tok)
         mock_feed.get_polymarket_orderbook_age.return_value = 1.0
 
-        # Kalshi book: yes bids at 40c (implies no_ask = 60c), no bids at 49c (implies yes_ask = 51c)
+        # Kalshi book: yes bids at 55c (implies no_ask = 45c), no bids at 60c (implies yes_ask = 40c)
         kalshi_ws_book = {
             "orderbook": {
-                "yes": [[40, 120]],
-                "no": [[49, 110]],
+                "yes": [[55, 120]],
+                "no": [[60, 110]],
             }
         }
         mock_feed.get_orderbook.return_value = (kalshi_ws_book, 1.5)
@@ -132,8 +132,8 @@ class TestCrossScanWSOrderbook:
                  "kalshi_event": kalshi_event,
                  "similarity": 95,
                  "confidence": "HIGH",
-             }]), patch("scans.helpers.get_clob_prices") as mock_pm_rest, \
-             patch.object(mock_kalshi_client, "get_order_book_depth") as mock_k_rest:
+                 "inverted": False,
+             }]), patch("scans.helpers.get_clob_prices") as mock_pm_rest:
 
             opps = sc.scan_cross_platform(
                 [poly_market], mock_kalshi_client, min_profit=0.01,
@@ -142,12 +142,84 @@ class TestCrossScanWSOrderbook:
                 feed_manager=mock_feed,
             )
 
-        # PM_YES (0.41) + K_NO (1 - 0.40 = 0.60 -> total 1.01, profit < 0)
-        # PM_NO (0.59) + K_YES (1 - 0.49 = 0.51 -> total 1.10, profit < 0)
-        assert opps == []
-        # Let's verify mock_pm_rest and mock_k_rest were not called during refinement
+        # PM_YES (0.35) + K_NO (0.45) = 0.80 -> net profit ~0.18 >= 0.01
+        assert len(opps) == 1
+        opp = opps[0]
+        assert opp["type"] == "Cross(PM_YES + K_NO)"
+        assert opp["_kalshi_yes"] == 0.40
+        assert opp["_kalshi_no"] == 0.45
+        assert opp["_clob_depth"] == 80  # min(80, 110)
         mock_pm_rest.assert_not_called()
-        mock_k_rest.assert_not_called()
+
+    def test_cross_scan_ws_preserves_inverted_kalshi_orientation(self):
+        """Cross scan with inverted=True swaps raw Kalshi YES/NO ask prices."""
+        poly_market = {
+            "question": "Candidate A will lose?",
+            "conditionId": "poly_cond2",
+            "outcomes": ["Yes", "No"],
+            "clobTokenIds": ["tok_y2", "tok_n2"],
+            "outcomePrices": ["0.35", "0.65"],
+            "volume": 5000,
+        }
+        kalshi_market = {
+            "ticker": "CAND-A-WIN",
+            "title": "Candidate A will win?",
+            "yes_bid": 38,
+            "no_bid": 52,
+        }
+        kalshi_event = {
+            "event_ticker": "CAND-A",
+            "title": "Candidate A will win?",
+            "markets": [kalshi_market],
+        }
+
+        mock_kalshi_client = MagicMock()
+        mock_kalshi_client.fetch_all_events.return_value = [kalshi_event]
+        # Inverted: Kalshi YES=0.60, NO=0.40 becomes stage 1 raw (0.40, 0.60)
+        mock_kalshi_client.get_market_price.return_value = (0.40, 0.60)
+
+        mock_feed = MagicMock()
+        mock_feed.get_polymarket_orderbook.side_effect = lambda tok: {
+            "tok_y2": {"asks": [{"price": 0.35, "size": 80}], "bids": [{"price": 0.33, "size": 50}]},
+            "tok_n2": {"asks": [{"price": 0.65, "size": 90}], "bids": [{"price": 0.63, "size": 50}]},
+        }.get(tok)
+        mock_feed.get_polymarket_orderbook_age.return_value = 1.0
+
+        # Raw Kalshi WS: yes bids at 55c (implies no_ask = 45c), no bids at 60c (implies yes_ask = 40c)
+        # Inverted should swap them: _kalshi_yes = 0.45, _kalshi_no = 0.40
+        kalshi_ws_book = {
+            "orderbook": {
+                "yes": [[55, 120]],
+                "no": [[60, 110]],
+            }
+        }
+        mock_feed.get_orderbook.return_value = (kalshi_ws_book, 1.5)
+
+        import scans.cross as sc
+        with patch.object(sc, "get_binary_markets", return_value=[poly_market]), \
+             patch.object(sc, "detect_inverted", return_value=True), \
+             patch.object(sc, "_within_resolution_window", return_value=True), \
+             patch.object(sc, "match_markets_to_events", return_value=[{
+                 "polymarket": poly_market,
+                 "kalshi_event": kalshi_event,
+                 "similarity": 95,
+                 "confidence": "HIGH",
+                 "inverted": True,
+             }]), patch("scans.helpers.get_clob_prices") as mock_pm_rest:
+
+            opps = sc.scan_cross_platform(
+                [poly_market], mock_kalshi_client, min_profit=0.01,
+                kalshi_events_preloaded=[kalshi_event],
+                kalshi_markets_by_event={"CAND-A": [kalshi_market]},
+                feed_manager=mock_feed,
+            )
+
+        assert len(opps) == 1
+        opp = opps[0]
+        # Inverted: raw y_ask (0.40) and n_ask (0.45) were swapped
+        assert opp["_kalshi_yes"] == 0.45
+        assert opp["_kalshi_no"] == 0.40
+        mock_pm_rest.assert_not_called()
 
 
 class TestKalshiScanWSOrderbook:

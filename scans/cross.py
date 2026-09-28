@@ -153,8 +153,11 @@ def _refine_cross_with_clob(opportunities: list[dict], markets_by_key: dict, min
                     y_ask = best_yes_ask(parsed)
                     n_ask = best_no_ask(parsed)
                     if y_ask is not None and n_ask is not None:
-                        opp["_kalshi_yes"] = y_ask[0]
-                        opp["_kalshi_no"] = n_ask[0]
+                        ky, kn = round(y_ask[0], 4), round(n_ask[0], 4)
+                        if opp.get("_inverted"):
+                            ky, kn = kn, ky
+                        opp["_kalshi_yes"] = ky
+                        opp["_kalshi_no"] = kn
                         k_depth = min(int(y_ask[1]), int(n_ask[1]))
                 except Exception as exc:
                     logger.debug("Failed parsing WS orderbook for %s: %s", k_ticker, exc)
@@ -163,8 +166,11 @@ def _refine_cross_with_clob(opportunities: list[dict], markets_by_key: dict, min
             cached_k = price_cache.get(("kalshi", k_ticker))
             if cached_k and (time.time() - cached_k.get("_ts", 0)) <= 15.0:
                 if cached_k.get("yes_ask") is not None and cached_k.get("no_ask") is not None:
-                    opp["_kalshi_yes"] = cached_k["yes_ask"]
-                    opp["_kalshi_no"] = cached_k["no_ask"]
+                    ky, kn = round(cached_k["yes_ask"], 4), round(cached_k["no_ask"], 4)
+                    if opp.get("_inverted"):
+                        ky, kn = kn, ky
+                    opp["_kalshi_yes"] = ky
+                    opp["_kalshi_no"] = kn
                     y_sz = cached_k.get("yes_ask_size")
                     n_sz = cached_k.get("no_ask_size")
                     if y_sz is not None and n_sz is not None:

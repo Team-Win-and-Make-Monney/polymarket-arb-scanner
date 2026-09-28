@@ -157,17 +157,22 @@ def pilot_env(monkeypatch):
     Yields the live config module so tests can monkeypatch further keys on
     the object mm_pilot actually reads.
     """
+    from inventory_balancer import reset_inventory_balancer
+    reset_inventory_balancer()
     cfg = live_config()
     monkeypatch.setattr(cfg, "MM_KALSHI_PILOT_ENABLED", True)
     monkeypatch.setattr(cfg, "MM_TOXIC_FLOW_ENABLED", True)
     monkeypatch.setattr(cfg, "MM_VOLATILITY_ADJUSTED_ENABLED", True)
     monkeypatch.setattr(cfg, "MM_AUTO_HEDGE_ENABLED", True)
     yield cfg
+    reset_inventory_balancer()
 
 
 def build_pilot(clock, client=None, dry_run=False, hedger=None,
                 controls_on=True, detector=None, vol=None,
-                selection=(TICKER,), reconciled=True, state_path=None):
+                selection=(TICKER,), reconciled=True, state_path=None,
+                inventory_balancer=None):
+    from inventory_balancer import InventoryBalancer
     def time_fn():
         return clock[0]
     controls = ControlsPoller(time_fn=time_fn)
@@ -178,24 +183,14 @@ def build_pilot(clock, client=None, dry_run=False, hedger=None,
         kalshi_client=client,
         controls=controls,
         toxic_detector=detector or ToxicFlowDetector(),
-        # min_samples=1: most gate/fill/hedge tests aren't exercising G8's
-        # volatility warm-up behavior and only ever record one book/WS
-        # price tick before quoting — a real (non-injected) tracker here
-        # would otherwise fail G8 as "insufficient_samples" on every one of
-        # them. TestVolatilityGate and the warm-up test inject their own
-        # fakes / real tracker with the production default instead.
         volatility_tracker=vol or VolatilityTracker(min_samples=1),
         hedger_factory=lambda proxy: hedger,
         decision_writer=decisions.append,
         dry_run=dry_run,
         time_fn=time_fn,
-        # Route the monotonic clock through the SAME fake clock as wall
-        # time so tests that fast-forward `clock[0]` (hedge latency,
-        # cancel-retry backoff, etc.) move both together. Real
-        # time.monotonic() would ignore the fake clock entirely.
         mono_fn=time_fn,
-        # Disable local-file persistence in unit tests unless explicitly requested.
         state_path=state_path,
+        inventory_balancer=inventory_balancer if inventory_balancer is not None else InventoryBalancer(),
     )
     if selection is not None:
         pilot.update_selection(list(selection))
@@ -2270,3 +2265,184 @@ class TestMMPilotWSOrderbookStreaming:
         pilot = build_pilot(clock, client=None, selection=[TICKER])
         placed = pilot.refresh_market(TICKER)
         assert placed == []
+
+
+# ---------------------------------------------------------------------------
+# Cross-Venue Inventory Skew Quoting
+# ---------------------------------------------------------------------------
+
+
+class TestMMPilotInventorySkewQuoting:
+    def test_quote_widening_with_local_inventory_skew(self, pilot_env, clock):
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+
+        # Flat inventory baseline
+        placed_flat = pilot.refresh_market(TICKER)
+        assert len(placed_flat) == 2
+        orders_flat = {o["purpose"]: o for o in pilot.resting_orders(TICKER)}
+        spread_flat = orders_flat["quote_ask"]["price"] - orders_flat["quote_bid"]["price"]
+
+        # Now simulate holding inventory under cap (100 contracts @ 0.50 = $50 with max $100)
+        pilot.inventory.apply_fill(TICKER, "yes", "buy", 100, 0.50)
+        assert pilot.inventory.net_usd(TICKER) == pytest.approx(50.0)
+
+        # Refresh with skewed local inventory
+        placed_skewed = pilot.refresh_market(TICKER)
+        assert len(placed_skewed) == 2
+        orders_skewed = {o["purpose"]: o for o in pilot.resting_orders(TICKER)}
+        spread_skewed = orders_skewed["quote_ask"]["price"] - orders_skewed["quote_bid"]["price"]
+
+        # Skew spread must be strictly wider than flat baseline
+        assert spread_skewed > spread_flat
+
+    def test_quote_widening_with_cross_venue_skew(self, pilot_env, clock):
+        from inventory_balancer import InventoryBalancer
+        balancer = InventoryBalancer(max_delta_contracts=100.0)
+        # Polymarket long YES 80 contracts -> delta_net = +80.0
+        balancer.update_position(TICKER, "polymarket", "yes", "buy", 80.0)
+
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48)})
+        # Flat pilot without balancer baseline
+        pilot_flat = build_pilot(clock, client=client, selection=[TICKER])
+        pilot_flat.refresh_market(TICKER)
+        orders_flat = {o["purpose"]: o for o in pilot_flat.resting_orders(TICKER)}
+        spread_flat = orders_flat["quote_ask"]["price"] - orders_flat["quote_bid"]["price"]
+
+        # Pilot with cross-venue balancer
+        pilot_cv = build_pilot(clock, client=client, selection=[TICKER], inventory_balancer=balancer)
+        pilot_cv.refresh_market(TICKER)
+        orders_cv = {o["purpose"]: o for o in pilot_cv.resting_orders(TICKER)}
+        spread_cv = orders_cv["quote_ask"]["price"] - orders_cv["quote_bid"]["price"]
+
+        assert spread_cv > spread_flat
+
+    def test_one_sided_quoting_when_cross_venue_severely_imbalanced(self, pilot_env, clock):
+        from inventory_balancer import InventoryBalancer
+        balancer = InventoryBalancer(max_delta_contracts=50.0)
+        # Severe imbalance: long YES 85 contracts (>= max_delta_contracts=50 and ratio=1.0 >= 0.70)
+        balancer.update_position(TICKER, "polymarket", "yes", "buy", 85.0)
+        skew = balancer.get_market_delta(TICKER)
+        assert skew["is_imbalanced"] is True
+        assert skew["delta_net"] > 0
+
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER], inventory_balancer=balancer)
+        placed = pilot.refresh_market(TICKER)
+
+        # Net long YES -> one_side = "ask_only" (sell YES to reduce cross-venue risk)
+        assert len(placed) == 1
+        orders = {o["purpose"]: o for o in pilot.resting_orders(TICKER)}
+        assert "quote_ask" in orders
+        assert "quote_bid" not in orders
+
+        # Now test negative imbalance (net long NO -> delta_net < 0)
+        balancer_neg = InventoryBalancer(max_delta_contracts=50.0)
+        balancer_neg.update_position(TICKER, "polymarket", "no", "buy", 85.0)
+        skew_neg = balancer_neg.get_market_delta(TICKER)
+        assert skew_neg["is_imbalanced"] is True
+        assert skew_neg["delta_net"] < 0
+
+        pilot_neg = build_pilot(clock, client=client, selection=[TICKER], inventory_balancer=balancer_neg)
+        placed_neg = pilot_neg.refresh_market(TICKER)
+
+        # Net long NO -> one_side = "bid_only" (buy YES to reduce cross-venue risk)
+        assert len(placed_neg) == 1
+        orders_neg = {o["purpose"]: o for o in pilot_neg.resting_orders(TICKER)}
+        assert "quote_bid" in orders_neg
+        assert "quote_ask" not in orders_neg
+
+    def test_accumulating_side_headroom_and_taper(self, pilot_env, clock):
+        from inventory_balancer import InventoryBalancer
+        balancer = InventoryBalancer(max_delta_contracts=100.0)
+        # Long YES 50 contracts (not yet severe enough for ask_only, so 2-sided quoting)
+        balancer.update_position(TICKER, "polymarket", "yes", "buy", 50.0)
+
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48, yes_qty=1000.0, no_qty=1000.0)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER], inventory_balancer=balancer)
+
+        placed = pilot.refresh_market(TICKER)
+        assert len(placed) == 2
+        orders = {o["purpose"]: o for o in pilot.resting_orders(TICKER)}
+
+        # Bid (YES) is accumulating side; cv_delta = 50.
+        # Bid count should be strictly smaller than Ask count (reducing side is not tapered)
+        assert orders["quote_bid"]["count"] < orders["quote_ask"]["count"]
+
+    def test_decision_logging_g7b_inventory_skew_widening(self, pilot_env, clock):
+        from inventory_balancer import InventoryBalancer
+        balancer = InventoryBalancer(max_delta_contracts=100.0)
+        balancer.update_position(TICKER, "polymarket", "yes", "buy", 60.0)
+
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER], inventory_balancer=balancer)
+        pilot.refresh_market(TICKER)
+
+        g7b_decisions = [d for d in pilot._decisions if d.get("gate") == "G7b_inventory_skew_widening"]
+        assert len(g7b_decisions) > 0
+        latest = g7b_decisions[-1]
+        assert latest["decision"] == "pass"
+        assert "local_usd=" in latest["reason"]
+        assert "cv_delta=" in latest["reason"]
+        assert "skew_ratio=" in latest["reason"]
+        assert "skew_spread_mult=" in latest["reason"]
+
+    def test_inventory_balancer_position_update_on_fill(self, pilot_env, clock):
+        from inventory_balancer import InventoryBalancer
+        balancer = InventoryBalancer()
+        pilot = build_pilot(clock, selection=[TICKER], inventory_balancer=balancer)
+
+        event = FillEvent(
+            fill_id="fill-1",
+            order_id="ord-fill-1",
+            ticker=TICKER,
+            side="yes",
+            action="buy",
+            count=15,
+            price=0.52,
+            is_taker=False,
+            created_ts=clock[0],
+            mid_at_detect=0.50,
+        )
+        order_info = {"purpose": "quote_bid", "ticker": TICKER, "side": "yes", "action": "buy"}
+        pilot._process_fill(event, order_info)
+        assert pilot.inventory.net_contracts(TICKER) == 15
+        assert balancer.get_delta(TICKER) == 15.0
+
+    def test_status_and_persisted_state_inventory_skew(self, pilot_env, clock, tmp_path):
+        import config
+        state_file = str(tmp_path / "pilot_state_skew.json")
+        pilot = build_pilot(clock, selection=[TICKER], state_path=state_file)
+
+        # get_status
+        status = pilot.get_status()
+        assert "inventory_skew" in status
+        skew_status = status["inventory_skew"]
+        assert skew_status["enabled"] is True
+        assert skew_status["cross_venue_enabled"] is True
+        assert skew_status["factor"] == getattr(config, "MM_SKEW_SPREAD_FACTOR", 1.0)
+        assert skew_status["max_multiplier"] == getattr(config, "MM_SKEW_SPREAD_MAX_MULTIPLIER", 3.0)
+
+        # persist_state
+        pilot._persist_state()
+        persisted = pilot._state_store.load()
+        assert persisted is not None
+        assert "inventory_skew" in persisted
+        assert persisted["inventory_skew"]["enabled"] is True
+
+    def test_cross_venue_skew_disabled_by_config(self, pilot_env, clock, monkeypatch):
+        import config
+        monkeypatch.setattr(config, "MM_CROSS_VENUE_SKEW_ENABLED", False)
+
+        from inventory_balancer import InventoryBalancer
+        balancer = InventoryBalancer(max_delta_contracts=100.0)
+        balancer.update_position(TICKER, "polymarket", "yes", "buy", 85.0)
+
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER], inventory_balancer=balancer)
+        skew_info = pilot._get_cross_venue_skew(TICKER)
+        assert skew_info == {"delta_net": 0.0, "imbalance_ratio": 0.0, "is_imbalanced": False}
+
+        placed = pilot.refresh_market(TICKER)
+        # When disabled, severe cross-venue delta does NOT force one_side
+        assert len(placed) == 2

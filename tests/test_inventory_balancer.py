@@ -310,3 +310,66 @@ class TestRiskManagerInventorySkewIntegration:
         allowed, reason = rm.check(opp_healing, mock_db)
         assert allowed is True
         assert reason == "OK"
+
+
+class TestInventoryBalancerSkewMetricsAndSingleton:
+    """Test get_delta, get_market_delta, get_skew_metrics, and singleton helper."""
+
+    def test_get_delta_and_market_delta(self):
+        from inventory_balancer import InventoryBalancer
+        balancer = InventoryBalancer(max_delta_contracts=50.0, max_imbalance_ratio=0.5)
+
+        # Untracked market
+        assert balancer.get_delta("untracked") == 0.0
+        assert balancer.get_market_delta("untracked") is None
+
+        # Add positions: Polymarket YES: 60, Kalshi NO: 10 -> net delta = 50
+        balancer.update_position("mkt_1", "polymarket", "yes", "buy", 60.0)
+        balancer.update_position("mkt_1", "kalshi", "no", "buy", 10.0)
+
+        assert balancer.get_delta("mkt_1") == 50.0
+        info = balancer.get_market_delta("mkt_1")
+        assert info is not None
+        assert info["market_key"] == "mkt_1"
+        assert info["delta_net"] == 50.0
+        assert info["total_qty"] == 70.0
+        assert info["is_imbalanced"] is True
+        assert info["imbalance_ratio"] == pytest.approx(50.0 / 70.0)
+
+    def test_register_ticker_alias(self):
+        from inventory_balancer import InventoryBalancer
+        balancer = InventoryBalancer()
+        balancer.register_ticker_alias("KXNY-T75", "weather_ny_t75")
+        balancer.update_position("weather_ny_t75", "polymarket", "yes", "buy", 40.0)
+
+        # Query using the alias ticker
+        assert balancer.get_delta("KXNY-T75") == 40.0
+        delta_info = balancer.get_market_delta("KXNY-T75")
+        assert delta_info is not None
+        assert delta_info["delta_net"] == 40.0
+
+    def test_get_skew_metrics_widens_spread_and_restricts_one_sided(self):
+        from inventory_balancer import InventoryBalancer
+        balancer = InventoryBalancer(max_delta_contracts=50.0, max_imbalance_ratio=0.5)
+
+        # Imbalanced long YES across venues
+        balancer.update_position("mkt_2", "polymarket", "yes", "buy", 80.0)
+        balancer.update_position("mkt_2", "kalshi", "no", "buy", 10.0)
+
+        metrics = balancer.get_skew_metrics("mkt_2", local_inventory_usd=50.0, max_inventory_usd=100.0)
+        assert metrics["cross_venue_delta"] == 70.0
+        assert metrics["is_cross_imbalanced"] is True
+        assert metrics["one_side_restriction"] == "ask_only"
+        assert metrics["spread_multiplier"] > 1.0
+
+    def test_singleton_get_and_reset(self):
+        from inventory_balancer import get_inventory_balancer, reset_inventory_balancer
+        reset_inventory_balancer()
+        b1 = get_inventory_balancer()
+        b2 = get_inventory_balancer()
+        assert b1 is b2
+
+        reset_inventory_balancer()
+        b3 = get_inventory_balancer()
+        assert b3 is not b1
+        reset_inventory_balancer()

@@ -13,7 +13,7 @@ the same current incentive-program data and eligibility filters.
 
 import logging
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from config import (
     LIP_MIN_POOL,
@@ -23,6 +23,9 @@ from config import (
     LIP_PRICE_BAND_HIGH,
     LIP_MIN_HOURS_REMAINING,
     LIP_DEPTH_PROBE_LIMIT,
+    MM_MIN_24H_VOLUME,
+    MM_MAX_SPREAD_CENTS,
+    MM_VOLUME_WEIGHT,
 )
 from kalshi_policy import event_blocked
 from .kalshi import _fetch_kalshi_data
@@ -100,11 +103,10 @@ def select_lip_markets(kalshi_client, kalshi_data: tuple | None = None,
     """
     if not kalshi_client:
         return []
-    import config
     limit = max_markets or LIP_MAX_MARKETS
-    eff_min_vol = getattr(config, "MM_MIN_24H_VOLUME", 0.0) if min_volume is None else min_volume
-    eff_max_spread = getattr(config, "MM_MAX_SPREAD_CENTS", 30.0) if max_spread_cents is None else max_spread_cents
-    eff_vol_wt = getattr(config, "MM_VOLUME_WEIGHT", 0.20) if volume_weight is None else volume_weight
+    eff_min_vol = MM_MIN_24H_VOLUME if min_volume is None else min_volume
+    eff_max_spread = MM_MAX_SPREAD_CENTS if max_spread_cents is None else max_spread_cents
+    eff_vol_wt = MM_VOLUME_WEIGHT if volume_weight is None else volume_weight
 
     programs = kalshi_client.fetch_incentive_programs(
         status="active", incentive_type="liquidity")

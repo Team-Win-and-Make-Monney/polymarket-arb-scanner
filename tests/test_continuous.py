@@ -2052,7 +2052,7 @@ class TestContinuousWSOrderbookStreamingWiring:
     """Verify continuous mode wires price_cache to hedger and feed_manager to executor & hedger."""
 
     def test_wiring_price_cache_and_feed_manager(self, monkeypatch):
-        import continuous
+        continuous_module = sys.modules["continuous"]
         from hedger import PartialFillHedger
 
         args = MagicMock()
@@ -2079,7 +2079,7 @@ class TestContinuousWSOrderbookStreamingWiring:
         monkeypatch.setattr(PartialFillHedger, "__init__", fake_hedger_init)
 
         mock_feed_mgr = MagicMock()
-        monkeypatch.setattr(continuous, "FeedManager", lambda **kwargs: mock_feed_mgr)
+        monkeypatch.setattr(continuous_module, "FeedManager", lambda **kwargs: mock_feed_mgr)
 
         class _StopSentinel(Exception):
             pass
@@ -2088,14 +2088,14 @@ class TestContinuousWSOrderbookStreamingWiring:
             coro.close()
             raise _StopSentinel()
 
-        monkeypatch.setattr(continuous.asyncio, "run", fake_asyncio_run)
+        monkeypatch.setattr(continuous_module.asyncio, "run", fake_asyncio_run)
 
         test_price_cache = {("polymarket", "tok1"): {"price": 0.5}}
         mock_executor = MagicMock()
 
         with pytest.raises(_StopSentinel), \
              patch("continuous.CONFIG_HEDGE_ENABLED", True):
-            continuous.run_continuous(
+            continuous_module.run_continuous(
                 args=args,
                 min_profit=0.01,
                 kalshi_client=None,

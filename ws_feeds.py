@@ -535,9 +535,11 @@ class FeedManager:
             # bid on the opposite side. Deltas carry a single (side, price, delta)
             # change, so a per-ticker book is maintained across messages.
             book = self._kalshi_books.get(ticker)
+            book_changed = False
             if msg_type == "orderbook_snapshot":
                 book = {"yes": {}, "no": {}}
                 self._kalshi_books[ticker] = book
+                book_changed = True
                 for side in ("yes", "no"):
                     ladder = msg.get(side) or []
                     book[side] = {
@@ -551,11 +553,16 @@ class FeedManager:
                 delta = msg.get("delta")
                 if side in ("yes", "no") and isinstance(price, (int, float)) and isinstance(delta, (int, float)):
                     levels = book[side]
-                    qty = levels.get(int(price), 0) + delta
+                    level = int(price)
+                    previous_qty = levels.get(level)
+                    qty = (previous_qty or 0) + delta
                     if qty > 0:
-                        levels[int(price)] = qty
-                    else:
-                        levels.pop(int(price), None)
+                        if previous_qty != qty:
+                            levels[level] = qty
+                            book_changed = True
+                    elif level in levels:
+                        levels.pop(level)
+                        book_changed = True
 
             normalised = dict(msg)  # keep raw fields for backward compat
             for side, opposite in (("yes", "no"), ("no", "yes")):
@@ -571,14 +578,16 @@ class FeedManager:
                     normalised[f"{side}_ask_size"] = 0
 
             if book is not None:
-                self._kalshi_book_times[ticker] = time.time()
+                if book_changed:
+                    self._kalshi_book_times[ticker] = time.time()
                 normalised["orderbook"] = {
                     "yes": [[p, q] for p, q in sorted(book.get("yes", {}).items())],
                     "no": [[p, q] for p, q in sorted(book.get("no", {}).items())],
                 }
 
             self._last_message_time["kalshi"] = time.time()
-            self.on_price_update("kalshi", ticker, normalised)
+            if book is None or book_changed:
+                self.on_price_update("kalshi", ticker, normalised)
 
     async def _run_polymarket(self):
         """Maintain Polymarket WebSocket connection with auto-reconnect and exponential backoff."""
@@ -713,6 +722,8 @@ class FeedManager:
                                 normalised["best_ask"] = float(ba)
                         except (ValueError, TypeError):
                             pass
+                        self._poly_books.pop(aid, None)
+                        self._poly_book_times.pop(aid, None)
                         self.on_price_update("polymarket", aid, normalised)
                 continue
 

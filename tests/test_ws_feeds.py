@@ -599,3 +599,52 @@ class TestKalshiOrderbookSemantics:
         fm.stop()
         assert fm.get_orderbook("kalshi", "KXTEST-A") == (None, None)
         assert fm.get_orderbook("polymarket", "tok_poly_1") == (None, None)
+
+    def test_kalshi_ignored_delta_does_not_update_timestamp_or_callback(self):
+        cb = MagicMock()
+        fm = _make_feed(cb)
+        fm._handle_kalshi_message(self.SNAPSHOT)
+        initial_time = fm._kalshi_book_times["KXTEST-A"]
+        cb.reset_mock()
+
+        # Delta that deletes a level that doesn't exist (price=99 with -10)
+        fm._handle_kalshi_message({
+            "type": "orderbook_delta",
+            "msg": {"market_ticker": "KXTEST-A", "side": "yes", "price": 99, "delta": -10},
+        })
+
+        # on_price_update should NOT be called for an ignored delta
+        cb.assert_not_called()
+        # book timestamp must not be updated
+        assert fm._kalshi_book_times["KXTEST-A"] == initial_time
+
+    def test_polymarket_price_change_invalidates_cached_book(self):
+        cb = MagicMock()
+        fm = _make_feed(cb)
+
+        # First receive a book snapshot
+        fm._handle_polymarket_message([{
+            "event_type": "book",
+            "asset_id": "tok_poly_1",
+            "asks": [{"price": "0.55", "size": "100"}],
+            "bids": [{"price": "0.45", "size": "150"}],
+        }])
+        assert fm.get_polymarket_orderbook("tok_poly_1") is not None
+        assert fm.get_polymarket_orderbook_age("tok_poly_1") is not None
+
+        # Then receive a price_change for the same asset
+        fm._handle_polymarket_message([{
+            "event_type": "price_change",
+            "price_changes": [{
+                "asset_id": "tok_poly_1",
+                "price": "0.56",
+                "size": "50",
+                "side": "SELL",
+                "best_bid": "0.45",
+                "best_ask": "0.56",
+            }],
+        }])
+
+        # The cached book should now be invalidated so callers fall back to REST
+        assert fm.get_polymarket_orderbook("tok_poly_1") is None
+        assert fm.get_polymarket_orderbook_age("tok_poly_1") is None

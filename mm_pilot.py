@@ -451,6 +451,8 @@ class KalshiMMPilot:
         # Selection snapshot (PR #43's select_lip_markets output). None until
         # the first snapshot arrives — G4 fails closed without one.
         self._selected: set[str] | None = None
+        self._selection_metadata: dict[str, dict] = {}
+        self._last_selection_time: float = 0.0
 
         # Halt state
         self.halted = False           # whole-pilot halt (manual restart)
@@ -550,14 +552,27 @@ class KalshiMMPilot:
 
         Accepts either ticker strings or market dicts with LIP pool metadata.
         When market dicts are provided, registers each market's incentive
-        program with the LIP reward tracker.
+        program with the LIP reward tracker and captures selection metadata.
         """
         selected_tickers: set[str] = set()
+        metadata: dict[str, dict] = {}
+        now = self._time_fn()
         for item in items or []:
             if isinstance(item, dict):
                 ticker = item.get("ticker", "")
                 if ticker:
                     selected_tickers.add(ticker)
+                    metadata[ticker] = {
+                        "score": item.get("score"),
+                        "base_score": item.get("base_score"),
+                        "pool_dollars": item.get("pool_dollars"),
+                        "volume_24h": item.get("volume_24h"),
+                        "spread_cents": item.get("spread_cents"),
+                        "category": item.get("category"),
+                        "target_size": item.get("target_size"),
+                        "discount_factor_bps": item.get("discount_factor_bps"),
+                        "selected_at": now,
+                    }
                     if hasattr(self, "_lip_tracker"):
                         try:
                             self._lip_tracker.set_market_program(
@@ -571,10 +586,33 @@ class KalshiMMPilot:
                         except Exception as exc:
                             logger.debug("Failed setting market program for %s: %s", ticker, exc)
             elif item:
-                selected_tickers.add(str(item))
+                ticker = str(item)
+                selected_tickers.add(ticker)
+                metadata[ticker] = {"selected_at": now}
 
         with self._lock:
             self._selected = selected_tickers
+            self._selection_metadata = metadata
+            self._last_selection_time = now
+
+    def get_selection_status(self) -> dict:
+        """Current market selection state, rank metadata, and schedule."""
+        import config
+        with self._lock:
+            selected = sorted(self._selected) if self._selected else []
+            meta = dict(self._selection_metadata)
+            last_time = self._last_selection_time
+        return {
+            "selected_tickers": selected,
+            "market_count": len(selected),
+            "last_selection_time": last_time,
+            "dynamic_selection_enabled": getattr(config, "MM_DYNAMIC_SELECTION_ENABLED", True),
+            "refresh_interval_sec": getattr(config, "MM_SELECTION_REFRESH_INTERVAL_SEC", 1800.0),
+            "min_24h_volume": getattr(config, "MM_MIN_24H_VOLUME", 0.0),
+            "max_spread_cents": getattr(config, "MM_MAX_SPREAD_CENTS", 0.0),
+            "volume_weight": getattr(config, "MM_VOLUME_WEIGHT", 0.20),
+            "markets": meta,
+        }
 
     def pilot_tickers(self) -> list[str]:
         """Markets the pilot currently owns: selected + carrying state."""
@@ -913,6 +951,8 @@ class KalshiMMPilot:
                 "factor": getattr(config, "MM_SKEW_SPREAD_FACTOR", 1.0),
                 "max_multiplier": getattr(config, "MM_SKEW_SPREAD_MAX_MULTIPLIER", 3.0),
             },
+            "portfolio_margin": self.get_portfolio_margin_metrics(),
+            "selection": self.get_selection_status(),
             "toxicity": toxicity_data,
             "seen_fill_ids": list(self._seen_fill_ids.keys())[-200:],
             "saved_at": self._time_fn(),
@@ -2583,6 +2623,10 @@ class KalshiMMPilot:
 
         last_controls = last_fills = last_refresh = last_selection = 0.0
         last_reconcile_attempt = self._time_fn()
+        if selection_provider is None and getattr(config, "MM_DYNAMIC_SELECTION_ENABLED", True) and self._client is not None:
+            if hasattr(self._client, "fetch_incentive_programs"):
+                from scans.lip_select import select_lip_markets
+                selection_provider = lambda: select_lip_markets(self._client)
         if not self._reconciled:
             self._reconciled = self.reconcile()
         while not stop_event.is_set():
@@ -2600,11 +2644,15 @@ class KalshiMMPilot:
                 if now - last_controls >= config.MM_CONTROLS_POLL_SECONDS:
                     last_controls = now
                     self._controls.poll()
-                if selection_provider is not None and now - last_selection >= 3600:
+                sel_interval = getattr(config, "MM_SELECTION_REFRESH_INTERVAL_SEC", 1800.0)
+                if selection_provider is not None and now - last_selection >= sel_interval:
                     last_selection = now
-                    tickers = selection_provider()
-                    if tickers is not None:
-                        self.update_selection(list(tickers))
+                    try:
+                        tickers = selection_provider()
+                        if tickers is not None:
+                            self.update_selection(list(tickers))
+                    except Exception as exc:
+                        logger.warning("Dynamic market selection provider failed: %s", exc)
                 if now - last_fills >= config.MM_FILL_POLL_SECONDS:
                     last_fills = now
                     self.poll_fills()
@@ -2772,6 +2820,7 @@ class KalshiMMPilot:
                 "max_multiplier": getattr(config, "MM_SKEW_SPREAD_MAX_MULTIPLIER", 3.0),
             },
             "portfolio_margin": self.get_portfolio_margin_metrics(),
+            "selection": self.get_selection_status(),
             "toxicity": toxicity_by_ticker,
 
             "dry_run": self.dry_run,

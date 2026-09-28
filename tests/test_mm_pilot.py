@@ -2668,3 +2668,96 @@ class TestMMPilotPortfolioMarginGuard:
         assert "total_notional" in pm
         assert "margin_utilization" in pm
         assert "is_over_cap" in pm
+
+
+class TestMMPilotDynamicMarketSelection:
+    def test_update_selection_records_metadata_and_selection_status(self, pilot_env, clock):
+        pilot = build_pilot(clock)
+        items = [
+            {
+                "ticker": "DYNAMIC_A",
+                "score": 95.5,
+                "base_score": 80.0,
+                "volume_24h": 5000.0,
+                "spread_cents": 8.0,
+                "pool_dollars": 3000.0,
+                "category": "Economics",
+                "target_size": 20,
+                "discount_factor_bps": 5000,
+            }
+        ]
+        pilot.update_selection(items)
+        assert pilot._selected == {"DYNAMIC_A"}
+        status = pilot.get_selection_status()
+        assert status["selected_tickers"] == ["DYNAMIC_A"]
+        assert status["market_count"] == 1
+        assert status["dynamic_selection_enabled"] is True
+        assert status["refresh_interval_sec"] == 1800.0
+        assert status["min_24h_volume"] == 0.0
+        assert status["max_spread_cents"] == 0.0
+        assert status["volume_weight"] == 0.20
+        meta = status["markets"]["DYNAMIC_A"]
+        assert meta["score"] == 95.5
+        assert meta["base_score"] == 80.0
+        assert meta["volume_24h"] == 5000.0
+        assert meta["spread_cents"] == 8.0
+        assert meta["pool_dollars"] == 3000.0
+
+        full_status = pilot.get_status()
+        assert "selection" in full_status
+        assert full_status["selection"]["market_count"] == 1
+        assert full_status["selection"]["selected_tickers"] == ["DYNAMIC_A"]
+
+    def test_update_selection_strings_captured_in_status(self, pilot_env, clock):
+        pilot = build_pilot(clock)
+        pilot.update_selection(["TICKER_X", "TICKER_Y"])
+        assert pilot._selected == {"TICKER_X", "TICKER_Y"}
+        status = pilot.get_selection_status()
+        assert status["selected_tickers"] == ["TICKER_X", "TICKER_Y"]
+        assert status["market_count"] == 2
+        assert "TICKER_X" in status["markets"]
+        assert "TICKER_Y" in status["markets"]
+
+    def test_run_loop_auto_wires_dynamic_selection(self, pilot_env, clock, monkeypatch):
+        import threading
+        client = FakeKalshiClient()
+        # Add fetch_incentive_programs so pilot detects client support
+        client.fetch_incentive_programs = lambda **kw: []
+        pilot = build_pilot(clock, client=client)
+
+        selected_mock = [{"ticker": "DYNAMIC_SEL", "score": 100.0}]
+        monkeypatch.setattr("scans.lip_select.select_lip_markets", lambda c: selected_mock)
+
+        stop = threading.Event()
+        original_poll = pilot._controls.poll
+
+        def stop_after_poll():
+            original_poll()
+            stop.set()
+
+        pilot._controls.poll = stop_after_poll
+        pilot.run_loop(stop, selection_provider=None)
+
+        assert pilot._selected == {"DYNAMIC_SEL"}
+        status = pilot.get_selection_status()
+        assert "DYNAMIC_SEL" in status["markets"]
+
+    def test_run_loop_selection_provider_failure_does_not_halt(self, pilot_env, clock):
+        import threading
+        pilot = build_pilot(clock, selection=[TICKER])
+        stop = threading.Event()
+
+        def failing_provider():
+            raise RuntimeError("API timeout during selection")
+
+        original_poll = pilot._controls.poll
+
+        def stop_after_poll():
+            original_poll()
+            stop.set()
+
+        pilot._controls.poll = stop_after_poll
+        pilot.run_loop(stop, selection_provider=failing_provider)
+
+        assert pilot.halted is False
+        assert pilot._selected == {TICKER}

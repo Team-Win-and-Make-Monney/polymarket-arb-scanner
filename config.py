@@ -1020,6 +1020,10 @@ PRICE_CACHE_EVICTION_AGE = _env_float("PRICE_CACHE_EVICTION_AGE", "60")
 WS_CACHE_MAX_AGE_SCAN = _env_float("WS_CACHE_MAX_AGE_SCAN", "30")
 WS_CACHE_MAX_AGE_REVALIDATION = _env_float("WS_CACHE_MAX_AGE_REVALIDATION", "15")
 
+# Cross-venue WebSocket Orderbook Streaming for Hedger and Arbitrage Executor
+WS_ORDERBOOK_STREAMING_ENABLED = _env_bool("WS_ORDERBOOK_STREAMING_ENABLED", "true")
+WS_ORDERBOOK_MAX_AGE_SECONDS = _env_float("WS_ORDERBOOK_MAX_AGE_SECONDS", "15.0")
+
 # WS feed stale detection threshold (seconds without any message)
 WS_STALE_FEED_SECONDS = _env_float("WS_STALE_FEED_SECONDS", "120")
 
@@ -1392,6 +1396,7 @@ def validate_config() -> list[str]:
         "MM_CANARY_MAX_LOSS_USD": MM_CANARY_MAX_LOSS_USD,
         "MM_CANARY_MIN_HOURS": MM_CANARY_MIN_HOURS,
         "MM_WS_BOOK_MAX_AGE_SECONDS": MM_WS_BOOK_MAX_AGE_SECONDS,
+        "WS_ORDERBOOK_MAX_AGE_SECONDS": WS_ORDERBOOK_MAX_AGE_SECONDS,
         "CTF_MAX_TRADE_SIZE": CTF_MAX_TRADE_SIZE,
     }
     for name, val in _positive.items():

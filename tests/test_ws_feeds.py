@@ -525,6 +525,7 @@ class TestKalshiOrderbookSemantics:
         cb = MagicMock()
         fm = _make_feed(cb)
         assert fm.get_kalshi_orderbook("KXTEST-A") is None
+        assert fm.get_kalshi_orderbook_age("KXTEST-A") is None
 
         fm._handle_kalshi_message(self.SNAPSHOT)
         ob = fm.get_kalshi_orderbook("KXTEST-A")
@@ -534,3 +535,67 @@ class TestKalshiOrderbookSemantics:
                 "no": [[45, 50], [55, 80]],
             }
         }
+        age = fm.get_kalshi_orderbook_age("KXTEST-A")
+        assert age is not None
+        assert age >= 0.0
+
+    def test_polymarket_orderbook_snapshot_and_query(self):
+        cb = MagicMock()
+        fm = _make_feed(cb)
+        assert fm.get_polymarket_orderbook("tok_poly_1") is None
+        assert fm.get_polymarket_orderbook_age("tok_poly_1") is None
+
+        event = {
+            "event_type": "book",
+            "asset_id": "tok_poly_1",
+            "asks": [{"price": "0.55", "size": "100"}, {"price": "0.60", "size": "200"}],
+            "bids": [{"price": "0.45", "size": "150"}, {"price": "0.40", "size": "250"}],
+        }
+        fm._handle_polymarket_message([event])
+
+        cb.assert_called_once()
+        payload = cb.call_args[0][2]
+        assert "orderbook" in payload
+        assert payload["orderbook"]["asks"] == [{"price": "0.55", "size": "100"}, {"price": "0.60", "size": "200"}]
+        assert payload["orderbook"]["bids"] == [{"price": "0.45", "size": "150"}, {"price": "0.40", "size": "250"}]
+
+        ob = fm.get_polymarket_orderbook("tok_poly_1")
+        assert ob == {
+            "asks": [{"price": "0.55", "size": "100"}, {"price": "0.60", "size": "200"}],
+            "bids": [{"price": "0.45", "size": "150"}, {"price": "0.40", "size": "250"}],
+        }
+        age = fm.get_polymarket_orderbook_age("tok_poly_1")
+        assert age is not None
+        assert age >= 0.0
+
+    def test_unified_get_orderbook(self):
+        cb = MagicMock()
+        fm = _make_feed(cb)
+
+        # Unknown platform
+        assert fm.get_orderbook("unknown", "key") == (None, None)
+
+        # Kalshi
+        fm._handle_kalshi_message(self.SNAPSHOT)
+        k_book, k_age = fm.get_orderbook("kalshi", "KXTEST-A")
+        assert k_book is not None
+        assert "orderbook" in k_book
+        assert k_age is not None and k_age >= 0.0
+
+        # Polymarket
+        event = {
+            "event_type": "book",
+            "asset_id": "tok_poly_1",
+            "asks": [{"price": "0.55", "size": "100"}],
+            "bids": [{"price": "0.45", "size": "150"}],
+        }
+        fm._handle_polymarket_message([event])
+        p_book, p_age = fm.get_orderbook("polymarket", "tok_poly_1")
+        assert p_book is not None
+        assert "asks" in p_book and "bids" in p_book
+        assert p_age is not None and p_age >= 0.0
+
+        # Reset clears both
+        fm.stop()
+        assert fm.get_orderbook("kalshi", "KXTEST-A") == (None, None)
+        assert fm.get_orderbook("polymarket", "tok_poly_1") == (None, None)

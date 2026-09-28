@@ -244,6 +244,17 @@ class TestValidateConfig:
         with pytest.raises(ValueError, match="MM_WS_BOOK_MAX_AGE_SECONDS.*must be > 0"):
             _reload_config()
 
+    @pytest.mark.parametrize("bad_val", ["0", "-1", "inf", "-inf", "nan"])
+    def test_ws_orderbook_max_age_seconds_rejects_non_positive_and_non_finite(self, monkeypatch, bad_val):
+        monkeypatch.setenv("WS_ORDERBOOK_MAX_AGE_SECONDS", bad_val)
+        with pytest.raises(ValueError, match="WS_ORDERBOOK_MAX_AGE_SECONDS.*must be > 0"):
+            _reload_config()
+
+    def test_ws_orderbook_streaming_defaults(self):
+        cfg = _reload_config()
+        assert cfg.WS_ORDERBOOK_STREAMING_ENABLED is True
+        assert cfg.WS_ORDERBOOK_MAX_AGE_SECONDS == 15.0
+
     @pytest.mark.parametrize("name,value", [
         ("LIP_MIN_POOL", "-0.01"),
         ("LIP_MAX_MARKETS", "0"),

@@ -3212,3 +3212,238 @@ class TestExecutorTemporal:
             # 15.0 / 0.75 = 20 contracts
             assert legs[0]["_contracts"] == 20
             assert legs[1]["_contracts"] == 20
+
+
+# ---------------------------------------------------------------------------
+# TestExecutorWebSocketOrderbookStreaming
+# ---------------------------------------------------------------------------
+
+class TestExecutorWebSocketOrderbookStreaming:
+    """Tests for Phase 4 WebSocket orderbook streaming in ArbitrageExecutor."""
+
+    def test_polymarket_orderbook_ws_hit(self, executor) -> None:
+        """Fresh Polymarket book from feed_manager is returned without REST call."""
+        mock_fm = MagicMock()
+        book = {"bids": [{"price": "0.45", "size": "100"}], "asks": [{"price": "0.55", "size": "100"}]}
+        mock_fm.get_orderbook.return_value = (book, 1.2)
+        executor.feed_manager = mock_fm
+
+        with patch("executor.fetch_order_book") as mock_rest:
+            res_book, source = executor._get_orderbook("polymarket", "token_123")
+            assert res_book == book
+            assert source == "ws"
+            mock_rest.assert_not_called()
+            mock_fm.get_orderbook.assert_called_once_with("polymarket", "token_123")
+            telemetry = executor.get_orderbook_telemetry()
+            assert telemetry["ws_hits"] == 1
+            assert telemetry["rest_fetches"] == 0
+
+    def test_polymarket_orderbook_stale_fallback_rest(self, executor) -> None:
+        """Stale Polymarket book from feed_manager triggers REST fallback."""
+        mock_fm = MagicMock()
+        stale_book = {"bids": [], "asks": []}
+        mock_fm.get_orderbook.return_value = (stale_book, 25.0)
+        executor.feed_manager = mock_fm
+
+        rest_book = {"bids": [{"price": "0.48", "size": "50"}], "asks": [{"price": "0.52", "size": "50"}]}
+        with patch("executor.fetch_order_book", return_value=rest_book) as mock_rest:
+            res_book, source = executor._get_orderbook("polymarket", "token_123")
+            assert res_book == rest_book
+            assert source == "rest"
+            mock_rest.assert_called_once_with("token_123")
+            telemetry = executor.get_orderbook_telemetry()
+            assert telemetry["ws_hits"] == 0
+            assert telemetry["rest_fetches"] == 1
+
+    def test_polymarket_orderbook_missing_fallback_rest(self, executor) -> None:
+        """Missing Polymarket book from feed_manager triggers REST fallback."""
+        mock_fm = MagicMock()
+        mock_fm.get_orderbook.return_value = (None, None)
+        executor.feed_manager = mock_fm
+
+        rest_book = {"bids": [], "asks": [{"price": "0.50", "size": "10"}]}
+        with patch("executor.fetch_order_book", return_value=rest_book) as mock_rest:
+            res_book, source = executor._get_orderbook("polymarket", "token_123")
+            assert res_book == rest_book
+            assert source == "rest"
+            mock_rest.assert_called_once_with("token_123")
+            telemetry = executor.get_orderbook_telemetry()
+            assert telemetry["ws_hits"] == 0
+            assert telemetry["rest_fetches"] == 1
+
+    def test_polymarket_orderbook_disabled_streaming(self, executor) -> None:
+        """When streaming disabled, bypasses feed_manager completely."""
+        mock_fm = MagicMock()
+        executor.feed_manager = mock_fm
+        rest_book = {"bids": [], "asks": []}
+
+        with patch("config.WS_ORDERBOOK_STREAMING_ENABLED", False), \
+             patch("executor.fetch_order_book", return_value=rest_book) as mock_rest:
+            res_book, source = executor._get_orderbook("polymarket", "token_123")
+            assert res_book == rest_book
+            assert source == "rest"
+            mock_fm.get_orderbook.assert_not_called()
+            mock_rest.assert_called_once_with("token_123")
+            telemetry = executor.get_orderbook_telemetry()
+            assert telemetry["ws_hits"] == 0
+            assert telemetry["rest_fetches"] == 1
+
+    def test_kalshi_orderbook_ws_hit(self, executor) -> None:
+        """Fresh Kalshi book from feed_manager is returned without REST call."""
+        mock_fm = MagicMock()
+        kalshi_book = {"orderbook": {"yes": [[45, 100]], "no": [[55, 100]]}}
+        mock_fm.get_orderbook.return_value = (kalshi_book, 0.5)
+        executor.feed_manager = mock_fm
+        executor.kalshi_client = MagicMock()
+
+        res_book, source = executor._get_orderbook("kalshi", "KXTEST")
+        assert res_book == kalshi_book
+        assert source == "ws"
+        executor.kalshi_client.fetch_order_book.assert_not_called()
+        telemetry = executor.get_orderbook_telemetry()
+        assert telemetry["ws_hits"] == 1
+        assert telemetry["rest_fetches"] == 0
+
+    def test_kalshi_orderbook_stale_fallback_rest(self, executor) -> None:
+        """Stale Kalshi book triggers REST fallback to kalshi_client.fetch_order_book."""
+        mock_fm = MagicMock()
+        stale_book = {"orderbook": {"yes": [[40, 10]], "no": [[60, 10]]}}
+        mock_fm.get_orderbook.return_value = (stale_book, 30.0)
+        executor.feed_manager = mock_fm
+        executor.kalshi_client = MagicMock()
+        rest_book = {"orderbook": {"yes": [[45, 50]], "no": [[55, 50]]}}
+        executor.kalshi_client.fetch_order_book.return_value = rest_book
+
+        res_book, source = executor._get_orderbook("kalshi", "KXTEST")
+        assert res_book == rest_book
+        assert source == "rest"
+        executor.kalshi_client.fetch_order_book.assert_called_once_with("KXTEST")
+        telemetry = executor.get_orderbook_telemetry()
+        assert telemetry["ws_hits"] == 0
+        assert telemetry["rest_fetches"] == 1
+
+    def test_kalshi_orderbook_no_client_returns_none(self, executor) -> None:
+        """When Kalshi orderbook is missing from WS and client is None, returns (None, 'none')."""
+        executor.feed_manager = None
+        executor.kalshi_client = None
+
+        res_book, source = executor._get_orderbook("kalshi", "KXTEST")
+        assert res_book is None
+        assert source == "none"
+
+    def test_check_exit_liquidity_uses_ws_orderbooks(self, executor) -> None:
+        """_check_exit_liquidity uses fresh WS orderbooks for both Polymarket and Kalshi."""
+        mock_fm = MagicMock()
+        poly_book = {
+            "bids": [{"price": "0.45", "size": "100"}],
+            "asks": [{"price": "0.55", "size": "100"}],
+        }
+        kalshi_book = {
+            "orderbook": {"yes": [[48, 100]], "no": [[52, 100]]},
+        }
+
+        def fake_get_orderbook(platform, key):
+            if platform == "polymarket":
+                return (poly_book, 1.0)
+            elif platform == "kalshi":
+                return (kalshi_book, 1.0)
+            return (None, None)
+
+        mock_fm.get_orderbook.side_effect = fake_get_orderbook
+        executor.feed_manager = mock_fm
+        executor.kalshi_client = MagicMock()
+        executor.dry_run = False
+
+        opp = {"type": "CrossPlatformArb"}
+        legs = [
+            {"platform": "kalshi", "action": "buy", "side": "yes", "_ticker": "KXTEST", "price": 0.48, "size": 10},
+            {"platform": "polymarket", "action": "buy", "side": "BUY", "_token_id": "tok_1", "price": 0.50, "size": 10},
+        ]
+
+        with patch("config.EXIT_LIQUIDITY_GATE_ENABLED", True), \
+             patch("polymarket_api.fetch_order_book") as mock_poly_rest, \
+             patch("kalshi_api.parse_orderbook", return_value={"yes_bids": [(0.48, 100.0)], "no_bids": [(0.52, 100.0)]}), \
+             patch("kalshi_api.best_yes_bid", return_value=(0.48, 100.0)), \
+             patch("polymarket_api.get_best_bid_ask", return_value={"bid": 0.45, "ask": 0.55, "bid_size": 100, "ask_size": 100}):
+            passed, reason = executor._check_exit_liquidity(opp, legs)
+            assert passed is True
+            mock_poly_rest.assert_not_called()
+            executor.kalshi_client.fetch_order_book.assert_not_called()
+            telemetry = executor.get_orderbook_telemetry()
+            assert telemetry["ws_hits"] == 2
+            assert telemetry["rest_fetches"] == 0
+
+    def test_revalidate_kalshi_binary_uses_ws_orderbook(self, executor) -> None:
+        """_revalidate_kalshi_binary revalidates with fresh WS book without calling client."""
+        mock_fm = MagicMock()
+        kalshi_book = {"orderbook": {"yes": [[45, 100]], "no": [[50, 100]]}}
+        mock_fm.get_orderbook.return_value = (kalshi_book, 0.5)
+        executor.feed_manager = mock_fm
+        executor.kalshi_client = MagicMock()
+
+        opp = {
+            "type": "KalshiBinaryArb",
+            "_kalshi_ticker": "KXTEST",
+            "net_profit": 0.05,
+            "net_roi": "5.0%",
+            "total_cost": "$0.95",
+        }
+
+        with patch("kalshi_api.parse_orderbook", return_value={"yes_bids": [(0.45, 100)], "no_bids": [(0.50, 100)]}), \
+             patch("kalshi_api.best_yes_ask", return_value=(0.50, 100.0)), \
+             patch("kalshi_api.best_no_ask", return_value=(0.45, 100.0)), \
+             patch("executor.net_profit_kalshi_binary", return_value={"net_profit": 0.05, "net_roi": 0.05}):
+            passed, net_profit, reason = executor._revalidate_kalshi_binary(opp, 0.05)
+            assert passed is True
+            assert net_profit == 0.05
+            executor.kalshi_client.fetch_order_book.assert_not_called()
+            telemetry = executor.get_orderbook_telemetry()
+            assert telemetry["ws_hits"] == 1
+            assert telemetry["rest_fetches"] == 0
+
+    def test_revalidate_cross_uses_ws_orderbooks(self, executor) -> None:
+        """_revalidate_cross revalidates with fresh WS books on both legs."""
+        mock_fm = MagicMock()
+        poly_book = {
+            "bids": [{"price": "0.45", "size": "100"}],
+            "asks": [{"price": "0.48", "size": "100"}],
+        }
+        kalshi_book = {
+            "orderbook": {"yes": [[48, 100]], "no": [[50, 100]]},
+        }
+
+        def fake_get_orderbook(platform, key):
+            if platform == "polymarket":
+                return (poly_book, 0.8)
+            elif platform == "kalshi":
+                return (kalshi_book, 0.8)
+            return (None, None)
+
+        mock_fm.get_orderbook.side_effect = fake_get_orderbook
+        executor.feed_manager = mock_fm
+        executor.kalshi_client = MagicMock()
+
+        opp = {
+            "type": "CrossPlatformArb",
+            "_token_ids": ["tok_yes", "tok_no"],
+            "_kalshi_ticker": "KXTEST",
+            "net_profit": 0.04,
+            "net_roi": "4.0%",
+            "total_cost": "$0.96",
+        }
+
+        with patch("polymarket_api.fetch_order_book") as mock_poly_rest, \
+             patch("kalshi_api.parse_orderbook", return_value={"yes_bids": [(0.48, 100)], "no_bids": [(0.50, 100)]}), \
+             patch("kalshi_api.best_yes_ask", return_value=(0.50, 100.0)), \
+             patch("kalshi_api.best_no_ask", return_value=(0.48, 100.0)), \
+             patch("executor.get_best_bid_ask", return_value={"bid": 0.45, "ask": 0.48, "bid_size": 100, "ask_size": 100}), \
+             patch("executor.net_profit_cross_platform", return_value={"net_profit": 0.04, "net_roi": 0.04}), \
+             patch("config.JEV_CROSS_EQUIVALENCE_ENABLED", False):
+            passed, net_profit, reason = executor._revalidate_cross(opp, 0.04, price_cache={})
+            assert passed is True
+            assert net_profit == 0.04
+            mock_poly_rest.assert_not_called()
+            executor.kalshi_client.fetch_order_book.assert_not_called()
+            telemetry = executor.get_orderbook_telemetry()
+            assert telemetry["ws_hits"] == 3  # 2 poly tokens + 1 kalshi ticker
+            assert telemetry["rest_fetches"] == 0

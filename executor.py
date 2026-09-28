@@ -212,6 +212,11 @@ def _check_min_entry_price(opportunity: dict, legs: list[dict]) -> tuple[bool, s
 class ArbitrageExecutor:
     """Executes arbitrage trades with risk controls, dry-run, and semi/full-auto modes."""
 
+    feed_manager = None
+    price_cache = None
+    _ws_orderbook_hits = 0
+    _rest_orderbook_fetches = 0
+
     def __init__(
         self,
         pm_trader: PolymarketTrader | None,
@@ -237,6 +242,7 @@ class ArbitrageExecutor:
         notifier=None,
         position_sizer=None,
         ctf_client: CTFClient | None = None,
+        feed_manager=None,
     ):
         self.pm_trader = pm_trader
         self.kalshi_client = kalshi_client
@@ -249,6 +255,7 @@ class ArbitrageExecutor:
         self.gas_monitor = gas_monitor
         self.notifier = notifier
         self.ctf_client = ctf_client
+        self.feed_manager = feed_manager
         self.db = db
         self.risk = risk_manager
         self.dry_run = dry_run
@@ -261,6 +268,9 @@ class ArbitrageExecutor:
         self.sizing_aggressiveness = sizing_aggressiveness
         self.concurrent_execution = concurrent_execution
         self.position_sizer = position_sizer
+        # Orderbook source telemetry
+        self._ws_orderbook_hits = 0
+        self._rest_orderbook_fetches = 0
         # Canary session counters (hard caps when CANARY_MODE is set)
         self._canary_trades_done = 0
         # Balance cache: avoids redundant API calls within a scan cycle
@@ -279,6 +289,76 @@ class ArbitrageExecutor:
         self._decision_fh = open(self._decision_log_path, "a", encoding="utf-8", buffering=1)
         # Whale copy position tracking
         self._whale_copy_position_count = 0
+
+    def get_orderbook_telemetry(self) -> dict:
+        """Return counts of orderbooks sourced from WebSocket cache vs REST."""
+        return {
+            "ws_hits": getattr(self, "_ws_orderbook_hits", 0),
+            "rest_fetches": getattr(self, "_rest_orderbook_fetches", 0),
+        }
+
+    def _get_orderbook(self, platform: str, key: str) -> tuple[dict | None, str]:
+        """Fetch orderbook from WebSocket feed if fresh, falling back to REST.
+
+        Returns:
+            (orderbook_dict, source) where source is 'ws' or 'rest' (or 'none').
+        """
+        _cfg = sys.modules.get("config")
+        ws_enabled = getattr(_cfg, "WS_ORDERBOOK_STREAMING_ENABLED", True) if _cfg else True
+        max_age = getattr(_cfg, "WS_ORDERBOOK_MAX_AGE_SECONDS", 15.0) if _cfg else 15.0
+
+        platform_lower = str(platform).lower()
+
+        # 1. Try WebSocket orderbook if enabled
+        if ws_enabled:
+            # Check feed_manager first
+            feed_mgr = getattr(self, "feed_manager", None)
+            if feed_mgr is not None and hasattr(feed_mgr, "get_orderbook"):
+                book, age = feed_mgr.get_orderbook(platform_lower, key)
+                if book is not None and age is not None and age <= max_age:
+                    self._ws_orderbook_hits = getattr(self, "_ws_orderbook_hits", 0) + 1
+                    return book, "ws"
+
+            # Check price_cache
+            pc = getattr(self, "price_cache", None)
+            if pc is not None:
+                entry = pc.get((platform_lower, key))
+                if isinstance(entry, dict):
+                    ts = entry.get("_ts", 0)
+                    if (time.time() - ts) <= max_age:
+                        if platform_lower == "kalshi":
+                            ob = entry.get("orderbook")
+                            if isinstance(ob, dict) and ("yes" in ob or "no" in ob):
+                                self._ws_orderbook_hits = getattr(self, "_ws_orderbook_hits", 0) + 1
+                                return {"orderbook": ob}, "ws"
+                        elif platform_lower == "polymarket":
+                            ob = entry.get("orderbook")
+                            if isinstance(ob, dict) and ("bids" in ob or "asks" in ob):
+                                self._ws_orderbook_hits = getattr(self, "_ws_orderbook_hits", 0) + 1
+                                return ob, "ws"
+
+        # 2. Fall back to REST
+        if platform_lower == "kalshi":
+            kalshi_client = getattr(self, "kalshi_client", None)
+            if not kalshi_client:
+                return None, "none"
+            try:
+                self._rest_orderbook_fetches = getattr(self, "_rest_orderbook_fetches", 0) + 1
+                book = kalshi_client.fetch_order_book(key)
+                return book, "rest"
+            except Exception as exc:
+                logger.warning("REST Kalshi book fetch failed for %s: %s", key, exc)
+                return None, "none"
+        elif platform_lower == "polymarket":
+            try:
+                self._rest_orderbook_fetches = getattr(self, "_rest_orderbook_fetches", 0) + 1
+                book = fetch_order_book(key)
+                return book, "rest"
+            except Exception as exc:
+                logger.warning("REST Polymarket book fetch failed for %s: %s", key, exc)
+                return None, "none"
+
+        return None, "none"
 
     def _get_cached_balances(self, opp_type: str) -> dict | None:
         """Return cached balances if fresh, otherwise fetch and cache.
@@ -607,7 +687,7 @@ class ArbitrageExecutor:
                     parsed = book_cache[ticker]
                 else:
                     try:
-                        book = self.kalshi_client.fetch_order_book(ticker)
+                        book, source = self._get_orderbook("kalshi", ticker)
                         parsed = parse_orderbook(book) if book else None
                     except Exception as exc:
                         logger.warning(f"Exit-liquidity book fetch raised for {ticker}: {exc}")
@@ -632,7 +712,7 @@ class ArbitrageExecutor:
                     best = book_cache[token_id]
                 else:
                     try:
-                        book = fetch_order_book(token_id)
+                        book, source = self._get_orderbook("polymarket", token_id)
                         best = get_best_bid_ask(book) if book else None
                     except Exception as exc:
                         logger.warning(f"Exit-liquidity CLOB fetch raised for {token_id[:16]}: {exc}")
@@ -1034,8 +1114,8 @@ class ArbitrageExecutor:
             no_ask = _cached_probability(cached_no, "best_ask", "ask", "price")
 
         if yes_ask is None or no_ask is None:
-            yes_book = fetch_order_book(token_ids[0])
-            no_book = fetch_order_book(token_ids[1])
+            yes_book, _ = self._get_orderbook("polymarket", token_ids[0])
+            no_book, _ = self._get_orderbook("polymarket", token_ids[1])
             if not yes_book or not no_book:
                 raise _RevalidationAPIError("failed to fetch order book for binary")
             yes_data = get_best_bid_ask(yes_book)
@@ -1368,7 +1448,7 @@ class ArbitrageExecutor:
             if cached_ask is not None:
                 yes_asks.append(cached_ask)
             else:
-                book = fetch_order_book(tid)
+                book, _ = self._get_orderbook("polymarket", tid)
                 if not book:
                     raise _RevalidationAPIError(f"failed to fetch order book for negrisk token {tid}")
                 data = get_best_bid_ask(book)
@@ -1417,7 +1497,7 @@ class ArbitrageExecutor:
             if cached_ask is not None:
                 no_asks.append(cached_ask)
             else:
-                book = fetch_order_book(tid)
+                book, _ = self._get_orderbook("polymarket", tid)
                 if not book:
                     raise _RevalidationAPIError(f"failed to fetch order book for negrisk_no token {tid}")
                 data = get_best_bid_ask(book)
@@ -1487,8 +1567,8 @@ class ArbitrageExecutor:
                     else:
                         pm_no = cached_ask
             if pm_yes is None or pm_no is None:
-                yes_book = fetch_order_book(token_ids[0])
-                no_book = fetch_order_book(token_ids[1])
+                yes_book, _ = self._get_orderbook("polymarket", token_ids[0])
+                no_book, _ = self._get_orderbook("polymarket", token_ids[1])
                 if not yes_book or not no_book:
                     raise _RevalidationAPIError("failed to fetch PM order book for cross")
                 yes_data = get_best_bid_ask(yes_book)
@@ -1510,7 +1590,7 @@ class ArbitrageExecutor:
                 k_yes = _cached_probability(cached_k, "yes_ask", "yes_price", "yes")
                 k_no = _cached_probability(cached_k, "no_ask", "no_price", "no")
             if k_yes is None or k_no is None:
-                book = self.kalshi_client.fetch_order_book(kalshi_ticker)
+                book, _ = self._get_orderbook("kalshi", kalshi_ticker)
                 if not book:
                     raise _RevalidationAPIError("failed to fetch Kalshi order book for cross")
                 from kalshi_api import parse_orderbook, best_yes_ask, best_no_ask, _audit_raw_orderbook
@@ -1561,7 +1641,7 @@ class ArbitrageExecutor:
         ticker = opp.get("_kalshi_ticker", "")
         if not ticker or not self.kalshi_client:
             raise _RevalidationAPIError("no ticker or no Kalshi client for kalshi_binary")
-        book = self.kalshi_client.fetch_order_book(ticker)
+        book, source = self._get_orderbook("kalshi", ticker)
         if not book:
             raise _RevalidationAPIError(f"failed to fetch Kalshi order book for {ticker}")
         from kalshi_api import parse_orderbook, best_yes_ask, best_no_ask, _audit_raw_orderbook
@@ -1609,7 +1689,7 @@ class ArbitrageExecutor:
             raise _RevalidationAPIError("no tickers or no Kalshi client for kalshi_multi")
         yes_prices = []
         for ticker in tickers:
-            book = self.kalshi_client.fetch_order_book(ticker)
+            book, source = self._get_orderbook("kalshi", ticker)
             if not book:
                 raise _RevalidationAPIError(f"failed to fetch Kalshi order book for {ticker}")
             from kalshi_api import parse_orderbook, best_yes_ask, _audit_raw_orderbook
@@ -3365,6 +3445,8 @@ class ArbitrageExecutor:
                     matchbook_client=self.matchbook_client,
                     gemini_client=self.gemini_client,
                     db=self.db,
+                    price_cache=self.price_cache,
+                    feed_manager=self.feed_manager,
                 )
                 for i, leg in enumerate(legs):
                     if results.get(i):
@@ -3522,6 +3604,8 @@ class ArbitrageExecutor:
                     matchbook_client=self.matchbook_client,
                     gemini_client=self.gemini_client,
                     db=self.db,
+                    price_cache=self.price_cache,
+                    feed_manager=self.feed_manager,
                 )
                 for i, leg in enumerate(legs):
                     if results.get(i):

@@ -101,6 +101,10 @@ class FeedManager:
         # Per-ticker Kalshi book state: {ticker: {"yes": {price_cents: qty}, "no": {...}}}.
         # Needed because orderbook_delta messages carry single-level changes, not ladders.
         self._kalshi_books: dict[str, dict[str, dict[int, float]]] = {}
+        self._kalshi_book_times: dict[str, float] = {}
+        # Per-asset Polymarket book state: {token_id: {"bids": [...], "asks": [...]}}
+        self._poly_books: dict[str, dict[str, list]] = {}
+        self._poly_book_times: dict[str, float] = {}
         self._poly_ws = None
         self._last_message_time: dict[str, float] = {}  # platform -> timestamp
 
@@ -326,11 +330,46 @@ class FeedManager:
             }
         }
 
+    def get_kalshi_orderbook_age(self, ticker: str) -> float | None:
+        """Return the age in seconds of the cached Kalshi orderbook, or None."""
+        t = self._kalshi_book_times.get(ticker)
+        return (time.time() - t) if t is not None else None
+
+    def get_polymarket_orderbook(self, token_id: str) -> dict | None:
+        """Return the cached Polymarket orderbook for token_id in standard format."""
+        book = self._poly_books.get(token_id)
+        if book is None:
+            return None
+        return {
+            "bids": list(book.get("bids", [])),
+            "asks": list(book.get("asks", [])),
+        }
+
+    def get_polymarket_orderbook_age(self, token_id: str) -> float | None:
+        """Return the age in seconds of the cached Polymarket orderbook, or None."""
+        t = self._poly_book_times.get(token_id)
+        return (time.time() - t) if t is not None else None
+
+    def get_orderbook(self, platform: str, key: str) -> tuple[dict | None, float | None]:
+        """Return (orderbook_dict, age_seconds) for platform and identifier, or (None, None)."""
+        platform_lower = str(platform).lower()
+        if platform_lower == "kalshi":
+            book = self.get_kalshi_orderbook(key)
+            age = self.get_kalshi_orderbook_age(key)
+            return (book, age) if book is not None else (None, None)
+        elif platform_lower == "polymarket":
+            book = self.get_polymarket_orderbook(key)
+            age = self.get_polymarket_orderbook_age(key)
+            return (book, age) if book is not None else (None, None)
+        return None, None
+
     def stop(self):
         """Signal feeds to stop."""
         self._running = False
         if self._betfair_feed:
             self._betfair_feed.stop()
+        self._reset_kalshi_books()
+        self._reset_poly_books()
 
     async def _run_betfair(self):
         """Maintain Betfair Stream API connection with auto-reconnect and exponential backoff."""
@@ -464,6 +503,16 @@ class FeedManager:
         stale, and deltas must not be applied until a fresh snapshot arrives.
         """
         self._kalshi_books.clear()
+        self._kalshi_book_times.clear()
+
+    def _reset_poly_books(self):
+        """Drop all cached Polymarket book state.
+
+        Called on (re)connect: after a connection gap the cached books are
+        stale, and fresh book snapshots must arrive.
+        """
+        self._poly_books.clear()
+        self._poly_book_times.clear()
 
     def _handle_kalshi_message(self, data: dict):
         """Process a Kalshi WebSocket message.
@@ -522,6 +571,7 @@ class FeedManager:
                     normalised[f"{side}_ask_size"] = 0
 
             if book is not None:
+                self._kalshi_book_times[ticker] = time.time()
                 normalised["orderbook"] = {
                     "yes": [[p, q] for p, q in sorted(book.get("yes", {}).items())],
                     "no": [[p, q] for p, q in sorted(book.get("no", {}).items())],
@@ -566,6 +616,7 @@ class FeedManager:
 
         async with websockets.connect(POLYMARKET_WS_URL, **connect_kwargs) as ws:
             logger.info("Polymarket connected. Subscribing to %d tokens...", len(self._poly_token_ids))
+            self._reset_poly_books()
 
             # ---- Initial subscription (first batch uses "type": "market") ----
             batch_size = 100
@@ -670,6 +721,10 @@ class FeedManager:
                 normalised = {"event_type": "book", "asset_id": asset_id}
                 asks = event.get("asks", [])
                 bids = event.get("bids", [])
+                if isinstance(asks, list) and isinstance(bids, list):
+                    self._poly_books[asset_id] = {"bids": list(bids), "asks": list(asks)}
+                    self._poly_book_times[asset_id] = time.time()
+                    normalised["orderbook"] = {"bids": list(bids), "asks": list(asks)}
                 if asks and isinstance(asks, list):
                     try:
                         best_ask_entry = min(asks, key=lambda x: float(x.get("price", 0)))

@@ -585,7 +585,11 @@ class KalshiMMPilot:
         return sorted(tickers)
 
     def _get_cross_venue_skew(self, ticker: str) -> dict:
-        """Query cross-venue delta tracking and skew metrics from InventoryBalancer."""
+        """Query cross-venue delta tracking and skew metrics from InventoryBalancer.
+
+        Note: Excludes the pilot's own Kalshi platform holdings so that
+        the external venue delta is not double-counted with local Kalshi inventory.
+        """
         import config
         if not getattr(config, "MM_CROSS_VENUE_SKEW_ENABLED", True):
             return {"delta_net": 0.0, "imbalance_ratio": 0.0, "is_imbalanced": False}
@@ -594,10 +598,28 @@ class KalshiMMPilot:
         try:
             info = self._inventory_balancer.get_market_delta(ticker)
             if info:
+                breakdown = info.get("platform_breakdown") or {}
+                # Exclude kalshi platform to get pure external venue delta without double counting
+                non_kalshi_yes = sum(
+                    float(outs.get("yes", 0.0) or 0.0)
+                    for plat, outs in breakdown.items()
+                    if str(plat).lower() != "kalshi"
+                )
+                non_kalshi_no = sum(
+                    float(outs.get("no", 0.0) or 0.0)
+                    for plat, outs in breakdown.items()
+                    if str(plat).lower() != "kalshi"
+                )
+                cv_delta = non_kalshi_yes - non_kalshi_no
+                cv_total = non_kalshi_yes + non_kalshi_no
+                cv_ratio = (abs(cv_delta) / cv_total) if cv_total > 0 else 0.0
+                max_delta = getattr(self._inventory_balancer, "max_delta_contracts", 50.0)
+                max_imb = getattr(self._inventory_balancer, "max_imbalance_ratio", 0.70)
+                is_cv_imbalanced = abs(cv_delta) >= max_delta and cv_ratio >= max_imb
                 return {
-                    "delta_net": float(info.get("delta_net", 0.0) or 0.0),
-                    "imbalance_ratio": float(info.get("imbalance_ratio", 0.0) or 0.0),
-                    "is_imbalanced": bool(info.get("is_imbalanced", False)),
+                    "delta_net": cv_delta,
+                    "imbalance_ratio": cv_ratio,
+                    "is_imbalanced": is_cv_imbalanced,
                 }
         except Exception as exc:
             logger.debug("Failed querying cross-venue skew for %s: %s", ticker, exc)
@@ -1842,7 +1864,7 @@ class KalshiMMPilot:
             else:
                 balanced_base = min(base_count, inv_headroom)
 
-            if is_accumulating and combined_ratio > 0:
+            if is_accumulating and combined_ratio > 0 and balanced_base > 0:
                 skew_size_taper = max(0.2, 1.0 - (combined_ratio * 0.5))
                 balanced_base = max(1, int(balanced_base * skew_size_taper))
 

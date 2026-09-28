@@ -2299,8 +2299,8 @@ class TestMMPilotInventorySkewQuoting:
     def test_quote_widening_with_cross_venue_skew(self, pilot_env, clock):
         from inventory_balancer import InventoryBalancer
         balancer = InventoryBalancer(max_delta_contracts=100.0)
-        # Polymarket long YES 80 contracts -> delta_net = +80.0
-        balancer.update_position(TICKER, "polymarket", "yes", "buy", 80.0)
+        # Polymarket long YES 30 contracts (under INVENTORY_MAX_DELTA_CONTRACTS=50) -> delta_net = +30.0
+        balancer.update_position(TICKER, "polymarket", "yes", "buy", 30.0)
 
         client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48)})
         # Flat pilot without balancer baseline
@@ -2355,8 +2355,8 @@ class TestMMPilotInventorySkewQuoting:
     def test_accumulating_side_headroom_and_taper(self, pilot_env, clock):
         from inventory_balancer import InventoryBalancer
         balancer = InventoryBalancer(max_delta_contracts=100.0)
-        # Long YES 50 contracts (not yet severe enough for ask_only, so 2-sided quoting)
-        balancer.update_position(TICKER, "polymarket", "yes", "buy", 50.0)
+        # Long YES 25 contracts (under cap of 50 contracts -> 2-sided quoting with headroom)
+        balancer.update_position(TICKER, "polymarket", "yes", "buy", 25.0)
 
         client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48, yes_qty=1000.0, no_qty=1000.0)})
         pilot = build_pilot(clock, client=client, selection=[TICKER], inventory_balancer=balancer)
@@ -2365,7 +2365,7 @@ class TestMMPilotInventorySkewQuoting:
         assert len(placed) == 2
         orders = {o["purpose"]: o for o in pilot.resting_orders(TICKER)}
 
-        # Bid (YES) is accumulating side; cv_delta = 50.
+        # Bid (YES) is accumulating side; cv_delta = 25.
         # Bid count should be strictly smaller than Ask count (reducing side is not tapered)
         assert orders["quote_bid"]["count"] < orders["quote_ask"]["count"]
 
@@ -2446,3 +2446,56 @@ class TestMMPilotInventorySkewQuoting:
         placed = pilot.refresh_market(TICKER)
         # When disabled, severe cross-venue delta does NOT force one_side
         assert len(placed) == 2
+
+    def test_accumulating_side_zero_headroom_does_not_place_one_contract(self, pilot_env, clock, monkeypatch):
+        import config
+        from inventory_balancer import InventoryBalancer
+        # INVENTORY_MAX_DELTA_CONTRACTS = 50
+        monkeypatch.setattr(config, "INVENTORY_MAX_DELTA_CONTRACTS", 50.0)
+        balancer = InventoryBalancer(max_delta_contracts=100.0)
+        # Polymarket has 50 YES contracts (reaches INVENTORY_MAX_DELTA_CONTRACTS, so cv_headroom = 0)
+        balancer.update_position(TICKER, "polymarket", "yes", "buy", 50.0)
+
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER], inventory_balancer=balancer)
+
+        placed = pilot.refresh_market(TICKER)
+        orders = {o["purpose"]: o for o in pilot.resting_orders(TICKER)}
+        # Bid order (accumulating side) had cv_headroom = 0 and balanced_base = 0; must not place 1 contract
+        assert "quote_bid" not in orders
+
+    def test_kalshi_fills_do_not_double_count_in_cross_venue_skew(self, pilot_env, clock):
+        from inventory_balancer import InventoryBalancer
+        balancer = InventoryBalancer()
+        # Add 30 YES contracts on Polymarket
+        balancer.update_position(TICKER, "polymarket", "yes", "buy", 30.0)
+
+        pilot = build_pilot(clock, selection=[TICKER], inventory_balancer=balancer)
+        skew_before = pilot._get_cross_venue_skew(TICKER)
+        assert skew_before["delta_net"] == 30.0
+
+        # Now simulate a fill on Kalshi
+        event = FillEvent(
+            fill_id="fill-kalshi-1",
+            order_id="ord-k-1",
+            ticker=TICKER,
+            side="yes",
+            action="buy",
+            count=15,
+            price=0.50,
+            is_taker=False,
+            created_ts=clock[0],
+            mid_at_detect=0.50,
+        )
+        order_info = {"purpose": "quote_bid", "ticker": TICKER, "side": "yes", "action": "buy"}
+        pilot._process_fill(event, order_info)
+
+        # Local inventory recorded the fill
+        assert pilot.inventory.net_contracts(TICKER) == 15
+
+        # Balancer overall has 30 (poly) + 15 (kalshi) = 45 delta
+        assert balancer.get_delta(TICKER) == 45.0
+
+        # BUT pilot._get_cross_venue_skew excludes Kalshi, so cv_delta is STILL 30 (no double counting!)
+        skew_after = pilot._get_cross_venue_skew(TICKER)
+        assert skew_after["delta_net"] == 30.0

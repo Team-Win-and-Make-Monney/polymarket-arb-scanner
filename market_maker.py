@@ -132,6 +132,7 @@ class QuoteEngine:
         market_key: str = "",
         toxicity: float | None = None,
         toxicity_spread_multiplier: float | None = None,
+        skew_spread_multiplier: float | None = None,
     ) -> dict:
         """Calculate bid and ask prices.
 
@@ -146,10 +147,11 @@ class QuoteEngine:
                 ``get_spread_multiplier(market_key)``.
             toxicity: Optional toxicity probability (0-1). Widens spread.
             toxicity_spread_multiplier: Optional explicit spread multiplier from toxicity.
+            skew_spread_multiplier: Optional explicit spread multiplier from inventory skew.
 
         Returns:
             Dict with ``bid``, ``ask``, ``spread``, ``skew``, ``mid``,
-            and ``toxicity_spread_multiplier``.
+            ``toxicity_spread_multiplier``, and ``skew_spread_multiplier``.
         """
         half_spread = self.min_spread / 2
 
@@ -178,6 +180,14 @@ class QuoteEngine:
 
         if tox_mult > 1.0:
             half_spread = half_spread * tox_mult
+
+        # Inventory Skew Spread Widening — widen spread when inventory is skewed
+        skew_mult = 1.0
+        if skew_spread_multiplier is not None and skew_spread_multiplier > 0:
+            skew_mult = float(skew_spread_multiplier)
+
+        if skew_mult > 1.0:
+            half_spread = half_spread * skew_mult
 
         # Volatility adjustment: wider spread in volatile markets
         vol_adj = volatility * 0.5  # 10% vol -> 5 cent wider spread
@@ -211,6 +221,7 @@ class QuoteEngine:
             "skew": round(skew, 4),
             "mid": round(mid_price, 4),
             "toxicity_spread_multiplier": round(tox_mult, 2),
+            "skew_spread_multiplier": round(skew_mult, 2),
         }
 
 

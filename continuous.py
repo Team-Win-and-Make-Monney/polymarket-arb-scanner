@@ -1632,11 +1632,19 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                     "MM pilot: Supabase controls client unavailable (%s) — "
                     "the kill-switch cache stays stale and the pilot fails "
                     "closed (no quotes).", exc)
+            _mm_inv_balancer = None
+            if getattr(config, "MM_CROSS_VENUE_SKEW_ENABLED", True):
+                try:
+                    from inventory_balancer import get_inventory_balancer
+                    _mm_inv_balancer = get_inventory_balancer()
+                except Exception as exc:
+                    logger.debug("MM pilot: inventory balancer unavailable (%s)", exc)
             _mm_pilot = KalshiMMPilot(
                 kalshi_client=kalshi_client,
                 db=db,
                 alert_manager=_pilot_alerts,
                 controls=ControlsPoller(supabase_client=_controls_client),
+                inventory_balancer=_mm_inv_balancer,
             )
             # Market selection is PR #43's select_lip_markets — not this
             # plan's job. Without it the pilot never receives a selection
@@ -2003,8 +2011,8 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
         kalshi_private_key_base64=kalshi_private_key_base64,
     )
     # Initialize cross-venue delta-neutral inventory balancer
-    from inventory_balancer import InventoryBalancer
-    inventory_balancer = InventoryBalancer()
+    from inventory_balancer import get_inventory_balancer
+    inventory_balancer = get_inventory_balancer()
 
     if executor is not None:
         executor.feed_manager = feed_manager

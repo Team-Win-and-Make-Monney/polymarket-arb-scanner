@@ -224,3 +224,28 @@ class TestQuoteEngineToxicitySpreadMultiplier:
         assert widened["toxicity_spread_multiplier"] == 1.5
         assert widened_spread > baseline_spread
         assert pytest.approx(widened_spread, abs=1e-4) == baseline_spread * 1.5
+
+
+class TestQuoteEngineInventorySkewSpreadMultiplier:
+    """Tests for QuoteEngine integration with inventory skew spread widening."""
+
+    def test_quote_engine_widens_spread_with_explicit_skew_multiplier(self):
+        engine = QuoteEngine(min_spread=0.04)
+        mid = 0.50
+
+        baseline = engine.calculate_quotes(mid, skew_spread_multiplier=1.0)
+        baseline_spread = baseline["ask"] - baseline["bid"]
+        assert baseline["skew_spread_multiplier"] == 1.0
+
+        widened = engine.calculate_quotes(mid, skew_spread_multiplier=1.5)
+        widened_spread = widened["ask"] - widened["bid"]
+        assert widened["skew_spread_multiplier"] == 1.5
+        assert pytest.approx(widened_spread, abs=1e-4) == baseline_spread * 1.5
+
+    def test_quote_engine_defaults_to_unit_skew_multiplier_without_argument(self):
+        engine = QuoteEngine(min_spread=0.04)
+        mid = 0.50
+
+        quotes = engine.calculate_quotes(mid)
+        assert quotes["skew_spread_multiplier"] == 1.0
+        assert quotes["spread"] == 0.04

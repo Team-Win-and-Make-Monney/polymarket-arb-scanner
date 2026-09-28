@@ -58,7 +58,37 @@ class InventoryBalancer:
         # In-memory inventory tracking:
         # {market_key: {platform: {"yes": float, "no": float}}}
         self._positions: dict[str, dict[str, dict[str, float]]] = {}
+        # Ticker-to-canonical-key alias mapping (e.g. Kalshi ticker -> market_key)
+        self._ticker_map: dict[str, str] = {}
+        # Track market keys populated by sync_from_db to preserve pilot-only positions
+        self._db_synced_markets: set[str] = set()
         self._lock = threading.Lock()
+
+    def register_ticker_alias(self, ticker: str, market_key: str) -> None:
+        """Register an alias mapping from a venue ticker/identifier to a canonical market key."""
+        if not ticker or not market_key:
+            return
+        t_clean = str(ticker).strip()
+        m_clean = str(market_key).strip()
+        if not t_clean or not m_clean:
+            return
+        with self._lock:
+            self._ticker_map[t_clean] = m_clean
+
+    def _resolve_market_key(self, identifier: str) -> str:
+        """Resolve a ticker or identifier to a tracked market key."""
+        key = str(identifier).strip()
+        with self._lock:
+            if key in self._positions:
+                return key
+            if key in self._ticker_map:
+                return self._ticker_map[key]
+            # Try exact case-insensitive match across existing keys
+            key_lower = key.lower()
+            for mk in self._positions:
+                if key_lower == mk.lower():
+                    return mk
+            return key
 
     def update_position(
         self,
@@ -71,7 +101,7 @@ class InventoryBalancer:
         """Update tracked position for a market, platform, and outcome.
 
         Args:
-            market_key: Unique market or condition identifier.
+            market_key: Unique market, condition, or ticker identifier.
             platform: Trading venue (e.g. 'polymarket', 'kalshi').
             outcome: Contract outcome ('yes' or 'no').
             side: Trade side ('buy' adds position, 'sell' reduces position).
@@ -80,7 +110,7 @@ class InventoryBalancer:
         if not market_key or not platform or not outcome:
             return
 
-        m_key = str(market_key).strip()
+        m_key = self._resolve_market_key(market_key)
         plat = str(platform).strip().lower()
         out = str(outcome).strip().lower()
         side_l = str(side).strip().lower()
@@ -128,6 +158,10 @@ class InventoryBalancer:
             if not m_key or not opp_id:
                 continue
 
+            m_ticker = pos.get("market_ticker")
+            if m_ticker:
+                self.register_ticker_alias(m_ticker, m_key)
+
             try:
                 trades = db.get_trades_for_opportunity(opp_id)
             except Exception as e:
@@ -161,7 +195,13 @@ class InventoryBalancer:
             synced_count += 1
 
         with self._lock:
-            self._positions = new_positions
+            # Remove previously DB-synced markets that are no longer open in DB
+            for old_m in self._db_synced_markets - set(new_positions.keys()):
+                self._positions.pop(old_m, None)
+            # Update DB positions while preserving in-memory positions for non-DB markets
+            for m_key, plat_map in new_positions.items():
+                self._positions[m_key] = plat_map
+            self._db_synced_markets = set(new_positions.keys())
 
         return synced_count
 
@@ -406,7 +446,7 @@ class InventoryBalancer:
         if not market_identifier or proposed_qty <= 0:
             return True, "OK"
 
-        m_key = str(market_identifier).strip()
+        m_key = self._resolve_market_key(market_identifier)
         outcome_l = str(proposed_outcome).strip().lower()
         side_l = str(proposed_side).strip().lower()
 
@@ -446,6 +486,95 @@ class InventoryBalancer:
             )
 
         return True, "OK (trade reduces or maintains inventory delta skew)"
+
+    def get_delta(self, market_identifier: str) -> float:
+        """Get net directional delta contracts (YES - NO) across all platforms for a market."""
+        if not market_identifier:
+            return 0.0
+        m_key = self._resolve_market_key(market_identifier)
+        with self._lock:
+            market_positions = self._positions.get(m_key)
+            if not market_positions:
+                return 0.0
+            total_yes = sum(float(p.get("yes", 0.0) or 0.0) for p in market_positions.values())
+            total_no = sum(float(p.get("no", 0.0) or 0.0) for p in market_positions.values())
+            return total_yes - total_no
+
+    def get_market_delta(self, market_identifier: str) -> dict | None:
+        """Get detailed inventory delta breakdown and imbalance status for a market."""
+        if not market_identifier:
+            return None
+        m_key = self._resolve_market_key(market_identifier)
+        with self._lock:
+            market_positions = self._positions.get(m_key)
+            if not market_positions:
+                return None
+            snapshot = {p: dict(outs) for p, outs in market_positions.items()}
+
+        total_yes = sum(float(p.get("yes", 0.0) or 0.0) for p in snapshot.values())
+        total_no = sum(float(p.get("no", 0.0) or 0.0) for p in snapshot.values())
+        total_qty = total_yes + total_no
+        delta_net = total_yes - total_no
+        imbalance_ratio = (abs(delta_net) / total_qty) if total_qty > 0 else 0.0
+        is_imbalanced = (
+            abs(delta_net) >= self.max_delta_contracts
+            and imbalance_ratio >= self.max_imbalance_ratio
+        )
+        return {
+            "market_key": m_key,
+            "delta_net": delta_net,
+            "imbalance_ratio": imbalance_ratio,
+            "is_imbalanced": is_imbalanced,
+            "qty_yes": total_yes,
+            "qty_no": total_no,
+            "total_qty": total_qty,
+            "platform_breakdown": snapshot,
+        }
+
+    def get_skew_metrics(
+        self,
+        market_identifier: str,
+        local_inventory_usd: float = 0.0,
+        max_inventory_usd: float = 100.0,
+    ) -> dict:
+        """Calculate combined inventory skew metrics combining local and cross-venue inventory."""
+        from config import (
+            MM_SKEW_SPREAD_ENABLED,
+            MM_SKEW_SPREAD_FACTOR,
+            MM_SKEW_SPREAD_MAX_MULTIPLIER,
+            MM_CROSS_VENUE_SKEW_ENABLED,
+        )
+        delta_info = self.get_market_delta(market_identifier) if MM_CROSS_VENUE_SKEW_ENABLED else None
+        cv_delta = float(delta_info.get("delta_net", 0.0)) if delta_info else 0.0
+        cv_ratio = float(delta_info.get("imbalance_ratio", 0.0)) if delta_info else 0.0
+        is_cv_imbalanced = bool(delta_info.get("is_imbalanced", False)) if delta_info else False
+
+        local_usd = float(local_inventory_usd)
+        local_ratio = (local_usd / max_inventory_usd) if max_inventory_usd > 0 else 0.0
+
+        cv_delta_ratio = (cv_delta / self.max_delta_contracts) if self.max_delta_contracts > 0 else 0.0
+        combined_skew_ratio = max(abs(local_ratio), abs(cv_delta_ratio))
+
+        spread_mult = 1.0
+        if MM_SKEW_SPREAD_ENABLED and combined_skew_ratio > 0:
+            spread_mult = min(
+                MM_SKEW_SPREAD_MAX_MULTIPLIER,
+                1.0 + (combined_skew_ratio * MM_SKEW_SPREAD_FACTOR),
+            )
+
+        one_side = None
+        if is_cv_imbalanced:
+            one_side = "ask_only" if cv_delta > 0 else "bid_only"
+
+        return {
+            "cross_venue_delta": cv_delta,
+            "cross_venue_imbalance_ratio": cv_ratio,
+            "is_cross_imbalanced": is_cv_imbalanced,
+            "local_skew_ratio": local_ratio,
+            "combined_skew_ratio": combined_skew_ratio,
+            "spread_multiplier": round(spread_mult, 4),
+            "one_side_restriction": one_side,
+        }
 
     def _query_venue_quotes(
         self,
@@ -498,3 +627,28 @@ class InventoryBalancer:
                     quotes.append({"venue": "polymarket", "price": best_ask, "size": ask_size or 0})
 
         return quotes
+
+
+# ---------------------------------------------------------------------------
+# Module Singleton
+# ---------------------------------------------------------------------------
+
+_inventory_balancer_instance: InventoryBalancer | None = None
+_balancer_lock = threading.Lock()
+
+
+def get_inventory_balancer() -> InventoryBalancer:
+    """Get or create the module-level InventoryBalancer singleton."""
+    global _inventory_balancer_instance
+    if _inventory_balancer_instance is None:
+        with _balancer_lock:
+            if _inventory_balancer_instance is None:
+                _inventory_balancer_instance = InventoryBalancer()
+    return _inventory_balancer_instance
+
+
+def reset_inventory_balancer() -> None:
+    """Reset the module-level InventoryBalancer singleton (for testing)."""
+    global _inventory_balancer_instance
+    with _balancer_lock:
+        _inventory_balancer_instance = None

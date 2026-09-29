@@ -456,7 +456,7 @@ class TestDedicatedFeedThread:
             await asyncio.get_running_loop().run_in_executor(None, started.wait, 2)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await task
+                await asyncio.gather(task)
             assert task.cancelled()
 
         asyncio.run(main())
@@ -475,7 +475,7 @@ class TestDedicatedFeedThread:
             fm.stop()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await task
+                await asyncio.gather(task)
             return thread
 
         thread = asyncio.run(main())
@@ -825,14 +825,54 @@ class TestDispatchValidity:
 
 
 class TestBetfairLiveness:
-    def test_betfair_ingress_records_liveness_and_dispatches(self):
+    def _feed(self, on_price_update=None, on_message=None):
+        return ws_feeds.BetfairFeed(
+            app_key="k", session_token="t", market_ids=["1.23"],
+            on_price_update=on_price_update or MagicMock(),
+            cache=ws_feeds.BetfairMarketCache(), on_message=on_message,
+        )
+
+    def test_betfair_price_ingress_dispatches(self):
         cb = MagicMock()
         alive = MagicMock()
         fm = FeedManager(on_price_update=cb, on_feed_message=alive, use_feed_thread=False)
         fm._on_betfair_update("betfair", "1.23", {"back": 2.0})
-        alive.assert_called_once_with("betfair")
         cb.assert_called_once()
         assert cb.call_args[0][:2] == ("betfair", "1.23")
+        alive.assert_not_called()  # liveness is counted once, at stream ingress
+
+    def test_heartbeat_and_success_status_count_as_liveness(self):
+        prices = MagicMock()
+        alive = MagicMock()
+        feed = self._feed(prices, alive)
+        feed._handle_message({"op": "mcm", "ct": "HEARTBEAT", "clk": "c1"})
+        feed._handle_message({"op": "mcm", "clk": "c2", "mc": [{"id": "1.23"}]})  # no runner change
+        feed._handle_message({"op": "status", "statusCode": "SUCCESS"})
+        assert alive.call_count == 3
+        prices.assert_not_called()
+
+    def test_price_change_counts_once_and_dispatches(self):
+        prices = MagicMock()
+        alive = MagicMock()
+        feed = self._feed(prices, alive)
+        feed._handle_message({"op": "mcm", "clk": "c1", "mc": [
+            {"id": "1.23", "rc": [{"id": 7, "batb": [[0, 2.0, 5.0]]}]}]})
+        alive.assert_called_once_with()
+        prices.assert_called_once()
+
+    def test_failed_status_and_unknown_ops_are_not_liveness(self):
+        alive = MagicMock()
+        feed = self._feed(on_message=alive)
+        feed._handle_message({"op": "status", "statusCode": "FAILURE", "errorMessage": "x"})
+        feed._handle_message({"op": "somethingElse"})
+        alive.assert_not_called()
+
+    def test_failing_liveness_hook_does_not_break_the_stream(self):
+        prices = MagicMock()
+        feed = self._feed(prices, MagicMock(side_effect=RuntimeError("boom")))
+        feed._handle_message({"op": "mcm", "clk": "c1", "mc": [
+            {"id": "1.23", "rc": [{"id": 7, "batb": [[0, 2.0, 5.0]]}]}]})
+        prices.assert_called_once()
 
     def test_run_betfair_wires_liveness_callback(self, monkeypatch):
         captured = {}
@@ -847,12 +887,53 @@ class TestBetfairLiveness:
             def stop(self):
                 pass
 
-        fm = FeedManager(on_price_update=MagicMock(), use_feed_thread=False,
+        alive = MagicMock()
+        fm = FeedManager(on_price_update=MagicMock(), on_feed_message=alive, use_feed_thread=False,
                          betfair_app_key="k", betfair_session_token="t")
         monkeypatch.setattr(ws_feeds, "BetfairFeed", FakeFeed)
         fm._running = True
         asyncio.run(fm._run_betfair())
         assert captured["on_price_update"] == fm._on_betfair_update
+        captured["on_message"]()
+        alive.assert_called_once_with("betfair")
+
+    def test_pending_subs_replaced_mid_drain_do_not_crash(self, monkeypatch):
+        """prune_subscriptions() may swap the pending list from another thread;
+        the drain must snapshot it under the lock, not check-then-pop."""
+        added = []
+
+        class FakeFeed:
+            def __init__(self, **kwargs):
+                pass
+
+            async def connect(self):
+                fm._running = False
+
+            def add_market_ids(self, ids):
+                added.extend(ids)
+
+            def stop(self):
+                pass
+
+        fm = FeedManager(on_price_update=MagicMock(), use_feed_thread=False,
+                         betfair_app_key="k", betfair_session_token="t")
+
+        class SwappedOnCheck(list):
+            """Simulates a concurrent prune: the first length check swaps the list out."""
+            swapped = False
+
+            def __len__(self):
+                if not SwappedOnCheck.swapped:
+                    SwappedOnCheck.swapped = True
+                    fm._pending_betfair_subs = []
+                return super().__len__()
+
+        fm._pending_betfair_subs = SwappedOnCheck(["1.5", "1.6"])
+        monkeypatch.setattr(ws_feeds, "BetfairFeed", FakeFeed)
+        fm._running = True
+        asyncio.run(fm._run_betfair())
+        assert added == ["1.5", "1.6"]
+        assert fm._pending_betfair_subs == []
 
 
 # ---------------------------------------------------------------------------
@@ -879,6 +960,8 @@ class _FakeWS:
             if callable(item):
                 item()
                 continue
+            if isinstance(item, str):
+                return item  # raw text frame, e.g. Polymarket's literal "PONG"
             return json.dumps(item)
         raise ConnectionError("script exhausted")
 
@@ -1010,6 +1093,15 @@ class TestInvalidationThroughRunner:
             assert entry["best_ask"] is None and entry["best_bid"] is None
         assert fm.get_polymarket_orderbook("tok1") is None
 
+    def test_polymarket_pong_counts_as_liveness(self, monkeypatch):
+        alive = MagicMock()
+        prices = MagicMock()
+        fm = FeedManager(on_price_update=prices, on_feed_message=alive, use_feed_thread=False)
+        fm._poly_token_ids = ["tok1"]
+        self._run(fm, fm._run_polymarket, monkeypatch, [["PONG", "PONG"]])
+        assert [c.args for c in alive.call_args_list] == [("polymarket",), ("polymarket",)]
+        assert not any(c.args[2].get("best_ask") for c in prices.call_args_list)
+
     def test_invalidated_entries_yield_no_tracking_price(self):
         import importlib
         saved = {n: sys.modules.get(n) for n in ("kalshi_api", "polymarket_api", "display", "recovery", "continuous")}
@@ -1028,3 +1120,56 @@ class TestInvalidationThroughRunner:
                     sys.modules[n] = mod
                 else:
                     sys.modules.pop(n, None)
+
+
+# ---------------------------------------------------------------------------
+# get_orderbook reads a book and its timestamp together
+# ---------------------------------------------------------------------------
+
+
+class TestOrderbookReadAtomicity:
+    @pytest.mark.parametrize("platform,key", [("kalshi", "KXA"), ("polymarket", "tok1")])
+    def test_snapshot_between_reads_cannot_pair_old_book_with_new_time(self, platform, key):
+        fm = FeedManager(on_price_update=MagicMock(), use_feed_thread=False)
+        old_time = time.time() - 100
+        if platform == "kalshi":
+            fm._kalshi_books[key] = {"yes": {45.0: 10.0}, "no": {}}
+            fm._kalshi_book_times[key] = old_time
+            getter = "get_kalshi_orderbook"
+        else:
+            fm._poly_books[key] = {"bids": [], "asks": [(0.55, 10.0)]}
+            fm._poly_book_times[key] = old_time
+            getter = "get_polymarket_orderbook"
+
+        def fresh_snapshot():
+            # A reset plus a new snapshot from the feed thread.
+            with fm._book_lock:
+                if platform == "kalshi":
+                    fm._kalshi_books[key] = {"yes": {60.0: 1.0}, "no": {}}
+                    fm._kalshi_book_times[key] = time.time()
+                else:
+                    fm._poly_books[key] = {"bids": [], "asks": [(0.70, 1.0)]}
+                    fm._poly_book_times[key] = time.time()
+
+        original = getattr(fm, getter)
+        writers = []
+
+        def racing_read(k):
+            book = original(k)
+            writer = threading.Thread(target=fresh_snapshot)
+            writer.start()
+            writer.join(timeout=0.2)  # completes here only if the lock isn't held
+            writers.append(writer)
+            return book
+
+        setattr(fm, getter, racing_read)
+        book, age = fm.get_orderbook(platform, key)
+        writers[0].join(timeout=2)
+        assert not writers[0].is_alive()
+        if platform == "kalshi":
+            assert book["orderbook"]["yes"] == [[45.0, 10.0]]
+        else:
+            assert book["asks"] == [(0.55, 10.0)]
+        assert age >= 99  # the old book's own age, not the new snapshot's
+        _, new_age = fm.get_orderbook(platform, key)
+        assert new_age < 5

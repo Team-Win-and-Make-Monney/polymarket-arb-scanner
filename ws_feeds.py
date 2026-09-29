@@ -574,8 +574,7 @@ class FeedManager:
         self._publish_kalshi_invalidation([ticker])
 
     def _on_betfair_update(self, platform: str, market_id: str, data: dict) -> None:
-        """Betfair ingress: record liveness, then dispatch the price update."""
-        self._note_feed_message(platform)
+        """Betfair price ingress. Liveness is recorded per message by BetfairFeed.on_message."""
         self._emit_price_update(platform, market_id, data)
 
     def _note_feed_message(self, platform: str) -> None:
@@ -754,15 +753,18 @@ class FeedManager:
     def get_orderbook(self, platform: str, key: str) -> tuple[dict | None, float | None]:
         """Return (orderbook_dict, age_seconds) for platform and identifier, or (None, None)."""
         platform_lower = str(platform).lower()
-        if platform_lower == "kalshi":
-            book = self.get_kalshi_orderbook(key)
-            age = self.get_kalshi_orderbook_age(key)
-            return (book, age) if book is not None else (None, None)
-        elif platform_lower == "polymarket":
-            book = self.get_polymarket_orderbook(key)
-            age = self.get_polymarket_orderbook_age(key)
-            return (book, age) if book is not None else (None, None)
-        return None, None
+        if platform_lower not in ("kalshi", "polymarket"):
+            return None, None
+        # One lock hold for both reads, so a reset and fresh snapshot between
+        # them can't pair the old book with the new book's timestamp.
+        with self._book_lock:
+            if platform_lower == "kalshi":
+                book = self.get_kalshi_orderbook(key)
+                age = self.get_kalshi_orderbook_age(key)
+            else:
+                book = self.get_polymarket_orderbook(key)
+                age = self.get_polymarket_orderbook_age(key)
+        return (book, age) if book is not None else (None, None)
 
     def stop(self):
         """Signal feeds to stop."""
@@ -783,6 +785,7 @@ class FeedManager:
             session_token=self._betfair_session_token,
             market_ids=list(self._betfair_market_ids),
             on_price_update=self._on_betfair_update,
+            on_message=lambda: self._note_feed_message("betfair"),
             cache=cache,
             host=BETFAIR_STREAM_HOST,
             port=BETFAIR_STREAM_PORT,
@@ -801,10 +804,13 @@ class FeedManager:
                     await asyncio.sleep(jittered)
                     delay = min(delay * 2, RECONNECT_MAX_DELAY)
 
-            # Pick up any dynamically queued betfair subs
-            while self._pending_betfair_subs:
-                mid = self._pending_betfair_subs.pop(0)
-                feed.add_market_ids([mid])
+            # Pick up any dynamically queued betfair subs. prune_subscriptions()
+            # can replace the list from another thread, so drain it under the lock.
+            with self._subs_lock:
+                pending_bf = list(self._pending_betfair_subs)
+                self._pending_betfair_subs.clear()
+            if pending_bf:
+                feed.add_market_ids(pending_bf)
 
         self._betfair_feed = None
 
@@ -1127,6 +1133,7 @@ class FeedManager:
                     raw = await asyncio.wait_for(ws.recv(), timeout=KEEPALIVE_INTERVAL)
                     # Server responds to PING with PONG (literal strings)
                     if raw == "PONG":
+                        self._note_feed_message("polymarket")
                         continue
                     data = json.loads(raw)
                     self._handle_polymarket_message(data)
@@ -1433,6 +1440,7 @@ class BetfairFeed:
         host: str = "stream-api.betfair.com",
         port: int = 443,
         heartbeat_ms: int = 5000,
+        on_message: Callable[[], None] | None = None,
     ):
         """
         Args:
@@ -1444,7 +1452,10 @@ class BetfairFeed:
             host: Stream API hostname.
             port: Stream API port.
             heartbeat_ms: Server heartbeat interval in milliseconds.
+            on_message: Called for every valid stream message (market changes,
+                heartbeats and SUCCESS status), whether or not prices changed.
         """
+        self._on_message = on_message
         self._app_key = app_key
         self._session_token = session_token
         self._market_ids = list(market_ids)
@@ -1583,16 +1594,28 @@ class BetfairFeed:
         """Route an incoming stream message to the appropriate handler."""
         op = msg.get("op", "")
         if op == "mcm":
+            self._note_message()
             self._handle_mcm(msg)
         elif op == "status":
             status = msg.get("statusCode", "")
             if status != "SUCCESS":
                 logger.warning("Betfair stream status: %s — %s",
                                status, msg.get("errorMessage", ""))
+            else:
+                self._note_message()
         elif op == "connection":
             pass  # Already handled during connect
         else:
             logger.debug("Betfair stream: unhandled op=%s", op)
+
+    def _note_message(self):
+        """Report a valid message for liveness; a failing hook never breaks the stream."""
+        if self._on_message is None:
+            return
+        try:
+            self._on_message()
+        except Exception as exc:
+            logger.debug("Betfair on_message failed: %s", exc)
 
     def _handle_mcm(self, msg: dict):
         """Handle a market change message (mcm).

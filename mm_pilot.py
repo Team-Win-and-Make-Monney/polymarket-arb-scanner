@@ -400,10 +400,13 @@ class KalshiMMPilot:
         mono_fn=time.monotonic,
         state_path: str | None = STATE_PATH,
         inventory_balancer=None,
+        queue_tracker=None,
+        micro_pricing=None,
     ):
         import config
         from market_maker import (QuoteEngine, get_toxic_flow_detector,
                                   get_volatility_tracker)
+        from queue_tracker import QueuePositionTracker
 
         self._client = kalshi_client
         self._db = db
@@ -419,6 +422,26 @@ class KalshiMMPilot:
         self._mono_fn = mono_fn
         self.dry_run = config.DRY_RUN if dry_run is None else dry_run
 
+        if micro_pricing is not None:
+            self._micro_pricing = micro_pricing
+        elif getattr(config, "MM_MICROSTRUCTURE_PRICING_ENABLED", True):
+            try:
+                from microstructure_pricing import AvellanedaStoikovEngine
+                self._micro_pricing = AvellanedaStoikovEngine(
+                    risk_aversion_gamma=getattr(config, "MM_RISK_AVERSION_GAMMA", 0.15),
+                    min_half_spread_cents=getattr(config, "MM_MIN_HALF_SPREAD_CENTS", 2.0),
+                    max_half_spread_cents=getattr(config, "MM_MAX_HALF_SPREAD_CENTS", 15.0),
+                    vol_halflife_seconds=getattr(config, "MM_MICRO_VOL_HALFLIFE_SEC", 30.0),
+                    default_kappa=getattr(config, "MM_HAZARD_RATE_DEFAULT_KAPPA", 10.0),
+                    adaptive_sizing_enabled=getattr(config, "MM_MICRO_SIZING_ADAPTIVE_ENABLED", True),
+                    time_fn=self._time_fn,
+                )
+            except Exception as e:
+                logger.debug("Failed initializing AvellanedaStoikovEngine: %s", e)
+                self._micro_pricing = None
+        else:
+            self._micro_pricing = None
+
         if inventory_balancer is not None:
             self._inventory_balancer = inventory_balancer
         elif getattr(config, "MM_CROSS_VENUE_SKEW_ENABLED", True):
@@ -429,6 +452,19 @@ class KalshiMMPilot:
                 self._inventory_balancer = None
         else:
             self._inventory_balancer = None
+
+        if queue_tracker is not None:
+            self._queue_tracker = queue_tracker
+        else:
+            self._queue_tracker = QueuePositionTracker(
+                enabled=getattr(config, "MM_QUEUE_TRACKER_ENABLED", True),
+                preservation_enabled=getattr(config, "MM_QUEUE_PRESERVATION_ENABLED", True),
+                resize_tolerance=getattr(config, "MM_QUEUE_RESIZE_TOLERANCE", 0.20),
+                max_queue_ahead=getattr(config, "MM_MAX_QUEUE_AHEAD", 100),
+                min_fill_probability=getattr(config, "MM_MIN_FILL_PROBABILITY", 0.05),
+                horizon_sec=getattr(config, "MM_FILL_PROB_HORIZON_SEC", 30.0),
+                time_fn=self._time_fn,
+            )
 
         # Pilot-owned hedger over the choke-point proxy (spec section 4).
         from hedger import PartialFillHedger
@@ -444,6 +480,8 @@ class KalshiMMPilot:
         self._orders: dict[str, dict] = {}
         self._order_seq = 0
         self.place_order_calls = 0  # test/runtime assertion counter
+        self._ws_fills_received = 0
+        self._ws_orders_received = 0
 
         # Book cache per ticker: parsed levels + raw + freshness.
         self._books: dict[str, dict] = {}
@@ -707,6 +745,16 @@ class KalshiMMPilot:
             except Exception as exc:
                 logger.debug("MM pilot vol record failed (book) for %s "
                              "mid=%.4f: %s", ticker, mid, exc)
+            if hasattr(self, "_micro_pricing") and self._micro_pricing is not None:
+                try:
+                    self._micro_pricing.record_price(ticker, mid)
+                except Exception as exc:
+                    logger.debug("Micro pricing record_price failed on %s: %s", ticker, exc)
+        if hasattr(self, "_queue_tracker") and self._queue_tracker is not None:
+            try:
+                self._queue_tracker.update_book(ticker, parsed)
+            except Exception as exc:
+                logger.debug("Queue tracker update_book failed on %s: %s", ticker, exc)
 
     def update_book_from_ws(self, ticker: str, raw_book: dict | None) -> None:
         """Update book from WebSocket streaming orderbook."""
@@ -730,6 +778,29 @@ class KalshiMMPilot:
         except Exception as exc:
             logger.debug("MM pilot vol record failed (WS) for %s price=%s: %s",
                          ticker, yes_price, exc)
+        if hasattr(self, "_micro_pricing") and self._micro_pricing is not None:
+            try:
+                self._micro_pricing.record_price(ticker, float(yes_price))
+            except Exception as exc:
+                logger.debug("Micro pricing record_price (WS) failed on %s: %s", ticker, exc)
+
+    def on_ws_trade(self, ticker: str, price: float, count: int, timestamp: float | None = None) -> None:
+        """Record trade print from WebSocket stream to deplete orders ahead in queue and update hazard rates."""
+        if hasattr(self, "_queue_tracker") and self._queue_tracker is not None:
+            try:
+                self._queue_tracker.record_trade(ticker, price, count, timestamp=timestamp)
+            except Exception as exc:
+                logger.debug("Queue tracker record_trade failed on %s: %s", ticker, exc)
+        if hasattr(self, "_micro_pricing") and self._micro_pricing is not None:
+            try:
+                mid = None
+                with self._lock:
+                    b = self._books.get(ticker)
+                    if b:
+                        mid = b.get("mid")
+                self._micro_pricing.record_trade(ticker, price, count, mid_price=mid, timestamp=timestamp)
+            except Exception as exc:
+                logger.debug("Micro pricing record_trade failed on %s: %s", ticker, exc)
 
     def get_raw_book(self, ticker: str) -> dict | None:
         with self._lock:
@@ -1417,6 +1488,22 @@ class KalshiMMPilot:
                 # the latency ceiling.
                 "placed_mono": self._mono_fn(),
             }
+        if hasattr(self, "_queue_tracker") and self._queue_tracker is not None:
+            try:
+                book_obj = self._book(ticker)
+                raw_or_parsed = (book_obj.get("raw") if book_obj else None) or book_obj
+                self._queue_tracker.record_placement(
+                    order_id=order_id,
+                    ticker=ticker,
+                    side=side,
+                    action=action,
+                    count=count,
+                    price=price,
+                    purpose=purpose,
+                    book=raw_or_parsed,
+                )
+            except Exception as exc:
+                logger.debug("Queue tracker record_placement failed for %s: %s", order_id, exc)
         self._persist_state()
         return order_id
 
@@ -1439,6 +1526,11 @@ class KalshiMMPilot:
         if self.dry_run or order_id.startswith("dry_"):
             with self._lock:
                 self._orders.pop(order_id, None)
+            if hasattr(self, "_queue_tracker") and self._queue_tracker is not None:
+                try:
+                    self._queue_tracker.record_cancel(order_id)
+                except Exception as exc:
+                    logger.debug("Queue tracker record_cancel failed for %s: %s", order_id, exc)
             self._persist_state()
             return True
         ok = False
@@ -1449,6 +1541,11 @@ class KalshiMMPilot:
         if ok:
             with self._lock:
                 self._orders.pop(order_id, None)
+            if hasattr(self, "_queue_tracker") and self._queue_tracker is not None:
+                try:
+                    self._queue_tracker.record_cancel(order_id)
+                except Exception as exc:
+                    logger.debug("Queue tracker record_cancel failed for %s: %s", order_id, exc)
             self._persist_state()
             return True
         with self._lock:
@@ -1490,6 +1587,21 @@ class KalshiMMPilot:
     def pull_market(self, ticker: str, reason: str) -> int:
         """Cancel every resting pilot order in a market (fail closed)."""
         order_ids = [o["order_id"] for o in self.resting_orders(ticker)]
+        import config
+        use_batch = getattr(config, "KALSHI_BATCH_CANCEL_ENABLED", True)
+        if use_batch and self._client is not None and hasattr(self._client, "batch_cancel_orders"):
+            try:
+                if self._client.batch_cancel_orders(ticker=ticker):
+                    with self._lock:
+                        for oid in order_ids:
+                            self._orders.pop(oid, None)
+                    if order_ids:
+                        logger.info("MM pilot batch-pulled %d quotes on %s (%s)",
+                                    len(order_ids), ticker, reason)
+                    return len(order_ids)
+            except Exception as exc:
+                logger.debug("MM pilot batch_cancel_orders failed for %s, falling back: %s", ticker, exc)
+
         for oid in order_ids:
             self._cancel_order(oid)
         if order_ids:
@@ -1499,6 +1611,21 @@ class KalshiMMPilot:
 
     def pull_all(self, reason: str) -> int:
         order_ids = [o["order_id"] for o in self.resting_orders()]
+        import config
+        use_batch = getattr(config, "KALSHI_BATCH_CANCEL_ENABLED", True)
+        if use_batch and self._client is not None and hasattr(self._client, "batch_cancel_orders"):
+            try:
+                if self._client.batch_cancel_orders():
+                    with self._lock:
+                        for oid in order_ids:
+                            self._orders.pop(oid, None)
+                    if order_ids:
+                        logger.warning("MM pilot batch-pulled ALL %d resting orders (%s)",
+                                       len(order_ids), reason)
+                    return len(order_ids)
+            except Exception as exc:
+                logger.debug("MM pilot batch_cancel_orders failed for pull_all, falling back: %s", exc)
+
         for oid in order_ids:
             self._cancel_order(oid)
         if order_ids:
@@ -1894,6 +2021,53 @@ class KalshiMMPilot:
         bid = self._round_tick(quotes["bid"])
         ask = self._round_tick(quotes["ask"])
 
+        # Microstructure Pricing Engine (Avellaneda-Stoikov / Realized Vol / Poisson Hazard Rate)
+        micro_res = None
+        if (hasattr(self, "_micro_pricing")
+                and self._micro_pricing is not None
+                and getattr(config, "MM_MICROSTRUCTURE_PRICING_ENABLED", True)):
+            try:
+                micro_res = self._micro_pricing.calculate_pricing(
+                    ticker=ticker,
+                    mid_price=mid,
+                    inventory=effective_inv,
+                    max_inventory=config.MM_MAX_INVENTORY_USD,
+                    book=book,
+                    toxicity_spread_multiplier=tox_spread_mult,
+                    skew_spread_multiplier=skew_spread_mult,
+                )
+            except Exception as exc:
+                logger.debug("Microstructure pricing calculation failed for %s: %s", ticker, exc)
+                micro_res = None
+
+        from market_maker import QuoteEngine
+        if micro_res is not None and isinstance(self._quote_engine, QuoteEngine):
+            bid = self._round_tick(micro_res.optimal_bid)
+            ask = self._round_tick(micro_res.optimal_ask)
+            self._write_decision(
+                "G12b_microstructure_pricing",
+                ticker,
+                True,
+                f"res_price={micro_res.reservation_price:.4f} half_spread={micro_res.half_spread:.4f} "
+                f"vol={micro_res.micro_vol:.4f} regime={micro_res.vol_regime} "
+                f"hazard_lambda={micro_res.hazard_rate:.2f} kappa={micro_res.intensity_decay_kappa:.2f} "
+                f"sizing_mult={micro_res.sizing_multiplier:.2f} bid={bid:.2f} ask={ask:.2f}",
+                reservation_price=micro_res.reservation_price,
+                half_spread=micro_res.half_spread,
+                micro_vol=micro_res.micro_vol,
+                vol_regime=micro_res.vol_regime,
+                hazard_rate=micro_res.hazard_rate,
+                intensity_decay_kappa=micro_res.intensity_decay_kappa,
+                sizing_multiplier=micro_res.sizing_multiplier,
+            )
+        else:
+            self._write_decision(
+                "G12b_microstructure_pricing",
+                ticker,
+                False,
+                "engine_unavailable_or_disabled",
+            )
+
         # G12 crossing guard (post-only semantics): never a marketable quote.
         best_yes_ask = book.get("yes_ask")
         best_yes_bid = book.get("yes_bid")
@@ -1998,6 +2172,12 @@ class KalshiMMPilot:
 
             if balanced_base <= 0:
                 return 0, lip_info
+
+            if (micro_res is not None
+                    and getattr(config, "MM_MICRO_SIZING_ADAPTIVE_ENABLED", True)
+                    and micro_res.sizing_multiplier > 0):
+                balanced_base = min(inv_headroom, max(1, int(balanced_base * micro_res.sizing_multiplier)))
+
             final_count = max(1, int(balanced_base * tox_size_mult))
             return final_count, lip_info
 
@@ -2066,23 +2246,77 @@ class KalshiMMPilot:
 
 
         # Cancel/replace: pull existing quote orders, then place fresh GTC.
+        # Queue-position preservation: if a resting quote is at a favourable queue
+        # position and meets price/size/probability thresholds, preserve it to retain FIFO priority.
         for order in self.resting_orders(ticker):
             if order["purpose"] in ("quote_bid", "quote_ask"):
-                if not self._cancel_order(order["order_id"]):
+                oid = order["order_id"]
+                is_bid = order["purpose"] == "quote_bid"
+                tgt_price = bid if is_bid else no_price
+                tgt_count = bid_count if is_bid else ask_count
+
+                should_preserve = False
+                preserve_reason = "tracker_missing"
+                preserve_meta: dict = {}
+                if order.get("count", 0) > tgt_count:
+                    should_preserve = False
+                    preserve_reason = f"count_exceeds_target: {order.get('count')} > {tgt_count}"
+                elif hasattr(self, "_queue_tracker") and self._queue_tracker is not None:
+                    try:
+                        should_preserve, preserve_reason, preserve_meta = (
+                            self._queue_tracker.should_preserve_quote(
+                                order_id=oid,
+                                target_price=tgt_price,
+                                target_count=tgt_count,
+                                book=book,
+                                order_dict=order,
+                            )
+                        )
+                    except Exception as exc:
+                        logger.debug("Queue tracker should_preserve_quote raised for %s: %s", oid, exc)
+                        should_preserve = False
+                        preserve_reason = f"error: {exc}"
+
+                decision_meta = dict(preserve_meta)
+                decision_meta.pop("ticker", None)
+                self._write_decision(
+                    "G11c_queue_preservation",
+                    ticker,
+                    should_preserve,
+                    f"order={oid} {order['purpose']} {preserve_reason}",
+                    **decision_meta,
+                )
+
+                if should_preserve:
+                    if is_bid:
+                        skip_bid = True
+                    else:
+                        skip_ask = True
+                    continue
+
+                if not self._cancel_order(oid):
                     logger.warning("MM pilot quote refresh aborted on %s: "
                                    "existing order %s is still live",
-                                   ticker, order["order_id"])
+                                   ticker, oid)
                     self._record_lip_snapshot(ticker)
                     return []
 
+                # If the quote was cancelled because it was buried in queue or had low fill
+                # probability, do not immediately re-create another quote at the same level.
+                if preserve_reason.startswith(("buried_in_queue", "low_fill_probability")):
+                    if is_bid:
+                        skip_bid = True
+                    else:
+                        skip_ask = True
+
         placed: list[str] = []
-        if bid_count >= 1:
+        if bid_count >= 1 and not skip_bid:
             oid = self.place_pilot_order(ticker, side="yes", action="buy",
                                          count=bid_count, price=bid,
                                          purpose="quote_bid")
             if oid:
                 placed.append(oid)
-        if ask_count >= 1 and 0 < no_price < 1:
+        if ask_count >= 1 and 0 < no_price < 1 and not skip_ask:
             oid = self.place_pilot_order(ticker, side="no", action="buy",
                                          count=ask_count, price=no_price,
                                          purpose="quote_ask")
@@ -2183,6 +2417,67 @@ class KalshiMMPilot:
             self._check_pending_hedges()
         self._persist_state()
         return events
+
+    def on_ws_fill(self, fill: dict) -> FillEvent | None:
+        """Process a real-time fill event received via WebSocket (<15ms latency).
+
+        Performs immediate fill accounting (inventory, queue position, delta balancer,
+        margin guard, toxicity) without waiting for periodic REST polling.
+        Deduplicates against seen trade_ids so poll_fills (running as fallback) never double counts.
+        """
+        fid = self._fill_id(fill)
+        if fid is None:
+            self.halt_all("fill without trade_id — dedupe unsafe, inventory accounting cannot be trusted")
+            return None
+
+        with self._lock:
+            if fid in self._seen_fill_ids:
+                return None
+            ticker = fill.get("ticker") or fill.get("market_ticker", "")
+            order_id = str(fill.get("order_id", ""))
+            known = order_id in self._orders
+            info = self._orders.get(order_id)
+            pilot_markets = set(self.pilot_tickers())
+
+        if not known:
+            if ticker in pilot_markets:
+                self._mark_seen(fid)
+                self.halt_all(f"fill on unknown order_id {order_id} in pilot market {ticker}")
+                return None
+            # Someone else's market — not ours to account
+            return None
+
+        detect_wall = self._time_fn()
+        detect_mono = self._mono_fn()
+        event = self._build_event(fid, fill, info)
+        if event is None:
+            self._require_reconciliation(f"unparseable fill {fid} on known order {order_id}")
+            return None
+
+        self._mark_seen(fid)
+        self._last_fill_ts = max(self._last_fill_ts, event.created_ts)
+        self._ws_fills_received = getattr(self, "_ws_fills_received", 0) + 1
+
+        self._process_fill(event, info, detect_wall=detect_wall, detect_mono=detect_mono)
+        if not self.halted:
+            self._check_pending_hedges()
+        self._persist_state()
+        return event
+
+    def on_ws_order(self, order: dict) -> None:
+        """Process an order lifecycle update received via WebSocket."""
+        order_id = str(order.get("order_id") or "")
+        status = str(order.get("status") or "").lower()
+        if not order_id:
+            return
+        self._ws_orders_received = getattr(self, "_ws_orders_received", 0) + 1
+        with self._lock:
+            info = self._orders.get(order_id)
+            if info is not None:
+                if status in ("canceled", "cancelled", "executed"):
+                    rem = order.get("remaining_count")
+                    if rem is not None and int(rem) <= 0:
+                        self._orders.pop(order_id, None)
 
     FILL_POLL_FAILURE_LIMIT = 3
 
@@ -2298,6 +2593,12 @@ class KalshiMMPilot:
                 )
             except Exception as exc:
                 logger.debug("Failed updating inventory balancer for fill on %s: %s", event.ticker, exc)
+
+        if hasattr(self, "_queue_tracker") and self._queue_tracker is not None:
+            try:
+                self._queue_tracker.record_fill(event.order_id, event.count)
+            except Exception as exc:
+                logger.debug("Queue tracker record_fill failed for %s: %s", event.order_id, exc)
 
         # Trade log: strategy-tagged from trade one (operating rule 5).
         self._log_fill(event)
@@ -2813,6 +3114,10 @@ class KalshiMMPilot:
                 "ws_updates_count": self._ws_book_updates,
                 "rest_fetches_count": self._rest_book_fetches,
             },
+            "ws_execution": {
+                "ws_fills_received": getattr(self, "_ws_fills_received", 0),
+                "ws_orders_received": getattr(self, "_ws_orders_received", 0),
+            },
             "inventory_skew": {
                 "enabled": getattr(config, "MM_SKEW_SPREAD_ENABLED", True),
                 "cross_venue_enabled": getattr(config, "MM_CROSS_VENUE_SKEW_ENABLED", True),
@@ -2822,6 +3127,8 @@ class KalshiMMPilot:
             "portfolio_margin": self.get_portfolio_margin_metrics(),
             "selection": self.get_selection_status(),
             "toxicity": toxicity_by_ticker,
+            "queue_tracker": self.get_queue_tracker_status(),
+            "microstructure_pricing": self.get_microstructure_pricing_status(),
 
             "dry_run": self.dry_run,
             "reconciled": self._reconciled,
@@ -2830,3 +3137,29 @@ class KalshiMMPilot:
             "loop_error_streak": self._loop_error_streak,
             "last_fill_ts": self._last_fill_ts,
         }
+
+    def get_queue_tracker_status(self) -> dict:
+        """Return queue position tracker status summary."""
+        if hasattr(self, "_queue_tracker") and self._queue_tracker is not None:
+            try:
+                return self._queue_tracker.get_status()
+            except Exception as e:
+                logger.debug("Failed getting queue tracker status: %s", e)
+        return {}
+
+    def get_microstructure_pricing_status(self) -> dict:
+        """Return microstructure pricing engine telemetry summary."""
+        if hasattr(self, "_micro_pricing") and self._micro_pricing is not None:
+            try:
+                import config
+                return {
+                    "enabled": getattr(config, "MM_MICROSTRUCTURE_PRICING_ENABLED", True),
+                    "adaptive_sizing_enabled": getattr(config, "MM_MICRO_SIZING_ADAPTIVE_ENABLED", True),
+                    "gamma": getattr(config, "MM_RISK_AVERSION_GAMMA", 0.15),
+                    "min_half_spread_cents": getattr(config, "MM_MIN_HALF_SPREAD_CENTS", 2.0),
+                    "max_half_spread_cents": getattr(config, "MM_MAX_HALF_SPREAD_CENTS", 15.0),
+                    "markets": self._micro_pricing.get_all_metrics(),
+                }
+            except Exception as e:
+                logger.debug("Failed getting microstructure pricing status: %s", e)
+        return {"enabled": False}

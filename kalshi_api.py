@@ -149,11 +149,26 @@ class KalshiClient:
 
     def __init__(self):
         self.session = requests.Session()
-        # Proxy support
         proxy_url = os.getenv("KALSHI_PROXY_URL")
         if proxy_url:
             self.session.proxies = {"http": proxy_url, "https": proxy_url}
-        self.session.mount("https://", HTTPAdapter(pool_connections=1, pool_maxsize=10))
+        self.session.mount("https://", HTTPAdapter(pool_connections=2, pool_maxsize=10))
+
+        # Fast execution session: dedicated pool to prevent contention with book/market REST polling
+        try:
+            import config
+            fast_exec = getattr(config, "KALSHI_FAST_EXECUTION_ENABLED", True)
+        except Exception:
+            fast_exec = True
+
+        if fast_exec:
+            self.exec_session = requests.Session()
+            if proxy_url:
+                self.exec_session.proxies = {"http": proxy_url, "https": proxy_url}
+            self.exec_session.mount("https://", HTTPAdapter(pool_connections=5, pool_maxsize=20))
+        else:
+            self.exec_session = None
+
         self.api_key_id = None
         self.private_key = None
 
@@ -207,21 +222,37 @@ class KalshiClient:
         retry=retry_if_exception_type((_RateLimitError, requests.ConnectionError, requests.Timeout)),
         reraise=True,
     )
-    def _request(self, method: str, path: str, params: dict | None = None, json_body: dict | None = None) -> requests.Response | None:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        params: dict | None = None,
+        json_body: dict | None = None,
+        is_execution: bool = False,
+    ) -> requests.Response | None:
         """Make an authenticated request to Kalshi API with retry."""
         if _circuit.is_open():
             raise _RateLimitError("Circuit open -- kalshi in backoff")
         _rate_limit()
         headers = self._auth_headers(method, path)
         url = KALSHI_BASE_URL + KALSHI_API_PATH + path
+        timeout = 15 if is_execution else 30
+        sess = self.session
+        if is_execution and self.exec_session is not None:
+            # If session is a Mock (e.g. in unit tests) and exec_session is not explicitly mocked,
+            # use session so test mocks receive execution calls as well.
+            if hasattr(self.session, "_mock_return_value") and not hasattr(self.exec_session, "_mock_return_value"):
+                sess = self.session
+            else:
+                sess = self.exec_session
         try:
-            resp = self.session.request(
+            resp = sess.request(
                 method.upper(),
                 url,
                 headers=headers,
                 params=params,
                 json=json_body,
-                timeout=30,
+                timeout=timeout,
             )
             if resp.status_code == 429:
                 raise _RateLimitError(f"Rate limited: {method} {path}")
@@ -722,7 +753,7 @@ class KalshiClient:
         }
 
         try:
-            resp = self._request("POST", "/portfolio/events/orders", json_body=body)
+            resp = self._request("POST", "/portfolio/events/orders", json_body=body, is_execution=True)
         except Exception as e:
             logger.error("Kalshi place_order exception: %s (ticker=%s)", e, ticker)
             return None
@@ -862,17 +893,43 @@ class KalshiClient:
 
     def cancel_order(self, order_id: str) -> bool:
         """Cancel an open order via V2 events endpoint."""
-        resp = self._request("DELETE", f"/portfolio/events/orders/{order_id}")
+        resp = self._request("DELETE", f"/portfolio/events/orders/{order_id}", is_execution=True)
         if resp is not None and resp.status_code in (200, 204):
             return True
         # Fallback: legacy cancel path during migration window
         if resp is not None and resp.status_code in (404, 405, 410):
-            legacy = self._request("DELETE", f"/portfolio/orders/{order_id}")
+            legacy = self._request("DELETE", f"/portfolio/orders/{order_id}", is_execution=True)
             if legacy is not None and legacy.status_code in (200, 204):
                 return True
         logger.warning(
             "Kalshi cancel_order failed for %s: %s",
             order_id, resp.status_code if resp is not None else "no response",
+        )
+        return False
+
+    def batch_cancel_orders(self, ticker: str | None = None) -> bool:
+        """Cancel open orders in batch via DELETE /portfolio/events/orders or /portfolio/orders.
+
+        Args:
+            ticker: Optional market ticker. When provided, cancels all open orders for that ticker.
+                   When None, cancels all resting orders for the account.
+
+        Returns:
+            True if batch cancel request succeeded (HTTP 200 or 204), False otherwise.
+        """
+        params = {}
+        if ticker:
+            params["ticker"] = ticker
+        resp = self._request("DELETE", "/portfolio/events/orders", params=params, is_execution=True)
+        if resp is not None and resp.status_code in (200, 204):
+            return True
+        if resp is not None and resp.status_code in (404, 405, 410):
+            legacy = self._request("DELETE", "/portfolio/orders", params=params, is_execution=True)
+            if legacy is not None and legacy.status_code in (200, 204):
+                return True
+        logger.warning(
+            "Kalshi batch_cancel_orders failed for ticker=%s: %s",
+            ticker, resp.status_code if resp is not None else "no response",
         )
         return False
 

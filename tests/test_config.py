@@ -871,3 +871,85 @@ class TestEnvFileHygiene:
             f"{module_file} must load only the .env adjacent to the module"
         )
         assert "load_dotenv(dotenv_path=" in source
+
+
+# ---------------------------------------------------------------------------
+# Queue Tracker Configuration Validation
+# ---------------------------------------------------------------------------
+
+class TestQueueTrackerConfig:
+    @pytest.fixture(autouse=True)
+    def restore_config(self):
+        yield
+        _reload_config()
+
+    def test_queue_tracker_defaults(self):
+        cfg = _reload_config()
+        assert cfg.MM_QUEUE_TRACKER_ENABLED is True
+        assert cfg.MM_QUEUE_PRESERVATION_ENABLED is True
+        assert cfg.MM_QUEUE_RESIZE_TOLERANCE == 0.20
+        assert cfg.MM_MAX_QUEUE_AHEAD == 100
+        assert cfg.MM_MIN_FILL_PROBABILITY == 0.05
+        assert cfg.MM_FILL_PROB_HORIZON_SEC == 30.0
+
+    def test_resize_tolerance_negative_raises(self, monkeypatch):
+        monkeypatch.setenv("MM_QUEUE_RESIZE_TOLERANCE", "-0.01")
+        with pytest.raises(ValueError, match="MM_QUEUE_RESIZE_TOLERANCE"):
+            _reload_config()
+
+    def test_max_queue_ahead_negative_raises(self, monkeypatch):
+        monkeypatch.setenv("MM_MAX_QUEUE_AHEAD", "-1")
+        with pytest.raises(ValueError, match="MM_MAX_QUEUE_AHEAD"):
+            _reload_config()
+
+    def test_min_fill_probability_out_of_bounds_raises(self, monkeypatch):
+        monkeypatch.setenv("MM_MIN_FILL_PROBABILITY", "1.5")
+        with pytest.raises(ValueError, match="MM_MIN_FILL_PROBABILITY"):
+            _reload_config()
+
+        monkeypatch.setenv("MM_MIN_FILL_PROBABILITY", "-0.1")
+        with pytest.raises(ValueError, match="MM_MIN_FILL_PROBABILITY"):
+            _reload_config()
+
+    def test_fill_prob_horizon_sec_non_positive_raises(self, monkeypatch):
+        monkeypatch.setenv("MM_FILL_PROB_HORIZON_SEC", "0.0")
+        with pytest.raises(ValueError, match="MM_FILL_PROB_HORIZON_SEC"):
+            _reload_config()
+
+
+class TestMicrostructurePricingConfig:
+    @pytest.fixture(autouse=True)
+    def restore_config(self):
+        yield
+        _reload_config()
+
+    def test_microstructure_pricing_defaults(self):
+        cfg = _reload_config()
+        assert cfg.MM_MICROSTRUCTURE_PRICING_ENABLED is True
+        assert cfg.MM_RISK_AVERSION_GAMMA == 0.15
+        assert cfg.MM_MIN_HALF_SPREAD_CENTS == 1.0
+        assert cfg.MM_MAX_HALF_SPREAD_CENTS == 15.0
+        assert cfg.MM_MICRO_VOL_HALFLIFE_SEC == 30.0
+        assert cfg.MM_HAZARD_RATE_DEFAULT_KAPPA == 100.0
+        assert cfg.MM_MICRO_SIZING_ADAPTIVE_ENABLED is True
+
+    def test_gamma_non_positive_raises(self, monkeypatch):
+        monkeypatch.setenv("MM_RISK_AVERSION_GAMMA", "0.0")
+        with pytest.raises(ValueError, match="MM_RISK_AVERSION_GAMMA"):
+            _reload_config()
+
+    def test_spread_bounds_invalid_raises(self, monkeypatch):
+        monkeypatch.setenv("MM_MIN_HALF_SPREAD_CENTS", "20.0")
+        monkeypatch.setenv("MM_MAX_HALF_SPREAD_CENTS", "10.0")
+        with pytest.raises(ValueError, match="MM_MIN_HALF_SPREAD_CENTS"):
+            _reload_config()
+
+    def test_halflife_non_positive_raises(self, monkeypatch):
+        monkeypatch.setenv("MM_MICRO_VOL_HALFLIFE_SEC", "-5.0")
+        with pytest.raises(ValueError, match="MM_MICRO_VOL_HALFLIFE_SEC"):
+            _reload_config()
+
+    def test_kappa_non_positive_raises(self, monkeypatch):
+        monkeypatch.setenv("MM_HAZARD_RATE_DEFAULT_KAPPA", "0.0")
+        with pytest.raises(ValueError, match="MM_HAZARD_RATE_DEFAULT_KAPPA"):
+            _reload_config()

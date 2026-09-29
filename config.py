@@ -851,6 +851,28 @@ MM_MIN_24H_VOLUME = _env_float("MM_MIN_24H_VOLUME", "0.0")
 MM_MAX_SPREAD_CENTS = _env_float("MM_MAX_SPREAD_CENTS", "0.0")
 MM_VOLUME_WEIGHT = _env_float("MM_VOLUME_WEIGHT", "0.20")
 
+# Queue Position Estimation & Microstructure Fill Probability
+MM_QUEUE_TRACKER_ENABLED = _env_bool("MM_QUEUE_TRACKER_ENABLED", "true")
+MM_QUEUE_PRESERVATION_ENABLED = _env_bool("MM_QUEUE_PRESERVATION_ENABLED", "true")
+MM_QUEUE_RESIZE_TOLERANCE = _env_float("MM_QUEUE_RESIZE_TOLERANCE", "0.20")
+MM_MAX_QUEUE_AHEAD = _env_int("MM_MAX_QUEUE_AHEAD", "100")
+MM_MIN_FILL_PROBABILITY = _env_float("MM_MIN_FILL_PROBABILITY", "0.05")
+MM_FILL_PROB_HORIZON_SEC = _env_float("MM_FILL_PROB_HORIZON_SEC", "30.0")
+
+# Private WebSocket Execution & Fast-Fill Stream (Sub-15ms Latency Alpha)
+KALSHI_WS_PRIVATE_ENABLED = _env_bool("KALSHI_WS_PRIVATE_ENABLED", "true")
+KALSHI_BATCH_CANCEL_ENABLED = _env_bool("KALSHI_BATCH_CANCEL_ENABLED", "true")
+KALSHI_FAST_EXECUTION_ENABLED = _env_bool("KALSHI_FAST_EXECUTION_ENABLED", "true")
+
+# Predictive Volatility & Hazard Rate Spread Sizing (Microstructure Alpha)
+MM_MICROSTRUCTURE_PRICING_ENABLED = _env_bool("MM_MICROSTRUCTURE_PRICING_ENABLED", "true")
+MM_RISK_AVERSION_GAMMA = _env_float("MM_RISK_AVERSION_GAMMA", "0.15")
+MM_MIN_HALF_SPREAD_CENTS = _env_float("MM_MIN_HALF_SPREAD_CENTS", "1.0")
+MM_MAX_HALF_SPREAD_CENTS = _env_float("MM_MAX_HALF_SPREAD_CENTS", "15.0")
+MM_MICRO_VOL_HALFLIFE_SEC = _env_float("MM_MICRO_VOL_HALFLIFE_SEC", "30.0")
+MM_HAZARD_RATE_DEFAULT_KAPPA = _env_float("MM_HAZARD_RATE_DEFAULT_KAPPA", "100.0")
+MM_MICRO_SIZING_ADAPTIVE_ENABLED = _env_bool("MM_MICRO_SIZING_ADAPTIVE_ENABLED", "true")
+
 
 # Kill switch / control plane (spec section 7). Fail closed: a cache older
 # than MM_CONTROLS_MAX_STALE_SECONDS means unknown operator intent = off.
@@ -1469,6 +1491,19 @@ def validate_config() -> list[str]:
         raise ConfigError(
             f"MM_VOLUME_WEIGHT={MM_VOLUME_WEIGHT} must be >= 0")
 
+    if not math.isfinite(MM_QUEUE_RESIZE_TOLERANCE) or MM_QUEUE_RESIZE_TOLERANCE < 0:
+        raise ConfigError(
+            f"MM_QUEUE_RESIZE_TOLERANCE={MM_QUEUE_RESIZE_TOLERANCE} must be finite and >= 0")
+    if MM_MAX_QUEUE_AHEAD < 0:
+        raise ConfigError(
+            f"MM_MAX_QUEUE_AHEAD={MM_MAX_QUEUE_AHEAD} must be >= 0")
+    if not math.isfinite(MM_MIN_FILL_PROBABILITY) or not (0.0 <= MM_MIN_FILL_PROBABILITY <= 1.0):
+        raise ConfigError(
+            f"MM_MIN_FILL_PROBABILITY={MM_MIN_FILL_PROBABILITY} must be finite and in [0, 1]")
+    if not math.isfinite(MM_FILL_PROB_HORIZON_SEC) or MM_FILL_PROB_HORIZON_SEC <= 0.0:
+        raise ConfigError(
+            f"MM_FILL_PROB_HORIZON_SEC={MM_FILL_PROB_HORIZON_SEC} must be finite and > 0")
+
 
 
     # Plan 10 non-negative keys (zero is a valid value for these)
@@ -1500,6 +1535,19 @@ def validate_config() -> list[str]:
     if MM_SKEW_SPREAD_MAX_MULTIPLIER < 1.0:
         raise ConfigError(
             f"MM_SKEW_SPREAD_MAX_MULTIPLIER={MM_SKEW_SPREAD_MAX_MULTIPLIER} must be >= 1.0")
+    if MM_RISK_AVERSION_GAMMA <= 0:
+        raise ConfigError(
+            f"MM_RISK_AVERSION_GAMMA={MM_RISK_AVERSION_GAMMA} must be > 0")
+    if not (0 < MM_MIN_HALF_SPREAD_CENTS < MM_MAX_HALF_SPREAD_CENTS):
+        raise ConfigError(
+            f"Expected 0 < MM_MIN_HALF_SPREAD_CENTS ({MM_MIN_HALF_SPREAD_CENTS}) < "
+            f"MM_MAX_HALF_SPREAD_CENTS ({MM_MAX_HALF_SPREAD_CENTS})")
+    if MM_MICRO_VOL_HALFLIFE_SEC <= 0:
+        raise ConfigError(
+            f"MM_MICRO_VOL_HALFLIFE_SEC={MM_MICRO_VOL_HALFLIFE_SEC} must be > 0")
+    if MM_HAZARD_RATE_DEFAULT_KAPPA <= 0:
+        raise ConfigError(
+            f"MM_HAZARD_RATE_DEFAULT_KAPPA={MM_HAZARD_RATE_DEFAULT_KAPPA} must be > 0")
 
     # --- Non-negative checks ---
     _non_negative = {

@@ -174,7 +174,7 @@ def pilot_env(monkeypatch):
 def build_pilot(clock, client=None, dry_run=False, hedger=None,
                 controls_on=True, detector=None, vol=None,
                 selection=(TICKER,), reconciled=True, state_path=None,
-                inventory_balancer=None):
+                inventory_balancer=None, micro_pricing=None):
     from inventory_balancer import InventoryBalancer
     def time_fn():
         return clock[0]
@@ -194,6 +194,7 @@ def build_pilot(clock, client=None, dry_run=False, hedger=None,
         mono_fn=time_fn,
         state_path=state_path,
         inventory_balancer=inventory_balancer if inventory_balancer is not None else InventoryBalancer(),
+        micro_pricing=micro_pricing,
     )
     if selection is not None:
         pilot.update_selection(list(selection))
@@ -2292,8 +2293,15 @@ class TestMMPilotInventorySkewQuoting:
 
         # Refresh with skewed local inventory
         placed_skewed = pilot.refresh_market(TICKER)
-        assert len(placed_skewed) == 2
+        # quote_ask is preserved to retain queue priority; quote_bid is skewed and replaced
+        assert placed_skewed == ["k_3"]
         orders_skewed = {o["purpose"]: o for o in pilot.resting_orders(TICKER)}
+        assert len(orders_skewed) == 2
+        assert "quote_bid" in orders_skewed
+        assert "quote_ask" in orders_skewed
+        assert orders_skewed["quote_bid"]["order_id"] == "k_3"
+        assert orders_skewed["quote_bid"]["count"] == 3
+        assert orders_skewed["quote_ask"]["order_id"] == orders_flat["quote_ask"]["order_id"]
         spread_skewed = orders_skewed["quote_ask"]["price"] - orders_skewed["quote_bid"]["price"]
 
         # Skew spread must be strictly wider than flat baseline
@@ -2761,3 +2769,305 @@ class TestMMPilotDynamicMarketSelection:
 
         assert pilot.halted is False
         assert pilot._selected == {TICKER}
+
+
+# ---------------------------------------------------------------------------
+# TestKalshiPrivateWSExecution
+# ---------------------------------------------------------------------------
+
+
+class TestKalshiPrivateWSExecution:
+    """Tests for private WebSocket fill handling, order tracking, and batch cancellations."""
+
+    def test_on_ws_fill_processes_immediately_and_updates_state(self, pilot_env, clock):
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client)
+        pilot.canary_graduated = True
+        oid = pilot.place_pilot_order(TICKER, side="yes", action="buy", count=10, price=0.48, purpose="quote_bid")
+        assert oid is not None
+
+        ws_fill = {
+            "ticker": TICKER,
+            "trade_id": "tr_ws_101",
+            "order_id": oid,
+            "side": "yes",
+            "action": "buy",
+            "count": 6,
+            "yes_price": 48,
+            "price": 0.48,
+            "is_taker": False,
+            "ts": clock[0],
+        }
+
+        event = pilot.on_ws_fill(ws_fill)
+        assert event is not None
+        assert event.fill_id == "tr_ws_101"
+        assert event.order_id == oid
+        assert event.count == 6
+        assert event.side == "yes"
+
+        assert pilot.inventory.net_contracts(TICKER) == 6
+
+        resting = pilot._orders.get(oid)
+        assert resting is not None
+        assert resting["count"] == 4
+
+        assert pilot._ws_fills_received == 1
+
+        quote_state = pilot._queue_tracker.get_queue_position(oid)
+        assert quote_state is not None
+        assert quote_state["order_id"] == oid
+
+    def test_on_ws_fill_deduplication_with_poll_fills(self, pilot_env, clock):
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client)
+        pilot.canary_graduated = True
+        oid = pilot.place_pilot_order(TICKER, side="yes", action="buy", count=10, price=0.48, purpose="quote_bid")
+        assert oid is not None
+
+        ws_fill = {
+            "ticker": TICKER,
+            "trade_id": "tr_ws_102",
+            "order_id": oid,
+            "side": "yes",
+            "action": "buy",
+            "count": 10,
+            "yes_price": 48,
+            "price": 0.48,
+            "is_taker": False,
+            "ts": clock[0],
+        }
+
+        event = pilot.on_ws_fill(ws_fill)
+        assert event is not None
+        assert pilot.inventory.net_contracts(TICKER) == 10
+
+        client.fills_script = [
+            kfill(order_id=oid, trade_id="tr_ws_102", count=10, yes_price=48)
+        ]
+        rest_events = pilot.poll_fills()
+
+        assert rest_events == []
+        assert pilot.inventory.net_contracts(TICKER) == 10
+
+    def test_on_ws_fill_missing_trade_id_halts(self, pilot_env, clock):
+        pilot = build_pilot(clock)
+        ws_fill = {
+            "ticker": TICKER,
+            "order_id": "some_oid",
+            "side": "yes",
+            "action": "buy",
+            "count": 5,
+        }
+        event = pilot.on_ws_fill(ws_fill)
+        assert event is None
+        assert pilot.halted is True
+        assert "fill without trade_id" in pilot.halt_reason
+
+    def test_on_ws_fill_unknown_order_in_pilot_market_halts(self, pilot_env, clock):
+        pilot = build_pilot(clock, selection=[TICKER])
+        ws_fill = {
+            "ticker": TICKER,
+            "trade_id": "tr_unknown_1",
+            "order_id": "unknown_order_999",
+            "side": "yes",
+            "action": "buy",
+            "count": 5,
+        }
+        event = pilot.on_ws_fill(ws_fill)
+        assert event is None
+        assert pilot.halted is True
+        assert "fill on unknown order_id" in pilot.halt_reason
+
+    def test_on_ws_fill_unknown_order_in_non_pilot_market_ignored(self, pilot_env, clock):
+        pilot = build_pilot(clock, selection=[TICKER])
+        ws_fill = {
+            "ticker": "NON_PILOT_TICKER",
+            "trade_id": "tr_non_pilot_1",
+            "order_id": "unknown_order_999",
+            "side": "yes",
+            "action": "buy",
+            "count": 5,
+        }
+        event = pilot.on_ws_fill(ws_fill)
+        assert event is None
+        assert pilot.halted is False
+
+    def test_on_ws_order_updates_and_clears_orders(self, pilot_env, clock):
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client)
+        oid = pilot.place_pilot_order(TICKER, side="yes", action="buy", count=10, price=0.48, purpose="quote_bid")
+        assert oid in pilot._orders
+
+        pilot.on_ws_order({
+            "order_id": oid,
+            "status": "executed",
+            "remaining_count": 0,
+        })
+        assert oid not in pilot._orders
+        assert pilot._ws_orders_received == 1
+
+    def test_pull_market_uses_batch_cancel_when_available(self, pilot_env, clock, monkeypatch):
+        client = FakeKalshiClient()
+        client.batch_cancel_orders = MagicMock(return_value=True)
+        pilot = build_pilot(clock, client=client)
+
+        oid1 = pilot.place_pilot_order(TICKER, side="yes", action="buy", count=5, price=0.45, purpose="quote_bid")
+        oid2 = pilot.place_pilot_order(TICKER, side="no", action="buy", count=5, price=0.45, purpose="quote_ask")
+        assert len(pilot.resting_orders(TICKER)) == 2
+
+        pulled = pilot.pull_market(TICKER, "test_batch_pull")
+        assert pulled == 2
+        client.batch_cancel_orders.assert_called_once_with(ticker=TICKER)
+        assert len(pilot.resting_orders(TICKER)) == 0
+
+    def test_pull_market_falls_back_when_batch_cancel_fails(self, pilot_env, clock, monkeypatch):
+        client = FakeKalshiClient()
+        client.batch_cancel_orders = MagicMock(return_value=False)
+        pilot = build_pilot(clock, client=client)
+
+        oid1 = pilot.place_pilot_order(TICKER, side="yes", action="buy", count=5, price=0.45, purpose="quote_bid")
+        oid2 = pilot.place_pilot_order(TICKER, side="no", action="buy", count=5, price=0.45, purpose="quote_ask")
+        assert len(pilot.resting_orders(TICKER)) == 2
+
+        pulled = pilot.pull_market(TICKER, "test_batch_pull_fallback")
+        assert pulled == 2
+        client.batch_cancel_orders.assert_called_once_with(ticker=TICKER)
+        assert oid1 in client.cancelled
+        assert oid2 in client.cancelled
+        assert len(pilot.resting_orders(TICKER)) == 0
+
+    def test_pull_all_uses_batch_cancel(self, pilot_env, clock):
+        client = FakeKalshiClient()
+        client.batch_cancel_orders = MagicMock(return_value=True)
+        pilot = build_pilot(clock, client=client)
+
+        pilot.place_pilot_order(TICKER, side="yes", action="buy", count=5, price=0.45, purpose="quote_bid")
+        assert len(pilot.resting_orders()) == 1
+
+        pulled = pilot.pull_all("test_pull_all_batch")
+        assert pulled == 1
+        client.batch_cancel_orders.assert_called_once_with()
+        assert len(pilot.resting_orders()) == 0
+
+    def test_status_telemetry_includes_ws_execution(self, pilot_env, clock):
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client)
+        status = pilot.get_status()
+        assert "ws_execution" in status
+        assert status["ws_execution"]["ws_fills_received"] == 0
+        assert status["ws_execution"]["ws_orders_received"] == 0
+
+        pilot.on_ws_order({"order_id": "dummy", "status": "resting"})
+        status2 = pilot.get_status()
+        assert status2["ws_execution"]["ws_orders_received"] == 1
+
+
+class TestMicrostructurePricingIntegration:
+    def test_g12b_decision_logged_and_pricing_applied(self, pilot_env, clock):
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        pilot.refresh_market(TICKER)
+
+        g12b = [d for d in pilot._decisions if d.get("gate") == "G12b_microstructure_pricing"]
+        assert len(g12b) >= 1
+        assert g12b[-1]["decision"] == "pass"
+        assert "res_price=" in g12b[-1]["reason"]
+        assert "vol_regime" in g12b[-1]
+
+    def test_spread_widens_under_volatility_shock(self, pilot_env, clock):
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        # Prevent legacy hourly vol tracker G8 ceiling trip so microstructure spread pricing can be evaluated
+        pilot._vol.get_spread_multiplier = lambda t: 1.0
+
+        # Inject series of sharp price jumps into the microstructure tracker via on_ws_price
+        for p in [0.50, 0.70, 0.30, 0.75, 0.25, 0.80]:
+            pilot.on_ws_price(TICKER, p)
+
+        # Update orderbook around 0.50 mid
+        client.books[TICKER] = make_book(yes_bid=0.48, no_bid=0.48)
+        pilot.update_book(TICKER, client.books[TICKER])
+
+        pilot.refresh_market(TICKER)
+
+        g12b = [d for d in pilot._decisions if d.get("gate") == "G12b_microstructure_pricing"][-1]
+        assert g12b["vol_regime"] in ("elevated", "extreme")
+        # Spread should widen above minimum half spread (0.02)
+        assert g12b["half_spread"] > 0.02
+
+    def test_inventory_skew_biases_reservation_price(self, pilot_env, clock):
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        pilot.canary_graduated = True
+
+        # When long inventory (+20 contracts), reservation price should skew down to encourage selling
+        event = FillEvent(
+            fill_id="fill-long",
+            order_id="ord-long",
+            ticker=TICKER,
+            side="yes",
+            action="buy",
+            count=20,
+            price=0.50,
+            is_taker=False,
+            created_ts=clock[0],
+            mid_at_detect=0.50,
+        )
+        pilot._process_fill(event, {"purpose": "quote_bid", "ticker": TICKER, "side": "yes", "action": "buy"})
+        assert pilot.inventory.net_contracts(TICKER) == 20
+
+        pilot.refresh_market(TICKER)
+        g12b = [d for d in pilot._decisions if d.get("gate") == "G12b_microstructure_pricing"][-1]
+        assert g12b["reservation_price"] < 0.50
+
+    def test_adaptive_sizing_scales_down_in_extreme_vol(self, pilot_env, clock):
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48, yes_qty=100, no_qty=100)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        pilot._vol.get_spread_multiplier = lambda t: 1.0
+
+        # Inject extreme price shocks
+        for p in [0.50, 0.70, 0.30, 0.75, 0.25, 0.80]:
+            pilot.on_ws_price(TICKER, p)
+
+        client.books[TICKER] = make_book(yes_bid=0.48, no_bid=0.48, yes_qty=100, no_qty=100)
+        pilot.update_book(TICKER, client.books[TICKER])
+
+        pilot.refresh_market(TICKER)
+        g12b = [d for d in pilot._decisions if d.get("gate") == "G12b_microstructure_pricing"][-1]
+        assert g12b["sizing_multiplier"] < 1.0
+
+    def test_ws_trade_records_in_micro_pricing(self, pilot_env, clock):
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        pilot.update_book(TICKER, client.books[TICKER])
+
+        pilot.on_ws_trade(TICKER, price=0.50, count=10, timestamp=clock[0])
+        status = pilot.get_microstructure_pricing_status()
+        assert status["enabled"] is True
+        market_stats = status["markets"].get(TICKER)
+        assert market_stats is not None
+        assert market_stats["trades_recorded"] >= 1
+
+    def test_microstructure_pricing_disabled_falls_back(self, pilot_env, clock, monkeypatch):
+        import config
+        monkeypatch.setattr(config, "MM_MICROSTRUCTURE_PRICING_ENABLED", False)
+
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        placed = pilot.refresh_market(TICKER)
+        assert len(placed) == 2
+        g12b = [d for d in pilot._decisions if d.get("gate") == "G12b_microstructure_pricing"][-1]
+        assert g12b["decision"] == "fail"
+        assert g12b["reason"] == "engine_unavailable_or_disabled"
+
+    def test_get_status_contains_microstructure_pricing(self, pilot_env, clock):
+        pilot = build_pilot(clock)
+        status = pilot.get_status()
+        assert "microstructure_pricing" in status
+        mp = status["microstructure_pricing"]
+        assert mp["enabled"] is True
+        assert mp["adaptive_sizing_enabled"] is True
+        assert mp["gamma"] == 0.15
+        assert mp["min_half_spread_cents"] == 1.0
+        assert mp["max_half_spread_cents"] == 15.0

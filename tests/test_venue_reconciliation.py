@@ -633,9 +633,16 @@ class TestMirrorSources:
         # later (delayed) status, is neither current nor a source change.
         later = (DAY_END + timedelta(minutes=45)).isoformat()
         old = _status("arb-scanner", db="g1", success=later, snapshot_complete=False)
-        new = _status("arb-scanner", db="g2", supersedes_db_instance_id="g1")
+        new = _status("arb-scanner", db="g2", supersedes_db_instance_ids=["g1"])
         assert self._check([old, new]) == set()
-        assert "ledger_mirror_incomplete" in self._check([old, dict(new, supersedes_db_instance_id=None)])
+        assert "ledger_mirror_incomplete" in self._check([old, dict(new, supersedes_db_instance_ids=[])])
+
+    def test_generation_superseded_through_an_unpublished_one_is_never_current(self):
+        # g0 was exported; g1 never published a status; g2 lists both.
+        later = (DAY_END + timedelta(minutes=45)).isoformat()
+        g0 = _status("arb-scanner", db="g0", success=later, snapshot_complete=False)
+        g2 = _status("arb-scanner", db="g2", supersedes_db_instance_ids=["g0", "g1"])
+        assert self._check([g0, g2]) == set()
 
 
 # ---------------------------------------------------------------------------
@@ -710,7 +717,7 @@ class TestRunReconciliation:
         # deleted locally before the re-snapshot). Neither may count.
         later = (DAY_END + timedelta(minutes=45)).isoformat()
         status = [_status("arb-scanner"), _status("kalshi-mm-pilot", db="g1", success=later),
-                  _status("kalshi-mm-pilot", db="g2", supersedes_db_instance_id="g1")]
+                  _status("kalshi-mm-pilot", db="g2", supersedes_db_instance_ids=["g0", "g1"])]
         counts = {r["source_key"]: {"trades": 3, "positions": 1} for r in status}
         trades = [_ledger("o1", 1.0, n=1, db_instance_id="g1", ledger_key="arbgrid:kalshi-mm-pilot:g1:trades:1"),
                   _ledger("o2", 1.0, n=2, db_instance_id="g1", ledger_key="arbgrid:kalshi-mm-pilot:g1:trades:2"),

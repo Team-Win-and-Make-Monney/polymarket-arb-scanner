@@ -7,6 +7,7 @@ another capture epoch than its stored key is refused, and a status older than
 the stored one is ignored. ``current`` applies the views' superseded filter.
 """
 
+import json
 import os
 import sqlite3
 import sys
@@ -62,15 +63,16 @@ class FakeRemote:
                     raise RuntimeError(f"{key} belongs to another generation")
                 if row["last_attempt_at"] < old["last_attempt_at"]:
                     continue  # status guard: keep the newer status
-                row = dict(row, supersedes_db_instance_id=(
-                    old.get("supersedes_db_instance_id") or row.get("supersedes_db_instance_id")))
+                kept = list(old.get("supersedes_db_instance_ids") or [])
+                row = dict(row, supersedes_db_instance_ids=kept + [
+                    i for i in row.get("supersedes_db_instance_ids") or [] if i not in kept])
             merged = dict(old or {})
             merged.update(row)
             store[key] = merged
 
     def superseded(self):
-        return {(r["service"], r["supersedes_db_instance_id"]) for r in self.tables["ledger_sync_status"].values()
-                if r.get("supersedes_db_instance_id")}
+        return {(r["service"], inst) for r in self.tables["ledger_sync_status"].values()
+                for inst in r.get("supersedes_db_instance_ids") or []}
 
     def current(self, name):
         """Live rows as the reporting views select them: no superseded generation."""
@@ -516,13 +518,13 @@ class TestCaptureGenerations:
         path = str(tmp_path / "t.db")
         tdb = TradeDB(path, ledger_capture=True)
         first = tdb.get_ledger_meta()
-        assert "previous_db_instance_id" not in first
+        assert json.loads(first["superseded_db_instance_ids"]) == []
         TradeDB(path, ledger_capture=True).close()  # plain reinstall: same generation
         assert tdb.get_ledger_meta()["db_instance_id"] == first["db_instance_id"]
         old, new = self._regenerate(tdb, path, how)
         assert new["capture_epoch"] != old["capture_epoch"]
         assert new["db_instance_id"] != old["db_instance_id"]
-        assert new["previous_db_instance_id"] == old["db_instance_id"]
+        assert json.loads(new["superseded_db_instance_ids"]) == [old["db_instance_id"]]
         tdb.close()
 
     @pytest.mark.parametrize("how", ["triggers", "epoch"])
@@ -545,7 +547,7 @@ class TestCaptureGenerations:
         assert ids[1] in [r["source_id"] for r in remote.rows("ledger_trades")
                           if r["db_instance_id"] == old["db_instance_id"]]
         status = remote.tables["ledger_sync_status"][_source_key(new)]
-        assert status["supersedes_db_instance_id"] == old["db_instance_id"]
+        assert status["supersedes_db_instance_ids"] == [old["db_instance_id"]]
         assert remote.mirror_complete(_source_key(new))
         assert not remote.mirror_complete(_source_key(old))
 
@@ -578,7 +580,7 @@ class TestCaptureGenerations:
         name, rows = seen[0]
         assert name == "ledger_sync_status"
         assert rows[0]["source_key"] == _source_key(new)
-        assert rows[0]["supersedes_db_instance_id"] == old["db_instance_id"]
+        assert rows[0]["supersedes_db_instance_ids"] == [old["db_instance_id"]]
         assert rows[0]["snapshot_complete"] is False and "last_success_at" not in rows[0]
         assert "ledger_trades" in [n for n, _ in seen[1:]]
 
@@ -644,7 +646,7 @@ class TestCaptureGenerations:
                                           for r in old_positions], "ledger_key")
         remote.apply("ledger_sync_status", [dict(old_status, last_attempt_at="9999-01-01T00:00:00+00:00",
                                                  last_success_at="9999-01-01T00:00:00+00:00",
-                                                 supersedes_db_instance_id=None)], "source_key")
+                                                 supersedes_db_instance_ids=[])], "source_key")
         assert remote.current("ledger_trades") == [] and remote.current("ledger_positions") == []
         assert not remote.mirror_complete(_source_key(old))
         assert remote.mirror_complete(_source_key(new))
@@ -652,6 +654,51 @@ class TestCaptureGenerations:
         remote.apply("ledger_sync_status", [dict(new_status, last_attempt_at="2000-01-01T00:00:00+00:00",
                                                  snapshot_complete=False)], "source_key")
         assert remote.mirror_complete(_source_key(new))
+
+    def test_two_resets_before_a_sync_keep_the_whole_ancestry(self, tmp_path):
+        path = str(tmp_path / "t.db")
+        tdb = TradeDB(path, ledger_capture=True)
+        g0 = tdb.get_ledger_meta()["db_instance_id"]
+        _, g1 = self._regenerate(tdb, path, "triggers")
+        _, g2 = self._regenerate(tdb, path, "epoch")
+        assert json.loads(g2["superseded_db_instance_ids"]) == [g0, g1["db_instance_id"]]
+        tdb.close()
+
+    def test_two_resets_before_a_sync_retire_the_last_exported_generation(self, ledger):
+        # G0 is exported. Capture resets to G1 while the exporter is offline,
+        # then again to G2 before G1's status ever reaches the mirror.
+        tdb, remote, exporter, path = ledger
+        ids = [_trade(tdb, run_mode="live") for _ in range(3)]
+        pid = tdb.create_position(1, "M", "kalshi", expected_pnl=0.1, run_mode="live")
+        exporter.sync_once()
+        g0 = tdb.get_ledger_meta()
+        old_status = dict(remote.tables["ledger_sync_status"][_source_key(g0)])
+        added = []
+
+        def delete_trade():
+            tdb.conn.execute("DELETE FROM trades WHERE id = ?", (ids[2],))
+            tdb.conn.commit()
+
+        def replace_position_and_trade():
+            tdb.conn.execute("DELETE FROM positions WHERE id = ?", (pid,))
+            tdb.conn.commit()
+            added.append(_trade(tdb, run_mode="live"))
+
+        _, g1 = self._regenerate(tdb, path, "triggers", delete_trade)
+        _, g2 = self._regenerate(tdb, path, "epoch", replace_position_and_trade)
+        assert exporter.sync_once().snapshot_complete
+        status = remote.tables["ledger_sync_status"][_source_key(g2)]
+        assert status["supersedes_db_instance_ids"] == [g0["db_instance_id"], g1["db_instance_id"]]
+        assert _source_key(g1) not in remote.tables["ledger_sync_status"]  # G1 never published
+        # Same trade count as G0, different rows; G0's rows are all retired.
+        assert [r["source_id"] for r in remote.current("ledger_trades")] == [ids[0], ids[1], added[0]]
+        assert remote.current("ledger_positions") == []
+        assert remote.mirror_complete(_source_key(g2)) and not remote.mirror_complete(_source_key(g0))
+        # A delayed G0 status, stamped later, changes nothing.
+        remote.apply("ledger_sync_status", [dict(old_status, last_attempt_at="9999-01-01T00:00:00+00:00",
+                                                 last_success_at="9999-01-01T00:00:00+00:00")], "source_key")
+        assert not remote.mirror_complete(_source_key(g0)) and remote.mirror_complete(_source_key(g2))
+        assert [r["source_id"] for r in remote.current("ledger_trades")] == [ids[0], ids[1], added[0]]
 
 
 class TestReconcileFills:

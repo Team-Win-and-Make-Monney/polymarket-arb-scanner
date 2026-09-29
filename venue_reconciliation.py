@@ -63,7 +63,7 @@ MIRROR_CLOCK_SKEW = timedelta(seconds=120)
 # evidence, even for a long-finished day: corrections may be unexported.
 DEFAULT_MAX_SOURCE_AGE_SECONDS = 3600
 # Status fields that must not move between the fence reads.
-_FENCE_FIELDS = ("source_key", "db_instance_id", "capture_epoch", "supersedes_db_instance_id",
+_FENCE_FIELDS = ("source_key", "db_instance_id", "capture_epoch", "supersedes_db_instance_ids",
                  "watermark_seq", "pending_changes",
                  "snapshot_complete", "local_trades_count", "local_positions_count",
                  "last_attempt_at", "last_success_at", "last_error")
@@ -167,8 +167,8 @@ def superseded_instances(status_rows: list[dict]) -> set[tuple[str, str]]:
     Their mirrored rows may include rows deleted or changed while nothing was
     captured, so they are excluded everywhere, as in the reporting views.
     """
-    return {(r.get("service"), r["supersedes_db_instance_id"]) for r in status_rows
-            if r.get("supersedes_db_instance_id")}
+    return {(r.get("service"), inst) for r in status_rows
+            for inst in (r.get("supersedes_db_instance_ids") or [])}
 
 
 # ---------------------------------------------------------------------------

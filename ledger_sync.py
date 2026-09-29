@@ -17,8 +17,9 @@ never captured.
 Generations: every new capture epoch comes with a new ``db_instance_id``
 (see ``TradeDB.enable_ledger_capture``), so its snapshot is written under new
 keys and never merges with rows the previous epoch left behind, including
-rows deleted while nothing was captured. Its status row names the id it
-replaces (``supersedes_db_instance_id``) and is published, incomplete, before
+rows deleted while nothing was captured. Its status row names every earlier
+id of the same file (``supersedes_db_instance_ids``, including generations
+that were never exported) and is published, incomplete, before
 any of its rows, so the reporting views drop the old generation first and
 report the new one as incomplete until its snapshot has been exported.
 
@@ -41,6 +42,7 @@ Deterministic; no LLM.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -405,7 +407,7 @@ class LedgerExporter:
             "service": self._service,
             "db_instance_id": meta.get("db_instance_id"),
             "capture_epoch": meta.get("capture_epoch"),
-            "supersedes_db_instance_id": meta.get("previous_db_instance_id"),
+            "supersedes_db_instance_ids": json.loads(meta.get("superseded_db_instance_ids", "[]")),
             "capture_since": meta.get("capture_since"),
             "capture_boundary_trades_id": int(meta.get("capture_boundary_trades_id", 0)),
             "capture_boundary_positions_id": int(meta.get("capture_boundary_positions_id", 0)),

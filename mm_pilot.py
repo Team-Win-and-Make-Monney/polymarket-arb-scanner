@@ -2132,7 +2132,10 @@ class KalshiMMPilot:
                 should_preserve = False
                 preserve_reason = "tracker_missing"
                 preserve_meta: dict = {}
-                if hasattr(self, "_queue_tracker") and self._queue_tracker is not None:
+                if order.get("count", 0) > tgt_count:
+                    should_preserve = False
+                    preserve_reason = f"count_exceeds_target: {order.get('count')} > {tgt_count}"
+                elif hasattr(self, "_queue_tracker") and self._queue_tracker is not None:
                     try:
                         should_preserve, preserve_reason, preserve_meta = (
                             self._queue_tracker.should_preserve_quote(

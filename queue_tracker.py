@@ -338,18 +338,23 @@ class QueuePositionTracker:
 
         with self._lock:
             order = self._orders.get(order_id)
-            if order is None and order_dict is not None:
-                # Auto-register order if missing from tracking
-                order = self.record_placement(
-                    order_id=order_id,
-                    ticker=order_dict.get("ticker", ""),
-                    side=order_dict.get("side", "yes"),
-                    action=order_dict.get("action", "buy"),
-                    count=order_dict.get("count", target_count),
-                    price=order_dict.get("price", target_price),
-                    purpose=order_dict.get("purpose", ""),
-                    book=book,
-                )
+
+        if order is None and order_dict is not None:
+            # Auto-register order if missing from tracking (record_placement manages its own lock)
+            order = self.record_placement(
+                order_id=order_id,
+                ticker=order_dict.get("ticker", ""),
+                side=order_dict.get("side", "yes"),
+                action=order_dict.get("action", "buy"),
+                count=order_dict.get("count", target_count),
+                price=order_dict.get("price", target_price),
+                purpose=order_dict.get("purpose", ""),
+                book=book,
+            )
+
+        with self._lock:
+            if order is None:
+                order = self._orders.get(order_id)
 
             if order is None:
                 return False, "order_not_tracked", {}

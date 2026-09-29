@@ -206,6 +206,34 @@ class TestQueuePositionTracker:
         assert meta["count"] == 10
         assert meta["price"] == 0.49
 
+    def test_should_preserve_quote_auto_registers_untracked_order(self) -> None:
+        tracker = QueuePositionTracker(time_fn=lambda: 1000.0)
+        book = make_book(yes_bid=0.49, no_bid=0.49, yes_qty=10.0, no_qty=10.0)
+        order_dict = {
+            "order_id": "untracked_1",
+            "ticker": TICKER,
+            "side": "yes",
+            "action": "buy",
+            "count": 10,
+            "price": 0.49,
+            "purpose": "quote_bid",
+        }
+        # Order was not recorded via record_placement beforehand, but order_dict is provided
+        ok, reason, meta = tracker.should_preserve_quote(
+            order_id="untracked_1",
+            target_price=0.49,
+            target_count=10,
+            book=book,
+            order_dict=order_dict,
+        )
+        assert ok is True
+        assert reason == "preserve_priority"
+        assert meta["order_id"] == "untracked_1"
+        # Order should now be tracked
+        tracked = tracker._orders.get("untracked_1")
+        assert tracked is not None
+        assert tracked.count == 10
+
     def test_should_preserve_quote_rejects_price_change(self) -> None:
         tracker = QueuePositionTracker(time_fn=lambda: 1000.0)
         tracker.record_placement(

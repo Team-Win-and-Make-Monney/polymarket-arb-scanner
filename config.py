@@ -1058,6 +1058,11 @@ WS_ORDERBOOK_MAX_AGE_SECONDS = _env_float("WS_ORDERBOOK_MAX_AGE_SECONDS", "15.0"
 # WS feed stale detection threshold (seconds without any message)
 WS_STALE_FEED_SECONDS = _env_float("WS_STALE_FEED_SECONDS", "120")
 
+# Read WS sockets on a dedicated thread/event loop so synchronous scan stages
+# on the main loop cannot starve them (Polymarket 1013 "slow consumer" closes).
+# Set false to fall back to reading feeds on the main event loop.
+WS_DEDICATED_FEED_THREAD = _env_bool("WS_DEDICATED_FEED_THREAD", "true")
+
 # Parallel workers for depth/order book fetches (separate from scan workers)
 DEPTH_FETCH_WORKERS = _env_int("DEPTH_FETCH_WORKERS", "8")
 

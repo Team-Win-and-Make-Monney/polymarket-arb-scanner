@@ -1062,6 +1062,9 @@ WS_STALE_FEED_SECONDS = _env_float("WS_STALE_FEED_SECONDS", "120")
 # on the main loop cannot starve them (Polymarket 1013 "slow consumer" closes).
 # Set false to fall back to reading feeds on the main event loop.
 WS_DEDICATED_FEED_THREAD = _env_bool("WS_DEDICATED_FEED_THREAD", "true")
+# Queued WS price updates received longer ago than this are dropped at
+# dispatch instead of being published as fresh (feed-thread receipt time).
+WS_DISPATCH_MAX_AGE_SECONDS = _env_float("WS_DISPATCH_MAX_AGE_SECONDS", "5.0")
 
 # Parallel workers for depth/order book fetches (separate from scan workers)
 DEPTH_FETCH_WORKERS = _env_int("DEPTH_FETCH_WORKERS", "8")

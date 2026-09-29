@@ -1815,7 +1815,8 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
     _feed_health.register_health_callback(_on_feed_health_change)
 
     def on_price_update(platform, ticker, data):
-        data["_ts"] = time.time()
+        # Age by feed receipt, not delivery: a queued update must not look fresh.
+        data["_ts"] = data.get("_recv_ts") or time.time()
         with _price_cache_lock:
             price_cache[(platform, ticker)] = data
 

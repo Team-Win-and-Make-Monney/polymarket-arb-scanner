@@ -31,6 +31,7 @@ import ws_feeds  # noqa: E402
 from ws_feeds import (  # noqa: E402
     FeedManager,
     FeedHealthTracker,
+    KalshiBookInvalid,
     KalshiSequenceGap,
     _kalshi_dollars_to_cents,
 )
@@ -119,15 +120,26 @@ class TestKalshiFixedPointSchema:
         assert _kalshi_dollars_to_cents("bad") is None
         assert _kalshi_dollars_to_cents("NaN") is None
 
-    def test_invalid_fp_delta_leaves_book_unchanged(self):
+    def test_unparsable_delta_on_live_book_fails_closed(self):
+        """An unknown level change must not leave the old book being served."""
         cb = MagicMock()
         fm = FeedManager(on_price_update=cb, use_feed_thread=False)
-        fm._handle_kalshi_message(_fp_snapshot())
-        before = fm.get_kalshi_orderbook("KXFP-A")
+        fm._handle_kalshi_message(_fp_snapshot(sid=4, seq=1))
         cb.reset_mock()
+        with pytest.raises(KalshiBookInvalid):
+            fm._handle_kalshi_message(_fp_delta(price="garbage", sid=4, seq=2))
+        assert fm.get_kalshi_orderbook("KXFP-A") is None
+        assert 4 not in fm._kalshi_seq
+        payload = cb.call_args[0][2]
+        assert payload["_invalidated"] is True
+        assert payload["yes_ask"] is None and payload["no_ask"] is None
+
+    def test_unparsable_delta_without_book_publishes_nothing_executable(self):
+        cb = MagicMock()
+        fm = FeedManager(on_price_update=cb, use_feed_thread=False)
         fm._handle_kalshi_message(_fp_delta(price="garbage"))
-        cb.assert_not_called()
-        assert fm.get_kalshi_orderbook("KXFP-A") == before
+        payload = cb.call_args[0][2]
+        assert payload["yes_ask"] is None and payload["no_ask"] is None
 
     def test_zero_quantity_snapshot_levels_dropped(self):
         cb = MagicMock()
@@ -166,7 +178,10 @@ class TestKalshiSequence:
         cb.reset_mock()
         with pytest.raises(KalshiSequenceGap):
             fm._handle_kalshi_message(_fp_delta(sid=7, seq=3))
-        cb.assert_not_called()
+        # Only a non-executable invalidation is published downstream.
+        cb.assert_called_once()
+        payload = cb.call_args[0][2]
+        assert payload["_invalidated"] is True and payload["yes_ask"] is None
         # Never serve a book that missed a delta.
         assert fm.get_kalshi_orderbook("KXFP-A") is None
         assert fm.get_orderbook("kalshi", "KXFP-A") == (None, None)
@@ -420,3 +435,181 @@ class TestDedicatedFeedThread:
         fm.stop()
         assert ran_on == ["ws-feeds"]
         assert fm._pending_kalshi_subs == []
+
+
+# ---------------------------------------------------------------------------
+# Dispatch queue: receipt time, expiry and invalidation (review of #189)
+# ---------------------------------------------------------------------------
+
+
+class _ManualLoop:
+    """Stands in for the caller loop: holds scheduled drains until run()."""
+
+    def __init__(self):
+        self.scheduled = []
+
+    def call_soon_threadsafe(self, fn, *args):
+        self.scheduled.append((fn, args))
+
+    def run(self):
+        while self.scheduled:
+            fn, args = self.scheduled.pop(0)
+            fn(*args)
+
+
+def _queued_feed(cb, **kw):
+    fm = FeedManager(on_price_update=cb, use_feed_thread=True, **kw)
+    loop = _ManualLoop()
+    fm._dispatch_loop = loop
+    return fm, loop
+
+
+class TestDispatchValidity:
+    def test_payload_carries_feed_receipt_time(self, monkeypatch):
+        cb = MagicMock()
+        fm, loop = _queued_feed(cb)
+        clock = [1000.0]
+        monkeypatch.setattr(ws_feeds.time, "time", lambda: clock[0])
+        fm._handle_kalshi_message(_fp_snapshot())
+        clock[0] += 2.0
+        loop.run()
+        assert cb.call_args[0][2]["_recv_ts"] == 1000.0
+
+    def test_delayed_dispatch_with_no_newer_tick_is_dropped(self, monkeypatch):
+        """Caller loop stalls past the max age and the feed goes quiet: the old
+        update must not be published as if it had just arrived."""
+        cb = MagicMock()
+        fm, loop = _queued_feed(cb)
+        fm._dispatch_max_age = 5.0
+        clock = [1000.0]
+        monkeypatch.setattr(ws_feeds.time, "time", lambda: clock[0])
+        fm._handle_kalshi_message(_fp_snapshot())
+        clock[0] += 6.0  # stall, no newer tick
+        loop.run()
+        cb.assert_not_called()
+        assert fm.dropped_expired_updates == 1
+
+    def test_delayed_dispatch_within_max_age_is_delivered(self, monkeypatch):
+        cb = MagicMock()
+        fm, loop = _queued_feed(cb)
+        fm._dispatch_max_age = 5.0
+        clock = [1000.0]
+        monkeypatch.setattr(ws_feeds.time, "time", lambda: clock[0])
+        fm._handle_kalshi_message(_fp_snapshot())
+        clock[0] += 4.0
+        loop.run()
+        cb.assert_called_once()
+
+    def test_invalidation_is_never_expired(self, monkeypatch):
+        cb = MagicMock()
+        fm, loop = _queued_feed(cb)
+        fm._dispatch_max_age = 5.0
+        clock = [1000.0]
+        monkeypatch.setattr(ws_feeds.time, "time", lambda: clock[0])
+        fm._handle_kalshi_message(_fp_snapshot(sid=1, seq=1))
+        with pytest.raises(KalshiSequenceGap):
+            fm._handle_kalshi_message(_fp_delta(sid=1, seq=5))
+        clock[0] += 60.0
+        loop.run()
+        cb.assert_called_once()
+        assert cb.call_args[0][2]["_invalidated"] is True
+
+    def test_gap_between_enqueue_and_drain_publishes_no_prices(self):
+        """A pre-gap executable update still queued must not be delivered."""
+        cb = MagicMock()
+        fm, loop = _queued_feed(cb)
+        fm._handle_kalshi_message(_fp_snapshot(sid=1, seq=1))
+        fm._handle_kalshi_message(_fp_delta(sid=1, seq=2))  # queued, executable
+        with pytest.raises(KalshiSequenceGap):
+            fm._handle_kalshi_message(_fp_delta(sid=1, seq=9))
+        loop.run()
+        delivered = [c[0][2] for c in cb.call_args_list]
+        assert delivered and all(p.get("_invalidated") for p in delivered)
+        assert all(p["yes_ask"] is None and p["no_ask"] is None for p in delivered)
+
+    def test_gap_invalidates_update_already_popped_for_delivery(self):
+        """Generation check: a batch popped before the gap is still rejected."""
+        cb = MagicMock()
+        fm, loop = _queued_feed(cb)
+        fm._handle_kalshi_message(_fp_snapshot(sid=1, seq=1))
+        with fm._pending_lock:
+            stale_batch = dict(fm._pending_updates)
+        with pytest.raises(KalshiSequenceGap):
+            fm._handle_kalshi_message(_fp_delta(sid=1, seq=9))
+        with fm._pending_lock:
+            fm._pending_updates.update(stale_batch)  # simulate a racing re-queue
+        loop.run()
+        assert all(c[0][2].get("_invalidated") for c in cb.call_args_list)
+        assert fm.dropped_invalidated_updates >= 1
+
+    def test_gap_on_one_ticker_keeps_other_ticker_updates(self):
+        cb = MagicMock()
+        fm, loop = _queued_feed(cb)
+        fm._handle_kalshi_message(_fp_snapshot("KXA", sid=1, seq=1))
+        fm._handle_kalshi_message(_fp_snapshot("KXB", sid=2, seq=1))
+        with pytest.raises(KalshiSequenceGap):
+            fm._handle_kalshi_message(_fp_delta("KXA", sid=1, seq=7))
+        loop.run()
+        by_ticker = {c[0][1]: c[0][2] for c in cb.call_args_list}
+        assert by_ticker["KXA"].get("_invalidated") is True
+        assert by_ticker["KXB"]["yes_ask"] == pytest.approx(0.45)
+
+    def test_disconnect_invalidates_queued_kalshi_updates(self, monkeypatch):
+        cb = MagicMock()
+        fm, loop = _queued_feed(cb)
+        fm._handle_kalshi_message(_fp_snapshot(sid=1, seq=1))  # queued
+
+        async def dropped():
+            fm._running = False
+            raise ConnectionError("socket closed")
+
+        async def no_sleep(_s):
+            return None
+
+        monkeypatch.setattr(fm, "_connect_kalshi", dropped)
+        monkeypatch.setattr(ws_feeds.asyncio, "sleep", no_sleep)
+        fm._running = True
+        asyncio.run(fm._run_kalshi())
+        loop.run()
+        delivered = [c[0][2] for c in cb.call_args_list]
+        assert delivered and all(p.get("_invalidated") for p in delivered)
+        assert fm.get_kalshi_orderbook("KXFP-A") is None
+
+    def test_polymarket_reset_drops_queued_updates(self):
+        cb = MagicMock()
+        fm, loop = _queued_feed(cb)
+        fm._handle_polymarket_message([{"event_type": "best_bid_ask", "asset_id": "tok", "best_bid": "0.4"}])
+        fm._reset_poly_books()
+        loop.run()
+        cb.assert_not_called()
+
+
+class TestBetfairLiveness:
+    def test_betfair_ingress_records_liveness_and_dispatches(self):
+        cb = MagicMock()
+        alive = MagicMock()
+        fm = FeedManager(on_price_update=cb, on_feed_message=alive, use_feed_thread=False)
+        fm._on_betfair_update("betfair", "1.23", {"back": 2.0})
+        alive.assert_called_once_with("betfair")
+        cb.assert_called_once()
+        assert cb.call_args[0][:2] == ("betfair", "1.23")
+
+    def test_run_betfair_wires_liveness_callback(self, monkeypatch):
+        captured = {}
+
+        class FakeFeed:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            async def connect(self):
+                fm._running = False
+
+            def stop(self):
+                pass
+
+        fm = FeedManager(on_price_update=MagicMock(), use_feed_thread=False,
+                         betfair_app_key="k", betfair_session_token="t")
+        monkeypatch.setattr(ws_feeds, "BetfairFeed", FakeFeed)
+        fm._running = True
+        asyncio.run(fm._run_betfair())
+        assert captured["on_price_update"] == fm._on_betfair_update

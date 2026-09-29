@@ -461,76 +461,201 @@ class LedgerExporter:
 # Venue reconciliation (pure; venue records come from read-only venue sources)
 # ---------------------------------------------------------------------------
 
+RECONCILE_MATCHED = "matched"
+RECONCILE_MISMATCHED = "mismatched"
+RECONCILE_INCOMPLETE = "incomplete"
+
 
 def _dec(value) -> Decimal | None:
-    if value is None:
+    """Finite Decimal, or None for missing, unparsable, boolean, NaN or infinite values."""
+    if value is None or isinstance(value, bool):
         return None
     try:
-        return Decimal(str(value))
+        dec = Decimal(str(value).strip())
     except (InvalidOperation, ValueError):
         return None
+    return dec if dec.is_finite() else None
+
+
+def _parse_utc(value) -> datetime | None:
+    """A timezone-aware instant in UTC, or None. Naive timestamps are rejected:
+    without an offset the instant is unknown."""
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str) and value.strip():
+        text = value.strip()
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    else:
+        return None
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        return None
+    return dt.astimezone(timezone.utc)
 
 
 def reconcile_fills(venue_fills: list[dict], ledger_trades: list[dict], *, venue: str,
-                    account_ref: str | None, interval_start: str, interval_end: str) -> dict:
-    """Compare a venue's fill records for one account/interval with ledger trade rows.
+                    account_ref: str | None, interval_start, interval_end,
+                    venue_coverage: dict | None) -> dict:
+    """Compare one account's venue fill records for [interval_start, interval_end) with the ledger.
 
-    venue_fills: records from a venue statement or read-only venue API, each
-        with ``order_id`` and optional ``qty`` and ``fee_usd``. They must cover
-        the whole interval for the account; the caller asserts that.
-    ledger_trades: ledger_trades records (as exported) for the same venue.
+    Fails closed: the result is "matched" only when every piece of evidence is
+    present and valid and agrees. Any missing or invalid evidence makes it
+    "incomplete" (listed in ``incomplete_reasons``); valid evidence that
+    disagrees makes it "mismatched". A verified interval with no activity on
+    either side is "matched" with zero counts.
 
-    Only live, non-deleted ledger rows with a fill (fill_price set, or status
-    "filled") and an order id count. Matching is by venue order id. Returns a
-    deterministic summary; status is "matched" only with no missing order on
-    either side and no quantity mismatch. Venue fees are summed from the venue
-    side, since the local ledger records none.
+    venue_fills: fill records from a venue statement or read-only venue API,
+        each with ``order_id``, ``qty``, ``filled_at`` (timezone-aware), and
+        optional ``fee_usd`` / ``account_ref``.
+    ledger_trades: ledger_trades records (as exported) for this venue.
+    venue_coverage: the source's own completeness assertion,
+        ``{"account_ref", "interval_start", "interval_end", "complete", "source"}``.
+        It must be complete, name the same account, and cover exactly the
+        requested interval (compared as UTC instants).
+
+    Interval bounds and all timestamps are compared as UTC instants, never as
+    strings. Only venue fills inside the interval count. Ledger fills count
+    toward "missing in venue" only when recorded inside the interval; the
+    engine log time can trail the venue fill time, so a boundary straddle is
+    reported as a mismatch rather than hidden.
     """
-    venue_by_order: dict[str, list[dict]] = {}
+    reasons: set[str] = set()
+    start = _parse_utc(interval_start)
+    end = _parse_utc(interval_end)
+    if start is None or end is None or end <= start:
+        reasons.add("invalid_interval")
+    if not account_ref:
+        reasons.add("account_unknown")
+
+    coverage_verified = False
+    if not isinstance(venue_coverage, dict):
+        reasons.add("venue_coverage_missing")
+    else:
+        cov_start = _parse_utc(venue_coverage.get("interval_start"))
+        cov_end = _parse_utc(venue_coverage.get("interval_end"))
+        coverage_verified = (
+            venue_coverage.get("complete") is True
+            and bool(venue_coverage.get("source"))
+            and bool(account_ref)
+            and venue_coverage.get("account_ref") == account_ref
+            and start is not None and end is not None
+            and cov_start == start and cov_end == end
+        )
+        if not coverage_verified:
+            reasons.add("venue_coverage_unverified")
+
+    def in_interval(ts) -> bool:
+        return start is not None and end is not None and start <= ts < end
+
+    # Venue side: every in-interval record must be attributable and complete.
+    # venue_qty[order] is None when any of the order's quantities is unknown.
+    venue_qty: dict[str, Decimal | None] = {}
+    out_of_interval = 0
+    fees: list[Decimal] = []
+    fees_complete = True
     for rec in venue_fills:
-        oid = str(rec.get("order_id") or "")
-        if oid:
-            venue_by_order.setdefault(oid, []).append(rec)
-    ledger_by_order: dict[str, list[dict]] = {}
-    for rec in ledger_trades:
-        if rec.get("deleted") or rec.get("venue") != venue or rec.get("run_mode") != "live":
+        rec_account = rec.get("account_ref")
+        if rec_account is not None and rec_account != account_ref:
+            reasons.add("venue_record_account_mismatch")
             continue
-        if account_ref is not None and rec.get("account_ref") != account_ref:
+        filled_at = _parse_utc(rec.get("filled_at"))
+        if filled_at is None:
+            reasons.add("venue_record_time_unknown")
+            continue
+        if not in_interval(filled_at):
+            out_of_interval += 1
+            continue
+        oid = str(rec.get("order_id") or "").strip()
+        if not oid:
+            reasons.add("venue_record_missing_order_id")
+            continue
+        qty = _dec(rec.get("qty"))
+        if qty is None:
+            venue_qty[oid] = None
+        elif venue_qty.get(oid, Decimal(0)) is not None:
+            venue_qty[oid] = venue_qty.get(oid, Decimal(0)) + qty
+        fee = _dec(rec.get("fee_usd"))
+        if fee is None:
+            fees_complete = False
+        else:
+            fees.append(fee)
+
+    # Ledger side: live fills for this venue and account; anything that could
+    # be one but is not attributable makes the result incomplete.
+    ledger_qty: dict[str, Decimal | None] = {}
+    ledger_in_interval: set[str] = set()
+    for rec in ledger_trades:
+        if rec.get("deleted") or rec.get("venue") != venue:
             continue
         if rec.get("fill_price") is None and rec.get("status") != "filled":
             continue
-        oid = str(rec.get("order_id") or "")
-        if oid:
-            ledger_by_order.setdefault(oid, []).append(rec)
-
-    missing_in_ledger = sorted(set(venue_by_order) - set(ledger_by_order))
-    # Ledger fills are only expected in the venue interval if recorded inside it.
-    missing_in_venue = sorted(
-        oid for oid, recs in ledger_by_order.items()
-        if oid not in venue_by_order
-        and any(interval_start <= str(r.get("recorded_at") or "") < interval_end for r in recs))
-    qty_mismatch = []
-    for oid in sorted(set(venue_by_order) & set(ledger_by_order)):
-        vq = [_dec(r.get("qty")) for r in venue_by_order[oid]]
-        lq = [_dec(r.get("fill_qty")) for r in ledger_by_order[oid]]
-        if None in vq or None in lq:
+        recorded_at = _parse_utc(rec.get("recorded_at"))
+        mode = rec.get("run_mode")
+        if mode == "paper":
             continue
-        if sum(vq, Decimal(0)) != sum(lq, Decimal(0)):
+        if mode != "live" or rec.get("account_ref") is None:
+            if recorded_at is None or in_interval(recorded_at):
+                reasons.add("ledger_fill_unattributed")
+            continue
+        if rec.get("account_ref") != account_ref:
+            continue
+        oid = str(rec.get("order_id") or "").strip()
+        if recorded_at is None:
+            reasons.add("ledger_record_time_unknown")
+        if not oid:
+            if recorded_at is None or in_interval(recorded_at):
+                reasons.add("ledger_record_missing_order_id")
+            continue
+        qty = _dec(rec.get("fill_qty"))
+        if qty is None:
+            ledger_qty[oid] = None
+        elif ledger_qty.get(oid, Decimal(0)) is not None:
+            ledger_qty[oid] = ledger_qty.get(oid, Decimal(0)) + qty
+        if recorded_at is not None and in_interval(recorded_at):
+            ledger_in_interval.add(oid)
+
+    venue_orders = set(venue_qty)
+    missing_in_ledger = sorted(venue_orders - set(ledger_qty))
+    missing_in_venue = sorted(ledger_in_interval - venue_orders)
+    qty_mismatch = []
+    for oid in sorted(venue_orders & set(ledger_qty)):
+        vq, lq = venue_qty[oid], ledger_qty[oid]
+        if vq is None:
+            reasons.add("venue_record_qty_unknown")
+        elif lq is None:
+            reasons.add("ledger_record_qty_unknown")
+        elif vq != lq:
             qty_mismatch.append(oid)
-    fees = [_dec(r.get("fee_usd")) for recs in venue_by_order.values() for r in recs]
-    fees_known = bool(fees) and None not in fees
-    ok = not missing_in_ledger and not missing_in_venue and not qty_mismatch
+    for oid in venue_orders - set(ledger_qty):
+        if venue_qty[oid] is None:
+            reasons.add("venue_record_qty_unknown")
+
+    if reasons:
+        status = RECONCILE_INCOMPLETE
+    elif missing_in_ledger or missing_in_venue or qty_mismatch:
+        status = RECONCILE_MISMATCHED
+    else:
+        status = RECONCILE_MATCHED
     return {
         "venue": venue,
         "account_ref": account_ref,
-        "interval_start": interval_start,
-        "interval_end": interval_end,
-        "venue_order_count": len(venue_by_order),
-        "ledger_order_count": len(ledger_by_order),
-        "matched_order_count": len(set(venue_by_order) & set(ledger_by_order)),
+        "interval_start": start.isoformat() if start else None,
+        "interval_end": end.isoformat() if end else None,
+        "venue_source": venue_coverage.get("source") if isinstance(venue_coverage, dict) else None,
+        "coverage_verified": coverage_verified,
+        "venue_order_count": len(venue_orders),
+        "ledger_order_count": len(ledger_in_interval),
+        "matched_order_count": len(venue_orders & set(ledger_qty)),
+        "venue_records_out_of_interval": out_of_interval,
         "missing_in_ledger": missing_in_ledger,
         "missing_in_venue": missing_in_venue,
         "qty_mismatch": qty_mismatch,
-        "venue_fees_usd": str(sum(fees, Decimal(0))) if fees_known else None,
-        "status": "matched" if ok else "mismatched",
+        "venue_fees_usd": str(sum(fees, Decimal(0))) if fees_complete else None,
+        "fees_complete": fees_complete,
+        "incomplete_reasons": sorted(reasons),
+        "status": status,
     }

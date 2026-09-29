@@ -120,24 +120,44 @@ create table if not exists public.ledger_sync_status (
   synced_at                     timestamptz not null default now()
 );
 
--- One row per completed venue check. Written by a separate reconciliation
--- job with read-only venue credentials (not part of this change).
+-- One row per venue check (ledger_sync.reconcile_fills output). Written by a
+-- separate reconciliation job with read-only venue credentials (deferred).
+-- Missing or invalid evidence is recorded as 'incomplete' with reasons; a row
+-- can only be 'matched' with verified coverage and nothing outstanding.
 create table if not exists public.ledger_venue_reconciliations (
   id                  uuid primary key default gen_random_uuid(),
   venue               text not null,
-  account_ref         text not null,
-  interval_start      timestamptz not null,
-  interval_end        timestamptz not null check (interval_end > interval_start),
-  venue_source        text not null,           -- statement id / API export reference
-  status              text not null check (status in ('matched', 'mismatched')),
+  account_ref         text,                    -- null only on an incomplete check
+  interval_start      timestamptz,
+  interval_end        timestamptz,
+  venue_source        text,                    -- statement id / API export reference
+  status              text not null check (status in ('matched', 'mismatched', 'incomplete')),
+  coverage_verified   boolean not null default false,
+  incomplete_reasons  jsonb not null default '[]'::jsonb,
   venue_order_count   integer not null,
   ledger_order_count  integer not null,
   matched_order_count integer not null,
+  venue_records_out_of_interval integer not null default 0,
   missing_in_ledger   jsonb not null default '[]'::jsonb,
   missing_in_venue    jsonb not null default '[]'::jsonb,
   qty_mismatch        jsonb not null default '[]'::jsonb,
-  venue_fees_usd      numeric,
+  venue_fees_usd      numeric check (venue_fees_usd is null
+                        or venue_fees_usd not in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)),
+  fees_complete       boolean not null default false,
   checked_at          timestamptz not null default now(),
+  constraint ledger_recon_interval_valid
+    check (interval_end is null or interval_start is null or interval_end > interval_start),
+  constraint ledger_recon_incomplete_has_reason
+    check ((status = 'incomplete') = (incomplete_reasons <> '[]'::jsonb)),
+  constraint ledger_recon_matched_is_verified
+    check (status <> 'matched' or (
+      coverage_verified and account_ref is not null and venue_source is not null
+      and interval_start is not null and interval_end is not null
+      and incomplete_reasons = '[]'::jsonb
+      and missing_in_ledger = '[]'::jsonb and missing_in_venue = '[]'::jsonb
+      and qty_mismatch = '[]'::jsonb
+      and matched_order_count = venue_order_count
+      and ledger_order_count <= matched_order_count)),
   unique (venue, account_ref, interval_start, interval_end, venue_source)
 );
 
@@ -263,8 +283,9 @@ where not deleted;
 
 create or replace view ledger_reporting.venue_reconciliations as
 select venue, account_ref, interval_start, interval_end, venue_source, status,
-       venue_order_count, ledger_order_count, matched_order_count,
-       missing_in_ledger, missing_in_venue, qty_mismatch, venue_fees_usd, checked_at
+       coverage_verified, incomplete_reasons, venue_order_count, ledger_order_count,
+       matched_order_count, venue_records_out_of_interval, missing_in_ledger,
+       missing_in_venue, qty_mismatch, venue_fees_usd, fees_complete, checked_at
 from public.ledger_venue_reconciliations;
 
 -- Engine-computed realized PnL of live, settled positions per UTC day, venue
@@ -296,11 +317,25 @@ select
   'not_recorded'::text as fee_status,
   false as pnl_verified,
   bool_and(coalesce(src.mirror_complete, false)) as mirror_complete_now,
+  -- True only when a verified 'matched' check covers the whole UTC day and no
+  -- later check touching that day for the same venue/account disagrees or is
+  -- incomplete.
   exists (
     select 1 from public.ledger_venue_reconciliations r
-    where r.venue = s.venue and r.account_ref = s.account_ref and r.status = 'matched'
+    where r.venue = s.venue and r.account_ref = s.account_ref
+      and r.status = 'matched' and r.coverage_verified
       and r.interval_start <= s.settle_day_utc::timestamp at time zone 'UTC'
       and r.interval_end >= (s.settle_day_utc + 1)::timestamp at time zone 'UTC'
+      and not exists (
+        select 1 from public.ledger_venue_reconciliations r2
+        where r2.venue = r.venue
+          and (r2.account_ref = r.account_ref or r2.account_ref is null)
+          and r2.status <> 'matched'
+          and r2.checked_at >= r.checked_at
+          and (r2.interval_start is null or r2.interval_end is null
+               or (r2.interval_start < (s.settle_day_utc + 1)::timestamp at time zone 'UTC'
+                   and r2.interval_end > s.settle_day_utc::timestamp at time zone 'UTC'))
+      )
   ) as fills_reconciled_for_day
 from settled s
 left join ledger_reporting.sources src

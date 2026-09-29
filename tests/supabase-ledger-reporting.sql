@@ -72,9 +72,61 @@ insert into public.ledger_sync_status (source_key, source_system, service, db_in
 values ('arbgrid:svc:db1', 'arbgrid', 'svc', 'db1', 'e2', true, 0, 1, 5,
   '2026-09-29T00:00:00+00:00', '2026-09-29T00:00:00+00:00', null);
 insert into public.ledger_venue_reconciliations (venue, account_ref, interval_start, interval_end,
-  venue_source, status, venue_order_count, ledger_order_count, matched_order_count)
-values ('kalshi', 'k1', '2026-09-28T00:00:00+00', '2026-09-29T00:00:00+00', 'stmt-1', 'matched', 1, 1, 1);
+  venue_source, status, coverage_verified, venue_order_count, ledger_order_count, matched_order_count,
+  checked_at)
+values ('kalshi', 'k1', '2026-09-28T00:00:00+00', '2026-09-29T00:00:00+00', 'stmt-1', 'matched', true, 1, 1, 1,
+  '2026-09-29T01:00:00+00');
 reset role;
+
+-- Reconciliation rows cannot claim a match from incomplete evidence.
+do $$
+begin
+  begin
+    insert into public.ledger_venue_reconciliations (venue, account_ref, interval_start, interval_end,
+      venue_source, status, coverage_verified, venue_order_count, ledger_order_count, matched_order_count)
+    values ('kalshi', 'k1', '2026-09-27T00:00:00+00', '2026-09-28T00:00:00+00', 's', 'matched', false, 0, 0, 0);
+    raise exception 'matched without verified coverage was accepted';
+  exception when check_violation then null;
+  end;
+  begin
+    insert into public.ledger_venue_reconciliations (venue, account_ref, interval_start, interval_end,
+      venue_source, status, coverage_verified, venue_order_count, ledger_order_count, matched_order_count)
+    values ('kalshi', null, '2026-09-27T00:00:00+00', '2026-09-28T00:00:00+00', 's', 'matched', true, 0, 0, 0);
+    raise exception 'matched without an account was accepted';
+  exception when check_violation then null;
+  end;
+  begin
+    insert into public.ledger_venue_reconciliations (venue, account_ref, interval_start, interval_end,
+      venue_source, status, coverage_verified, venue_order_count, ledger_order_count, matched_order_count,
+      missing_in_venue)
+    values ('kalshi', 'k1', '2026-09-27T00:00:00+00', '2026-09-28T00:00:00+00', 's', 'matched', true, 0, 1, 0,
+      '["B"]');
+    raise exception 'matched with a missing order was accepted';
+  exception when check_violation then null;
+  end;
+  begin
+    insert into public.ledger_venue_reconciliations (venue, account_ref, interval_start, interval_end,
+      venue_source, status, venue_order_count, ledger_order_count, matched_order_count)
+    values ('kalshi', 'k1', '2026-09-27T00:00:00+00', '2026-09-28T00:00:00+00', 's', 'incomplete', 0, 0, 0);
+    raise exception 'incomplete without a reason was accepted';
+  exception when check_violation then null;
+  end;
+  begin
+    insert into public.ledger_venue_reconciliations (venue, account_ref, interval_start, interval_end,
+      venue_source, status, incomplete_reasons, venue_order_count, ledger_order_count, matched_order_count,
+      venue_fees_usd)
+    values ('kalshi', 'k1', '2026-09-27T00:00:00+00', '2026-09-28T00:00:00+00', 's', 'incomplete',
+      '["venue_record_qty_unknown"]', 0, 0, 0, 'NaN');
+    raise exception 'non-finite fees were accepted';
+  exception when check_violation then null;
+  end;
+end $$;
+-- An incomplete check with no account is recordable (and matches nothing).
+insert into public.ledger_venue_reconciliations (venue, account_ref, interval_start, interval_end,
+  venue_source, status, incomplete_reasons, venue_order_count, ledger_order_count, matched_order_count,
+  checked_at)
+values ('kalshi', null, null, null, null, 'incomplete', '["account_unknown", "invalid_interval"]', 0, 0, 0,
+  '2026-09-29T00:30:00+00');
 
 -- Reporter: views only, read only.
 set role ledger_reporter;
@@ -173,6 +225,28 @@ update public.ledger_sync_status set last_error = null, last_success_at = last_a
 do $$ begin
   if (select mirror_complete from ledger_reporting.sources) then
     raise exception 'a row-count mismatch must make the mirror incomplete';
+  end if;
+end $$;
+
+-- A later incomplete check touching the day withdraws the reconciliation.
+do $$ begin
+  if not (select fills_reconciled_for_day from ledger_reporting.realized_pnl_daily
+          where settle_day_utc = '2026-09-28') then
+    raise exception 'setup: day should start reconciled';
+  end if;
+end $$;
+insert into public.ledger_venue_reconciliations (venue, account_ref, interval_start, interval_end,
+  venue_source, status, incomplete_reasons, venue_order_count, ledger_order_count, matched_order_count,
+  checked_at)
+values ('kalshi', 'k1', '2026-09-28T12:00:00+00', '2026-09-28T13:00:00+00', 'stmt-2', 'incomplete',
+  '["venue_record_missing_order_id"]', 0, 0, 0, '2026-09-29T02:00:00+00');
+do $$ begin
+  if (select fills_reconciled_for_day from ledger_reporting.realized_pnl_daily
+      where settle_day_utc = '2026-09-28') then
+    raise exception 'a later incomplete check must withdraw the reconciled flag';
+  end if;
+  if (select count(*) from ledger_reporting.venue_reconciliations where status = 'incomplete') <> 2 then
+    raise exception 'incomplete checks must be visible to reporters';
   end if;
 end $$;
 

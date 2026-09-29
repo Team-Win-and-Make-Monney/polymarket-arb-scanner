@@ -391,6 +391,9 @@ class TestExporter:
 
 
 class TestReconcileFills:
+    START, END = "2026-09-28T00:00:00+00:00", "2026-09-29T00:00:00+00:00"
+    COVERAGE = {"account_ref": "k1", "interval_start": START, "interval_end": END,
+                "complete": True, "source": "kalshi-fills-export-2026-09-28"}
     LEDGER = [
         {"venue": "kalshi", "run_mode": "live", "status": "filled", "fill_price": 0.4, "fill_qty": 10,
          "order_id": "A", "account_ref": "k1", "recorded_at": "2026-09-28T10:00:00+00:00"},
@@ -399,24 +402,119 @@ class TestReconcileFills:
         {"venue": "kalshi", "run_mode": "paper", "status": "filled", "fill_price": 0.5,
          "order_id": "dry_1", "account_ref": "k1", "recorded_at": "2026-09-28T11:00:00+00:00"},
     ]
-    KW = dict(venue="kalshi", account_ref="k1",
-              interval_start="2026-09-28T00:00:00", interval_end="2026-09-29T00:00:00")
+    VENUE = [
+        {"order_id": "A", "qty": "10", "fee_usd": "0.07", "filled_at": "2026-09-28T10:00:01Z"},
+        {"order_id": "B", "qty": 3, "fee_usd": "0.02", "filled_at": "2026-09-28T11:00:01Z"},
+    ]
 
-    def test_matched(self):
-        venue = [{"order_id": "A", "qty": "10", "fee_usd": "0.07"}, {"order_id": "B", "qty": 3, "fee_usd": "0.02"}]
-        out = reconcile_fills(venue, self.LEDGER, **self.KW)
-        assert out["status"] == "matched" and out["matched_order_count"] == 2
-        assert Decimal(out["venue_fees_usd"]) == Decimal("0.09")
+    def _run(self, venue=None, ledger=None, **kw):
+        args = dict(venue="kalshi", account_ref="k1", interval_start=self.START,
+                    interval_end=self.END, venue_coverage=self.COVERAGE)
+        args.update(kw)
+        return reconcile_fills(self.VENUE if venue is None else venue,
+                               self.LEDGER if ledger is None else ledger, **args)
 
-    def test_missing_both_sides_and_qty(self):
-        venue = [{"order_id": "A", "qty": 9}, {"order_id": "C", "qty": 1}]
-        out = reconcile_fills(venue, self.LEDGER, **self.KW)
-        assert out["status"] == "mismatched"
+    def test_matched_with_verified_coverage(self):
+        out = self._run()
+        assert out["status"] == "matched" and out["incomplete_reasons"] == []
+        assert out["matched_order_count"] == 2 and out["coverage_verified"] is True
+        assert Decimal(out["venue_fees_usd"]) == Decimal("0.09") and out["fees_complete"] is True
+
+    def test_verified_zero_activity_interval_is_matched(self):
+        out = self._run(venue=[], ledger=[])
+        assert out["status"] == "matched"
+        assert (out["venue_order_count"], out["ledger_order_count"]) == (0, 0)
+
+    def test_empty_inputs_without_coverage_are_incomplete(self):
+        out = self._run(venue=[], ledger=[], venue_coverage=None)
+        assert out["status"] == "incomplete" and "venue_coverage_missing" in out["incomplete_reasons"]
+
+    def test_absent_account_is_incomplete(self):
+        out = self._run(account_ref=None)
+        assert out["status"] == "incomplete" and "account_unknown" in out["incomplete_reasons"]
+
+    def test_coverage_must_be_complete_same_account_exact_interval(self):
+        for change in ({"complete": False}, {"complete": "true"}, {"account_ref": "k2"},
+                       {"interval_end": "2026-09-28T23:00:00+00:00"}, {"source": ""}):
+            out = self._run(venue_coverage={**self.COVERAGE, **change})
+            assert out["status"] == "incomplete", change
+            assert "venue_coverage_unverified" in out["incomplete_reasons"]
+
+    def test_equivalent_timezone_offsets_match(self):
+        coverage = {**self.COVERAGE, "interval_start": "2026-09-27T20:00:00-04:00",
+                    "interval_end": "2026-09-28T20:00:00-04:00"}
+        venue = [dict(self.VENUE[0], filled_at="2026-09-28T06:00:01-04:00"), self.VENUE[1]]
+        out = self._run(venue=venue, venue_coverage=coverage,
+                        interval_start="2026-09-28T02:00:00+02:00", interval_end="2026-09-29T00:00:00Z")
+        assert out["status"] == "matched", out
+        assert out["interval_start"] == "2026-09-28T00:00:00+00:00"
+
+    def test_naive_or_invalid_interval_is_incomplete(self):
+        for start, end in (("2026-09-28T00:00:00", self.END), (self.START, "not a time"), (self.END, self.START)):
+            out = self._run(interval_start=start, interval_end=end)
+            assert out["status"] == "incomplete" and "invalid_interval" in out["incomplete_reasons"]
+
+    def test_only_intended_interval_counts(self):
+        """Bounds are UTC instants, not strings: each record below sorts the
+        wrong way as text."""
+        looks_inside = {"order_id": "C", "qty": 1, "fee_usd": 0, "filled_at": "2026-09-28T23:30:00-01:00"}
+        looks_outside = {"order_id": "E", "qty": 1, "fee_usd": 0, "filled_at": "2026-09-29T00:30:00+01:00"}
+        out = self._run(venue=self.VENUE + [looks_inside])
+        assert out["status"] == "matched" and out["venue_records_out_of_interval"] == 1
+        out = self._run(venue=self.VENUE + [looks_outside])
+        assert out["status"] == "mismatched" and out["missing_in_ledger"] == ["E"]
+        assert out["venue_records_out_of_interval"] == 0
+
+    def test_missing_venue_qty_is_incomplete_not_matched(self):
+        venue = [dict(self.VENUE[0], qty=None), self.VENUE[1]]
+        out = self._run(venue=venue)
+        assert out["status"] == "incomplete" and "venue_record_qty_unknown" in out["incomplete_reasons"]
+
+    def test_missing_ledger_qty_is_incomplete_not_matched(self):
+        ledger = [dict(self.LEDGER[0], fill_qty=None)] + self.LEDGER[1:]
+        out = self._run(ledger=ledger)
+        assert out["status"] == "incomplete" and "ledger_record_qty_unknown" in out["incomplete_reasons"]
+
+    def test_non_finite_values_are_unknown(self):
+        for bad in ("NaN", "Infinity", "-inf", float("nan"), float("inf"), "sNaN", True):
+            assert ledger_sync._dec(bad) is None, bad
+            venue = [dict(self.VENUE[0], qty=bad), self.VENUE[1]]
+            assert self._run(venue=venue)["status"] == "incomplete", bad
+        fee_nan = [dict(self.VENUE[0], fee_usd="NaN"), self.VENUE[1]]
+        out = self._run(venue=fee_nan)
+        assert out["status"] == "matched" and out["venue_fees_usd"] is None and out["fees_complete"] is False
+
+    def test_venue_row_without_order_id_is_incomplete(self):
+        out = self._run(venue=self.VENUE + [{"order_id": "", "qty": 1, "filled_at": "2026-09-28T12:00:00Z"}])
+        assert out["status"] == "incomplete" and "venue_record_missing_order_id" in out["incomplete_reasons"]
+
+    def test_venue_row_without_time_or_other_account_is_incomplete(self):
+        out = self._run(venue=self.VENUE + [{"order_id": "Z", "qty": 1}])
+        assert "venue_record_time_unknown" in out["incomplete_reasons"]
+        out = self._run(venue=self.VENUE + [{"order_id": "Z", "qty": 1, "account_ref": "k2",
+                                             "filled_at": "2026-09-28T12:00:00Z"}])
+        assert "venue_record_account_mismatch" in out["incomplete_reasons"]
+
+    def test_unattributed_ledger_fill_is_incomplete(self):
+        unknown = {"venue": "kalshi", "run_mode": "unknown", "status": "filled", "fill_price": 0.3,
+                   "order_id": "Q", "account_ref": None, "recorded_at": "2026-09-28T09:00:00+00:00"}
+        out = self._run(ledger=self.LEDGER + [unknown])
+        assert out["status"] == "incomplete" and "ledger_fill_unattributed" in out["incomplete_reasons"]
+
+    def test_ledger_fill_without_order_id_is_incomplete(self):
+        out = self._run(ledger=self.LEDGER + [dict(self.LEDGER[0], order_id=None)])
+        assert "ledger_record_missing_order_id" in out["incomplete_reasons"]
+
+    def test_valid_evidence_that_disagrees_is_mismatched(self):
+        venue = [dict(self.VENUE[0], qty=9), {"order_id": "C", "qty": 1, "fee_usd": 0,
+                                               "filled_at": "2026-09-28T12:00:00Z"}]
+        out = self._run(venue=venue)
+        assert out["status"] == "mismatched" and out["incomplete_reasons"] == []
         assert out["missing_in_ledger"] == ["C"] and out["missing_in_venue"] == ["B"]
-        assert out["qty_mismatch"] == ["A"] and out["venue_fees_usd"] is None
+        assert out["qty_mismatch"] == ["A"]
 
     def test_paper_rows_never_count(self):
-        out = reconcile_fills([], self.LEDGER[2:], **self.KW)
+        out = self._run(venue=[], ledger=self.LEDGER[2:])
         assert out["ledger_order_count"] == 0 and out["status"] == "matched"
 
     def test_paper_rows_never_count_as_run_modes(self):
@@ -450,3 +548,9 @@ class TestRemoteSchemaContract:
         for name in ("ledger_trades", "ledger_positions", "ledger_sync_status"):
             sent = set().union(*(set(r) for r in remote.tables[name].values()))
             assert sent <= self._columns(name), (name, sent - self._columns(name))
+
+    def test_reconciliation_fields_exist_remotely(self):
+        cols = self._columns("ledger_venue_reconciliations")
+        rec = TestReconcileFills()
+        for out in (rec._run(), rec._run(account_ref=None), rec._run(venue=[dict(rec.VENUE[0], qty=9)])):
+            assert set(out) <= cols, set(out) - cols

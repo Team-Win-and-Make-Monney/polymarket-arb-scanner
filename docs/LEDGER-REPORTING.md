@@ -48,6 +48,31 @@ stays the source record, and venue records check completeness.
 - **Zero fills or zero PnL for an account and period.** This needs a `matched` venue reconciliation covering that account and interval, plus complete mirrors of every service that trades that account. Otherwise the value is null or unverified. An absent row in `realized_pnl_daily` means no data, not zero.
 - **Realized PnL** stays `pnl_verified = false` until a settlement-level venue reconciliation exists. That doesn't exist yet.
 
+## Venue reconciliation (`ledger_sync.reconcile_fills`)
+
+Fails closed. A result is `matched` only when all of the following hold:
+
+- **Coverage:** the venue source asserts complete coverage (`venue_coverage.complete is True`) for the same, known `account_ref`, over exactly the requested interval.
+- **Venue records:** every in-interval record has an order id, a finite quantity and a timezone-aware fill time.
+- **Ledger rows:** every relevant ledger fill is live, attributed to the account, and carries an order id and a finite quantity.
+- **Agreement:** nothing is missing on either side and all quantities agree.
+
+The other outcomes:
+
+- **`incomplete`:** any missing or invalid evidence (listed in `incomplete_reasons`). This includes NaN or infinite values, naive or unparsable timestamps, and ledger fills of unknown mode or account in the interval.
+- **`mismatched`:** valid evidence that disagrees.
+- **Quiet period:** a verified interval with no activity on either side is `matched` with zero counts.
+
+Timestamps are compared as UTC instants, never as strings, and only venue fills inside `[start, end)` count.
+
+The draft table enforces the same rules with CHECK constraints:
+
+- `matched` requires verified coverage, an account, a source, an interval, no reasons and nothing missing.
+- `incomplete` requires at least one reason.
+- Fees must be finite.
+
+`fills_reconciled_for_day` is true only when a verified `matched` check covers the whole UTC day and no later check touching that day disagrees or is incomplete. The job that fetches venue records is deferred.
+
 ## Reporter access
 
 - **The `ledger_reporter` role** is `NOLOGIN`. It has `USAGE` on the `ledger_reporting` schema and `SELECT` on its views only, with no base-table, write or function access.

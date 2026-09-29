@@ -16,8 +16,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config  # noqa: E402
 import db as db_module  # noqa: E402
 import ledger_sync  # noqa: E402
-from db import TradeDB  # noqa: E402
-from ledger_sync import LedgerCaptureMissing, LedgerExporter, derive_run_mode, reconcile_fills  # noqa: E402
+
+TradeDB = db_module.TradeDB
+LedgerCaptureMissing = ledger_sync.LedgerCaptureMissing
+LedgerExporter = ledger_sync.LedgerExporter
+derive_run_mode = ledger_sync.derive_run_mode
+reconcile_fills = ledger_sync.reconcile_fills
 
 
 class FakeRemote:
@@ -528,7 +532,8 @@ class TestRemoteSchemaContract:
 
     def _columns(self, table):
         import re
-        sql = open(self.DRAFT).read()
+        with open(self.DRAFT) as fh:
+            sql = fh.read()
         body = re.search(rf"create table if not exists public\.{table} \((.*?)\n\);", sql, re.S).group(1)
         cols = set()
         for line in body.splitlines():

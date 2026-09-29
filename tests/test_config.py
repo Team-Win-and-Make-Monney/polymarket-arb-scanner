@@ -250,6 +250,23 @@ class TestValidateConfig:
         with pytest.raises(ValueError, match="WS_ORDERBOOK_MAX_AGE_SECONDS.*must be > 0"):
             _reload_config()
 
+    @pytest.mark.parametrize("bad_val", ["0", "-0.5", "-1", "inf", "-inf", "nan", "NaN"])
+    def test_ws_dispatch_max_age_seconds_rejects_non_positive_and_non_finite(self, monkeypatch, bad_val):
+        # A NaN/inf/<=0 max age would disable or invert the stale-queue check.
+        monkeypatch.setenv("WS_DISPATCH_MAX_AGE_SECONDS", bad_val)
+        with pytest.raises(ValueError, match="WS_DISPATCH_MAX_AGE_SECONDS.*must be > 0"):
+            _reload_config()
+
+    @pytest.mark.parametrize("good_val, expected", [("0.25", 0.25), ("5", 5.0), ("12.5", 12.5)])
+    def test_ws_dispatch_max_age_seconds_accepts_positive_finite(self, monkeypatch, good_val, expected):
+        monkeypatch.setenv("WS_DISPATCH_MAX_AGE_SECONDS", good_val)
+        cfg = _reload_config()
+        assert cfg.WS_DISPATCH_MAX_AGE_SECONDS == expected
+
+    def test_ws_dispatch_max_age_seconds_default(self, monkeypatch):
+        monkeypatch.delenv("WS_DISPATCH_MAX_AGE_SECONDS", raising=False)
+        assert _reload_config().WS_DISPATCH_MAX_AGE_SECONDS == 5.0
+
     def test_ws_orderbook_streaming_defaults(self):
         cfg = _reload_config()
         assert cfg.WS_ORDERBOOK_STREAMING_ENABLED is True

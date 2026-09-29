@@ -735,13 +735,13 @@ class TestDryRunIsolation:
                 rows = store.setdefault(name, {})
 
                 class _Q:
-                    def upsert(q, records, on_conflict=""):
-                        q.records, q.key = records, on_conflict
-                        return q
+                    def upsert(self, records, on_conflict=""):
+                        self.records, self.key = records, on_conflict
+                        return self
 
-                    def execute(q):
-                        for rec in q.records:
-                            rows.setdefault(rec[q.key], {}).update(rec)
+                    def execute(self):
+                        for rec in self.records:
+                            rows.setdefault(rec[self.key], {}).update(rec)
                 return _Q()
 
         worker = ledger_sync.start_ledger_sync_worker(

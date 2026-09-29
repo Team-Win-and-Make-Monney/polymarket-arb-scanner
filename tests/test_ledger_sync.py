@@ -686,7 +686,8 @@ class TestLedgerSyncWorker:
     def test_continuous_mode_runs_the_worker_for_every_mode(self):
         # The exporter is started once at init (any --mode, including
         # mm-pilot) and stopped after the pilot at shutdown, not tied to scans.
-        src = open(os.path.join(os.path.dirname(__file__), "..", "continuous.py")).read()
+        with open(os.path.join(os.path.dirname(__file__), "..", "continuous.py")) as fh:
+            src = fh.read()
         init = src.index("start_ledger_sync_worker(")
         pilot_start = src.index("if (config.MM_KALSHI_PILOT_ENABLED")
         assert init < pilot_start

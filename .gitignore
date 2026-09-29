@@ -28,3 +28,7 @@ PLAN.md
 .claude/claudex/
 data/dryrun-*/
 /backtest_recommendations.json
+
+# Local checkouts, supporting projects and preserved cleanup archives
+.local-projects/
+.local-archive/

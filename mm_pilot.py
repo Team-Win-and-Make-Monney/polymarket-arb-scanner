@@ -29,7 +29,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, DecimalException
 
 from url_guard import assert_public_url
 from kalshi_lip import LIPScoreTracker
@@ -96,9 +96,27 @@ def _finite_decimal(raw) -> Decimal | None:
         return None
     try:
         value = Decimal(str(raw).strip())
-    except (InvalidOperation, ValueError):
+    except (DecimalException, ValueError):
         return None
     return value if value.is_finite() else None
+
+
+def _exact_qty(value: Decimal) -> float | None:
+    """``value`` as a float in 0.01 steps, or None when it can't be carried exactly.
+
+    Refuses off-step values, values too large for decimal arithmetic or a
+    finite float, and values whose float form doesn't reproduce them — so a
+    quantity is either carried exactly or refused, never approximated.
+    """
+    try:
+        if value % _QTY_STEP != 0:
+            return None
+        qty = _round_qty(float(value))
+        if not math.isfinite(qty) or Decimal(repr(qty)) != value:
+            return None
+    except (DecimalException, OverflowError, ValueError):
+        return None
+    return qty
 
 
 def parse_fill_quantity(fill: dict) -> tuple[float | None, str]:
@@ -116,15 +134,17 @@ def parse_fill_quantity(fill: dict) -> tuple[float | None, str]:
     fp = legacy = None
     if has_fp:
         fp = _finite_decimal(fill.get("count_fp"))
-        if fp is None or fp <= 0 or fp % _QTY_STEP != 0:
+        fp_qty = _exact_qty(fp) if fp is not None and fp > 0 else None
+        if fp_qty is None:
             return None, f"invalid count_fp {fill.get('count_fp')!r}"
     if has_legacy:
         legacy = _finite_decimal(fill.get("count"))
-        if legacy is None or legacy <= 0 or legacy != legacy.to_integral_value():
+        legacy_qty = _exact_qty(legacy) if legacy is not None and legacy > 0 else None
+        if legacy_qty is None or legacy_qty != int(legacy_qty):
             return None, f"invalid count {fill.get('count')!r}"
     if fp is not None and legacy is not None and fp != legacy:
         return None, f"count_fp {fill.get('count_fp')!r} disagrees with count {fill.get('count')!r}"
-    return float(fp if fp is not None else legacy), ""
+    return (fp_qty if fp is not None else legacy_qty), ""
 
 
 def parse_fill_yes_price(fill: dict) -> tuple[float | None, str]:
@@ -148,12 +168,16 @@ def parse_fill_yes_price(fill: dict) -> tuple[float | None, str]:
     no = _finite_decimal(no_raw) if no_raw is not None else None
     if (yes_raw is not None and yes is None) or (no_raw is not None and no is None):
         return None, f"invalid price yes={yes_raw!r} no={no_raw!r}"
-    if yes is not None and no is not None and yes + no != 1:
-        return None, f"yes {yes_raw!r} and no {no_raw!r} do not sum to 1"
-    price = yes if yes is not None else 1 - no
-    if not 0 < price < 1:
-        return None, f"price {price} out of range"
-    return float(price), ""
+    try:
+        if yes is not None and no is not None and yes + no != 1:
+            return None, f"yes {yes_raw!r} and no {no_raw!r} do not sum to 1"
+        price = float(yes if yes is not None else 1 - no)
+    except (DecimalException, OverflowError, ValueError):
+        return None, f"invalid price yes={yes_raw!r} no={no_raw!r}"
+    # Checked on the float actually used: a tiny Decimal can round to 0.0.
+    if not (math.isfinite(price) and 0.0 < price < 1.0):
+        return None, f"price yes={yes_raw!r} no={no_raw!r} out of range"
+    return price, ""
 
 
 def _parse_created_ts(fill: dict, fallback: float) -> float:
@@ -266,12 +290,25 @@ class PilotInventory:
             }
 
     def restore(self, snap: dict) -> None:
-        """Restore a snapshot() payload (restart reconciliation)."""
+        """Restore a snapshot() payload (restart reconciliation).
+
+        Raises ValueError, leaving the current state untouched, when any value
+        is NaN or infinite: caps compared against NaN never trip.
+        """
+        def finite(mapping, convert):
+            out = {}
+            for t, v in (mapping or {}).items():
+                value = convert(float(v))
+                if not math.isfinite(value):
+                    raise ValueError(f"non-finite inventory value {v!r} for {t}")
+                out[t] = value
+            return out
+
+        net = finite(snap.get("net"), _round_qty)
+        avg = finite(snap.get("avg"), float)
+        realized = finite(snap.get("realized"), float)
         with self._lock:
-            self._net = {t: _round_qty(float(v)) for t, v in (snap.get("net") or {}).items()}
-            self._avg = {t: float(v) for t, v in (snap.get("avg") or {}).items()}
-            self._realized = {t: float(v)
-                              for t, v in (snap.get("realized") or {}).items()}
+            self._net, self._avg, self._realized = net, avg, realized
 
 
 # ---------------------------------------------------------------------------
@@ -1176,14 +1213,15 @@ class KalshiMMPilot:
             # zero baseline.
             raw_pos = pos.get("position_fp", 0)
             parsed = _finite_decimal(raw_pos if raw_pos not in (None, "") else 0)
-            if parsed is None:
-                # Non-numeric, NaN or infinite: never seed a guessed position.
+            net = _exact_qty(parsed) if parsed is not None else None
+            if net is None:
+                # Non-numeric, NaN, infinite, off-step or too large to carry
+                # exactly: never seed a guessed position.
                 logger.error("MM pilot reconcile: unparsable position_fp %r "
                              "for %s — fail closed",
                              pos.get("position_fp"), ticker)
                 self._reconciled = False
                 return False
-            net = _round_qty(float(parsed))
             if net == 0:
                 continue
             net_map[ticker] = net
@@ -1208,8 +1246,10 @@ class KalshiMMPilot:
             else:
                 try:
                     avg_map[ticker] = abs(float(raw_exposure)) / abs(net)
-                except (TypeError, ValueError, ZeroDivisionError):
+                except (TypeError, ValueError, ZeroDivisionError, OverflowError):
                     avg_map[ticker] = 1.0
+                if not math.isfinite(avg_map[ticker]):
+                    avg_map[ticker] = 1.0  # NaN/inf exposure: same worst case
         # restore() replaces the inventory wholesale under its own lock —
         # this IS the "seed from venue truth, not an assumed zero" fix.
         # Realized P&L has no live-venue source in scope here (that would
@@ -1222,8 +1262,14 @@ class KalshiMMPilot:
         realized_map: dict = {}
         if persisted and persisted.get("inventory"):
             realized_map = dict(persisted["inventory"].get("realized") or {})
-        self.inventory.restore({"net": net_map, "avg": avg_map,
-                               "realized": realized_map})
+        try:
+            self.inventory.restore({"net": net_map, "avg": avg_map,
+                                   "realized": realized_map})
+        except (TypeError, ValueError, OverflowError):
+            logger.exception("MM pilot reconcile: persisted inventory is not "
+                             "finite — fail closed")
+            self._reconciled = False
+            return False
 
         with self._lock:
             self._orders = {}

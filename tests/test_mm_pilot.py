@@ -1155,13 +1155,52 @@ class TestFixedPointPositionReconciliation:
         assert pilot.inventory.net_contracts(TICKER) == 2.5
         assert pilot.inventory.avg_cost(TICKER) == pytest.approx(0.44)
 
-    @pytest.mark.parametrize("raw", ["NaN", "Infinity", "-Infinity", True])
+    @pytest.mark.parametrize("raw", ["NaN", "Infinity", "-Infinity", True,
+                                     "1e400", "-1e100", "12345678901234567.01",
+                                     "2.505"])
     def test_non_finite_position_fails_closed(self, pilot_env, clock, raw):
         client = FakeKalshiClient()
         client.positions_script = [{"ticker": TICKER, "position_fp": raw}]
         pilot = self._direct_pilot(clock, client)
         assert pilot.reconcile() is False
         assert pilot._reconciled is False
+
+
+    @pytest.mark.parametrize("exposure", ["NaN", "Infinity", "1e400"])
+    def test_non_finite_exposure_uses_worst_case_cost(self, pilot_env, clock,
+                                                      exposure):
+        client = FakeKalshiClient()
+        client.positions_script = [
+            {"ticker": TICKER, "position_fp": "2.50",
+             "market_exposure_dollars": exposure},
+        ]
+        pilot = self._direct_pilot(clock, client)
+        assert pilot.reconcile() is True
+        assert pilot.inventory.avg_cost(TICKER) == 1.0
+        assert pilot.inventory.net_usd(TICKER) == 2.5
+
+    def test_non_finite_persisted_realized_pnl_fails_closed(self, pilot_env,
+                                                            clock, tmp_path):
+        from mm_pilot import ControlsPoller, KalshiMMPilot
+        state = tmp_path / "state.json"
+        state.write_text(json.dumps(
+            {"inventory": {"realized": {TICKER: float("nan")}}}))
+        client = FakeKalshiClient()
+        client.positions_script = [
+            {"ticker": TICKER, "position_fp": "2.50",
+             "market_exposure_dollars": 1.10},
+        ]
+        controls = ControlsPoller(time_fn=lambda: clock[0])
+        controls.set_cached(True)
+        pilot = KalshiMMPilot(
+            kalshi_client=client, controls=controls,
+            volatility_tracker=VolatilityTracker(min_samples=1),
+            dry_run=False, time_fn=lambda: clock[0], mono_fn=lambda: clock[0],
+            state_path=str(state),
+        )
+        assert pilot.reconcile() is False
+        assert pilot._reconciled is False
+        assert pilot.inventory.net_contracts(TICKER) == 0
 
 
 class TestHedgeSizeClamp:
@@ -1281,6 +1320,15 @@ class TestFixedPointFills:
         {"yes_price_dollars": "0.4900", "no_price_dollars": "0.5000"},
         {"yes_price_dollars": None},
         {"yes_price_dollars": None, "yes_price": 0},
+        # Extreme finite inputs (Codex validation, 2026-09-29)
+        {"count_fp": "1e100"},
+        {"count_fp": "1e400"},
+        {"count_fp": "12345678901234567.01"},  # float can't carry the .01
+        {"count_fp": None, "count": "1e1000"},
+        {"count_fp": None, "count": "1e100"},
+        {"yes_price_dollars": "1e-1000"},
+        {"yes_price_dollars": "1e999999999"},
+        {"yes_price_dollars": None, "no_price_dollars": "-1e999999999"},
     ])
     def test_invalid_fill_is_refused_and_forces_reconciliation(
             self, pilot_env, clock, fields):
@@ -1296,6 +1344,45 @@ class TestFixedPointFills:
         assert pilot.inventory.net_contracts(TICKER) == 0
         assert pilot._reconciled is False and pilot.halted
         assert oid in client.cancelled  # the halt pulled the resting quote
+
+    @pytest.mark.parametrize("fill", [
+        {"count_fp": "1e100"}, {"count_fp": "1e400"}, {"count": "1e1000"},
+        {"count": "1e100"}, {"count_fp": "-1e999999999"},
+    ])
+    def test_extreme_quantities_are_refused_not_raised(self, fill):
+        from mm_pilot import parse_fill_quantity
+        qty, reason = parse_fill_quantity(fill)
+        assert qty is None and reason
+
+    @pytest.mark.parametrize("fill", [
+        {"yes_price_dollars": "1e-1000"}, {"yes_price_dollars": "1e999999999"},
+        {"no_price_dollars": "-1e999999999"},
+        {"yes_price_dollars": "1e999999999", "no_price_dollars": "-1e999999999"},
+    ])
+    def test_extreme_prices_are_refused_not_raised(self, fill):
+        from mm_pilot import parse_fill_yes_price
+        price, reason = parse_fill_yes_price(fill)
+        assert price is None and reason
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("0.01", 0.01), ("1.25", 1.25), ("250.00", 250.0), ("1e20", 1e20)])
+    def test_exact_quantities_are_kept(self, raw, expected):
+        from mm_pilot import parse_fill_quantity
+        assert parse_fill_quantity({"count_fp": raw}) == (expected, "")
+
+    @pytest.mark.parametrize("snap", [
+        {"net": {TICKER: float("nan")}},
+        {"net": {TICKER: float("inf")}},
+        {"net": {TICKER: 1.25}, "avg": {TICKER: float("nan")}},
+        {"net": {TICKER: 1.25}, "avg": {TICKER: 0.5}, "realized": {TICKER: float("-inf")}},
+    ])
+    def test_restore_refuses_non_finite_and_keeps_state(self, pilot_env, clock, snap):
+        pilot = build_pilot(clock, client=FakeKalshiClient())
+        pilot.inventory.apply_fill(TICKER, "yes", "buy", 1.25, 0.49)
+        before = pilot.inventory.snapshot()
+        with pytest.raises(ValueError):
+            pilot.inventory.restore(snap)
+        assert pilot.inventory.snapshot() == before
 
     def test_agreeing_count_fp_and_legacy_count_are_accepted(self, pilot_env,
                                                              clock):

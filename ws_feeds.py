@@ -90,6 +90,19 @@ def _kalshi_qty(value) -> float | None:
     return qty if math.isfinite(qty) else None
 
 
+def _kalshi_add_qty(previous, delta) -> float:
+    """previous + delta in exact decimal arithmetic, as a float.
+
+    Kalshi quantities are fixed-point decimal strings (2 dp). Adding them as
+    binary floats leaves residue (0.1 + 0.2 - 0.3 is 5.6e-17, not 0), which
+    would keep an exhausted level alive with a phantom size. Each float here
+    came from a short decimal string, so str() recovers it exactly; the sum
+    has no more places than its inputs, and no real fraction is rounded away.
+    """
+    from decimal import Decimal
+    return float(Decimal(str(previous or 0)) + Decimal(str(delta)))
+
+
 def _parse_kalshi_ladder(msg: dict, side: str) -> dict:
     """Return {price_cents: qty} for one side of a Kalshi snapshot (either schema)."""
     for key in (f"{side}_dollars_fp", f"{side}_dollars"):
@@ -412,21 +425,23 @@ class FeedManager:
         """
         data.setdefault("_recv_ts", time.time())
         loop = self._dispatch_loop
+        # Tracking the key and queueing the update happen under one lock, so a
+        # drain never sees a key tracked without its queued update.
         with self._pending_lock:
             keys = self._downstream_keys.setdefault(platform, set())
             if data.get("_invalidated"):
                 keys.discard(key)
             else:
                 keys.add(key)
+            if loop is not None:
+                self._pending_updates[(platform, key)] = (
+                    data, self._platform_gen.get(platform, 0), self._key_gen.get((platform, key), 0))
+                if self._drain_scheduled:
+                    return
+                self._drain_scheduled = True
         if loop is None:
             self.on_price_update(platform, key, data)
             return
-        with self._pending_lock:
-            self._pending_updates[(platform, key)] = (
-                data, self._platform_gen.get(platform, 0), self._key_gen.get((platform, key), 0))
-            if self._drain_scheduled:
-                return
-            self._drain_scheduled = True
         try:
             loop.call_soon_threadsafe(self._drain_price_updates)
         except RuntimeError:
@@ -439,9 +454,15 @@ class FeedManager:
         """Run on the caller loop: deliver each pending update that is still valid.
 
         Dropped: entries queued before an invalidation of their platform or key
-        (generation mismatch), and entries received more than
-        ``_dispatch_max_age`` seconds ago. Invalidations are always delivered:
-        they carry no executable price, so they can never be stale or unsafe.
+        (generation mismatch). Invalidations are always delivered: they carry
+        no executable price, so they can never be stale or unsafe.
+
+        An entry received more than ``_dispatch_max_age`` seconds ago is not
+        delivered as a price. An invalidation stamped with the current time is
+        delivered in its place, because the caller may still hold an older
+        executable quote for the key that this tick was meant to replace. A
+        newer tick for the key that arrived after this batch was taken is left
+        queued and still tracked, so the next drain delivers it.
         """
         with self._pending_lock:
             batch = self._pending_updates
@@ -459,9 +480,13 @@ class FeedManager:
             if (not invalidation
                     and now - data.get("_recv_ts", now) > self._dispatch_max_age):
                 self.dropped_expired_updates += 1
-                logger.debug("Dropped %s %s update received %.1fs ago", platform, key,
+                logger.debug("Expired %s %s update received %.1fs ago; invalidating", platform, key,
                              now - data["_recv_ts"])
-                continue
+                with self._pending_lock:
+                    if (platform, key) not in self._pending_updates:
+                        self._downstream_keys.get(platform, set()).discard(key)
+                data = self._invalidation_payload(platform, key)
+                data["_recv_ts"] = now
             try:
                 self.on_price_update(platform, key, data)
             except Exception:
@@ -955,7 +980,7 @@ class FeedManager:
                         side, level, delta = parsed
                         levels = book[side]
                         previous_qty = levels.get(level)
-                        qty = (previous_qty or 0) + delta
+                        qty = _kalshi_add_qty(previous_qty, delta)
                         if qty > 0:
                             if previous_qty != qty:
                                 levels[level] = qty

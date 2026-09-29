@@ -141,6 +141,32 @@ class TestKalshiFixedPointSchema:
         payload = cb.call_args[0][2]
         assert payload["yes_ask"] is None and payload["no_ask"] is None
 
+    def test_fractional_deltas_that_cancel_remove_the_level(self):
+        """0.1 + 0.2 - 0.3 is 5.6e-17 in binary floats: the level must be gone,
+        not left with a phantom size."""
+        cb = MagicMock()
+        fm = FeedManager(on_price_update=cb, use_feed_thread=False)
+        fm._handle_kalshi_message(_fp_snapshot())
+        for delta in ("0.10", "0.20", "-0.30"):
+            fm._handle_kalshi_message(_fp_delta(side="yes", price="0.4200", delta=delta))
+        assert fm.get_kalshi_orderbook("KXFP-A")["orderbook"]["yes"] == [[30, 10.0], [40, 20.0]]
+        payload = cb.call_args[0][2]
+        assert payload["no_ask"] == pytest.approx(0.60)
+        assert payload["no_ask_size"] == 20
+
+    def test_smallest_positive_quantity_is_kept_exactly(self):
+        cb = MagicMock()
+        fm = FeedManager(on_price_update=cb, use_feed_thread=False)
+        fm._handle_kalshi_message(_fp_snapshot())
+        fm._handle_kalshi_message(_fp_delta(side="yes", price="0.4200", delta="0.01"))
+        assert cb.call_args[0][2]["no_ask_size"] == 0.01
+        # 80.00 - 79.99 leaves exactly 0.01, not 0.00999... or 0.
+        fm._handle_kalshi_message(_fp_delta(side="no", price="0.5500", delta="-79.99"))
+        payload = cb.call_args[0][2]
+        assert payload["yes_ask"] == pytest.approx(0.45)
+        assert payload["yes_ask_size"] == 0.01
+        assert fm.get_kalshi_orderbook("KXFP-A")["orderbook"]["no"] == [[45, 50.0], [55, 0.01]]
+
     def test_zero_quantity_snapshot_levels_dropped(self):
         cb = MagicMock()
         fm = FeedManager(on_price_update=cb, use_feed_thread=False)
@@ -475,9 +501,10 @@ class TestDispatchValidity:
         loop.run()
         assert cb.call_args[0][2]["_recv_ts"] == 1000.0
 
-    def test_delayed_dispatch_with_no_newer_tick_is_dropped(self, monkeypatch):
+    def test_delayed_dispatch_with_no_newer_tick_is_invalidated(self, monkeypatch):
         """Caller loop stalls past the max age and the feed goes quiet: the old
-        update must not be published as if it had just arrived."""
+        update must not be published as if it had just arrived, and an
+        invalidation stamped now goes in its place."""
         cb = MagicMock()
         fm, loop = _queued_feed(cb)
         fm._dispatch_max_age = 5.0
@@ -486,8 +513,90 @@ class TestDispatchValidity:
         fm._handle_kalshi_message(_fp_snapshot())
         clock[0] += 6.0  # stall, no newer tick
         loop.run()
-        cb.assert_not_called()
+        cb.assert_called_once()
+        platform, key, payload = cb.call_args[0]
+        assert (platform, key) == ("kalshi", "KXFP-A")
+        assert payload["_invalidated"] is True
+        assert payload["yes_ask"] is None and payload["no_ask"] is None
+        assert payload["_recv_ts"] == 1006.0
         assert fm.dropped_expired_updates == 1
+        assert "KXFP-A" not in fm._downstream_keys["kalshi"]
+
+    def test_expired_tick_invalidates_the_older_cached_quote(self, monkeypatch):
+        """The caller cache holds an executable quote; the next tick for the key
+        expires in the queue. The cache must not keep the older quote."""
+        cache = {}
+        fm, loop = _queued_feed(_downstream(cache))
+        fm._dispatch_max_age = 5.0
+        clock = [1000.0]
+        monkeypatch.setattr(ws_feeds.time, "time", lambda: clock[0])
+        fm._handle_kalshi_message(_fp_snapshot())
+        loop.run()
+        assert cache[("kalshi", "KXFP-A")]["yes_ask"] == pytest.approx(0.45)
+        fm._handle_kalshi_message(_fp_delta())  # queued; the caller loop then stalls
+        clock[0] += 6.0
+        loop.run()
+        entry = cache[("kalshi", "KXFP-A")]
+        assert entry["_invalidated"] is True
+        assert entry["yes_ask"] is None and entry["no_ask"] is None
+        # Polymarket gets its own invalidation shape.
+        fm._handle_polymarket_message([{"event_type": "best_bid_ask", "asset_id": "tok", "best_ask": "0.4"}])
+        clock[0] += 6.0
+        loop.run()
+        poly = cache[("polymarket", "tok")]
+        assert poly["_invalidated"] is True and poly["best_ask"] is None
+        assert poly["_recv_ts"] == clock[0]
+
+    def test_newer_tick_during_expiry_is_delivered_and_stays_tracked(self, monkeypatch):
+        """A newer tick queued while the expired one is being handled keeps its
+        tracking, and the next drain delivers it over the invalidation."""
+        cache = {}
+        fm, loop = _queued_feed(_downstream(cache))
+        fm._dispatch_max_age = 5.0
+        clock = [1000.0]
+        monkeypatch.setattr(ws_feeds.time, "time", lambda: clock[0])
+        fm._handle_kalshi_message(_fp_snapshot())
+        clock[0] += 6.0
+        debug = ws_feeds.logger.debug
+
+        def newer_tick_arrives(msg, *args):
+            # Runs after the expired entry was popped, before its tracking is cleared.
+            if msg.startswith("Expired"):
+                fm._handle_kalshi_message(_fp_delta())
+            debug(msg, *args)
+
+        monkeypatch.setattr(ws_feeds.logger, "debug", newer_tick_arrives)
+        loop.run()
+        entry = cache[("kalshi", "KXFP-A")]
+        assert not entry.get("_invalidated")
+        assert entry["yes_ask"] == pytest.approx(0.55)
+        assert "KXFP-A" in fm._downstream_keys["kalshi"]
+        # Still tracked, so a later reset invalidates it.
+        fm._reset_kalshi_books()
+        loop.run()
+        assert cache[("kalshi", "KXFP-A")]["_invalidated"] is True
+
+    def test_expired_tick_after_a_gap_is_fenced_not_redelivered(self, monkeypatch):
+        """Generation fencing still wins: a pre-gap tick that also expired is
+        dropped as invalidated, and only the gap's invalidation is delivered."""
+        cb = MagicMock()
+        fm, loop = _queued_feed(cb)
+        fm._dispatch_max_age = 5.0
+        clock = [1000.0]
+        monkeypatch.setattr(ws_feeds.time, "time", lambda: clock[0])
+        fm._handle_kalshi_message(_fp_snapshot(sid=1, seq=1))
+        with fm._pending_lock:
+            stale_batch = dict(fm._pending_updates)
+        with pytest.raises(KalshiSequenceGap):
+            fm._handle_kalshi_message(_fp_delta(sid=1, seq=9))
+        loop.run()
+        with fm._pending_lock:
+            fm._pending_updates.update(stale_batch)  # racing re-queue of the pre-gap tick
+        clock[0] += 6.0
+        fm._drain_price_updates()
+        assert fm.dropped_invalidated_updates >= 1
+        assert fm.dropped_expired_updates == 0
+        assert all(c[0][2].get("_invalidated") for c in cb.call_args_list)
 
     def test_delayed_dispatch_within_max_age_is_delivered(self, monkeypatch):
         cb = MagicMock()

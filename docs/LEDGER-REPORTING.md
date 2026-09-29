@@ -137,6 +137,11 @@ The collector is read-only. Its transport allows only `GET` on `/portfolio/fills
 - **Staleness.** `venue_reconciliation_days` marks a check stale when a row it depended on is written at or after `ledger_read_started_at`. That includes changes between the read and the row being stored, corrections to compared orders logged outside the window, and deletes. The day is then no longer verified until the check is re-run.
 - **Bounded settings.** `LEDGER_RECON_FINALITY_SECONDS` must be finite and ≥ 300 (the recording lag), and `LEDGER_RECON_MAX_SOURCE_AGE_SECONDS` finite and > 0; otherwise the script exits 2. The collector also refuses non-finite or negative backoff and non-positive retry, page and cutoff counts. A fill `ts` outside the datetime range is `venue_record_time_invalid`, not a crash.
 - **Writer change.** The MM pilot now records `fill_qty` (contracts) on each fill row, so its orders can be compared. Older pilot rows have no quantity and reconcile as incomplete.
+- **Live inventory rebalances** (`inventory_balancer`) record a `filled` row with `fill_qty`, and move inventory, only when the venue confirms the fill:
+  - Kalshi: status `executed` with a valid `fill_count_fp`/`fill_count`.
+  - Polymarket: status `matched` with a valid `takingAmount` (shares received on a BUY).
+  - The quantity must be finite, positive and at most the order size, and it is kept exact, fractions included.
+  - A canceled, unmatched, resting, delayed or ambiguous response writes no fill row and moves no inventory. The requested size is never assumed filled. A real fill on such an order then shows as `missing_in_ledger` rather than being guessed.
 
 Run it as its own process with the existing credentials. It prints JSON and writes only with `--write`:
 

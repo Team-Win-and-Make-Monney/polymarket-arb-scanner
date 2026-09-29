@@ -250,6 +250,17 @@ class TestValidateConfig:
         with pytest.raises(ValueError, match="LEDGER_SYNC_INTERVAL_SECONDS.*must be > 0"):
             _reload_config()
 
+    @pytest.mark.parametrize("bad_val", ["0", "-1", "-500"])
+    def test_ledger_sync_batch_size_rejects_non_positive(self, monkeypatch, bad_val):
+        monkeypatch.setenv("LEDGER_SYNC_BATCH_SIZE", bad_val)
+        with pytest.raises(ValueError, match="LEDGER_SYNC_BATCH_SIZE.*must be > 0"):
+            _reload_config()
+
+    def test_ledger_sync_batch_size_default_and_positive_override(self, monkeypatch):
+        assert _reload_config().LEDGER_SYNC_BATCH_SIZE == 500
+        monkeypatch.setenv("LEDGER_SYNC_BATCH_SIZE", "1")
+        assert _reload_config().LEDGER_SYNC_BATCH_SIZE == 1
+
     @pytest.mark.parametrize("bad_val", ["0", "-1", "inf", "-inf", "nan"])
     def test_ws_orderbook_max_age_seconds_rejects_non_positive_and_non_finite(self, monkeypatch, bad_val):
         monkeypatch.setenv("WS_ORDERBOOK_MAX_AGE_SECONDS", bad_val)

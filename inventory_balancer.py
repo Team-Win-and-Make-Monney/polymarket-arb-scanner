@@ -9,6 +9,7 @@ import json
 import logging
 import threading
 import time
+from decimal import Decimal, InvalidOperation
 
 from config import (
     INVENTORY_BALANCER_ENABLED,
@@ -21,6 +22,75 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Live rebalance fill confirmation
+# ---------------------------------------------------------------------------
+# A rebalance order is recorded as filled, and inventory moves, only on the
+# venue's own confirmation of a match with a valid executed quantity. The
+# requested size is never assumed filled.
+FILL_CONFIRMED = "filled"
+FILL_NONE = "not_filled"          # the venue confirms nothing executed
+FILL_UNCONFIRMED = "fill_unconfirmed"  # accepted, but the fill is not established
+
+
+def _positive_qty(value, limit: float) -> Decimal | None:
+    """An executed quantity as an exact Decimal: finite, > 0 and <= limit; else None."""
+    if value is None or isinstance(value, bool) or value == "":
+        return None
+    try:
+        qty = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if not qty.is_finite() or qty <= 0 or qty > Decimal(str(limit)):
+        return None
+    return qty
+
+
+def _zero_qty(value) -> bool:
+    try:
+        return value is not None and value != "" and Decimal(str(value)) == 0
+    except (InvalidOperation, ValueError, TypeError):
+        return False
+
+
+def kalshi_rebalance_fill(order: dict, requested: float) -> tuple[str, float | None]:
+    """(state, filled contracts) from a ``kalshi_api.place_order`` order object.
+
+    ``place_order`` normalizes a V2 response to status ``executed`` only when
+    something filled and nothing remains. The quantity comes from
+    ``fill_count_fp`` (fixed-point string), else ``fill_count``, kept exact
+    so a fractional fill is not rounded.
+    """
+    status = str(order.get("status") or "").lower()
+    raw = order.get("fill_count_fp", order.get("fill_count"))
+    if status == "executed":
+        qty = _positive_qty(raw, requested)
+        if qty is not None:
+            return FILL_CONFIRMED, float(qty)
+        return FILL_UNCONFIRMED, None
+    if status in ("canceled", "cancelled", "expired", "rejected") and (raw is None or _zero_qty(raw)):
+        return FILL_NONE, None
+    return FILL_UNCONFIRMED, None
+
+
+def polymarket_rebalance_fill(resp: dict, requested: float) -> tuple[str, float | None]:
+    """(state, filled shares) from a Polymarket CLOB BUY order response.
+
+    Per the CLOB docs, ``status`` is ``matched`` when the order matched
+    immediately, ``live`` when it rests, and ``delayed`` when matching has not
+    happened yet; for a BUY, ``takingAmount`` is the shares received.
+    ``success`` alone only means the order was accepted.
+    """
+    status = str(resp.get("status") or "").lower()
+    if status == "matched":
+        qty = _positive_qty(resp.get("takingAmount"), requested)
+        if qty is not None:
+            return FILL_CONFIRMED, float(qty)
+        return FILL_UNCONFIRMED, None
+    if status == "unmatched":
+        return FILL_NONE, None
+    return FILL_UNCONFIRMED, None
 
 
 
@@ -628,10 +698,30 @@ class InventoryBalancer:
                         reducing=True,
                     )
                     order_obj = resp.get("order") if resp else None
-                    if order_obj:
+                    fill_state, filled = (kalshi_rebalance_fill(order_obj, int(size))
+                                          if order_obj else (None, None))
+                    if order_obj and fill_state != FILL_CONFIRMED:
+                        # Accepted but not (or not provably) filled: keep the
+                        # cooldown so it is not resubmitted, move no inventory.
                         order_id = order_obj.get("order_id", "")
                         self.record_rebalance_time(m_key, now)
-                        self.update_position(m_key, "kalshi", outcome, "buy", float(int(size)))
+                        logger.warning(
+                            "Kalshi rebalance order %s for %s not recorded as filled (%s, status=%r)",
+                            order_id, m_key, fill_state, order_obj.get("status"))
+                        results.append({
+                            "market_key": m_key,
+                            "venue": venue,
+                            "outcome": outcome,
+                            "size": size,
+                            "price": price,
+                            "executed": False,
+                            "status": fill_state,
+                            "order_id": order_id,
+                        })
+                    elif order_obj:
+                        order_id = order_obj.get("order_id", "")
+                        self.record_rebalance_time(m_key, now)
+                        self.update_position(m_key, "kalshi", outcome, "buy", filled)
                         if trade_db and hasattr(trade_db, "log_opportunity"):
                             try:
                                 opp_id = trade_db.log_opportunity(
@@ -656,6 +746,7 @@ class InventoryBalancer:
                                         order_id=order_id,
                                         outcome=outcome,
                                         run_mode="live",
+                                        fill_qty=filled,
                                     )
                             except Exception as e:
                                 logger.debug("TradeDB error during live rebalance: %s", e)
@@ -666,7 +757,7 @@ class InventoryBalancer:
                             "action": "rebalance_buy",
                             "outcome": outcome,
                             "side": side,
-                            "size": float(int(size)),
+                            "size": filled,
                             "price": price,
                             "cost": est_cost,
                             "status": "filled",
@@ -725,10 +816,29 @@ class InventoryBalancer:
                         size=size,
                         order_type="FOK",
                     )
-                    if resp and resp.get("success"):
+                    accepted = bool(resp and resp.get("success"))
+                    fill_state, filled = (polymarket_rebalance_fill(resp, size)
+                                          if accepted else (None, None))
+                    if accepted and fill_state != FILL_CONFIRMED:
                         order_id = resp.get("orderID", resp.get("order_id", ""))
                         self.record_rebalance_time(m_key, now)
-                        self.update_position(m_key, "polymarket", outcome, "buy", size)
+                        logger.warning(
+                            "Polymarket rebalance order %s for %s not recorded as filled (%s, status=%r)",
+                            order_id, m_key, fill_state, resp.get("status"))
+                        results.append({
+                            "market_key": m_key,
+                            "venue": venue,
+                            "outcome": outcome,
+                            "size": size,
+                            "price": price,
+                            "executed": False,
+                            "status": fill_state,
+                            "order_id": order_id,
+                        })
+                    elif accepted:
+                        order_id = resp.get("orderID", resp.get("order_id", ""))
+                        self.record_rebalance_time(m_key, now)
+                        self.update_position(m_key, "polymarket", outcome, "buy", filled)
                         if trade_db and hasattr(trade_db, "log_opportunity"):
                             try:
                                 opp_id = trade_db.log_opportunity(
@@ -753,6 +863,7 @@ class InventoryBalancer:
                                         order_id=order_id,
                                         outcome=outcome,
                                         run_mode="live",
+                                        fill_qty=filled,
                                     )
                             except Exception as e:
                                 logger.debug("TradeDB error during live Polymarket rebalance: %s", e)
@@ -763,7 +874,7 @@ class InventoryBalancer:
                             "action": "rebalance_buy",
                             "outcome": outcome,
                             "side": side,
-                            "size": size,
+                            "size": filled,
                             "price": price,
                             "cost": est_cost,
                             "status": "filled",

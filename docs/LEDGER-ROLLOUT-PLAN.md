@@ -31,7 +31,8 @@ Design and claim rules are in [`LEDGER-REPORTING.md`](LEDGER-REPORTING.md).
 3. **Remote migration history.**
    - Run `list_migrations` on the project and compare it with `supabase/migrations`. Per `supabase/API-DEFAULTS-2026-09-21.md`, the history is known to differ.
    - Promote the draft to `supabase/migrations/<UTC timestamp>_trade_ledger_reporting.sql` in its own PR, after reconciling with that history.
-   - Re-run `tests/supabase-ledger-reporting.sh` on **PostgreSQL 17** (local evidence so far is 16.13).
+   - Local evidence so far: `tests/supabase-ledger-reporting.sh` passed at 73cce8a on a disposable local PostgreSQL 16.13 cluster, and on a new disposable local **PostgreSQL 17.11** cluster, run by Codex on Jonathon's machine on 2026-09-29. That run used socket-only access, NOLOGIN `anon`/`authenticated`/`service_role` (BYPASSRLS) and no production access. It applied all repository migrations, then the draft twice, then the assertions, and the cluster was stopped afterwards.
+   - Neither run is the production PostgreSQL 17.6, nor hosted Supabase/PostgREST end to end. Re-run the script against the promoted migration on a Supabase branch or an equivalent 17.6 target before relying on it.
 4. **MM pilot durability.**
    - `kalshi-mm-pilot` has no volume, so its `trades.db` and capture state are lost on every redeploy. The mirror would see a new `db_instance_id` each time, and any unexported tail is gone.
    - Before capture is enabled there, attach a volume and point `DATA_DIR` at it (a production infra change, needing its own approval).

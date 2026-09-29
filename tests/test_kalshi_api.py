@@ -1185,6 +1185,12 @@ class TestKalshiBatchCancelAndFastExecution:
         assert getattr(adapter, "_pool_connections", None) == 5
         assert getattr(adapter, "_pool_maxsize", None) == 20
 
+    def test_exec_session_disabled_by_config(self, monkeypatch):
+        import config
+        monkeypatch.setattr(config, "KALSHI_FAST_EXECUTION_ENABLED", False)
+        c = KalshiClient()
+        assert c.exec_session is None
+
     def test_batch_cancel_orders_all_success(self):
         c = KalshiClient()
         with patch.object(c, "_request", return_value=_mock_response(200)) as req:

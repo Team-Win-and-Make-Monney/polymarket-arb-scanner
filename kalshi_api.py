@@ -149,14 +149,26 @@ class KalshiClient:
 
     def __init__(self):
         self.session = requests.Session()
-        self.exec_session = requests.Session()
-        # Proxy support
         proxy_url = os.getenv("KALSHI_PROXY_URL")
         if proxy_url:
             self.session.proxies = {"http": proxy_url, "https": proxy_url}
-            self.exec_session.proxies = {"http": proxy_url, "https": proxy_url}
         self.session.mount("https://", HTTPAdapter(pool_connections=2, pool_maxsize=10))
-        self.exec_session.mount("https://", HTTPAdapter(pool_connections=5, pool_maxsize=20))
+
+        # Fast execution session: dedicated pool to prevent contention with book/market REST polling
+        try:
+            import config
+            fast_exec = getattr(config, "KALSHI_FAST_EXECUTION_ENABLED", True)
+        except Exception:
+            fast_exec = True
+
+        if fast_exec:
+            self.exec_session = requests.Session()
+            if proxy_url:
+                self.exec_session.proxies = {"http": proxy_url, "https": proxy_url}
+            self.exec_session.mount("https://", HTTPAdapter(pool_connections=5, pool_maxsize=20))
+        else:
+            self.exec_session = None
+
         self.api_key_id = None
         self.private_key = None
 

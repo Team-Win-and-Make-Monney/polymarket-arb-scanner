@@ -408,3 +408,16 @@ Single-context repo. See `docs/agents/domain.md`.
 Mem0 `app_id=johnsnow92-polymarket-arb-scanner`. Search this app_id plus `personal-prefs` at session start before rediscovering durable decisions.
 Personal prefs → `personal-prefs`. Open items → Linear. Human notes → Obsidian. Claude Code session learnings → native MEMORY.md.
 Policy: `~/Dev/mem0-knowledge-base/FULL-LEVERAGE.md`.
+
+## Project folder and worktree lifecycle
+
+The canonical project path is `/Users/jonathontamm/Dev/polymarket-arb-scanner`.
+Preserve this path and inspect active owners and local changes before choosing a checkout.
+
+- Reuse a suitable free checkout before creating another. Sequential work can use the canonical checkout only when existing changes and active sessions are accounted for. Concurrent or overlapping edits require isolation or serialization.
+- Do not create new sibling `~/Dev/pm-arb-*` directories or another scanner clone. Manual temporary worktrees belong in the canonical project's `.worktrees/`; Codex-managed worktrees stay in Codex-managed storage and use its lifecycle tools.
+- Prepare the correct branch/base before reuse, without resetting or overwriting another task's work. A task name does not require a newly named directory.
+- At task closure, account for the checkout: preserve unique commits, detached history, uncommitted/untracked files and needed ignored data; check processes, chat ownership and path dependencies; then archive or retire it when no longer needed. A merged PR alone is insufficient. Never force removal to bypass unpreserved work.
+- `.local-projects/` contains independent supporting projects. `.local-archive/` contains preserved historical checkouts. Both, and `.worktrees/`, must remain excluded from Git and Docker/deployment uploads. Do not develop in the archive.
+- Hidden compatibility links in `~/Dev` preserve existing tool paths. Reuse their targets; do not replace them with new clones or remove them without checking dependents.
+- Folder cleanup never authorizes a branch merge, deployment, scanner launch, evaluation restart, integrity-guard bypass, order, or change to financial controls.

@@ -28,8 +28,13 @@ cycles. One item per invocation, done properly, beats three items rushed.
 4. Take the **top unblocked item** from the board's Remaining Work tab. If the top item
    is "collect paper data" and the collection window hasn't elapsed, take the next
    build item instead (execution-HIGH triage, scan performance, PR #62, etc.).
-5. Work it end-to-end on a fresh worktree branched from `origin/master` (the local
-   checkout may sit on an old branch — never build on it without checking).
+5. Inspect active owners, local changes and existing worktrees. Reuse a suitable
+   free checkout with the correct task branch/base from current `origin/master`.
+   Use the canonical checkout for sequential work only when it is safe; isolate
+   concurrent or overlapping work. Create a new worktree only when none can be
+   reused: manual worktrees go under `.worktrees/`, and Codex-managed worktrees
+   use Codex's tools and storage. Never create another `~/Dev/pm-arb-*` sibling.
+   The local checkout may sit on an old branch — never build on it without checking.
    TDD for any code change: failing test first, then the fix, then the full suite.
    Known baseline: ~50 `test_dashboard*` failures are pre-existing in the local env —
    compare against pristine master before attributing failures to your change.
@@ -46,7 +51,11 @@ cycles. One item per invocation, done properly, beats three items rushed.
    by passing it as `url` to the Artifact tool.
 9. Update `CLAUDE.md` Current Status if it has drifted, and project memory if you
    learned something non-obvious.
-10. Report: what shipped, what was verified (with output), what's now top of the
+10. Account for the task worktree before closing: preserve unique history and
+    local/ignored data, check process/chat ownership and path dependencies, and
+    archive or retire it only when no longer needed. Merged status alone is not
+    sufficient. Keep reusable active checkouts in their existing designated place.
+11. Report: what shipped, what was verified (with output), what's now top of the
     backlog, and the current honest read on the edge question.
 
 ## Hard rules — never cross without asking Jonathon explicitly

@@ -9,3 +9,8 @@ CLAUDE.md
 .claude/
 scans/__pycache__
 .planning/
+
+# Local checkouts, supporting projects and preserved cleanup archives
+.worktrees/
+.local-projects/
+.local-archive/

@@ -430,21 +430,24 @@ class TradeDB:
         order_id: str | None = None,
         outcome: str | None = None,
         run_mode: str | None = None,
+        fill_qty: float | None = None,
     ) -> int | None:
         """Log a trade leg. Returns the trade ID.
 
         outcome is the traded market outcome (e.g. "yes"/"no") — distinct
         from side (BUY/SELL) so settlement can score Polymarket BUY_NO legs.
         run_mode is the writer's own "paper"/"live" assertion for this row;
-        omitted, the row's mode is unknown.
+        omitted, the row's mode is unknown. fill_qty is the filled contract
+        count when the writer already knows it (venue reconciliation compares
+        it per order); omitted, it stays unknown.
         """
         _check_run_mode(run_mode)
         with self._lock:
             cur = self.conn.execute(
                 """INSERT INTO trades
                    (opportunity_id, timestamp, platform, side, price, size, status, fill_price, order_id, outcome,
-                    run_mode, account_ref)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    run_mode, account_ref, fill_qty)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     opportunity_id,
                     datetime.now(timezone.utc).isoformat(),
@@ -458,6 +461,7 @@ class TradeDB:
                     outcome,
                     run_mode,
                     self._account_refs.get(str(platform).lower()),
+                    fill_qty,
                 ),
             )
             self.conn.commit()

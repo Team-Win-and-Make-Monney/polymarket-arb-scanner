@@ -128,6 +128,13 @@ class TestChangeCapture:
         meta = TradeDB(path, ledger_capture=True).get_ledger_meta()
         assert meta["capture_boundary_trades_id"] == "2"
 
+    def test_fill_qty_recorded_at_insert_when_known(self, ledger):
+        tdb, *_ = ledger
+        known = _trade(tdb, status="filled", run_mode="live", fill_qty=2.5)
+        unknown = _trade(tdb, status="filled", run_mode="live")
+        qty = {r["id"]: r["fill_qty"] for r in tdb.conn.execute("SELECT id, fill_qty FROM trades")}
+        assert qty == {known: 2.5, unknown: None}
+
     def test_invalid_run_mode_rejected(self, ledger):
         tdb, *_ = ledger
         with pytest.raises(ValueError):
@@ -417,6 +424,12 @@ class TestReconcileFills:
         args.update(kw)
         return reconcile_fills(self.VENUE if venue is None else venue,
                                self.LEDGER if ledger is None else ledger, **args)
+
+    def test_caller_evidence_gaps_make_an_agreeing_check_incomplete(self):
+        result = self._run(evidence_gaps=["ledger_mirror_stale", "", None])
+        assert result["status"] == "incomplete"
+        assert result["incomplete_reasons"] == ["ledger_mirror_stale"]
+        assert self._run()["status"] == "matched"
 
     def test_matched_with_verified_coverage(self):
         out = self._run()

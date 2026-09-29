@@ -499,7 +499,7 @@ def _parse_utc(value) -> datetime | None:
 
 def reconcile_fills(venue_fills: list[dict], ledger_trades: list[dict], *, venue: str,
                     account_ref: str | None, interval_start, interval_end,
-                    venue_coverage: dict | None) -> dict:
+                    venue_coverage: dict | None, evidence_gaps=()) -> dict:
     """Compare one account's venue fill records for [interval_start, interval_end) with the ledger.
 
     Fails closed: the result is "matched" only when every piece of evidence is
@@ -517,13 +517,17 @@ def reconcile_fills(venue_fills: list[dict], ledger_trades: list[dict], *, venue
         It must be complete, name the same account, and cover exactly the
         requested interval (compared as UTC instants).
 
+    evidence_gaps: problems the caller already found in its own evidence (a
+        venue collection that did not finish, a stale or incomplete ledger
+        mirror). Each one is an incomplete reason.
+
     Interval bounds and all timestamps are compared as UTC instants, never as
     strings. Only venue fills inside the interval count. Ledger fills count
     toward "missing in venue" only when recorded inside the interval; the
     engine log time can trail the venue fill time, so a boundary straddle is
     reported as a mismatch rather than hidden.
     """
-    reasons: set[str] = set()
+    reasons: set[str] = {str(g) for g in evidence_gaps if g}
     start = _parse_utc(interval_start)
     end = _parse_utc(interval_end)
     if start is None or end is None or end <= start:

@@ -701,6 +701,17 @@ class TestDryRunIsolation:
         assert client.place_order_calls == 0
         assert client.cancel_order_calls == 0
 
+    def test_simulated_fill_is_logged_as_paper_with_its_quantity(self, pilot_env, clock):
+        pilot = build_pilot(clock, client=FakeKalshiClient(), dry_run=True)
+        pilot._db = MagicMock()
+        pilot._db.log_opportunity.return_value = 7
+        pilot.place_pilot_order(TICKER, "yes", "buy", 4, 0.49, purpose="quote_bid")
+        pilot.update_book(TICKER, make_book(yes_bid=0.10, no_bid=0.88))
+        assert len(pilot.poll_fills()) == 1
+        kwargs = pilot._db.log_trade.call_args.kwargs
+        assert kwargs["run_mode"] == "paper" and kwargs["fill_qty"] == 4.0
+        assert kwargs["status"] == "filled" and kwargs["order_id"].startswith("dry_")
+
     def test_simulated_fill_runs_the_full_pipeline(self, pilot_env, clock):
         client = FakeKalshiClient()
         hedger = RecordingHedger()

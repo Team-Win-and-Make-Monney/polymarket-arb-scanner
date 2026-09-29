@@ -1,0 +1,15 @@
+{
+  "cursor": "c-live-2",
+  "fills": [
+    {"fill_id": "f-overlap", "trade_id": "f-overlap", "exchange_index": 0, "order_id": "ord-a",
+     "ticker": "KXTEST-26SEP28-A", "market_ticker": "KXTEST-26SEP28-A", "outcome_side": "yes", "book_side": "bid",
+     "count_fp": "1.25", "yes_price_dollars": "0.4200", "no_price_dollars": "0.5800",
+     "is_taker": false, "fee_cost": "0.0000", "created_time": "2026-09-28T16:00:00Z", "ts": 1790611200,
+     "subaccount_number": 0},
+    {"fill_id": "f-live-b", "trade_id": "f-live-b", "exchange_index": 0, "order_id": "ord-b",
+     "ticker": "KXTEST-26SEP28-B", "market_ticker": "KXTEST-26SEP28-B", "outcome_side": "no", "book_side": "ask",
+     "count_fp": "10.00", "yes_price_dollars": "0.6100", "no_price_dollars": "0.3900",
+     "is_taker": true, "fee_cost": "0.1700", "created_time": "2026-09-28T20:15:30.250000Z", "ts": 1790626530,
+     "subaccount_number": 0}
+  ]
+}

@@ -1,6 +1,6 @@
 # Trade-ledger reporting mirror
 
-Status: code merged behind flags that default to off. The Supabase schema is a
+Status: proposed in PR #190; every flag defaults to off. The Supabase schema is a
 **draft** at `supabase/drafts/0007_trade_ledger_reporting.sql` and has not been
 applied anywhere. Decision (Jonathon, 2026-09-29): reports read trades synced
 to Supabase through a restricted read-only view/role. The operational ledger
@@ -15,7 +15,7 @@ stays the source record, and venue records check completeness.
 | Fees | not recorded locally | `fee_usd` is null, `fee_status = not_recorded`. Venue fees come only from reconciliation |
 | `partial_fills`, `transfers`, `opportunities` | not mirrored | Opportunities already mirror via `OpportunitySync` |
 | Exporter state | `ledger_sync_status` | One row per service and DB file |
-| Venue checks | `ledger_venue_reconciliations` | Written by a future job with read-only venue credentials |
+| Venue checks | `ledger_venue_reconciliations` | Written by `scripts/reconcile_venue_fills.py` (Kalshi fills today), one row per run |
 
 ## Provenance rules
 
@@ -45,33 +45,89 @@ stays the source record, and venue records check completeness.
 ## What a report may claim
 
 - **One service's DB file** (`ledger_reporting.sources.mirror_complete`): the latest export succeeded, the snapshot is complete, no captured change is pending, and the mirror's row counts equal the local counts. This says nothing about an account.
-- **Zero fills or zero PnL for an account and period.** This needs a `matched` venue reconciliation covering that account and interval, plus complete mirrors of every service that trades that account. Otherwise the value is null or unverified. An absent row in `realized_pnl_daily` means no data, not zero.
-- **Realized PnL** stays `pnl_verified = false` until a settlement-level venue reconciliation exists. That doesn't exist yet.
+- **Zero fills for an account and day.** This needs `ledger_reporting.venue_reconciliation_days.fills_verified = true` for that venue, account and America/Detroit day. The check behind it covered the venue completely, verified the mirrors of every mapped service, and no mirrored ledger row changed afterwards. Otherwise the value is null or unverified. A missing row in either view means no data, not zero.
+- **Account-wide.** Only when `account_wide = true`, meaning the check covered all subaccounts. A check made with a subaccount-restricted key covers that subaccount only.
+- **Realized PnL** stays `pnl_verified = false`. Fills reconciliation does not cover fees, settlements or positions, and nothing reconciles those yet.
 
-## Venue reconciliation (`ledger_sync.reconcile_fills`)
+## Venue reconciliation
 
-Fails closed. A result is `matched` only when all of the following hold:
+**Comparison rules** (`ledger_sync.reconcile_fills`). It fails closed. A result is `matched` only when all of the following hold:
 
 - **Coverage:** the venue source asserts complete coverage (`venue_coverage.complete is True`) for the same, known `account_ref`, over exactly the requested interval.
 - **Venue records:** every in-interval record has an order id, a finite quantity and a timezone-aware fill time.
 - **Ledger rows:** every relevant ledger fill is live, attributed to the account, and carries an order id and a finite quantity.
 - **Agreement:** nothing is missing on either side and all quantities agree.
+- **No caller gaps:** the caller reported no evidence gaps (`evidence_gaps`).
 
-The other outcomes:
+Any missing or invalid evidence is `incomplete`, with reasons. Valid evidence that disagrees is `mismatched`. A verified quiet day is `matched` with zero counts. Timestamps are compared as UTC instants. Only venue fills inside `[start, end)` count.
 
-- **`incomplete`:** any missing or invalid evidence (listed in `incomplete_reasons`). This includes NaN or infinite values, naive or unparsable timestamps, and ledger fills of unknown mode or account in the interval.
-- **`mismatched`:** valid evidence that disagrees.
-- **Quiet period:** a verified interval with no activity on either side is `matched` with zero counts.
+### Kalshi fill collector (`kalshi_fill_collector.py`)
 
-Timestamps are compared as UTC instants, never as strings, and only venue fills inside `[start, end)` count.
+The collector is read-only. Its transport allows only `GET` on `/portfolio/fills`, `/historical/fills` and `/historical/cutoff`, reusing the existing `KalshiClient` signing. It has no order code.
 
-The draft table enforces the same rules with CHECK constraints:
+**Source docs** (Kalshi Trade API OpenAPI 3.31.0, retrieved 2026-09-29):
+- <https://docs.kalshi.com/getting_started/historical_data>
+- <https://docs.kalshi.com/api-reference/portfolio/get-fills>
+- <https://docs.kalshi.com/api-reference/historical/get-historical-fills>
+- <https://docs.kalshi.com/api-reference/historical/get-historical-cutoff-timestamps>
 
-- `matched` requires verified coverage, an account, a source, an interval, no reasons and nothing missing.
-- `incomplete` requires at least one reason.
-- Fees must be finite.
+**What those docs require, and how the collector handles each point:**
+- **Tiers.** `trades_created_ts` from `/historical/cutoff` splits fills: older fills are only in `/historical/fills`. The collector reads whichever tiers the interval needs.
+- **Moving cutoff.** It reads the cutoff before and after collecting. If the cutoff moved, it retries once, then marks the collection `venue_cutoff_moved`.
+- **Pagination.** Every tier is paginated until the cursor is empty. An empty page with a cursor is not the end. It stops with a gap on any of these:
+  - a repeated cursor (`venue_cursor_repeated`)
+  - page-limit exhaustion (`venue_page_limit_exhausted`)
+  - a malformed page (`venue_page_malformed`)
+  - a failed page. Retries are bounded: 3 attempts with backoff on 429, 5xx or transport errors (`venue_request_failed`), and no retry on other 4xx (`venue_request_rejected`).
+- **Partial results.** Successful partial pagination never counts as coverage. The old `KalshiClient.get_fills` list helper is not used: it defaults to 5 pages, can return a partial list silently, and stops at an empty page even when a cursor remains.
+- **Time bounds.** `min_ts`/`max_ts` are documented only as "after"/"before" a Unix second. The collector over-fetches one second on each side, and reconciliation filters the exact interval.
+- **Fill fields:**
+  - `fill_id` (with `trade_id` as a legacy alias that must agree)
+  - `order_id`
+  - `count_fp`: a fixed-point string, finite, positive, at most 2 decimals, fractional allowed
+  - `fee_cost`: fixed-point dollars
+  - `created_time`, cross-checked against the legacy `ts` when both are present
+  - `subaccount_number`
+- **Duplicates.** A duplicate `fill_id` with identical content is dropped (tiers can overlap). One with different content makes the collection incomplete (`venue_conflicting_duplicate_fill`).
+- **Scope (declared by the operator, never inferred).** `LEDGER_KALSHI_SCOPE` names:
+  - the account label
+  - the API key's SHA-256 fingerprint (never the key)
+  - `subaccount` (`"all"` or 0–63)
+  - the ledger services that trade the account
+  - who verified it, and when
 
-`fills_reconciled_for_day` is true only when a verified `matched` check covers the whole UTC day and no later check touching that day disagrees or is incomplete. The job that fetches venue records is deferred.
+  The running key must match the fingerprint (`venue_credential_scope_mismatch`). A key restricted to one subaccount only ever returns that subaccount. Its checks record `coverage_scope = subaccount:N` and are never account-wide. Fills from another subaccount make the check incomplete.
+- **Finality.** A day is collectable `LEDGER_RECON_FINALITY_SECONDS` (default 900) after it ends. Before that, it is incomplete (`venue_interval_not_final`).
+
+### Reconciliation job (`venue_reconciliation.py`, `scripts/reconcile_venue_fills.py`)
+
+- **Reporting days.** Days are America/Detroit calendar days converted to UTC: 23 hours in March, 25 in November. The draft table enforces that `interval_start`/`interval_end` equal the local day's bounds.
+- **Ledger side.** It reads the Supabase mirror, never a local `trades.db`. It first verifies every mapped service's `ledger_sync_status`:
+  - present: `ledger_mirror_source_missing`
+  - one DB instance throughout the interval: `ledger_mirror_source_changed`
+  - capture began before the interval: `ledger_capture_not_covering_interval`
+  - latest export succeeded: `ledger_mirror_sync_failing`
+  - snapshot complete and nothing pending: `ledger_mirror_incomplete`
+  - last success after the day plus the finality lag: `ledger_mirror_stale`
+  - mirror row counts equal the local counts: `ledger_mirror_count_mismatch`
+- **Reads.** Every mirror read is paged with an exact count. A short or capped read is `ledger_mirror_read_truncated`. Rows for the account written by a service outside the mapping make the check incomplete (`ledger_unmapped_source`).
+- **Empty or stale mirrors.** An empty, stale or truncated mirror can never yield a reconciled zero.
+- **Rows.** Each run writes one row, keyed by `run_id` so a retry is idempotent. It records the gaps, `coverage_scope`, `ledger_mirror_verified` and an `evidence` object: pages, cutoffs, retries, duplicates and the sources checked. Re-runs add rows, and the latest check per day wins.
+- **Staleness.** `venue_reconciliation_days` marks a check stale when a mirrored ledger row for that venue and account changes after it, for example a fill correction. The day is then no longer verified until the check is re-run.
+- **Writer change.** The MM pilot now records `fill_qty` (contracts) on each fill row, so its orders can be compared. Older pilot rows have no quantity and reconcile as incomplete.
+
+Run it as its own process with the existing credentials. It prints JSON and writes only with `--write`:
+
+```sh
+python scripts/reconcile_venue_fills.py --print-key-fingerprint   # value for LEDGER_KALSHI_SCOPE
+python scripts/reconcile_venue_fills.py --venue kalshi --day 2026-09-28 [--write]
+```
+
+**Known limits:**
+- Only order-level quantities are compared; the local ledger has no venue fill ids.
+- An order that fills across a day boundary shows as a quantity mismatch on both days.
+- Fees are summed from the venue side only.
+- Settlement and position reconciliation do not exist yet.
 
 ## Reporter access
 
@@ -84,20 +140,15 @@ The draft table enforces the same rules with CHECK constraints:
 
 ```sh
 pytest tests/test_ledger_sync.py -v
+pytest tests/test_venue_reconciliation.py -v
 # Disposable Postgres, as postgres, with NOLOGIN anon/authenticated and
 # service_role (BYPASSRLS, as on Supabase) created:
 bash tests/supabase-ledger-reporting.sh
 ```
 
-## Rollout plan (each step needs operator approval; none has been done)
+## Rollout plan
 
-1. **Review and merge** the code. Flags stay off, so nothing changes at runtime. Auto-deploy restarts services with the new nullable columns, and writers start stamping `run_mode` on new rows.
-2. **Verify the target Supabase project.** Confirm ownership and schema (see `supabase/API-DEFAULTS-2026-09-21.md` about remote history). Then apply `0007` as a real migration, after reconciling it with the deployed migration history.
-3. **Create a login role for routines** that is a member of `ledger_reporter`, with `default_transaction_read_only = on` and a secret held outside the repo. Connect through the pooler, not PostgREST.
-4. **Set `LEDGER_ACCOUNT_REFS`** (non-secret labels) and `LEDGER_CAPTURE_ENABLED=true` on each service. Capture starts; the outbox grows until sync is on.
-5. **Set `LEDGER_SYNC_ENABLED=true`.** The exporter uses the existing `SUPABASE_URL`/`SUPABASE_SERVICE_KEY` backend credential; a least-privilege writer role is a follow-up. The service name comes from `RAILWAY_SERVICE_NAME`, or `LEDGER_SERVICE_NAME` if that's missing. The first sync snapshots history with its honest (mostly unknown) provenance.
-6. **Build a reconciliation job** with read-only venue credentials. It writes `ledger_venue_reconciliations` using `ledger_sync.reconcile_fills`.
-7. **Point the routines** at the `ledger_reporting` views.
+See [`LEDGER-ROLLOUT-PLAN.md`](LEDGER-ROLLOUT-PLAN.md): exact targets, gates, order, verification and rollback. Every step needs operator approval, and none has been done.
 
 ## Rollback
 

@@ -120,12 +120,15 @@ create table if not exists public.ledger_sync_status (
   synced_at                     timestamptz not null default now()
 );
 
--- One row per venue check (ledger_sync.reconcile_fills output). Written by a
--- separate reconciliation job with read-only venue credentials (deferred).
+-- One row per venue check, written by scripts/reconcile_venue_fills.py
+-- (venue_reconciliation.run_reconciliation) with read-only venue access.
 -- Missing or invalid evidence is recorded as 'incomplete' with reasons; a row
--- can only be 'matched' with verified coverage and nothing outstanding.
+-- can only be 'matched' with verified venue coverage, a verified ledger
+-- mirror and nothing outstanding. Re-runs add rows; the latest check for a
+-- reporting day wins (see ledger_reporting.venue_reconciliation_days).
 create table if not exists public.ledger_venue_reconciliations (
   id                  uuid primary key default gen_random_uuid(),
+  run_id              text not null unique,    -- idempotency key for one collector run
   venue               text not null,
   account_ref         text,                    -- null only on an incomplete check
   interval_start      timestamptz,
@@ -144,22 +147,39 @@ create table if not exists public.ledger_venue_reconciliations (
   venue_fees_usd      numeric check (venue_fees_usd is null
                         or venue_fees_usd not in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)),
   fees_complete       boolean not null default false,
+  coverage_scope      text check (coverage_scope is null
+                        or coverage_scope ~ '^(all_subaccounts|subaccount:[0-9]{1,2})$'),
+  reporting_tz        text,
+  reporting_day       date,                    -- local calendar day the interval covers
+  collector           text,
+  collector_version   text,
+  collected_at        timestamptz,
+  ledger_mirror_verified boolean not null default false,
+  evidence            jsonb not null default '{}'::jsonb,  -- pages, cutoffs, sources checked
   checked_at          timestamptz not null default now(),
   constraint ledger_recon_interval_valid
     check (interval_end is null or interval_start is null or interval_end > interval_start),
   constraint ledger_recon_incomplete_has_reason
     check ((status = 'incomplete') = (incomplete_reasons <> '[]'::jsonb)),
+  constraint ledger_recon_day_matches_interval
+    check (reporting_day is null or (
+      reporting_tz is not null
+      and interval_start = (reporting_day::timestamp at time zone reporting_tz)
+      and interval_end = ((reporting_day + 1)::timestamp at time zone reporting_tz))),
   constraint ledger_recon_matched_is_verified
     check (status <> 'matched' or (
-      coverage_verified and account_ref is not null and venue_source is not null
+      coverage_verified and ledger_mirror_verified and coverage_scope is not null
+      and account_ref is not null and venue_source is not null
       and interval_start is not null and interval_end is not null
       and incomplete_reasons = '[]'::jsonb
       and missing_in_ledger = '[]'::jsonb and missing_in_venue = '[]'::jsonb
       and qty_mismatch = '[]'::jsonb
       and matched_order_count = venue_order_count
-      and ledger_order_count <= matched_order_count)),
-  unique (venue, account_ref, interval_start, interval_end, venue_source)
+      and ledger_order_count <= matched_order_count))
 );
+
+create index if not exists ledger_venue_recon_day_idx
+  on public.ledger_venue_reconciliations (venue, account_ref, reporting_day, checked_at);
 
 -- ---------------------------------------------------------------------------
 -- Version guard: an older export never overwrites a newer one
@@ -282,22 +302,64 @@ from public.ledger_positions
 where not deleted;
 
 create or replace view ledger_reporting.venue_reconciliations as
-select venue, account_ref, interval_start, interval_end, venue_source, status,
-       coverage_verified, incomplete_reasons, venue_order_count, ledger_order_count,
-       matched_order_count, venue_records_out_of_interval, missing_in_ledger,
-       missing_in_venue, qty_mismatch, venue_fees_usd, fees_complete, checked_at
+select run_id, venue, account_ref, interval_start, interval_end, reporting_tz, reporting_day,
+       venue_source, coverage_scope, status, coverage_verified, ledger_mirror_verified,
+       incomplete_reasons, venue_order_count, ledger_order_count, matched_order_count,
+       venue_records_out_of_interval, missing_in_ledger, missing_in_venue, qty_mismatch,
+       venue_fees_usd, fees_complete, collector, collector_version, collected_at,
+       checked_at, evidence
 from public.ledger_venue_reconciliations;
 
--- Engine-computed realized PnL of live, settled positions per UTC day, venue
--- and account label. A day with no settled live position has NO row: absence
--- is not zero. realized_pnl_sum is null when any settled position in the
--- group lacks realized_pnl. Rows with unknown mode or account are excluded
--- here and counted in unattributed_settlements_daily instead.
--- pnl_verified is always false: no settlement/PnL reconciliation exists yet.
+-- Latest check per venue, account and local reporting day. A day with no
+-- check has NO row: absence is unknown, never zero.
+--   fills_verified: the latest check is 'matched' (verified venue coverage and
+--     verified ledger mirror) and no mirrored ledger row for that venue and
+--     account changed after the check within the window the check read
+--     (2 days before to 1 day after the day). A later ledger correction makes
+--     the check stale until it is re-run.
+--   account_wide: the venue coverage was for all subaccounts. A check made
+--     with a subaccount-restricted key covers that subaccount only.
+-- Fills only: fees, settlements and positions are not reconciled here.
+create or replace view ledger_reporting.venue_reconciliation_days as
+with latest as (
+  select distinct on (r.venue, r.account_ref, r.reporting_day) r.*
+  from public.ledger_venue_reconciliations r
+  where r.reporting_day is not null and r.account_ref is not null
+  order by r.venue, r.account_ref, r.reporting_day, r.checked_at desc, r.id desc
+)
+select
+  l.venue, l.account_ref, l.reporting_day, l.reporting_tz, l.interval_start, l.interval_end,
+  l.run_id, l.status, l.coverage_scope, (l.coverage_scope = 'all_subaccounts') as account_wide,
+  l.coverage_verified, l.ledger_mirror_verified, l.incomplete_reasons,
+  l.venue_order_count, l.ledger_order_count, l.matched_order_count,
+  l.venue_fees_usd, l.fees_complete, l.collected_at, l.checked_at,
+  stale.changed as ledger_changed_since_check,
+  (l.status = 'matched' and not stale.changed) as fills_verified,
+  false as pnl_verified
+from latest l
+cross join lateral (
+  select exists (
+    select 1 from public.ledger_trades t
+    where t.venue = l.venue
+      and (t.account_ref = l.account_ref or t.account_ref is null)
+      and t.synced_at > l.checked_at
+      and (t.recorded_at is null
+           or (t.recorded_at >= l.interval_start - interval '2 days'
+               and t.recorded_at < l.interval_end + interval '1 day'))
+  ) as changed
+) stale;
+
+-- Engine-computed realized PnL of live, settled positions per America/Detroit
+-- day, venue and account label. A day with no settled live position has NO
+-- row: absence is not zero. realized_pnl_sum is null when any settled position
+-- in the group lacks realized_pnl. Rows with unknown mode or account are
+-- excluded here and counted in unattributed_settlements_daily instead.
+-- pnl_verified is always false: settlements, fees and positions are not
+-- reconciled with the venue; fills_reconciled_for_day covers fills only.
 create or replace view ledger_reporting.realized_pnl_daily as
 with settled as (
   select p.service, p.db_instance_id, p.venue, p.account_ref, p.realized_pnl,
-         (p.settled_at at time zone 'UTC')::date as settle_day_utc
+         (p.settled_at at time zone 'America/Detroit')::date as settle_day_local
   from public.ledger_positions p
   where not p.deleted
     and p.run_mode = 'live'
@@ -306,7 +368,8 @@ with settled as (
     and p.settled_at is not null
 )
 select
-  s.settle_day_utc,
+  s.settle_day_local,
+  'America/Detroit'::text as reporting_tz,
   s.venue,
   s.account_ref,
   count(*) as settled_positions,
@@ -317,34 +380,20 @@ select
   'not_recorded'::text as fee_status,
   false as pnl_verified,
   bool_and(coalesce(src.mirror_complete, false)) as mirror_complete_now,
-  -- True only when a verified 'matched' check covers the whole UTC day and no
-  -- later check touching that day for the same venue/account disagrees or is
-  -- incomplete.
-  exists (
-    select 1 from public.ledger_venue_reconciliations r
-    where r.venue = s.venue and r.account_ref = s.account_ref
-      and r.status = 'matched' and r.coverage_verified
-      and r.interval_start <= s.settle_day_utc::timestamp at time zone 'UTC'
-      and r.interval_end >= (s.settle_day_utc + 1)::timestamp at time zone 'UTC'
-      and not exists (
-        select 1 from public.ledger_venue_reconciliations r2
-        where r2.venue = r.venue
-          and (r2.account_ref = r.account_ref or r2.account_ref is null)
-          and r2.status <> 'matched'
-          and r2.checked_at >= r.checked_at
-          and (r2.interval_start is null or r2.interval_end is null
-               or (r2.interval_start < (s.settle_day_utc + 1)::timestamp at time zone 'UTC'
-                   and r2.interval_end > s.settle_day_utc::timestamp at time zone 'UTC'))
-      )
-  ) as fills_reconciled_for_day
+  coalesce(bool_or(d.fills_verified), false) as fills_reconciled_for_day,
+  coalesce(bool_or(d.fills_verified and d.account_wide), false) as account_wide_fills_reconciled
 from settled s
 left join ledger_reporting.sources src
   on src.service = s.service and src.db_instance_id = s.db_instance_id
-group by s.settle_day_utc, s.venue, s.account_ref;
+left join ledger_reporting.venue_reconciliation_days d
+  on d.venue = s.venue and d.account_ref = s.account_ref
+ and d.reporting_day = s.settle_day_local and d.reporting_tz = 'America/Detroit'
+group by s.settle_day_local, s.venue, s.account_ref;
 
 create or replace view ledger_reporting.unattributed_settlements_daily as
 select
-  (settled_at at time zone 'UTC')::date as settle_day_utc,
+  (settled_at at time zone 'America/Detroit')::date as settle_day_local,
+  'America/Detroit'::text as reporting_tz,
   venue,
   run_mode,
   (account_ref is null) as account_unknown,
@@ -354,7 +403,7 @@ where not deleted
   and status = 'settled'
   and settled_at is not null
   and (run_mode is distinct from 'live' or account_ref is null)
-group by 1, 2, 3, 4;
+group by 1, 2, 3, 4, 5;
 
 revoke all on all tables in schema ledger_reporting from public, anon, authenticated;
 grant usage on schema ledger_reporting to ledger_reporter;

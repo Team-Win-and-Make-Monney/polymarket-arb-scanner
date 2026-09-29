@@ -575,13 +575,33 @@ class TestDispatchValidity:
         assert delivered and all(p.get("_invalidated") for p in delivered)
         assert fm.get_kalshi_orderbook("KXFP-A") is None
 
-    def test_polymarket_reset_drops_queued_updates(self):
+    def test_polymarket_reset_replaces_queued_update_with_invalidation(self):
         cb = MagicMock()
         fm, loop = _queued_feed(cb)
-        fm._handle_polymarket_message([{"event_type": "best_bid_ask", "asset_id": "tok", "best_bid": "0.4"}])
+        fm._handle_polymarket_message([{"event_type": "best_bid_ask", "asset_id": "tok", "best_ask": "0.4"}])
         fm._reset_poly_books()
         loop.run()
+        cb.assert_called_once()
+        payload = cb.call_args[0][2]
+        assert payload["_invalidated"] is True and payload["best_ask"] is None
+
+    def test_reset_without_live_keys_publishes_nothing(self):
+        cb = MagicMock()
+        fm, loop = _queued_feed(cb)
+        fm._reset_poly_books()
+        fm._reset_kalshi_books()
+        loop.run()
         cb.assert_not_called()
+
+    def test_invalidated_key_is_not_reinvalidated(self):
+        cb = MagicMock()
+        fm, loop = _queued_feed(cb)
+        fm._handle_kalshi_message(_fp_snapshot("KXA"))
+        fm._reset_kalshi_books()
+        loop.run()
+        fm._reset_kalshi_books()
+        loop.run()
+        assert [c[0][2].get("_invalidated") for c in cb.call_args_list] == [True]
 
 
 class TestBetfairLiveness:
@@ -613,3 +633,178 @@ class TestBetfairLiveness:
         fm._running = True
         asyncio.run(fm._run_betfair())
         assert captured["on_price_update"] == fm._on_betfair_update
+
+
+# ---------------------------------------------------------------------------
+# End-to-end invalidation through the runner (second review of #189)
+# ---------------------------------------------------------------------------
+
+
+class _FakeWS:
+    """Scripted socket: each item is a message dict, a callable, or an exception."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.sent = []
+
+    async def send(self, msg):
+        self.sent.append(msg)
+
+    async def recv(self):
+        import json
+        while self.script:
+            item = self.script.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            if callable(item):
+                item()
+                continue
+            return json.dumps(item)
+        raise ConnectionError("script exhausted")
+
+    async def ping(self):
+        return None
+
+
+def _fake_connect(fm, scripts):
+    """websockets.connect stand-in: one scripted socket per connection attempt."""
+
+    class _Ctx:
+        def __init__(self, ws):
+            self.ws = ws
+
+        async def __aenter__(self):
+            return self.ws
+
+        async def __aexit__(self, *exc):
+            return False
+
+    def connect(*_a, **_kw):
+        if not scripts:
+            fm._running = False
+            raise ConnectionError("no more connections")
+        return _Ctx(_FakeWS(scripts.pop(0)))
+
+    return connect
+
+
+def _downstream(cache):
+    """Mimics continuous.on_price_update: the payload replaces the cache entry."""
+    def on_price_update(platform, key, data):
+        cache[(platform, key)] = data
+    return on_price_update
+
+
+class TestInvalidationThroughRunner:
+    def _kalshi_fm(self, cache):
+        fm, loop = _queued_feed(_downstream(cache))
+        fm.kalshi_api_key_id = "kid"
+        fm.kalshi_private_key = object()
+        fm._kalshi_tickers = ["KXA", "KXB"]
+        return fm, loop
+
+    def _run(self, fm, runner, monkeypatch, scripts):
+        async def no_sleep(_s):
+            return None
+
+        monkeypatch.setattr(ws_feeds.websockets, "connect", _fake_connect(fm, scripts))
+        monkeypatch.setattr(ws_feeds.asyncio, "sleep", no_sleep)
+        fm._running = True
+        asyncio.run(runner())
+
+    def test_gap_then_repeated_resets_leave_no_executable_kalshi_quote(self, monkeypatch):
+        """handler gap -> _run_kalshi catch -> reset -> reconnect reset -> further
+        resets, with the caller loop blocked throughout: when dispatch finally
+        runs, every ticker that had an executable quote downstream is invalidated."""
+        cache = {}
+        fm, loop = self._kalshi_fm(cache)
+        scripts = [
+            [
+                _fp_snapshot("KXA", sid=1, seq=1),
+                _fp_snapshot("KXB", sid=2, seq=1),
+                loop.run,  # caller loop delivers both executable quotes, then blocks
+                _fp_delta("KXA", sid=1, seq=2),  # queued, executable, pre-gap
+                _fp_delta("KXA", sid=1, seq=9),  # gap: handler raises
+            ],
+            [ConnectionError("reset again")],  # reconnect, then another drop
+            [ConnectionError("and again")],
+        ]
+        assert fm._kalshi_tickers == ["KXA", "KXB"]
+        self._run(fm, fm._run_kalshi, monkeypatch, scripts)
+        loop.run()  # caller loop unblocks
+        for ticker in ("KXA", "KXB"):
+            entry = cache[("kalshi", ticker)]
+            assert entry.get("_invalidated") is True, ticker
+            assert entry["yes_ask"] is None and entry["no_ask"] is None
+
+    def test_gap_invalidation_survives_reset_before_any_drain(self, monkeypatch):
+        """The gapped ticker is popped before the reset; its queued invalidation
+        must not be discarded by the reset's generation bump."""
+        cache = {}
+        fm, loop = self._kalshi_fm(cache)
+        fm._kalshi_tickers = ["KXA"]
+        scripts = [[
+            _fp_snapshot("KXA", sid=1, seq=1),
+            loop.run,
+            _fp_delta("KXA", sid=1, seq=5),
+        ]]
+        self._run(fm, fm._run_kalshi, monkeypatch, scripts)
+        loop.run()
+        assert cache[("kalshi", "KXA")].get("_invalidated") is True
+
+    def test_new_snapshot_after_reconnect_is_delivered(self, monkeypatch):
+        """Invalidation must not shadow fresh data from the next connection."""
+        cache = {}
+        fm, loop = self._kalshi_fm(cache)
+        fm._kalshi_tickers = ["KXA"]
+        scripts = [
+            [_fp_snapshot("KXA", sid=1, seq=1), loop.run, _fp_delta("KXA", sid=1, seq=5)],
+            [_fp_snapshot("KXA", sid=3, seq=1), loop.run, lambda: setattr(fm, "_running", False),
+             ConnectionError("done")],
+        ]
+        self._run(fm, fm._run_kalshi, monkeypatch, scripts)
+        entry = cache[("kalshi", "KXA")]
+        assert not entry.get("_invalidated")
+        assert entry["yes_ask"] == pytest.approx(0.45)
+
+    def test_polymarket_disconnect_invalidates_delivered_quotes(self, monkeypatch):
+        cache = {}
+        fm, loop = _queued_feed(_downstream(cache))
+        fm._poly_token_ids = ["tok1", "tok2"]
+        book = {"event_type": "book", "asset_id": "tok1",
+                "asks": [{"price": "0.55", "size": "10"}], "bids": [{"price": "0.50", "size": "5"}]}
+        scripts = [
+            [
+                [book, {"event_type": "best_bid_ask", "asset_id": "tok2", "best_ask": "0.47"}],
+                loop.run,  # both executable quotes delivered downstream
+                {"event_type": "best_bid_ask", "asset_id": "tok1", "best_ask": "0.56"},  # queued
+                ConnectionError("1013 slow consumer"),
+            ],
+            [ConnectionError("reset again")],
+        ]
+        self._run(fm, fm._run_polymarket, monkeypatch, scripts)
+        loop.run()
+        for tok in ("tok1", "tok2"):
+            entry = cache[("polymarket", tok)]
+            assert entry.get("_invalidated") is True, tok
+            assert entry["best_ask"] is None and entry["best_bid"] is None
+        assert fm.get_polymarket_orderbook("tok1") is None
+
+    def test_invalidated_entries_yield_no_tracking_price(self):
+        import importlib
+        saved = {n: sys.modules.get(n) for n in ("kalshi_api", "polymarket_api", "display", "recovery", "continuous")}
+        for n in ("kalshi_api", "polymarket_api", "display", "recovery"):
+            sys.modules[n] = MagicMock()
+        sys.modules.pop("continuous", None)
+        try:
+            continuous = importlib.import_module("continuous")
+            fm = FeedManager(on_price_update=MagicMock(), use_feed_thread=False)
+            for platform, key in (("kalshi", "KXA"), ("polymarket", "tok")):
+                payload = fm._invalidation_payload(platform, key)
+                assert continuous._ws_tracking_probability(platform, payload) is None
+        finally:
+            for n, mod in saved.items():
+                if mod is not None:
+                    sys.modules[n] = mod
+                else:
+                    sys.modules.pop(n, None)

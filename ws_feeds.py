@@ -194,6 +194,10 @@ class FeedManager:
         self._drain_scheduled = False
         self._platform_gen: dict[str, int] = {}
         self._key_gen: dict[tuple[str, str], int] = {}
+        # Keys per platform whose last emitted update may carry executable prices
+        # (queued or delivered). A reset publishes an invalidation for each, so
+        # the caller's cache never keeps a quote from a dropped connection.
+        self._downstream_keys: dict[str, set[str]] = {}
         # Queued updates older than this (by feed-thread receipt time) are dropped
         # at drain instead of being published as if fresh. Invalidations never expire.
         self._dispatch_max_age = _dispatch_max_age_default()
@@ -405,6 +409,12 @@ class FeedManager:
         """
         data.setdefault("_recv_ts", time.time())
         loop = self._dispatch_loop
+        with self._pending_lock:
+            keys = self._downstream_keys.setdefault(platform, set())
+            if data.get("_invalidated"):
+                keys.discard(key)
+            else:
+                keys.add(key)
         if loop is None:
             self.on_price_update(platform, key, data)
             return
@@ -427,7 +437,8 @@ class FeedManager:
 
         Dropped: entries queued before an invalidation of their platform or key
         (generation mismatch), and entries received more than
-        ``_dispatch_max_age`` seconds ago, unless they are invalidations.
+        ``_dispatch_max_age`` seconds ago. Invalidations are always delivered:
+        they carry no executable price, so they can never be stale or unsafe.
         """
         with self._pending_lock:
             batch = self._pending_updates
@@ -435,13 +446,14 @@ class FeedManager:
             self._drain_scheduled = False
         now = time.time()
         for (platform, key), (data, platform_gen, key_gen) in batch.items():
+            invalidation = bool(data.get("_invalidated"))
             with self._pending_lock:
                 current = (platform_gen == self._platform_gen.get(platform, 0)
                            and key_gen == self._key_gen.get((platform, key), 0))
-            if not current:
+            if not current and not invalidation:
                 self.dropped_invalidated_updates += 1
                 continue
-            if (not data.get("_invalidated")
+            if (not invalidation
                     and now - data.get("_recv_ts", now) > self._dispatch_max_age):
                 self.dropped_expired_updates += 1
                 logger.debug("Dropped %s %s update received %.1fs ago", platform, key,
@@ -453,26 +465,60 @@ class FeedManager:
                 logger.exception("on_price_update failed for %s %s", platform, key)
 
     def _invalidate_updates(self, platform: str, keys: list[str] | None = None) -> None:
-        """Discard queued updates for a platform (or some keys) and bump their generation."""
+        """Discard queued price updates for a platform (or some keys) and bump their generation.
+
+        Queued invalidations are kept: dropping one would leave the caller's
+        cache holding the executable quote it was meant to overwrite.
+        """
         with self._pending_lock:
             if keys is None:
                 self._platform_gen[platform] = self._platform_gen.get(platform, 0) + 1
-                for pending_key in [k for k in self._pending_updates if k[0] == platform]:
-                    del self._pending_updates[pending_key]
+                pending_keys = [k for k in self._pending_updates if k[0] == platform]
             else:
                 for key in keys:
                     self._key_gen[(platform, key)] = self._key_gen.get((platform, key), 0) + 1
-                    self._pending_updates.pop((platform, key), None)
+                pending_keys = [(platform, key) for key in keys if (platform, key) in self._pending_updates]
+            for pending_key in pending_keys:
+                data = self._pending_updates[pending_key][0]
+                if data.get("_invalidated"):
+                    self._pending_updates[pending_key] = (
+                        data, self._platform_gen.get(platform, 0), self._key_gen.get(pending_key, 0))
+                else:
+                    del self._pending_updates[pending_key]
 
-    def _publish_kalshi_invalidation(self, tickers: list[str]) -> None:
-        """Overwrite downstream Kalshi prices for tickers with non-executable ones."""
-        for ticker in tickers:
-            self._emit_price_update("kalshi", ticker, {
-                "market_ticker": ticker,
+    @staticmethod
+    def _invalidation_payload(platform: str, key: str) -> dict:
+        """A price update with no executable price, replacing the caller's cache entry."""
+        if platform == "kalshi":
+            return {
+                "market_ticker": key,
                 "yes_ask": None, "no_ask": None,
                 "yes_ask_size": 0, "no_ask_size": 0,
                 "_invalidated": True,
-            })
+            }
+        return {
+            "event_type": "invalidated",
+            "asset_id": key,
+            "best_ask": None, "best_bid": None,
+            "best_ask_size": 0, "best_bid_size": 0,
+            "_invalidated": True,
+        }
+
+    def _publish_invalidations(self, platform: str, keys) -> None:
+        """Overwrite downstream prices for keys with non-executable ones."""
+        for key in keys:
+            self._emit_price_update(platform, key, self._invalidation_payload(platform, key))
+
+    def _publish_kalshi_invalidation(self, tickers: list[str]) -> None:
+        self._publish_invalidations("kalshi", tickers)
+
+    def _reset_downstream(self, platform: str, book_keys: list[str], publish_invalidation: bool) -> None:
+        """Drop queued prices for a platform; optionally invalidate every key that may be live downstream."""
+        with self._pending_lock:
+            live = set(self._downstream_keys.get(platform, ())) | set(book_keys)
+        self._invalidate_updates(platform)
+        if publish_invalidation and live:
+            self._publish_invalidations(platform, sorted(live))
 
     def _invalidate_kalshi_ticker(self, ticker: str, sid: int | None = None) -> None:
         """Drop one ticker's book and anything queued from it, then publish no prices."""
@@ -731,7 +777,7 @@ class FeedManager:
             except Exception as e:
                 # The connection is gone: nothing from it may be served while
                 # we back off, so drop books and queued updates now.
-                self._reset_kalshi_books(publish_invalidation=True)
+                self._reset_kalshi_books()
                 if self._running:
                     if _ws_metrics:
                         _ws_metrics.inc("ws_reconnections", {"platform": "kalshi"})
@@ -769,7 +815,7 @@ class FeedManager:
             with self._subs_lock:
                 tickers = list(self._kalshi_tickers)
             logger.info("Kalshi connected. Subscribing to %d tickers...", len(tickers))
-            self._reset_kalshi_books(publish_invalidation=True)
+            self._reset_kalshi_books()
 
             # Subscribe to orderbook updates for each ticker
             for ticker in tickers:
@@ -813,14 +859,15 @@ class FeedManager:
             },
         }
 
-    def _reset_kalshi_books(self, publish_invalidation: bool = False):
+    def _reset_kalshi_books(self, publish_invalidation: bool = True):
         """Drop all cached Kalshi book state.
 
         Called on (re)connect and disconnect: after a connection gap the cached
         ladders are stale, and deltas must not be applied until a fresh
-        snapshot arrives. Queued updates from the old connection are discarded;
-        with publish_invalidation, every ticker that had a book gets a
-        non-executable price published downstream.
+        snapshot arrives. Queued price updates from the old connection are
+        discarded (queued invalidations are kept); with publish_invalidation,
+        every ticker that had a book or may hold an executable quote downstream
+        gets a non-executable price published.
         """
         with self._book_lock:
             tickers = list(self._kalshi_books)
@@ -828,20 +875,20 @@ class FeedManager:
             self._kalshi_book_times.clear()
             self._kalshi_seq.clear()
             self._kalshi_sid_ticker.clear()
-        self._invalidate_updates("kalshi")
-        if publish_invalidation and tickers:
-            self._publish_kalshi_invalidation(tickers)
+        self._reset_downstream("kalshi", tickers, publish_invalidation)
 
-    def _reset_poly_books(self):
+    def _reset_poly_books(self, publish_invalidation: bool = True):
         """Drop all cached Polymarket book state.
 
-        Called on (re)connect: after a connection gap the cached books are
-        stale, and fresh book snapshots must arrive.
+        Called on (re)connect and disconnect: after a connection gap the cached
+        books are stale, and fresh book snapshots must arrive. Same downstream
+        invalidation as _reset_kalshi_books.
         """
         with self._book_lock:
+            tokens = list(self._poly_books)
             self._poly_books.clear()
             self._poly_book_times.clear()
-        self._invalidate_updates("polymarket")
+        self._reset_downstream("polymarket", tokens, publish_invalidation)
 
     def _handle_kalshi_message(self, data: dict):
         """Process a Kalshi WebSocket message.

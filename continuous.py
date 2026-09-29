@@ -290,6 +290,26 @@ def _route_kalshi_ws_to_mm_pilot(pilot, platform: str, ticker: str, data: dict,
             logger.debug("MM pilot WS trade route failed: %s", exc)
 
 
+def _route_kalshi_fill_to_mm_pilot(pilot, platform: str, fill: dict) -> None:
+    """Route real-time WebSocket fill event directly to the MM pilot."""
+    if not pilot or platform != "kalshi":
+        return
+    try:
+        pilot.on_ws_fill(fill)
+    except Exception as exc:
+        logger.debug("MM pilot WS fill route failed: %s", exc)
+
+
+def _route_kalshi_order_to_mm_pilot(pilot, platform: str, order: dict) -> None:
+    """Route real-time WebSocket order lifecycle event directly to the MM pilot."""
+    if not pilot or platform != "kalshi":
+        return
+    try:
+        pilot.on_ws_order(order)
+    except Exception as exc:
+        logger.debug("MM pilot WS order route failed: %s", exc)
+
+
 class _WSTriggerDeduper:
     """Thread-safe short cooldown for identical WS-triggered opportunities."""
 
@@ -2097,6 +2117,8 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
         kalshi_api_key_id=kalshi_api_key_id,
         kalshi_private_key_path=kalshi_private_key_path,
         kalshi_private_key_base64=kalshi_private_key_base64,
+        on_fill_update=lambda platform, fill: _route_kalshi_fill_to_mm_pilot(_mm_pilot, platform, fill),
+        on_order_update=lambda platform, order: _route_kalshi_order_to_mm_pilot(_mm_pilot, platform, order),
     )
     # Initialize cross-venue delta-neutral inventory balancer
     from inventory_balancer import get_inventory_balancer

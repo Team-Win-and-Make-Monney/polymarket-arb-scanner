@@ -459,6 +459,8 @@ class KalshiMMPilot:
         self._orders: dict[str, dict] = {}
         self._order_seq = 0
         self.place_order_calls = 0  # test/runtime assertion counter
+        self._ws_fills_received = 0
+        self._ws_orders_received = 0
 
         # Book cache per ticker: parsed levels + raw + freshness.
         self._books: dict[str, dict] = {}
@@ -1544,6 +1546,21 @@ class KalshiMMPilot:
     def pull_market(self, ticker: str, reason: str) -> int:
         """Cancel every resting pilot order in a market (fail closed)."""
         order_ids = [o["order_id"] for o in self.resting_orders(ticker)]
+        import config
+        use_batch = getattr(config, "KALSHI_BATCH_CANCEL_ENABLED", True)
+        if use_batch and self._client is not None and hasattr(self._client, "batch_cancel_orders"):
+            try:
+                if self._client.batch_cancel_orders(ticker=ticker):
+                    with self._lock:
+                        for oid in order_ids:
+                            self._orders.pop(oid, None)
+                    if order_ids:
+                        logger.info("MM pilot batch-pulled %d quotes on %s (%s)",
+                                    len(order_ids), ticker, reason)
+                    return len(order_ids)
+            except Exception as exc:
+                logger.debug("MM pilot batch_cancel_orders failed for %s, falling back: %s", ticker, exc)
+
         for oid in order_ids:
             self._cancel_order(oid)
         if order_ids:
@@ -1553,6 +1570,21 @@ class KalshiMMPilot:
 
     def pull_all(self, reason: str) -> int:
         order_ids = [o["order_id"] for o in self.resting_orders()]
+        import config
+        use_batch = getattr(config, "KALSHI_BATCH_CANCEL_ENABLED", True)
+        if use_batch and self._client is not None and hasattr(self._client, "batch_cancel_orders"):
+            try:
+                if self._client.batch_cancel_orders():
+                    with self._lock:
+                        for oid in order_ids:
+                            self._orders.pop(oid, None)
+                    if order_ids:
+                        logger.warning("MM pilot batch-pulled ALL %d resting orders (%s)",
+                                       len(order_ids), reason)
+                    return len(order_ids)
+            except Exception as exc:
+                logger.debug("MM pilot batch_cancel_orders failed for pull_all, falling back: %s", exc)
+
         for oid in order_ids:
             self._cancel_order(oid)
         if order_ids:
@@ -2292,6 +2324,67 @@ class KalshiMMPilot:
         self._persist_state()
         return events
 
+    def on_ws_fill(self, fill: dict) -> FillEvent | None:
+        """Process a real-time fill event received via WebSocket (<15ms latency).
+
+        Performs immediate fill accounting (inventory, queue position, delta balancer,
+        margin guard, toxicity) without waiting for periodic REST polling.
+        Deduplicates against seen trade_ids so poll_fills (running as fallback) never double counts.
+        """
+        fid = self._fill_id(fill)
+        if fid is None:
+            self.halt_all("fill without trade_id — dedupe unsafe, inventory accounting cannot be trusted")
+            return None
+
+        with self._lock:
+            if fid in self._seen_fill_ids:
+                return None
+            ticker = fill.get("ticker") or fill.get("market_ticker", "")
+            order_id = str(fill.get("order_id", ""))
+            known = order_id in self._orders
+            info = self._orders.get(order_id)
+            pilot_markets = set(self.pilot_tickers())
+
+        if not known:
+            if ticker in pilot_markets:
+                self._mark_seen(fid)
+                self.halt_all(f"fill on unknown order_id {order_id} in pilot market {ticker}")
+                return None
+            # Someone else's market — not ours to account
+            return None
+
+        detect_wall = self._time_fn()
+        detect_mono = self._mono_fn()
+        event = self._build_event(fid, fill, info)
+        if event is None:
+            self._require_reconciliation(f"unparseable fill {fid} on known order {order_id}")
+            return None
+
+        self._mark_seen(fid)
+        self._last_fill_ts = max(self._last_fill_ts, event.created_ts)
+        self._ws_fills_received = getattr(self, "_ws_fills_received", 0) + 1
+
+        self._process_fill(event, info, detect_wall=detect_wall, detect_mono=detect_mono)
+        if not self.halted:
+            self._check_pending_hedges()
+        self._persist_state()
+        return event
+
+    def on_ws_order(self, order: dict) -> None:
+        """Process an order lifecycle update received via WebSocket."""
+        order_id = str(order.get("order_id") or "")
+        status = str(order.get("status") or "").lower()
+        if not order_id:
+            return
+        self._ws_orders_received = getattr(self, "_ws_orders_received", 0) + 1
+        with self._lock:
+            info = self._orders.get(order_id)
+            if info is not None:
+                if status in ("canceled", "cancelled", "executed"):
+                    rem = order.get("remaining_count")
+                    if rem is not None and int(rem) <= 0:
+                        self._orders.pop(order_id, None)
+
     FILL_POLL_FAILURE_LIMIT = 3
 
     def _on_fill_poll_failure(self) -> None:
@@ -2926,6 +3019,10 @@ class KalshiMMPilot:
                 "max_age_seconds": getattr(config, "MM_WS_BOOK_MAX_AGE_SECONDS", 15.0),
                 "ws_updates_count": self._ws_book_updates,
                 "rest_fetches_count": self._rest_book_fetches,
+            },
+            "ws_execution": {
+                "ws_fills_received": getattr(self, "_ws_fills_received", 0),
+                "ws_orders_received": getattr(self, "_ws_orders_received", 0),
             },
             "inventory_skew": {
                 "enabled": getattr(config, "MM_SKEW_SPREAD_ENABLED", True),

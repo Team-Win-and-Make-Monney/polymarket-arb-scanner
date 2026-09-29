@@ -1166,3 +1166,72 @@ class TestFetchIncentivePrograms:
         with patch.object(c, "_request", return_value=_mock_response(200, page)):
             progs = c.fetch_incentive_programs()
         assert progs[0]["period_reward_dollars"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# TestKalshiBatchCancelAndFastExecution
+# ---------------------------------------------------------------------------
+
+
+class TestKalshiBatchCancelAndFastExecution:
+    """Tests for batch order cancellations and dedicated execution session routing."""
+
+    def test_exec_session_initialized_with_pool(self):
+        c = KalshiClient()
+        assert c.exec_session is not None
+        assert c.exec_session != c.session
+        adapter = c.exec_session.adapters.get("https://")
+        assert adapter is not None
+        assert getattr(adapter, "_pool_connections", None) == 5
+        assert getattr(adapter, "_pool_maxsize", None) == 20
+
+    def test_batch_cancel_orders_all_success(self):
+        c = KalshiClient()
+        with patch.object(c, "_request", return_value=_mock_response(200)) as req:
+            result = c.batch_cancel_orders()
+        assert result is True
+        req.assert_called_once_with("DELETE", "/portfolio/events/orders", params={}, is_execution=True)
+
+    def test_batch_cancel_orders_ticker_success(self):
+        c = KalshiClient()
+        with patch.object(c, "_request", return_value=_mock_response(204)) as req:
+            result = c.batch_cancel_orders(ticker="KXTEST-26DEC31")
+        assert result is True
+        req.assert_called_once_with(
+            "DELETE", "/portfolio/events/orders", params={"ticker": "KXTEST-26DEC31"}, is_execution=True,
+        )
+
+    def test_batch_cancel_orders_fallback_legacy(self):
+        c = KalshiClient()
+        resp_404 = _mock_response(404)
+        resp_200 = _mock_response(200)
+        with patch.object(c, "_request", side_effect=[resp_404, resp_200]) as req:
+            result = c.batch_cancel_orders(ticker="KXTEST-A")
+        assert result is True
+        assert req.call_count == 2
+        assert req.call_args_list[0][0] == ("DELETE", "/portfolio/events/orders")
+        assert req.call_args_list[1][0] == ("DELETE", "/portfolio/orders")
+        assert req.call_args_list[1][1]["is_execution"] is True
+
+    def test_batch_cancel_orders_failure(self):
+        c = KalshiClient()
+        with patch.object(c, "_request", return_value=_mock_response(500)):
+            assert c.batch_cancel_orders() is False
+        with patch.object(c, "_request", return_value=None):
+            assert c.batch_cancel_orders() is False
+
+    def test_execution_calls_use_exec_session(self):
+        c = KalshiClient()
+        c.api_key_id = "test-kid"
+        c.private_key = MagicMock()
+        c.private_key.sign.return_value = b"sig"
+        c.session = MagicMock()
+        c.exec_session = MagicMock()
+        c.exec_session.request.return_value = _mock_response(200)
+        c.session.request.return_value = _mock_response(200)
+
+        with patch("kalshi_api._rate_limit"):
+            c.cancel_order("order-123")
+
+        c.exec_session.request.assert_called_once()
+        c.session.request.assert_not_called()

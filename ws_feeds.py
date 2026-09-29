@@ -59,6 +59,10 @@ class FeedManager:
         betfair_app_key: str | None = None,
         betfair_session_token: str | None = None,
         price_cache: dict | None = None,
+        on_fill_update: Callable[[str, dict], None] | None = None,
+        on_order_update: Callable[[str, dict], None] | None = None,
+        on_trade_update: Callable[[str, str, dict], None] | None = None,
+        kalshi_private_channels_enabled: bool | None = None,
     ):
         """
         Args:
@@ -69,8 +73,20 @@ class FeedManager:
             betfair_app_key: Betfair API application key for stream auth
             betfair_session_token: Betfair SSO session token (ssoid)
             price_cache: Optional shared dict for marking stale prices (keyed by (platform, ticker))
+            on_fill_update: Optional callback(platform, fill_record) for private WS fills
+            on_order_update: Optional callback(platform, order_record) for private WS order events
+            on_trade_update: Optional callback(platform, ticker, trade_record) for public market trades
+            kalshi_private_channels_enabled: Optional boolean override for subscribing to private channels
         """
         self.on_price_update = on_price_update
+        self.on_fill_update = on_fill_update
+        self.on_order_update = on_order_update
+        self.on_trade_update = on_trade_update
+        if kalshi_private_channels_enabled is None:
+            from config import KALSHI_WS_PRIVATE_ENABLED
+            self._kalshi_private_channels_enabled = KALSHI_WS_PRIVATE_ENABLED
+        else:
+            self._kalshi_private_channels_enabled = bool(kalshi_private_channels_enabled)
         self._price_cache = price_cache or {}
         self._price_cache_lock = threading.Lock()
         self.kalshi_api_key_id = kalshi_api_key_id
@@ -465,6 +481,18 @@ class FeedManager:
                 }
                 await ws.send(json.dumps(sub_msg))
 
+            # Subscribe to private user channels (fill, user_orders) if authenticated
+            if getattr(self, "_kalshi_private_channels_enabled", True) and self.kalshi_api_key_id:
+                logger.info("Subscribing to Kalshi private WebSocket channels: fill, user_orders")
+                private_sub_msg = {
+                    "id": 2,
+                    "cmd": "subscribe",
+                    "params": {
+                        "channels": ["fill", "user_orders"],
+                    },
+                }
+                await ws.send(json.dumps(private_sub_msg))
+
             self._kalshi_ws = ws
 
             # Read messages with keepalive
@@ -588,6 +616,80 @@ class FeedManager:
             self._last_message_time["kalshi"] = time.time()
             if book is None or book_changed:
                 self.on_price_update("kalshi", ticker, normalised)
+
+        elif msg_type == "fill":
+            self._last_message_time["kalshi"] = time.time()
+            msg = data.get("msg") if isinstance(data.get("msg"), dict) else data
+            ticker = msg.get("market_ticker") or msg.get("ticker", "")
+            trade_id = str(msg.get("trade_id") or "")
+            order_id = str(msg.get("order_id") or "")
+            side = str(msg.get("side") or "yes").lower()
+            action = str(msg.get("action") or "buy").lower()
+            try:
+                count = int(msg.get("count", 0))
+            except (TypeError, ValueError):
+                count = 0
+
+            price = 0.0
+            if "yes_price" in msg and msg.get("yes_price") is not None and side == "yes":
+                price = float(msg["yes_price"]) / 100.0
+            elif "no_price" in msg and msg.get("no_price") is not None and side == "no":
+                price = float(msg["no_price"]) / 100.0
+            elif "price" in msg and msg.get("price") is not None:
+                raw_p = float(msg["price"])
+                price = raw_p / 100.0 if raw_p > 1.0 else raw_p
+
+            fill_record = {
+                "platform": "kalshi",
+                "ticker": ticker,
+                "trade_id": trade_id,
+                "order_id": order_id,
+                "side": side,
+                "action": action,
+                "count": count,
+                "price": price,
+                "yes_price": msg.get("yes_price"),
+                "no_price": msg.get("no_price"),
+                "is_taker": bool(msg.get("is_taker", False)),
+                "ts": float(msg.get("ts") or time.time()),
+                "raw": data,
+            }
+            if self.on_fill_update:
+                try:
+                    self.on_fill_update("kalshi", fill_record)
+                except Exception as exc:
+                    logger.debug("Kalshi on_fill_update callback failed: %s", exc)
+
+        elif msg_type in ("user_orders", "order"):
+            self._last_message_time["kalshi"] = time.time()
+            msg = data.get("msg") if isinstance(data.get("msg"), dict) else data
+            order_record = {
+                "platform": "kalshi",
+                "order_id": str(msg.get("order_id") or ""),
+                "ticker": msg.get("market_ticker") or msg.get("ticker", ""),
+                "status": str(msg.get("status") or ""),
+                "side": str(msg.get("side") or ""),
+                "action": str(msg.get("action") or ""),
+                "count": int(msg.get("count", 0)),
+                "remaining_count": int(msg.get("remaining_count", 0)),
+                "ts": float(msg.get("ts") or time.time()),
+                "raw": data,
+            }
+            if self.on_order_update:
+                try:
+                    self.on_order_update("kalshi", order_record)
+                except Exception as exc:
+                    logger.debug("Kalshi on_order_update callback failed: %s", exc)
+
+        elif msg_type == "trade":
+            self._last_message_time["kalshi"] = time.time()
+            msg = data.get("msg") if isinstance(data.get("msg"), dict) else data
+            ticker = msg.get("market_ticker") or msg.get("ticker", "")
+            if ticker and self.on_trade_update:
+                try:
+                    self.on_trade_update("kalshi", ticker, msg)
+                except Exception as exc:
+                    logger.debug("Kalshi on_trade_update callback failed: %s", exc)
 
     async def _run_polymarket(self):
         """Maintain Polymarket WebSocket connection with auto-reconnect and exponential backoff."""

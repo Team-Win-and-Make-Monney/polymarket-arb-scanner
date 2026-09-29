@@ -648,3 +648,183 @@ class TestKalshiOrderbookSemantics:
         # The cached book should now be invalidated so callers fall back to REST
         assert fm.get_polymarket_orderbook("tok_poly_1") is None
         assert fm.get_polymarket_orderbook_age("tok_poly_1") is None
+
+
+# ---------------------------------------------------------------------------
+# TestKalshiPrivateWSChannels
+# ---------------------------------------------------------------------------
+
+
+class TestKalshiPrivateWSChannels:
+    """Tests for private channel subscriptions and fill/order/trade WebSocket message routing."""
+
+    def test_connect_kalshi_sends_private_channel_subscription(self):
+        from unittest.mock import AsyncMock, patch
+        import json
+
+        cb = MagicMock()
+        fm = FeedManager(
+            on_price_update=cb,
+            kalshi_api_key_id="test-kid",
+            kalshi_private_channels_enabled=True,
+        )
+        fm.kalshi_private_key = MagicMock()
+        fm._kalshi_tickers = ["KXTEST-A"]
+        fm._running = False  # Exit message loop immediately
+
+        mock_ws = MagicMock()
+        mock_ws.send = AsyncMock()
+
+        class FakeWsConnect:
+            async def __aenter__(self):
+                return mock_ws
+
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                return None
+
+        with patch("websockets.connect", return_value=FakeWsConnect()):
+            asyncio.run(fm._connect_kalshi())
+
+        assert mock_ws.send.call_count == 2
+        call1 = json.loads(mock_ws.send.call_args_list[0][0][0])
+        call2 = json.loads(mock_ws.send.call_args_list[1][0][0])
+        assert call1["params"]["channels"] == ["orderbook_delta"]
+        assert call2["params"]["channels"] == ["fill", "user_orders"]
+
+    def test_connect_kalshi_skips_private_channels_when_disabled(self):
+        from unittest.mock import AsyncMock, patch
+        import json
+
+        cb = MagicMock()
+        fm = FeedManager(
+            on_price_update=cb,
+            kalshi_api_key_id="test-kid",
+            kalshi_private_channels_enabled=False,
+        )
+        fm.kalshi_private_key = MagicMock()
+        fm._kalshi_tickers = ["KXTEST-A"]
+        fm._running = False
+
+        mock_ws = MagicMock()
+        mock_ws.send = AsyncMock()
+
+        class FakeWsConnect:
+            async def __aenter__(self):
+                return mock_ws
+
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                return None
+
+        with patch("websockets.connect", return_value=FakeWsConnect()):
+            asyncio.run(fm._connect_kalshi())
+
+        assert mock_ws.send.call_count == 1
+        call1 = json.loads(mock_ws.send.call_args_list[0][0][0])
+        assert call1["params"]["channels"] == ["orderbook_delta"]
+
+    def test_handle_fill_message_routes_to_on_fill_update(self):
+        on_fill = MagicMock()
+        fm = FeedManager(on_price_update=MagicMock(), on_fill_update=on_fill)
+
+        fill_data = {
+            "type": "fill",
+            "msg": {
+                "market_ticker": "KXTEST-26DEC31",
+                "trade_id": "tr_12345",
+                "order_id": "ord_999",
+                "side": "yes",
+                "action": "buy",
+                "count": 10,
+                "yes_price": 48,
+                "no_price": 52,
+                "is_taker": False,
+                "ts": 1727500000.0,
+            },
+        }
+        fm._handle_kalshi_message(fill_data)
+
+        on_fill.assert_called_once()
+        platform, record = on_fill.call_args[0]
+        assert platform == "kalshi"
+        assert record["ticker"] == "KXTEST-26DEC31"
+        assert record["trade_id"] == "tr_12345"
+        assert record["order_id"] == "ord_999"
+        assert record["side"] == "yes"
+        assert record["action"] == "buy"
+        assert record["count"] == 10
+        assert record["price"] == 0.48
+        assert record["is_taker"] is False
+
+    def test_handle_fill_message_no_side_price(self):
+        on_fill = MagicMock()
+        fm = FeedManager(on_price_update=MagicMock(), on_fill_update=on_fill)
+
+        fill_data = {
+            "type": "fill",
+            "msg": {
+                "ticker": "KXTEST-26DEC31",
+                "trade_id": "tr_12346",
+                "order_id": "ord_1000",
+                "side": "no",
+                "action": "buy",
+                "count": 5,
+                "no_price": 55,
+                "is_taker": True,
+            },
+        }
+        fm._handle_kalshi_message(fill_data)
+
+        on_fill.assert_called_once()
+        _, record = on_fill.call_args[0]
+        assert record["ticker"] == "KXTEST-26DEC31"
+        assert record["side"] == "no"
+        assert record["price"] == 0.55
+        assert record["is_taker"] is True
+
+    def test_handle_user_orders_message_routes_to_on_order_update(self):
+        on_order = MagicMock()
+        fm = FeedManager(on_price_update=MagicMock(), on_order_update=on_order)
+
+        order_data = {
+            "type": "user_orders",
+            "msg": {
+                "order_id": "ord_1001",
+                "market_ticker": "KXTEST-26DEC31",
+                "status": "executed",
+                "side": "yes",
+                "action": "buy",
+                "count": 10,
+                "remaining_count": 0,
+            },
+        }
+        fm._handle_kalshi_message(order_data)
+
+        on_order.assert_called_once()
+        platform, record = on_order.call_args[0]
+        assert platform == "kalshi"
+        assert record["order_id"] == "ord_1001"
+        assert record["ticker"] == "KXTEST-26DEC31"
+        assert record["status"] == "executed"
+        assert record["remaining_count"] == 0
+
+    def test_handle_trade_message_routes_to_on_trade_update(self):
+        on_trade = MagicMock()
+        fm = FeedManager(on_price_update=MagicMock(), on_trade_update=on_trade)
+
+        trade_data = {
+            "type": "trade",
+            "msg": {
+                "market_ticker": "KXTEST-26DEC31",
+                "price": 50,
+                "count": 20,
+                "yes_price": 50,
+                "no_price": 50,
+            },
+        }
+        fm._handle_kalshi_message(trade_data)
+
+        on_trade.assert_called_once()
+        platform, ticker, msg = on_trade.call_args[0]
+        assert platform == "kalshi"
+        assert ticker == "KXTEST-26DEC31"
+        assert msg["count"] == 20

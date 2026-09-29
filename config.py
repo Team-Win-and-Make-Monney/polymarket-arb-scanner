@@ -859,6 +859,11 @@ MM_MAX_QUEUE_AHEAD = _env_int("MM_MAX_QUEUE_AHEAD", "100")
 MM_MIN_FILL_PROBABILITY = _env_float("MM_MIN_FILL_PROBABILITY", "0.05")
 MM_FILL_PROB_HORIZON_SEC = _env_float("MM_FILL_PROB_HORIZON_SEC", "30.0")
 
+# Private WebSocket Execution & Fast-Fill Stream (Sub-15ms Latency Alpha)
+KALSHI_WS_PRIVATE_ENABLED = _env_bool("KALSHI_WS_PRIVATE_ENABLED", "true")
+KALSHI_BATCH_CANCEL_ENABLED = _env_bool("KALSHI_BATCH_CANCEL_ENABLED", "true")
+KALSHI_FAST_EXECUTION_ENABLED = _env_bool("KALSHI_FAST_EXECUTION_ENABLED", "true")
+
 
 # Kill switch / control plane (spec section 7). Fail closed: a cache older
 # than MM_CONTROLS_MAX_STALE_SECONDS means unknown operator intent = off.

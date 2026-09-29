@@ -145,6 +145,8 @@ The collector is read-only. Its transport allows only `GET` on `/portfolio/fills
   - Polymarket: status `matched` with a valid `takingAmount` (shares received on a BUY).
   - The quantity must be finite, positive and at most the order size, and it is kept exact, fractions included.
   - A canceled, unmatched, resting, delayed or ambiguous response writes no fill row and moves no inventory. The requested size is never assumed filled. A real fill on such an order then shows as `missing_in_ledger` rather than being guessed.
+  - A response the venue confirms as unfilled (Kalshi canceled or rejected with no fill, Polymarket `unmatched`) writes nothing. Any other unconfirmed response is logged as a `pending` trade with its order id, and crash recovery (`recovery.py`) reconciles it against the venue at startup. That market takes no further live rebalance until the row leaves `pending`. An order that can't be logged (no order id, or a failed write) blocks its market in memory until restart. A failed lookup of pending rows also blocks.
+  - Recovery's existing rules decide the outcome: `filled` when the venue reports it executed or matched, with no `fill_qty`, so it reconciles as incomplete; `failed` when canceled; `orphaned`, and then a hedge record, when the status is unknown; still `pending` while it rests.
 
 Run it as its own process with the existing credentials. It prints JSON and writes only with `--write`:
 

@@ -727,6 +727,17 @@ class TradeDB:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def get_pending_trades_by_type(self, opp_type: str) -> list[dict]:
+        """Pending trades whose opportunity has ``opp_type``, each with that opportunity's ``market``."""
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT t.*, o.market AS market FROM trades t
+                   JOIN opportunities o ON o.id = t.opportunity_id
+                   WHERE t.status = 'pending' AND o.type = ? ORDER BY t.id""",
+                (opp_type,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     def get_open_positions_with_trades(self) -> list[dict]:
         """Get open positions with their associated trade order IDs.
 

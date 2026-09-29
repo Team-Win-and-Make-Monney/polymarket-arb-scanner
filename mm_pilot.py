@@ -23,11 +23,13 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 
 from url_guard import assert_public_url
 from kalshi_lip import LIPScoreTracker
@@ -58,7 +60,7 @@ class FillEvent:
     ticker: str
     side: str            # "yes" | "no"
     action: str          # "buy" | "sell"
-    count: int           # contracts
+    count: float         # contracts; Kalshi count_fp allows 0.01 fractions
     price: float         # yes-price in dollars 0.01-0.99
     is_taker: bool       # True should never happen for resting quotes
     created_ts: float
@@ -71,6 +73,87 @@ class GateResult:
 
     allowed: bool
     reason: str
+
+
+# ---------------------------------------------------------------------------
+# Fill field parsing (Kalshi Fill schema: count_fp, yes/no_price_dollars)
+# ---------------------------------------------------------------------------
+
+_QTY_STEP = Decimal("0.01")  # Kalshi fixed-point contract counts have 2 decimals
+
+
+def _round_qty(value: float) -> float:
+    """Round a contract quantity to Kalshi's 0.01 step (clears float residue)."""
+    return round(value, 2)
+
+
+def _finite_decimal(raw) -> Decimal | None:
+    """Parse a numeric string/number as a finite Decimal; None when invalid.
+
+    bool is rejected: ``True`` must never read as one contract.
+    """
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        value = Decimal(str(raw).strip())
+    except (InvalidOperation, ValueError):
+        return None
+    return value if value.is_finite() else None
+
+
+def parse_fill_quantity(fill: dict) -> tuple[float | None, str]:
+    """Contracts filled, from ``count_fp`` (current schema) or legacy ``count``.
+
+    ``count_fp`` must be finite, positive and a multiple of 0.01. Legacy
+    ``count`` must be a positive whole number. When both are present they
+    must agree. Returns ``(quantity, "")`` or ``(None, reason)``; the caller
+    refuses the fill rather than guess.
+    """
+    has_fp = fill.get("count_fp") is not None
+    has_legacy = fill.get("count") is not None
+    if not has_fp and not has_legacy:
+        return None, "no count_fp or count"
+    fp = legacy = None
+    if has_fp:
+        fp = _finite_decimal(fill.get("count_fp"))
+        if fp is None or fp <= 0 or fp % _QTY_STEP != 0:
+            return None, f"invalid count_fp {fill.get('count_fp')!r}"
+    if has_legacy:
+        legacy = _finite_decimal(fill.get("count"))
+        if legacy is None or legacy <= 0 or legacy != legacy.to_integral_value():
+            return None, f"invalid count {fill.get('count')!r}"
+    if fp is not None and legacy is not None and fp != legacy:
+        return None, f"count_fp {fill.get('count_fp')!r} disagrees with count {fill.get('count')!r}"
+    return float(fp if fp is not None else legacy), ""
+
+
+def parse_fill_yes_price(fill: dict) -> tuple[float | None, str]:
+    """YES price in dollars from ``yes_price_dollars``/``no_price_dollars``.
+
+    Falls back to the legacy integer-cent ``yes_price``/``no_price``. The
+    price must be finite and strictly between 0 and 1; when both dollar
+    fields are present they must sum to 1.
+    """
+    yes_raw = fill.get("yes_price_dollars")
+    no_raw = fill.get("no_price_dollars")
+    if yes_raw is None and no_raw is None:
+        from kalshi_vip import fill_price_dollars
+        price = fill_price_dollars(fill)
+        if price is None or not math.isfinite(price):
+            return None, "no price"
+        if not 0.0 < price < 1.0:
+            return None, f"price {price!r} out of range"
+        return price, ""
+    yes = _finite_decimal(yes_raw) if yes_raw is not None else None
+    no = _finite_decimal(no_raw) if no_raw is not None else None
+    if (yes_raw is not None and yes is None) or (no_raw is not None and no is None):
+        return None, f"invalid price yes={yes_raw!r} no={no_raw!r}"
+    if yes is not None and no is not None and yes + no != 1:
+        return None, f"yes {yes_raw!r} and no {no_raw!r} do not sum to 1"
+    price = yes if yes is not None else 1 - no
+    if not 0 < price < 1:
+        return None, f"price {price} out of range"
+    return float(price), ""
 
 
 def _parse_created_ts(fill: dict, fallback: float) -> float:
@@ -100,21 +183,26 @@ class PilotInventory:
     """
 
     def __init__(self):
-        self._net: dict[str, int] = {}       # ticker -> signed contracts
+        self._net: dict[str, float] = {}     # ticker -> signed contracts (0.01 steps)
         self._avg: dict[str, float] = {}     # ticker -> avg cost/contract (direction terms)
         self._realized: dict[str, float] = {}
         self._lock = threading.Lock()
 
     @staticmethod
-    def signed_contracts(side: str, action: str, count: int) -> int:
+    def signed_contracts(side: str, action: str, count: float) -> float:
         """YES-equivalent signed contract delta for a fill."""
         positive = (side == "yes") == (action == "buy")
         return count if positive else -count
 
-    def apply_fill(self, ticker: str, side: str, action: str, count: int,
+    def apply_fill(self, ticker: str, side: str, action: str, count: float,
                    yes_price: float) -> float:
-        """Apply a fill; returns realized P&L delta (0.0 when accumulating)."""
-        delta = self.signed_contracts(side, action, count)
+        """Apply a fill; returns realized P&L delta (0.0 when accumulating).
+
+        Quantities may be fractional (0.01 steps) and are rounded to that
+        step after each change, so float residue never leaves a phantom
+        position or flips a sign.
+        """
+        delta = _round_qty(self.signed_contracts(side, action, count))
         with self._lock:
             net = self._net.get(ticker, 0)
             avg = self._avg.get(ticker, 0.0)
@@ -125,8 +213,8 @@ class PilotInventory:
                 reduce_ct = min(abs(remaining), abs(net))
                 exit_price = yes_price if net > 0 else (1.0 - yes_price)
                 realized = (exit_price - avg) * reduce_ct
-                net += reduce_ct if remaining > 0 else -reduce_ct
-                remaining += reduce_ct if remaining < 0 else -reduce_ct
+                net = _round_qty(net + (reduce_ct if remaining > 0 else -reduce_ct))
+                remaining = _round_qty(remaining + (reduce_ct if remaining < 0 else -reduce_ct))
                 if net == 0:
                     avg = 0.0
             if remaining != 0:
@@ -135,13 +223,13 @@ class PilotInventory:
                 total_ct = abs(net) + abs(remaining)
                 avg = ((abs(net) * avg + abs(remaining) * dir_price) / total_ct
                        if total_ct else 0.0)
-                net += remaining
+                net = _round_qty(net + remaining)
             self._net[ticker] = net
             self._avg[ticker] = avg
             self._realized[ticker] = self._realized.get(ticker, 0.0) + realized
             return realized
 
-    def net_contracts(self, ticker: str) -> int:
+    def net_contracts(self, ticker: str) -> float:
         with self._lock:
             return self._net.get(ticker, 0)
 
@@ -180,7 +268,7 @@ class PilotInventory:
     def restore(self, snap: dict) -> None:
         """Restore a snapshot() payload (restart reconciliation)."""
         with self._lock:
-            self._net = {t: int(v) for t, v in (snap.get("net") or {}).items()}
+            self._net = {t: _round_qty(float(v)) for t, v in (snap.get("net") or {}).items()}
             self._avg = {t: float(v) for t, v in (snap.get("avg") or {}).items()}
             self._realized = {t: float(v)
                               for t, v in (snap.get("realized") or {}).items()}
@@ -1071,7 +1159,7 @@ class KalshiMMPilot:
             self._reconciled = False
             return False
 
-        net_map: dict[str, int] = {}
+        net_map: dict[str, float] = {}
         avg_map: dict[str, float] = {}
         for pos in positions or []:
             ticker = pos.get("ticker", "")
@@ -1086,14 +1174,16 @@ class KalshiMMPilot:
             # the bug this reconciliation exists to fix: it would report
             # "reconciled successfully" while still seeding from a wrong
             # zero baseline.
-            try:
-                net = int(float(pos.get("position_fp", 0) or 0))
-            except (TypeError, ValueError):
+            raw_pos = pos.get("position_fp", 0)
+            parsed = _finite_decimal(raw_pos if raw_pos not in (None, "") else 0)
+            if parsed is None:
+                # Non-numeric, NaN or infinite: never seed a guessed position.
                 logger.error("MM pilot reconcile: unparsable position_fp %r "
                              "for %s — fail closed",
                              pos.get("position_fp"), ticker)
                 self._reconciled = False
                 return False
+            net = _round_qty(float(parsed))
             if net == 0:
                 continue
             net_map[ticker] = net
@@ -1318,7 +1408,9 @@ class KalshiMMPilot:
                 unit_delta = PilotInventory.signed_contracts(
                     side, action, 1)
                 if net_ct != 0 and (unit_delta > 0) != (net_ct > 0):
-                    count = min(count, abs(net_ct))
+                    # Orders are whole contracts: floor a fractional
+                    # position so a reduce never exceeds what is held.
+                    count = min(count, int(abs(net_ct)))
             signed = PilotInventory.signed_contracts(side, action, count)
             derived_reducing = (
                 net_ct != 0
@@ -1949,7 +2041,7 @@ class KalshiMMPilot:
             is_accumulating = (comb_ct == 0) or (abs(comb_ct + signed_unit) > abs(comb_ct))
 
             if is_accumulating:
-                inv_ct_headroom = max(0, config.MM_MAX_INVENTORY_CONTRACTS - abs(net_ct))
+                inv_ct_headroom = max(0, int(config.MM_MAX_INVENTORY_CONTRACTS - abs(net_ct)))
                 inv_usd_headroom = int(max(0.0, config.MM_MAX_INVENTORY_USD - net_usd) / price)
                 inv_tot_headroom = int(max(0.0, config.MM_MAX_TOTAL_INVENTORY_USD - self.inventory.total_net_usd()) / price)
                 gross_avail = config.MM_MAX_GROSS_PER_MARKET_USD - (abs(self.inventory.net_usd(ticker)) + self._resting_notional(ticker))
@@ -2223,19 +2315,17 @@ class KalshiMMPilot:
             self.halt_market(ticker, "hedge order unfilled past latency ceiling")
 
     def _build_event(self, fid: str, fill: dict, info: dict) -> FillEvent | None:
-        from kalshi_vip import fill_price_dollars
-        price = fill_price_dollars(fill)
+        """Parse a fill for a known order; None (caller fails closed) when invalid."""
+        price, reason = parse_fill_yes_price(fill)
         if price is None:
-            logger.warning("MM pilot fill %s has no price — ignored", fid)
+            logger.warning("MM pilot fill %s refused: %s", fid, reason)
+            return None
+        count, reason = parse_fill_quantity(fill)
+        if count is None:
+            logger.warning("MM pilot fill %s refused: %s", fid, reason)
             return None
         book = self._book(info["ticker"])
         mid = (book or {}).get("mid") or price
-        try:
-            count = int(fill.get("count", 0))
-        except (TypeError, ValueError):
-            count = 0
-        if count <= 0:
-            return None
         return FillEvent(
             fill_id=fid,
             order_id=str(fill.get("order_id", "")),
@@ -2280,7 +2370,7 @@ class KalshiMMPilot:
         with self._lock:
             live = self._orders.get(event.order_id)
             if live is not None:
-                live["count"] -= event.count
+                live["count"] = _round_qty(live["count"] - event.count)
                 if live["count"] <= 0:
                     self._orders.pop(event.order_id, None)
 
@@ -2510,7 +2600,8 @@ class KalshiMMPilot:
                     # reduce order must never be sized past the position it
                     # is reducing, regardless of how far price has moved
                     # since entry (finding #5).
-                    max_contracts=abs(net_ct),
+                    # Whole contracts only: floor a fractional position.
+                    max_contracts=int(abs(net_ct)),
                 )
             except Exception as exc:
                 success = False

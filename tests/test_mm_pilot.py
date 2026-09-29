@@ -1140,6 +1140,30 @@ class TestReconciliation:
 # while reducing=True bypassed inventory caps entirely.
 # ---------------------------------------------------------------------------
 
+class TestFixedPointPositionReconciliation:
+    def _direct_pilot(self, clock, client):
+        return TestReconciliation()._direct_pilot(clock, client)
+
+    def test_fractional_position_is_seeded_exactly(self, pilot_env, clock):
+        client = FakeKalshiClient()
+        client.positions_script = [
+            {"ticker": TICKER, "position_fp": "2.50",
+             "market_exposure_dollars": 1.10},
+        ]
+        pilot = self._direct_pilot(clock, client)
+        assert pilot.reconcile() is True
+        assert pilot.inventory.net_contracts(TICKER) == 2.5
+        assert pilot.inventory.avg_cost(TICKER) == pytest.approx(0.44)
+
+    @pytest.mark.parametrize("raw", ["NaN", "Infinity", "-Infinity", True])
+    def test_non_finite_position_fails_closed(self, pilot_env, clock, raw):
+        client = FakeKalshiClient()
+        client.positions_script = [{"ticker": TICKER, "position_fp": raw}]
+        pilot = self._direct_pilot(clock, client)
+        assert pilot.reconcile() is False
+        assert pilot._reconciled is False
+
+
 class TestHedgeSizeClamp:
     def test_hedge_on_fill_passes_actual_position_as_max_contracts(
             self, pilot_env, clock, monkeypatch):
@@ -1159,6 +1183,174 @@ class TestHedgeSizeClamp:
         assert hedger.calls  # hedge fired
         call = hedger.calls[-1]
         assert call["max_contracts"] == 20  # abs(net_contracts), not a guess
+
+
+def fpfill(order_id, count_fp="4.00", yes_price_dollars="0.4900",
+           no_price_dollars=None, ticker=TICKER, fill_id=None, **extra):
+    """A fill in Kalshi's current Fill schema: count_fp and *_price_dollars
+    strings, no integer ``count`` or cent ``yes_price``."""
+    fid = fill_id or f"f_{order_id}_{count_fp}"
+    fill = {
+        "fill_id": fid, "trade_id": fid, "order_id": order_id,
+        "ticker": ticker, "market_ticker": ticker, "side": "yes",
+        "action": "buy", "count_fp": count_fp, "is_taker": False,
+        "fee_cost": "0.0000",
+    }
+    if yes_price_dollars is not None:
+        fill["yes_price_dollars"] = yes_price_dollars
+    if no_price_dollars is not None:
+        fill["no_price_dollars"] = no_price_dollars
+    fill.update(extra)
+    return fill
+
+
+class TestFixedPointFills:
+    """Kalshi's Fill schema carries count_fp (2-decimal string, fractions
+    allowed) and yes/no_price_dollars. Fail-before: _build_event read only
+    integer ``count`` and cent ``yes_price``, so every current-schema fill
+    was refused and forced reconciliation."""
+
+    def _placed(self, clock, count=4, price=0.49, client=None):
+        client = client or FakeKalshiClient()
+        pilot = build_pilot(clock, client=client)
+        oid = pilot.place_pilot_order(TICKER, "yes", "buy", count, price,
+                                      purpose="quote_bid")
+        assert oid is not None
+        return pilot, client, oid
+
+    def test_current_schema_fill_is_accounted(self, pilot_env, clock):
+        pilot, client, oid = self._placed(clock)
+        client.fills_script = [fpfill(oid, "4.00", "0.4900", "0.5100")]
+        events = pilot.poll_fills()
+        assert len(events) == 1
+        assert events[0].count == 4.0
+        assert events[0].price == pytest.approx(0.49)
+        assert pilot.inventory.net_contracts(TICKER) == 4.0
+        assert pilot._reconciled is True and not pilot.halted
+
+    def test_fractional_fill_is_carried_exactly(self, pilot_env, clock):
+        pilot, client, oid = self._placed(clock)
+        client.fills_script = [fpfill(oid, "1.25", "0.4900")]
+        events = pilot.poll_fills()
+        assert events[0].count == 1.25
+        assert pilot.inventory.net_contracts(TICKER) == 1.25
+        assert pilot.inventory.net_usd(TICKER) == pytest.approx(1.25 * 0.49)
+        assert pilot._orders[oid]["count"] == 2.75  # remainder still resting
+
+    def test_fractional_partials_close_the_order_exactly(self, pilot_env, clock):
+        pilot, client, oid = self._placed(clock, count=1)
+        client.fills_script = [fpfill(oid, "0.30", "0.4900", fill_id="a"),
+                               fpfill(oid, "0.70", "0.4900", fill_id="b")]
+        assert len(pilot.poll_fills()) == 2
+        assert oid not in pilot._orders  # no 1e-16 residue keeps it "resting"
+        assert pilot.inventory.net_contracts(TICKER) == 1.0
+
+    def test_no_price_only_is_converted_to_yes_price(self, pilot_env, clock):
+        pilot, client, oid = self._placed(clock)
+        client.fills_script = [fpfill(oid, "4.00", None, "0.5100")]
+        events = pilot.poll_fills()
+        assert events[0].price == pytest.approx(0.49)
+
+    def test_side_and_action_fall_back_to_the_order(self, pilot_env, clock):
+        pilot, client, oid = self._placed(clock)
+        fill = fpfill(oid, "2.00", "0.4900")
+        del fill["side"], fill["action"]
+        client.fills_script = [fill]
+        events = pilot.poll_fills()
+        assert (events[0].side, events[0].action) == ("yes", "buy")
+        assert pilot.inventory.net_contracts(TICKER) == 2.0
+
+    @pytest.mark.parametrize("fields", [
+        {"count_fp": "0.00"},
+        {"count_fp": "-1.00"},
+        {"count_fp": "NaN"},
+        {"count_fp": "Infinity"},
+        {"count_fp": "1.005"},
+        {"count_fp": "abc"},
+        {"count_fp": ""},
+        {"count_fp": True},
+        {"count_fp": None, "count": 1.5},
+        {"count_fp": None, "count": 0},
+        {"count_fp": None, "count": True},
+        {"count_fp": None, "count": "nan"},
+        {"count_fp": None},
+        {"count_fp": "2.00", "count": 3},
+        {"yes_price_dollars": "NaN"},
+        {"yes_price_dollars": "1.0000"},
+        {"yes_price_dollars": "0.0000"},
+        {"yes_price_dollars": "0.4900", "no_price_dollars": "0.5000"},
+        {"yes_price_dollars": None},
+        {"yes_price_dollars": None, "yes_price": 0},
+    ])
+    def test_invalid_fill_is_refused_and_forces_reconciliation(
+            self, pilot_env, clock, fields):
+        pilot, client, oid = self._placed(clock)
+        fill = fpfill(oid, "4.00", "0.4900")
+        for key, value in fields.items():
+            if value is None:
+                fill.pop(key, None)
+            else:
+                fill[key] = value
+        client.fills_script = [fill]
+        assert pilot.poll_fills() == []
+        assert pilot.inventory.net_contracts(TICKER) == 0
+        assert pilot._reconciled is False and pilot.halted
+        assert oid in client.cancelled  # the halt pulled the resting quote
+
+    def test_agreeing_count_fp_and_legacy_count_are_accepted(self, pilot_env,
+                                                             clock):
+        pilot, client, oid = self._placed(clock)
+        client.fills_script = [fpfill(oid, "3.00", "0.4900", count=3)]
+        assert pilot.poll_fills()[0].count == 3.0
+
+    def test_legacy_cent_price_still_accepted_with_count_fp(self, pilot_env,
+                                                            clock):
+        pilot, client, oid = self._placed(clock)
+        client.fills_script = [fpfill(oid, "4.00", None, yes_price=49)]
+        assert pilot.poll_fills()[0].price == pytest.approx(0.49)
+
+    def test_fractional_round_trip_leaves_no_phantom_position(self, pilot_env,
+                                                              clock):
+        pilot = build_pilot(clock, client=FakeKalshiClient())
+        inv = pilot.inventory
+        inv.apply_fill(TICKER, "yes", "buy", 0.10, 0.49)
+        inv.apply_fill(TICKER, "yes", "buy", 0.20, 0.49)
+        assert inv.net_contracts(TICKER) == 0.30  # not 0.30000000000000004
+        inv.apply_fill(TICKER, "yes", "sell", 0.30, 0.52)
+        assert inv.net_contracts(TICKER) == 0
+        assert inv.tickers_with_inventory() == []
+        assert inv.realized_pnl_total() == pytest.approx(0.30 * 0.03)
+
+    def test_snapshot_restore_keeps_fractions(self, pilot_env, clock):
+        pilot = build_pilot(clock, client=FakeKalshiClient())
+        pilot.inventory.apply_fill(TICKER, "yes", "buy", 1.25, 0.49)
+        snap = json.loads(json.dumps(pilot.inventory.snapshot()))
+        other = build_pilot(clock, client=FakeKalshiClient())
+        other.inventory.restore(snap)
+        assert other.inventory.net_contracts(TICKER) == 1.25
+
+    def test_reduce_order_floors_a_fractional_position(self, pilot_env, clock):
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client)
+        pilot.inventory.apply_fill(TICKER, "yes", "buy", 2.5, 0.49)
+        oid = pilot.place_pilot_order(TICKER, "yes", "sell", 50, 0.49,
+                                      purpose="hedge", reducing=True)
+        assert oid is not None
+        assert client.placed[-1]["count"] == 2  # never 2.5, never above held
+
+    def test_hedge_ceiling_is_whole_contracts_below_position(
+            self, pilot_env, clock, monkeypatch):
+        monkeypatch.setattr(live_config(), "MM_CANARY_QUOTE_SIZE_USD", 100.0)
+        hedger = RecordingHedger(result=True)
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client, hedger=hedger)
+        oid = pilot.place_pilot_order(TICKER, "yes", "buy", 21, 0.50,
+                                      purpose="quote_bid")
+        client.fills_script = [fpfill(oid, "20.50", "0.5000")]
+        pilot.poll_fills()
+        assert hedger.calls
+        assert hedger.calls[-1]["max_contracts"] == 20
+        assert isinstance(hedger.calls[-1]["max_contracts"], int)
 
 
 class TestHedgeKalshiContractClamp:

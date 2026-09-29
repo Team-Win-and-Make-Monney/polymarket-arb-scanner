@@ -2172,6 +2172,14 @@ class KalshiMMPilot:
                     self._record_lip_snapshot(ticker)
                     return []
 
+                # If the quote was cancelled because it was buried in queue or had low fill
+                # probability, do not immediately re-create another quote at the same level.
+                if preserve_reason.startswith(("buried_in_queue", "low_fill_probability")):
+                    if is_bid:
+                        skip_bid = True
+                    else:
+                        skip_ask = True
+
         placed: list[str] = []
         if bid_count >= 1 and not skip_bid:
             oid = self.place_pilot_order(ticker, side="yes", action="buy",

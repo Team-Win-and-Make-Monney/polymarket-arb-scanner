@@ -90,7 +90,7 @@ class QueuePositionTracker:
         self._last_book_snapshots: dict[str, dict] = {}  # ticker -> parsed orderbook
         self._preserved_count = 0
         self._replaced_count = 0
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def _normalize_book(self, book: dict | None) -> dict | None:
         """Ensure book is a parsed dict with 'yes_bids' and 'no_bids'."""
@@ -365,7 +365,7 @@ class QueuePositionTracker:
 
             # Size check: count difference must be within resize tolerance
             diff = abs(order.count - target_count)
-            tolerance = max(1, int(order.count * self.resize_tolerance))
+            tolerance = int(order.count * self.resize_tolerance)
             if diff > tolerance:
                 self._replaced_count += 1
                 return (

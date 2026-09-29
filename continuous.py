@@ -268,6 +268,27 @@ def _route_kalshi_ws_to_mm_pilot(pilot, platform: str, ticker: str, data: dict,
         except Exception as exc:
             logger.debug("MM pilot WS feed failed: %s", exc)
 
+    # Trade prints: route to pilot.on_ws_trade to deplete queue ahead
+    trade_data = data.get("trade")
+    if trade_data and isinstance(trade_data, dict):
+        try:
+            t_price = float(trade_data.get("price", trade_data.get("yes_price", 0.0)))
+            t_count = int(trade_data.get("count", trade_data.get("size", 1)))
+            t_ts = trade_data.get("ts", trade_data.get("created_time"))
+            if t_price > 0 and t_count > 0:
+                pilot.on_ws_trade(ticker, t_price, t_count, timestamp=t_ts)
+        except Exception as exc:
+            logger.debug("MM pilot WS trade route failed: %s", exc)
+    elif data.get("type") == "trade" or data.get("event") == "trade":
+        try:
+            t_price = float(data.get("price", data.get("yes_price", 0.0)))
+            t_count = int(data.get("count", data.get("size", 1)))
+            t_ts = data.get("ts", data.get("created_time"))
+            if t_price > 0 and t_count > 0:
+                pilot.on_ws_trade(ticker, t_price, t_count, timestamp=t_ts)
+        except Exception as exc:
+            logger.debug("MM pilot WS trade route failed: %s", exc)
+
 
 class _WSTriggerDeduper:
     """Thread-safe short cooldown for identical WS-triggered opportunities."""

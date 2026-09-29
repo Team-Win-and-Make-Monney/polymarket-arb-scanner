@@ -884,7 +884,7 @@ class TestQueueTrackerConfig:
         _reload_config()
 
     def test_queue_tracker_defaults(self):
-        import config as cfg
+        cfg = _reload_config()
         assert cfg.MM_QUEUE_TRACKER_ENABLED is True
         assert cfg.MM_QUEUE_PRESERVATION_ENABLED is True
         assert cfg.MM_QUEUE_RESIZE_TOLERANCE == 0.20

@@ -6,15 +6,10 @@ fill probability estimation, queue preservation decisions, and MM pilot integrat
 
 from __future__ import annotations
 
-import logging
-from unittest.mock import MagicMock
-
 import pytest
 
-from kalshi_api import parse_orderbook
-from mm_pilot import KalshiMMPilot
-from queue_tracker import QueuePosition, QueuePositionTracker
-from tests.test_mm_pilot import FakeKalshiClient, TICKER, build_pilot, kfill, make_book, live_config
+from queue_tracker import QueuePositionTracker
+from tests.test_mm_pilot import FakeKalshiClient, TICKER, build_pilot, make_book, live_config
 
 
 @pytest.fixture
@@ -387,3 +382,40 @@ class TestQueueTrackerPilotIntegration:
         q_stat = status["queue_tracker"]
         assert q_stat["enabled"] is True
         assert q_stat["active_orders_count"] == 2
+
+    def test_continuous_routes_ws_trade_to_pilot(self, pilot_env, clock) -> None:
+        from continuous import _route_kalshi_ws_to_mm_pilot
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.49, no_bid=0.49, yes_qty=50.0, no_qty=50.0)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        pilot.refresh_market(TICKER)
+
+        ws_msg = {
+            "type": "trade",
+            "price": 0.49,
+            "count": 25,
+            "ts": clock[0],
+        }
+        _route_kalshi_ws_to_mm_pilot(pilot, "kalshi", TICKER, ws_msg, 0.49)
+        q_pos = pilot.get_queue_tracker_status()
+        bid_oid = [o["order_id"] for o in pilot.resting_orders(TICKER) if o["purpose"] == "quote_bid"][0]
+        ord_info = [o for o in q_pos["orders"] if o["order_id"] == bid_oid][0]
+        assert ord_info["estimated_queue_ahead"] == 25.0
+
+    def test_pilot_skips_recreation_when_buried(self, pilot_env, clock) -> None:
+        # Start with normal book
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.49, no_bid=0.49, yes_qty=50.0, no_qty=50.0)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        pilot.refresh_market(TICKER)
+        assert len(pilot.resting_orders(TICKER)) == 2
+
+        # A massive wall of 500 contracts arrives at the bid level (> max_queue_ahead 100)
+        wall_book = make_book(yes_bid=0.49, no_bid=0.49, yes_qty=500.0, no_qty=50.0)
+        client.books[TICKER] = wall_book
+        pilot.update_book(TICKER, wall_book)
+
+        # Refresh pulls the buried bid without immediately recreating it at the same unfillable price level
+        pilot.refresh_market(TICKER)
+        resting = {o["purpose"]: o for o in pilot.resting_orders(TICKER)}
+        # Bid order was cancelled and NOT recreated behind the wall; ask was preserved
+        assert "quote_bid" not in resting
+        assert "quote_ask" in resting

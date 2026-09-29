@@ -1477,18 +1477,18 @@ def validate_config() -> list[str]:
         raise ConfigError(
             f"MM_VOLUME_WEIGHT={MM_VOLUME_WEIGHT} must be >= 0")
 
-    if MM_QUEUE_RESIZE_TOLERANCE < 0:
+    if not math.isfinite(MM_QUEUE_RESIZE_TOLERANCE) or MM_QUEUE_RESIZE_TOLERANCE < 0:
         raise ConfigError(
-            f"MM_QUEUE_RESIZE_TOLERANCE={MM_QUEUE_RESIZE_TOLERANCE} must be >= 0")
+            f"MM_QUEUE_RESIZE_TOLERANCE={MM_QUEUE_RESIZE_TOLERANCE} must be finite and >= 0")
     if MM_MAX_QUEUE_AHEAD < 0:
         raise ConfigError(
             f"MM_MAX_QUEUE_AHEAD={MM_MAX_QUEUE_AHEAD} must be >= 0")
-    if not (0.0 <= MM_MIN_FILL_PROBABILITY <= 1.0):
+    if not math.isfinite(MM_MIN_FILL_PROBABILITY) or not (0.0 <= MM_MIN_FILL_PROBABILITY <= 1.0):
         raise ConfigError(
-            f"MM_MIN_FILL_PROBABILITY={MM_MIN_FILL_PROBABILITY} must be in [0, 1]")
-    if MM_FILL_PROB_HORIZON_SEC <= 0.0:
+            f"MM_MIN_FILL_PROBABILITY={MM_MIN_FILL_PROBABILITY} must be finite and in [0, 1]")
+    if not math.isfinite(MM_FILL_PROB_HORIZON_SEC) or MM_FILL_PROB_HORIZON_SEC <= 0.0:
         raise ConfigError(
-            f"MM_FILL_PROB_HORIZON_SEC={MM_FILL_PROB_HORIZON_SEC} must be > 0")
+            f"MM_FILL_PROB_HORIZON_SEC={MM_FILL_PROB_HORIZON_SEC} must be finite and > 0")
 
 
 

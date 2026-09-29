@@ -2111,3 +2111,47 @@ class TestContinuousWSOrderbookStreamingWiring:
         assert mock_executor.feed_manager is mock_feed_mgr
         assert len(captured_hedger_instances) >= 1
         assert captured_hedger_instances[0].feed_manager is mock_feed_mgr
+
+
+# ---------------------------------------------------------------------------
+# TestContinuousPrivateWSRouting
+# ---------------------------------------------------------------------------
+
+
+class TestContinuousPrivateWSRouting:
+    """Verify fill and order update routing from FeedManager to MM pilot."""
+
+    def test_route_kalshi_fill_to_pilot(self):
+        from continuous import _route_kalshi_fill_to_mm_pilot
+        pilot = MagicMock()
+        fill = {"trade_id": "tr_1", "order_id": "o_1", "count": 5}
+        _route_kalshi_fill_to_mm_pilot(pilot, "kalshi", fill)
+        pilot.on_ws_fill.assert_called_once_with(fill)
+
+    def test_route_kalshi_fill_ignores_non_kalshi(self):
+        from continuous import _route_kalshi_fill_to_mm_pilot
+        pilot = MagicMock()
+        fill = {"trade_id": "tr_1"}
+        _route_kalshi_fill_to_mm_pilot(pilot, "polymarket", fill)
+        pilot.on_ws_fill.assert_not_called()
+
+    def test_route_kalshi_fill_tolerates_exception(self):
+        from continuous import _route_kalshi_fill_to_mm_pilot
+        pilot = MagicMock()
+        pilot.on_ws_fill.side_effect = RuntimeError("fill error")
+        _route_kalshi_fill_to_mm_pilot(pilot, "kalshi", {"trade_id": "tr_1"})
+        pilot.on_ws_fill.assert_called_once()
+
+    def test_route_kalshi_order_to_pilot(self):
+        from continuous import _route_kalshi_order_to_mm_pilot
+        pilot = MagicMock()
+        order = {"order_id": "o_1", "status": "executed"}
+        _route_kalshi_order_to_mm_pilot(pilot, "kalshi", order)
+        pilot.on_ws_order.assert_called_once_with(order)
+
+    def test_route_kalshi_order_ignores_non_kalshi(self):
+        from continuous import _route_kalshi_order_to_mm_pilot
+        pilot = MagicMock()
+        order = {"order_id": "o_1"}
+        _route_kalshi_order_to_mm_pilot(pilot, "polymarket", order)
+        pilot.on_ws_order.assert_not_called()

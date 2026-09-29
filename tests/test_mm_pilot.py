@@ -2292,8 +2292,15 @@ class TestMMPilotInventorySkewQuoting:
 
         # Refresh with skewed local inventory
         placed_skewed = pilot.refresh_market(TICKER)
-        assert len(placed_skewed) == 2
+        # quote_ask is preserved to retain queue priority; quote_bid is skewed and replaced
+        assert placed_skewed == ["k_3"]
         orders_skewed = {o["purpose"]: o for o in pilot.resting_orders(TICKER)}
+        assert len(orders_skewed) == 2
+        assert "quote_bid" in orders_skewed
+        assert "quote_ask" in orders_skewed
+        assert orders_skewed["quote_bid"]["order_id"] == "k_3"
+        assert orders_skewed["quote_bid"]["count"] == 3
+        assert orders_skewed["quote_ask"]["order_id"] == orders_flat["quote_ask"]["order_id"]
         spread_skewed = orders_skewed["quote_ask"]["price"] - orders_skewed["quote_bid"]["price"]
 
         # Skew spread must be strictly wider than flat baseline
@@ -2761,3 +2768,195 @@ class TestMMPilotDynamicMarketSelection:
 
         assert pilot.halted is False
         assert pilot._selected == {TICKER}
+
+
+# ---------------------------------------------------------------------------
+# TestKalshiPrivateWSExecution
+# ---------------------------------------------------------------------------
+
+
+class TestKalshiPrivateWSExecution:
+    """Tests for private WebSocket fill handling, order tracking, and batch cancellations."""
+
+    def test_on_ws_fill_processes_immediately_and_updates_state(self, pilot_env, clock):
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client)
+        pilot.canary_graduated = True
+        oid = pilot.place_pilot_order(TICKER, side="yes", action="buy", count=10, price=0.48, purpose="quote_bid")
+        assert oid is not None
+
+        ws_fill = {
+            "ticker": TICKER,
+            "trade_id": "tr_ws_101",
+            "order_id": oid,
+            "side": "yes",
+            "action": "buy",
+            "count": 6,
+            "yes_price": 48,
+            "price": 0.48,
+            "is_taker": False,
+            "ts": clock[0],
+        }
+
+        event = pilot.on_ws_fill(ws_fill)
+        assert event is not None
+        assert event.fill_id == "tr_ws_101"
+        assert event.order_id == oid
+        assert event.count == 6
+        assert event.side == "yes"
+
+        assert pilot.inventory.net_contracts(TICKER) == 6
+
+        resting = pilot._orders.get(oid)
+        assert resting is not None
+        assert resting["count"] == 4
+
+        assert pilot._ws_fills_received == 1
+
+        quote_state = pilot._queue_tracker.get_queue_position(oid)
+        assert quote_state is not None
+        assert quote_state["order_id"] == oid
+
+    def test_on_ws_fill_deduplication_with_poll_fills(self, pilot_env, clock):
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client)
+        pilot.canary_graduated = True
+        oid = pilot.place_pilot_order(TICKER, side="yes", action="buy", count=10, price=0.48, purpose="quote_bid")
+        assert oid is not None
+
+        ws_fill = {
+            "ticker": TICKER,
+            "trade_id": "tr_ws_102",
+            "order_id": oid,
+            "side": "yes",
+            "action": "buy",
+            "count": 10,
+            "yes_price": 48,
+            "price": 0.48,
+            "is_taker": False,
+            "ts": clock[0],
+        }
+
+        event = pilot.on_ws_fill(ws_fill)
+        assert event is not None
+        assert pilot.inventory.net_contracts(TICKER) == 10
+
+        client.fills_script = [
+            kfill(order_id=oid, trade_id="tr_ws_102", count=10, yes_price=48)
+        ]
+        rest_events = pilot.poll_fills()
+
+        assert rest_events == []
+        assert pilot.inventory.net_contracts(TICKER) == 10
+
+    def test_on_ws_fill_missing_trade_id_halts(self, pilot_env, clock):
+        pilot = build_pilot(clock)
+        ws_fill = {
+            "ticker": TICKER,
+            "order_id": "some_oid",
+            "side": "yes",
+            "action": "buy",
+            "count": 5,
+        }
+        event = pilot.on_ws_fill(ws_fill)
+        assert event is None
+        assert pilot.halted is True
+        assert "fill without trade_id" in pilot.halt_reason
+
+    def test_on_ws_fill_unknown_order_in_pilot_market_halts(self, pilot_env, clock):
+        pilot = build_pilot(clock, selection=[TICKER])
+        ws_fill = {
+            "ticker": TICKER,
+            "trade_id": "tr_unknown_1",
+            "order_id": "unknown_order_999",
+            "side": "yes",
+            "action": "buy",
+            "count": 5,
+        }
+        event = pilot.on_ws_fill(ws_fill)
+        assert event is None
+        assert pilot.halted is True
+        assert "fill on unknown order_id" in pilot.halt_reason
+
+    def test_on_ws_fill_unknown_order_in_non_pilot_market_ignored(self, pilot_env, clock):
+        pilot = build_pilot(clock, selection=[TICKER])
+        ws_fill = {
+            "ticker": "NON_PILOT_TICKER",
+            "trade_id": "tr_non_pilot_1",
+            "order_id": "unknown_order_999",
+            "side": "yes",
+            "action": "buy",
+            "count": 5,
+        }
+        event = pilot.on_ws_fill(ws_fill)
+        assert event is None
+        assert pilot.halted is False
+
+    def test_on_ws_order_updates_and_clears_orders(self, pilot_env, clock):
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client)
+        oid = pilot.place_pilot_order(TICKER, side="yes", action="buy", count=10, price=0.48, purpose="quote_bid")
+        assert oid in pilot._orders
+
+        pilot.on_ws_order({
+            "order_id": oid,
+            "status": "executed",
+            "remaining_count": 0,
+        })
+        assert oid not in pilot._orders
+        assert pilot._ws_orders_received == 1
+
+    def test_pull_market_uses_batch_cancel_when_available(self, pilot_env, clock, monkeypatch):
+        client = FakeKalshiClient()
+        client.batch_cancel_orders = MagicMock(return_value=True)
+        pilot = build_pilot(clock, client=client)
+
+        oid1 = pilot.place_pilot_order(TICKER, side="yes", action="buy", count=5, price=0.45, purpose="quote_bid")
+        oid2 = pilot.place_pilot_order(TICKER, side="no", action="buy", count=5, price=0.45, purpose="quote_ask")
+        assert len(pilot.resting_orders(TICKER)) == 2
+
+        pulled = pilot.pull_market(TICKER, "test_batch_pull")
+        assert pulled == 2
+        client.batch_cancel_orders.assert_called_once_with(ticker=TICKER)
+        assert len(pilot.resting_orders(TICKER)) == 0
+
+    def test_pull_market_falls_back_when_batch_cancel_fails(self, pilot_env, clock, monkeypatch):
+        client = FakeKalshiClient()
+        client.batch_cancel_orders = MagicMock(return_value=False)
+        pilot = build_pilot(clock, client=client)
+
+        oid1 = pilot.place_pilot_order(TICKER, side="yes", action="buy", count=5, price=0.45, purpose="quote_bid")
+        oid2 = pilot.place_pilot_order(TICKER, side="no", action="buy", count=5, price=0.45, purpose="quote_ask")
+        assert len(pilot.resting_orders(TICKER)) == 2
+
+        pulled = pilot.pull_market(TICKER, "test_batch_pull_fallback")
+        assert pulled == 2
+        client.batch_cancel_orders.assert_called_once_with(ticker=TICKER)
+        assert oid1 in client.cancelled
+        assert oid2 in client.cancelled
+        assert len(pilot.resting_orders(TICKER)) == 0
+
+    def test_pull_all_uses_batch_cancel(self, pilot_env, clock):
+        client = FakeKalshiClient()
+        client.batch_cancel_orders = MagicMock(return_value=True)
+        pilot = build_pilot(clock, client=client)
+
+        pilot.place_pilot_order(TICKER, side="yes", action="buy", count=5, price=0.45, purpose="quote_bid")
+        assert len(pilot.resting_orders()) == 1
+
+        pulled = pilot.pull_all("test_pull_all_batch")
+        assert pulled == 1
+        client.batch_cancel_orders.assert_called_once_with()
+        assert len(pilot.resting_orders()) == 0
+
+    def test_status_telemetry_includes_ws_execution(self, pilot_env, clock):
+        client = FakeKalshiClient()
+        pilot = build_pilot(clock, client=client)
+        status = pilot.get_status()
+        assert "ws_execution" in status
+        assert status["ws_execution"]["ws_fills_received"] == 0
+        assert status["ws_execution"]["ws_orders_received"] == 0
+
+        pilot.on_ws_order({"order_id": "dummy", "status": "resting"})
+        status2 = pilot.get_status()
+        assert status2["ws_execution"]["ws_orders_received"] == 1

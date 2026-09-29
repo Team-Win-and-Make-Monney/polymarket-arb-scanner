@@ -174,7 +174,7 @@ def pilot_env(monkeypatch):
 def build_pilot(clock, client=None, dry_run=False, hedger=None,
                 controls_on=True, detector=None, vol=None,
                 selection=(TICKER,), reconciled=True, state_path=None,
-                inventory_balancer=None):
+                inventory_balancer=None, micro_pricing=None):
     from inventory_balancer import InventoryBalancer
     def time_fn():
         return clock[0]
@@ -194,6 +194,7 @@ def build_pilot(clock, client=None, dry_run=False, hedger=None,
         mono_fn=time_fn,
         state_path=state_path,
         inventory_balancer=inventory_balancer if inventory_balancer is not None else InventoryBalancer(),
+        micro_pricing=micro_pricing,
     )
     if selection is not None:
         pilot.update_selection(list(selection))
@@ -2960,3 +2961,113 @@ class TestKalshiPrivateWSExecution:
         pilot.on_ws_order({"order_id": "dummy", "status": "resting"})
         status2 = pilot.get_status()
         assert status2["ws_execution"]["ws_orders_received"] == 1
+
+
+class TestMicrostructurePricingIntegration:
+    def test_g12b_decision_logged_and_pricing_applied(self, pilot_env, clock):
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        pilot.refresh_market(TICKER)
+
+        g12b = [d for d in pilot._decisions if d.get("gate") == "G12b_microstructure_pricing"]
+        assert len(g12b) >= 1
+        assert g12b[-1]["decision"] == "pass"
+        assert "res_price=" in g12b[-1]["reason"]
+        assert "vol_regime" in g12b[-1]
+
+    def test_spread_widens_under_volatility_shock(self, pilot_env, clock):
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        # Prevent legacy hourly vol tracker G8 ceiling trip so microstructure spread pricing can be evaluated
+        pilot._vol.get_spread_multiplier = lambda t: 1.0
+
+        # Inject series of sharp price jumps into the microstructure tracker via on_ws_price
+        for p in [0.50, 0.70, 0.30, 0.75, 0.25, 0.80]:
+            pilot.on_ws_price(TICKER, p)
+
+        # Update orderbook around 0.50 mid
+        client.books[TICKER] = make_book(yes_bid=0.48, no_bid=0.48)
+        pilot.update_book(TICKER, client.books[TICKER])
+
+        pilot.refresh_market(TICKER)
+
+        g12b = [d for d in pilot._decisions if d.get("gate") == "G12b_microstructure_pricing"][-1]
+        assert g12b["vol_regime"] in ("elevated", "extreme")
+        # Spread should widen above minimum half spread (0.02)
+        assert g12b["half_spread"] > 0.02
+
+    def test_inventory_skew_biases_reservation_price(self, pilot_env, clock):
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        pilot.canary_graduated = True
+
+        # When long inventory (+20 contracts), reservation price should skew down to encourage selling
+        event = FillEvent(
+            fill_id="fill-long",
+            order_id="ord-long",
+            ticker=TICKER,
+            side="yes",
+            action="buy",
+            count=20,
+            price=0.50,
+            is_taker=False,
+            created_ts=clock[0],
+            mid_at_detect=0.50,
+        )
+        pilot._process_fill(event, {"purpose": "quote_bid", "ticker": TICKER, "side": "yes", "action": "buy"})
+        assert pilot.inventory.net_contracts(TICKER) == 20
+
+        pilot.refresh_market(TICKER)
+        g12b = [d for d in pilot._decisions if d.get("gate") == "G12b_microstructure_pricing"][-1]
+        assert g12b["reservation_price"] < 0.50
+
+    def test_adaptive_sizing_scales_down_in_extreme_vol(self, pilot_env, clock):
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48, yes_qty=100, no_qty=100)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        pilot._vol.get_spread_multiplier = lambda t: 1.0
+
+        # Inject extreme price shocks
+        for p in [0.50, 0.70, 0.30, 0.75, 0.25, 0.80]:
+            pilot.on_ws_price(TICKER, p)
+
+        client.books[TICKER] = make_book(yes_bid=0.48, no_bid=0.48, yes_qty=100, no_qty=100)
+        pilot.update_book(TICKER, client.books[TICKER])
+
+        pilot.refresh_market(TICKER)
+        g12b = [d for d in pilot._decisions if d.get("gate") == "G12b_microstructure_pricing"][-1]
+        assert g12b["sizing_multiplier"] < 1.0
+
+    def test_ws_trade_records_in_micro_pricing(self, pilot_env, clock):
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        pilot.update_book(TICKER, client.books[TICKER])
+
+        pilot.on_ws_trade(TICKER, price=0.50, count=10, timestamp=clock[0])
+        status = pilot.get_microstructure_pricing_status()
+        assert status["enabled"] is True
+        market_stats = status["markets"].get(TICKER)
+        assert market_stats is not None
+        assert market_stats["trades_recorded"] >= 1
+
+    def test_microstructure_pricing_disabled_falls_back(self, pilot_env, clock, monkeypatch):
+        import config
+        monkeypatch.setattr(config, "MM_MICROSTRUCTURE_PRICING_ENABLED", False)
+
+        client = FakeKalshiClient(books={TICKER: make_book(yes_bid=0.48, no_bid=0.48)})
+        pilot = build_pilot(clock, client=client, selection=[TICKER])
+        placed = pilot.refresh_market(TICKER)
+        assert len(placed) == 2
+        g12b = [d for d in pilot._decisions if d.get("gate") == "G12b_microstructure_pricing"][-1]
+        assert g12b["decision"] == "fail"
+        assert g12b["reason"] == "engine_unavailable_or_disabled"
+
+    def test_get_status_contains_microstructure_pricing(self, pilot_env, clock):
+        pilot = build_pilot(clock)
+        status = pilot.get_status()
+        assert "microstructure_pricing" in status
+        mp = status["microstructure_pricing"]
+        assert mp["enabled"] is True
+        assert mp["adaptive_sizing_enabled"] is True
+        assert mp["gamma"] == 0.15
+        assert mp["min_half_spread_cents"] == 1.0
+        assert mp["max_half_spread_cents"] == 15.0

@@ -864,6 +864,15 @@ KALSHI_WS_PRIVATE_ENABLED = _env_bool("KALSHI_WS_PRIVATE_ENABLED", "true")
 KALSHI_BATCH_CANCEL_ENABLED = _env_bool("KALSHI_BATCH_CANCEL_ENABLED", "true")
 KALSHI_FAST_EXECUTION_ENABLED = _env_bool("KALSHI_FAST_EXECUTION_ENABLED", "true")
 
+# Predictive Volatility & Hazard Rate Spread Sizing (Microstructure Alpha)
+MM_MICROSTRUCTURE_PRICING_ENABLED = _env_bool("MM_MICROSTRUCTURE_PRICING_ENABLED", "true")
+MM_RISK_AVERSION_GAMMA = _env_float("MM_RISK_AVERSION_GAMMA", "0.15")
+MM_MIN_HALF_SPREAD_CENTS = _env_float("MM_MIN_HALF_SPREAD_CENTS", "1.0")
+MM_MAX_HALF_SPREAD_CENTS = _env_float("MM_MAX_HALF_SPREAD_CENTS", "15.0")
+MM_MICRO_VOL_HALFLIFE_SEC = _env_float("MM_MICRO_VOL_HALFLIFE_SEC", "30.0")
+MM_HAZARD_RATE_DEFAULT_KAPPA = _env_float("MM_HAZARD_RATE_DEFAULT_KAPPA", "100.0")
+MM_MICRO_SIZING_ADAPTIVE_ENABLED = _env_bool("MM_MICRO_SIZING_ADAPTIVE_ENABLED", "true")
+
 
 # Kill switch / control plane (spec section 7). Fail closed: a cache older
 # than MM_CONTROLS_MAX_STALE_SECONDS means unknown operator intent = off.
@@ -1526,6 +1535,19 @@ def validate_config() -> list[str]:
     if MM_SKEW_SPREAD_MAX_MULTIPLIER < 1.0:
         raise ConfigError(
             f"MM_SKEW_SPREAD_MAX_MULTIPLIER={MM_SKEW_SPREAD_MAX_MULTIPLIER} must be >= 1.0")
+    if MM_RISK_AVERSION_GAMMA <= 0:
+        raise ConfigError(
+            f"MM_RISK_AVERSION_GAMMA={MM_RISK_AVERSION_GAMMA} must be > 0")
+    if not (0 < MM_MIN_HALF_SPREAD_CENTS < MM_MAX_HALF_SPREAD_CENTS):
+        raise ConfigError(
+            f"Expected 0 < MM_MIN_HALF_SPREAD_CENTS ({MM_MIN_HALF_SPREAD_CENTS}) < "
+            f"MM_MAX_HALF_SPREAD_CENTS ({MM_MAX_HALF_SPREAD_CENTS})")
+    if MM_MICRO_VOL_HALFLIFE_SEC <= 0:
+        raise ConfigError(
+            f"MM_MICRO_VOL_HALFLIFE_SEC={MM_MICRO_VOL_HALFLIFE_SEC} must be > 0")
+    if MM_HAZARD_RATE_DEFAULT_KAPPA <= 0:
+        raise ConfigError(
+            f"MM_HAZARD_RATE_DEFAULT_KAPPA={MM_HAZARD_RATE_DEFAULT_KAPPA} must be > 0")
 
     # --- Non-negative checks ---
     _non_negative = {

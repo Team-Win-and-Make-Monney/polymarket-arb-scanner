@@ -401,6 +401,7 @@ class KalshiMMPilot:
         state_path: str | None = STATE_PATH,
         inventory_balancer=None,
         queue_tracker=None,
+        micro_pricing=None,
     ):
         import config
         from market_maker import (QuoteEngine, get_toxic_flow_detector,
@@ -420,6 +421,26 @@ class KalshiMMPilot:
         # (NTP, DST, frozen clocks) must not defeat or false-trigger ceilings.
         self._mono_fn = mono_fn
         self.dry_run = config.DRY_RUN if dry_run is None else dry_run
+
+        if micro_pricing is not None:
+            self._micro_pricing = micro_pricing
+        elif getattr(config, "MM_MICROSTRUCTURE_PRICING_ENABLED", True):
+            try:
+                from microstructure_pricing import AvellanedaStoikovEngine
+                self._micro_pricing = AvellanedaStoikovEngine(
+                    risk_aversion_gamma=getattr(config, "MM_RISK_AVERSION_GAMMA", 0.15),
+                    min_half_spread_cents=getattr(config, "MM_MIN_HALF_SPREAD_CENTS", 2.0),
+                    max_half_spread_cents=getattr(config, "MM_MAX_HALF_SPREAD_CENTS", 15.0),
+                    vol_halflife_seconds=getattr(config, "MM_MICRO_VOL_HALFLIFE_SEC", 30.0),
+                    default_kappa=getattr(config, "MM_HAZARD_RATE_DEFAULT_KAPPA", 10.0),
+                    adaptive_sizing_enabled=getattr(config, "MM_MICRO_SIZING_ADAPTIVE_ENABLED", True),
+                    time_fn=self._time_fn,
+                )
+            except Exception as e:
+                logger.debug("Failed initializing AvellanedaStoikovEngine: %s", e)
+                self._micro_pricing = None
+        else:
+            self._micro_pricing = None
 
         if inventory_balancer is not None:
             self._inventory_balancer = inventory_balancer
@@ -724,6 +745,11 @@ class KalshiMMPilot:
             except Exception as exc:
                 logger.debug("MM pilot vol record failed (book) for %s "
                              "mid=%.4f: %s", ticker, mid, exc)
+            if hasattr(self, "_micro_pricing") and self._micro_pricing is not None:
+                try:
+                    self._micro_pricing.record_price(ticker, mid)
+                except Exception as exc:
+                    logger.debug("Micro pricing record_price failed on %s: %s", ticker, exc)
         if hasattr(self, "_queue_tracker") and self._queue_tracker is not None:
             try:
                 self._queue_tracker.update_book(ticker, parsed)
@@ -752,14 +778,29 @@ class KalshiMMPilot:
         except Exception as exc:
             logger.debug("MM pilot vol record failed (WS) for %s price=%s: %s",
                          ticker, yes_price, exc)
+        if hasattr(self, "_micro_pricing") and self._micro_pricing is not None:
+            try:
+                self._micro_pricing.record_price(ticker, float(yes_price))
+            except Exception as exc:
+                logger.debug("Micro pricing record_price (WS) failed on %s: %s", ticker, exc)
 
     def on_ws_trade(self, ticker: str, price: float, count: int, timestamp: float | None = None) -> None:
-        """Record trade print from WebSocket stream to deplete orders ahead in queue."""
+        """Record trade print from WebSocket stream to deplete orders ahead in queue and update hazard rates."""
         if hasattr(self, "_queue_tracker") and self._queue_tracker is not None:
             try:
                 self._queue_tracker.record_trade(ticker, price, count, timestamp=timestamp)
             except Exception as exc:
                 logger.debug("Queue tracker record_trade failed on %s: %s", ticker, exc)
+        if hasattr(self, "_micro_pricing") and self._micro_pricing is not None:
+            try:
+                mid = None
+                with self._lock:
+                    b = self._books.get(ticker)
+                    if b:
+                        mid = b.get("mid")
+                self._micro_pricing.record_trade(ticker, price, count, mid_price=mid, timestamp=timestamp)
+            except Exception as exc:
+                logger.debug("Micro pricing record_trade failed on %s: %s", ticker, exc)
 
     def get_raw_book(self, ticker: str) -> dict | None:
         with self._lock:
@@ -1980,6 +2021,53 @@ class KalshiMMPilot:
         bid = self._round_tick(quotes["bid"])
         ask = self._round_tick(quotes["ask"])
 
+        # Microstructure Pricing Engine (Avellaneda-Stoikov / Realized Vol / Poisson Hazard Rate)
+        micro_res = None
+        if (hasattr(self, "_micro_pricing")
+                and self._micro_pricing is not None
+                and getattr(config, "MM_MICROSTRUCTURE_PRICING_ENABLED", True)):
+            try:
+                micro_res = self._micro_pricing.calculate_pricing(
+                    ticker=ticker,
+                    mid_price=mid,
+                    inventory=effective_inv,
+                    max_inventory=config.MM_MAX_INVENTORY_USD,
+                    book=book,
+                    toxicity_spread_multiplier=tox_spread_mult,
+                    skew_spread_multiplier=skew_spread_mult,
+                )
+            except Exception as exc:
+                logger.debug("Microstructure pricing calculation failed for %s: %s", ticker, exc)
+                micro_res = None
+
+        from market_maker import QuoteEngine
+        if micro_res is not None and isinstance(self._quote_engine, QuoteEngine):
+            bid = self._round_tick(micro_res.optimal_bid)
+            ask = self._round_tick(micro_res.optimal_ask)
+            self._write_decision(
+                "G12b_microstructure_pricing",
+                ticker,
+                True,
+                f"res_price={micro_res.reservation_price:.4f} half_spread={micro_res.half_spread:.4f} "
+                f"vol={micro_res.micro_vol:.4f} regime={micro_res.vol_regime} "
+                f"hazard_lambda={micro_res.hazard_rate:.2f} kappa={micro_res.intensity_decay_kappa:.2f} "
+                f"sizing_mult={micro_res.sizing_multiplier:.2f} bid={bid:.2f} ask={ask:.2f}",
+                reservation_price=micro_res.reservation_price,
+                half_spread=micro_res.half_spread,
+                micro_vol=micro_res.micro_vol,
+                vol_regime=micro_res.vol_regime,
+                hazard_rate=micro_res.hazard_rate,
+                intensity_decay_kappa=micro_res.intensity_decay_kappa,
+                sizing_multiplier=micro_res.sizing_multiplier,
+            )
+        else:
+            self._write_decision(
+                "G12b_microstructure_pricing",
+                ticker,
+                False,
+                "engine_unavailable_or_disabled",
+            )
+
         # G12 crossing guard (post-only semantics): never a marketable quote.
         best_yes_ask = book.get("yes_ask")
         best_yes_bid = book.get("yes_bid")
@@ -2084,6 +2172,12 @@ class KalshiMMPilot:
 
             if balanced_base <= 0:
                 return 0, lip_info
+
+            if (micro_res is not None
+                    and getattr(config, "MM_MICRO_SIZING_ADAPTIVE_ENABLED", True)
+                    and micro_res.sizing_multiplier > 0):
+                balanced_base = min(inv_headroom, max(1, int(balanced_base * micro_res.sizing_multiplier)))
+
             final_count = max(1, int(balanced_base * tox_size_mult))
             return final_count, lip_info
 
@@ -3034,6 +3128,7 @@ class KalshiMMPilot:
             "selection": self.get_selection_status(),
             "toxicity": toxicity_by_ticker,
             "queue_tracker": self.get_queue_tracker_status(),
+            "microstructure_pricing": self.get_microstructure_pricing_status(),
 
             "dry_run": self.dry_run,
             "reconciled": self._reconciled,
@@ -3051,3 +3146,20 @@ class KalshiMMPilot:
             except Exception as e:
                 logger.debug("Failed getting queue tracker status: %s", e)
         return {}
+
+    def get_microstructure_pricing_status(self) -> dict:
+        """Return microstructure pricing engine telemetry summary."""
+        if hasattr(self, "_micro_pricing") and self._micro_pricing is not None:
+            try:
+                import config
+                return {
+                    "enabled": getattr(config, "MM_MICROSTRUCTURE_PRICING_ENABLED", True),
+                    "adaptive_sizing_enabled": getattr(config, "MM_MICRO_SIZING_ADAPTIVE_ENABLED", True),
+                    "gamma": getattr(config, "MM_RISK_AVERSION_GAMMA", 0.15),
+                    "min_half_spread_cents": getattr(config, "MM_MIN_HALF_SPREAD_CENTS", 2.0),
+                    "max_half_spread_cents": getattr(config, "MM_MAX_HALF_SPREAD_CENTS", 15.0),
+                    "markets": self._micro_pricing.get_all_metrics(),
+                }
+            except Exception as e:
+                logger.debug("Failed getting microstructure pricing status: %s", e)
+        return {"enabled": False}

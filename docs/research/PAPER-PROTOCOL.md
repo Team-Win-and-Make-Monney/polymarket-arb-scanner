@@ -41,8 +41,10 @@ observation must be 5–30 seconds later and received within two seconds. Both b
 must show at least one contract of depth. Applicable initial and delayed taker fee
 amounts must be verified, including current series fees, event overrides, effective
 times and member-specific rounding. Never substitute a generic fee when unknown.
-Later fee changes must be tracked outside this v1 contract; exclude affected rows
-until the protocol supports the change. No maker rebates or incentive estimates count.
+The schema requires `fee_effective_from` (inclusive) and `fee_effective_until`
+(exclusive), verified from the retained fee evidence. The same verified fee model
+must cover both decision and delayed recheck; exclude a row when a fee change falls
+between them. Never invent an applicability end time when the evidence is missing. No maker rebates or incentive estimates count.
 
 Outcomes require independent venue resolution evidence received by the evaluation
 cutoff. There is no conversion from a log's `execute` label to a verified fill.

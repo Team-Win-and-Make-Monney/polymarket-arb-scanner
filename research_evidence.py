@@ -56,7 +56,7 @@ def validate_record(row, cutoff, allow_synthetic=False):
     if row.get("execution_authorized") is not False:
         raise EvidenceError("execution_boundary_missing")
     times = {key: timestamp(row.get(key)) for key in (
-        "observed_at", "received_at", "decision_at", "fee_known_at",
+        "observed_at", "received_at", "decision_at", "fee_known_at", "fee_effective_from", "fee_effective_until",
         "recheck_observed_at", "recheck_received_at", "resolved_at", "resolution_received_at"
     )}
     if not (times["observed_at"] <= times["received_at"] <= times["decision_at"]
@@ -65,6 +65,9 @@ def validate_record(row, cutoff, allow_synthetic=False):
         raise EvidenceError("chronology_invalid")
     if times["fee_known_at"] > times["decision_at"]:
         raise EvidenceError("fee_lookahead")
+    if not (times["fee_effective_from"] <= times["decision_at"]
+            and times["recheck_observed_at"] < times["fee_effective_until"]):
+        raise EvidenceError("fee_not_applicable_through_recheck")
     if (times["decision_at"] - times["observed_at"]).total_seconds() > 2:
         raise EvidenceError("stale_initial_book")
     delay = (times["recheck_observed_at"] - times["decision_at"]).total_seconds()
@@ -120,16 +123,16 @@ def evaluate(rows, cutoff, allow_synthetic=False):
     ordered = sorted(enumerate(rows), key=order_key)
     seen = set()
     for _, row in ordered:
-        if (isinstance(row, dict) and isinstance(row.get("record_id"), str)
-                and row["record_id"] and identities[row["record_id"]] > 1):
-            rejected["duplicate_record_id"] += 1
-            continue
         event_id = row.get("event_id") if isinstance(row, dict) else None
         if isinstance(event_id, str) and event_id:
             if event_id in seen:
                 rejected["repeated_event"] += 1
                 continue
             seen.add(event_id)
+        if (isinstance(row, dict) and isinstance(row.get("record_id"), str)
+                and row["record_id"] and identities[row["record_id"]] > 1):
+            rejected["duplicate_record_id"] += 1
+            continue
         try:
             value = validate_record(row, cutoff, allow_synthetic)
             if identities[value["record_id"]] != 1:

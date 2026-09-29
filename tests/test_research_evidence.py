@@ -18,7 +18,8 @@ def fixture():
             "record_id": "fixture-1", "event_id": "fixture-event-1", "contract_id": "fixture-contract",
             "strategy_id": "fixture-strategy", "observed_at": "2026-09-29T10:00:00Z",
             "received_at": "2026-09-29T10:00:00Z", "decision_at": "2026-09-29T10:00:01Z",
-            "fee_known_at": "2026-09-29T09:00:00Z", "recheck_observed_at": "2026-09-29T10:00:06Z",
+            "fee_known_at": "2026-09-29T09:00:00Z",
+            "fee_effective_from": "2026-09-29T09:00:00Z", "fee_effective_until": "2026-09-30T00:00:00Z", "recheck_observed_at": "2026-09-29T10:00:06Z",
             "recheck_received_at": "2026-09-29T10:00:07Z", "resolved_at": "2026-09-29T12:00:00Z",
             "resolution_received_at": "2026-09-29T12:01:00Z", "book_sha256": "a" * 64,
             "recheck_book_sha256": "b" * 64, "fee_source_sha256": "c" * 64,
@@ -67,7 +68,7 @@ class TestResearchEvidence:
     def test_duplicate_identity_excludes_all_copies(self):
         result = evaluate([fixture(), fixture()], CUTOFF, True)
         assert result["eligible_independent_events"] == 0
-        assert result["exclusions"] == {"duplicate_record_id": 2}
+        assert result["exclusions"] == {"duplicate_record_id": 1, "repeated_event": 1}
 
     def test_repeated_event_is_not_independent(self):
         row = fixture()
@@ -132,3 +133,17 @@ class TestResearchEvidence:
     def test_missing_ids_are_not_counted_as_duplicate_real_records(self):
         result = evaluate([{"ts": 1}, {"ts": 2}], CUTOFF)
         assert result["exclusions"] == {"unsupported_schema": 2}
+
+    def test_fee_change_between_decision_and_recheck_is_rejected(self):
+        row = fixture()
+        row["fee_effective_until"] = "2026-09-29T10:00:04Z"
+        with pytest.raises(EvidenceError, match="fee_not_applicable_through_recheck"):
+            validate_record(row, CUTOFF, True)
+
+    def test_duplicated_first_observation_does_not_promote_later_record(self):
+        first = fixture()
+        later = fixture()
+        later.update(record_id="later", decision_at="2026-09-29T10:00:02Z")
+        result = evaluate([later, first, copy.deepcopy(first)], CUTOFF, True)
+        assert result["eligible_independent_events"] == 0
+        assert result["exclusions"] == {"duplicate_record_id": 1, "repeated_event": 2}

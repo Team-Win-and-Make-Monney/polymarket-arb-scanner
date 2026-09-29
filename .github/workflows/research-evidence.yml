@@ -23,7 +23,7 @@ jobs:
       - name: Validate synthetic evidence with standard library only
         run: >-
           python research_evidence.py tests/fixtures/research-evidence.jsonl
-          --sha256 375956977972f7fc73a8fbd2e0eb6d11262fb6c3b40e1c6d30775fc307ccc96c
+          --sha256 97b8a9fb9aa4e7a11551abc969d952acc260661a69b421aeb87434e160e3e809
           --cutoff 2026-09-30T00:00:00Z --synthetic
           --output research-output/fixture-validation.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a

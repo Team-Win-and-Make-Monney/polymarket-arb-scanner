@@ -8,7 +8,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 
 # Mock kalshi_api module before importing ws_feeds.
 # Save the original so we can restore it after import to avoid polluting
@@ -187,9 +187,9 @@ class TestHandlePolymarketMessage:
         fm._handle_polymarket_message(events)
 
         assert cb.call_count == 3
-        cb.assert_any_call("polymarket", "token_aaa", events[0])
-        cb.assert_any_call("polymarket", "token_bbb", events[1])
-        cb.assert_any_call("polymarket", "token_ccc", events[2])
+        cb.assert_any_call("polymarket", "token_aaa", {**events[0], "_recv_ts": ANY})
+        cb.assert_any_call("polymarket", "token_bbb", {**events[1], "_recv_ts": ANY})
+        cb.assert_any_call("polymarket", "token_ccc", {**events[2], "_recv_ts": ANY})
 
     def test_single_dict_event_calls_once(self):
         cb = MagicMock()
@@ -198,7 +198,7 @@ class TestHandlePolymarketMessage:
         event = {"asset_id": "token_xyz", "price": "0.60"}
         fm._handle_polymarket_message(event)
 
-        cb.assert_called_once_with("polymarket", "token_xyz", event)
+        cb.assert_called_once_with("polymarket", "token_xyz", {**event, "_recv_ts": ANY})
 
     def test_event_missing_asset_id_does_not_call(self):
         cb = MagicMock()
@@ -232,8 +232,8 @@ class TestHandlePolymarketMessage:
         fm._handle_polymarket_message(events)
 
         assert cb.call_count == 2
-        cb.assert_any_call("polymarket", "token_good", events[0])
-        cb.assert_any_call("polymarket", "token_also_good", events[3])
+        cb.assert_any_call("polymarket", "token_good", {**events[0], "_recv_ts": ANY})
+        cb.assert_any_call("polymarket", "token_also_good", {**events[3], "_recv_ts": ANY})
 
     def test_empty_list_does_not_call(self):
         cb = MagicMock()

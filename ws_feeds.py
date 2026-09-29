@@ -364,11 +364,20 @@ class FeedManager:
             return
         self._dispatch_loop = asyncio.get_running_loop()
         future = asyncio.run_coroutine_threadsafe(self._run_feeds(), self._ensure_feed_loop())
+        wrapped = asyncio.wrap_future(future)
         try:
-            await asyncio.wrap_future(future)
+            # asyncio.wait never raises for the awaited future, so a
+            # CancelledError here can only be the caller cancelling this task:
+            # that propagates. (Works on 3.10, which has no Task.cancelling().)
+            await asyncio.wait({wrapped})
         finally:
             if not future.done():
                 future.cancel()
+        if wrapped.cancelled():
+            # stop() cancelled the feed tasks on the feed loop: an internal
+            # shutdown, so return normally rather than raise into the caller.
+            return
+        wrapped.result()  # re-raise a feed failure
 
     def _ensure_feed_loop(self) -> asyncio.AbstractEventLoop:
         """Start (once) the daemon thread that owns the feed event loop."""
@@ -416,14 +425,18 @@ class FeedManager:
     def _emit_price_update(self, platform: str, key: str, data: dict) -> None:
         """Deliver a price update to on_price_update on the caller's loop.
 
-        Every payload carries ``_recv_ts``, the feed-side receipt time, so the
-        caller can age it by when it was received rather than when it was
-        delivered. Direct call when no dispatch loop is set (tests,
+        Every payload carries ``_recv_ts``, the local receipt time stamped
+        here at ingress (never taken from the feed), so the caller can age it
+        by when it was received rather than when it was delivered. Direct call when no dispatch loop is set (tests,
         use_feed_thread=False). Otherwise updates queue latest-wins per
         (platform, key) and one drain is scheduled; coalescing only happens
         while the caller loop is behind.
         """
-        data.setdefault("_recv_ts", time.time())
+        # _recv_ts is reserved: stamp the local receipt time here, at ingress,
+        # overwriting any feed-supplied value (a future or non-numeric one
+        # would bypass or break the freshness check). A copy, so a raw event
+        # or shared cache dict is never mutated.
+        data = {**data, "_recv_ts": time.time()}
         loop = self._dispatch_loop
         # Tracking the key and queueing the update happen under one lock, so a
         # drain never sees a key tracked without its queued update.
@@ -517,6 +530,8 @@ class FeedManager:
     @staticmethod
     def _invalidation_payload(platform: str, key: str) -> dict:
         """A price update with no executable price, replacing the caller's cache entry."""
+        if platform == "betfair":
+            return {"market_id": key, "runners": {}, "_invalidated": True}
         if platform == "kalshi":
             return {
                 "market_ticker": key,

@@ -430,13 +430,68 @@ class TestDedicatedFeedThread:
             await asyncio.sleep(0.05)
             thread = fm._feed_thread
             fm.stop()
-            with pytest.raises(asyncio.CancelledError):
-                await asyncio.gather(task)
+            # An internal shutdown returns normally; it is not the caller's cancel.
+            assert await asyncio.wait_for(task, timeout=2) is None
             return thread
 
         thread = asyncio.run(main())
         thread.join(timeout=2)
         assert not thread.is_alive()
+
+    def _blocking_feeds(self, fm, started):
+        async def fake_feeds():
+            fm._running = True
+            started.set()
+            while fm._running:
+                await asyncio.sleep(0.01)
+        return fake_feeds
+
+    def test_caller_cancellation_still_propagates(self):
+        fm = FeedManager(on_price_update=MagicMock(), use_feed_thread=True)
+        started = threading.Event()
+        fm._run_feeds = self._blocking_feeds(fm, started)
+
+        async def main():
+            task = asyncio.create_task(fm.run())
+            await asyncio.get_running_loop().run_in_executor(None, started.wait, 2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert task.cancelled()
+
+        asyncio.run(main())
+        fm.stop()
+
+    def test_caller_cancel_racing_stop_propagates(self):
+        """stop() and a caller cancel in the same tick: the caller's intent wins."""
+        fm = FeedManager(on_price_update=MagicMock(), use_feed_thread=True)
+        started = threading.Event()
+        fm._run_feeds = self._blocking_feeds(fm, started)
+
+        async def main():
+            task = asyncio.create_task(fm.run())
+            await asyncio.get_running_loop().run_in_executor(None, started.wait, 2)
+            thread = fm._feed_thread
+            fm.stop()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            return thread
+
+        thread = asyncio.run(main())
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+    def test_feed_failure_still_raises(self):
+        fm = FeedManager(on_price_update=MagicMock(), use_feed_thread=True)
+
+        async def failing_feeds():
+            raise RuntimeError("feed crashed")
+
+        fm._run_feeds = failing_feeds
+        with pytest.raises(RuntimeError, match="feed crashed"):
+            asyncio.run(fm.run())
+        fm.stop()
 
     def test_late_kalshi_start_runs_on_feed_loop(self, monkeypatch):
         fm = FeedManager(on_price_update=MagicMock(), use_feed_thread=True)
@@ -575,6 +630,62 @@ class TestDispatchValidity:
         fm._reset_kalshi_books()
         loop.run()
         assert cache[("kalshi", "KXFP-A")]["_invalidated"] is True
+
+    def test_expired_betfair_tick_replaces_the_cache_entry_with_no_runners(self, monkeypatch):
+        """Through the Betfair ingress: an expired tick leaves the continuous-style
+        cache entry replaced by a Betfair-shaped invalidation, no runner priced."""
+        cache = {}
+        fm, loop = _queued_feed(_downstream(cache))
+        fm._dispatch_max_age = 5.0
+        clock = [1000.0]
+        monkeypatch.setattr(ws_feeds.time, "time", lambda: clock[0])
+        priced = {"market_id": "1.234", "runners": {111: {"back": [[2.0, 50.0]], "lay": [[2.02, 40.0]]}}}
+        fm._on_betfair_update("betfair", "1.234", priced)
+        loop.run()
+        assert cache[("betfair", "1.234")]["runners"]
+        fm._on_betfair_update("betfair", "1.234", {"market_id": "1.234",
+                                                   "runners": {111: {"back": [[2.1, 5.0]], "lay": []}}})
+        clock[0] += 6.0
+        loop.run()
+        entry = cache[("betfair", "1.234")]
+        assert entry == {"market_id": "1.234", "runners": {}, "_invalidated": True, "_recv_ts": 1006.0}
+        assert "1.234" not in fm._downstream_keys["betfair"]
+
+    def test_invalidation_payload_shapes_by_platform(self):
+        betfair = FeedManager._invalidation_payload("betfair", "1.9")
+        assert betfair == {"market_id": "1.9", "runners": {}, "_invalidated": True}
+        kalshi = FeedManager._invalidation_payload("kalshi", "KX")
+        assert kalshi["market_ticker"] == "KX" and kalshi["yes_ask"] is None
+        poly = FeedManager._invalidation_payload("polymarket", "tok")
+        assert poly["asset_id"] == "tok" and poly["best_ask"] is None
+
+    @pytest.mark.parametrize("forged", [1e12, "soon", float("nan"), None, -5.0])
+    def test_feed_supplied_receipt_time_is_replaced_at_ingress(self, monkeypatch, forged):
+        """A _recv_ts inside a feed event (price_change or pass-through) is
+        overwritten with the local receipt time, so a future, non-numeric or NaN
+        value can't make an old tick look fresh or break the drain."""
+        cache = {}
+        fm, loop = _queued_feed(_downstream(cache))
+        fm._dispatch_max_age = 5.0
+        clock = [1000.0]
+        monkeypatch.setattr(ws_feeds.time, "time", lambda: clock[0])
+        fm._handle_polymarket_message([
+            {"event_type": "price_change", "price_changes": [
+                {"asset_id": "tokA", "best_ask": "0.41", "best_bid": "0.39", "_recv_ts": forged}]},
+            {"event_type": "last_trade_price", "asset_id": "tokB", "price": "0.5", "_recv_ts": forged},
+        ])
+        clock[0] += 1.0
+        loop.run()  # queued 1s: still dispatched, stamped with the ingress time
+        assert cache[("polymarket", "tokA")]["_recv_ts"] == 1000.0
+        assert cache[("polymarket", "tokA")]["best_ask"] == pytest.approx(0.41)
+        assert cache[("polymarket", "tokB")]["_recv_ts"] == 1000.0
+        # A later tick that waits past the max age expires, whatever it claims.
+        fm._handle_polymarket_message([{"event_type": "last_trade_price", "asset_id": "tokB",
+                                        "price": "0.6", "_recv_ts": forged}])
+        clock[0] += 6.0
+        loop.run()
+        assert cache[("polymarket", "tokB")]["_invalidated"] is True
+        assert fm.dropped_expired_updates == 1
 
     def test_expired_tick_after_a_gap_is_fenced_not_redelivered(self, monkeypatch):
         """Generation fencing still wins: a pre-gap tick that also expired is

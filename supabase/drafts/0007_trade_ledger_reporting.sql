@@ -162,7 +162,8 @@ create table if not exists public.ledger_venue_reconciliations (
   ledger_order_ids    jsonb not null default '[]'::jsonb check (jsonb_typeof(ledger_order_ids) = 'array'),
   ledger_sources      jsonb not null default '[]'::jsonb check (jsonb_typeof(ledger_sources) = 'array'),
   max_source_age_seconds numeric check (max_source_age_seconds is null
-                        or (max_source_age_seconds > 0 and max_source_age_seconds <> 'Infinity'::numeric)),
+                        or (max_source_age_seconds > 0
+                            and max_source_age_seconds not in ('NaN'::numeric, 'Infinity'::numeric))),
   evidence            jsonb not null default '{}'::jsonb,  -- pages, cutoffs, sources checked
   checked_at          timestamptz not null default now(),
   constraint ledger_recon_interval_valid
@@ -207,10 +208,10 @@ begin
     end if;
     if new.capture_epoch = old.capture_epoch and new.source_version = old.source_version
        and new.deleted = old.deleted then
-      -- A replay of the same version carries the same content: not a change,
-      -- so it must not make earlier venue checks look stale.
-      new.synced_at := old.synced_at;
-      return new;
+      -- A replay of the same version carries the same source state: keep the
+      -- stored row as it is (its tombstone provenance and synced_at too), so
+      -- a retry neither erases provenance nor makes venue checks look stale.
+      return old;
     end if;
     if new.deleted then
       -- A tombstone keeps the provenance the row had, so a delete still

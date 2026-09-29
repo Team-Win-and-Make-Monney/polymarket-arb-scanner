@@ -39,7 +39,7 @@ stays the source record, and venue records check completeness.
    - A failure only logs a warning.
 3. **First sync of an epoch.** The exporter pages a full snapshot first, and it can resume after a restart. It then follows the outbox from where the snapshot began.
 4. **Versions.** Each record carries `source_version`, the highest outbox sequence number visible when the row was read in the same read transaction. The remote version guard ignores a lower version within the same epoch. That makes replays, retries and partial batches idempotent.
-5. **Deletes** become tombstones (`deleted = true`). The remote guard keeps the stored venue, account, order id and time on a tombstone even if the upsert sends nulls, so a delete still invalidates venue checks. A replay of the same version does not move `synced_at`.
+5. **Deletes** become tombstones (`deleted = true`). The remote guard keeps the stored venue, account, order id and time on a tombstone even if the upsert sends nulls, so a delete still invalidates venue checks. A replay of the same version leaves the stored row unchanged, including its provenance and `synced_at`.
 6. **Watermark.** The local watermark advances, and consumed outbox rows are pruned, only after every remote write succeeds. The status row gets `last_success_at` only on success.
 
 **Keys.** `ledger_key` is `arbgrid:<service>:<db_instance_id>:<table>:<id>`. `db_instance_id` is a random id stored in the DB file, so a recreated volume or a second service never collides. Venue and account are attributes, not part of the key: a deleted row no longer has them, and history has no account at all.

@@ -179,6 +179,16 @@ begin
   exception when check_violation then null;
   end;
   begin
+    perform pg_temp.recon('bad-12b', 'matched', '2026-09-27', max_age => 'NaN');
+    raise exception 'a NaN source age was accepted';
+  exception when check_violation then null;
+  end;
+  begin
+    perform pg_temp.recon('bad-12c', 'matched', '2026-09-27', max_age => 'Infinity');
+    raise exception 'an infinite source age was accepted';
+  exception when check_violation then null;
+  end;
+  begin
     perform pg_temp.recon('bad-13', 'matched', '2026-09-27', order_ids => '{"o": 1}');
     raise exception 'non-array order ids were accepted';
   exception when check_violation then null;
@@ -499,6 +509,22 @@ do $$ declare r record; begin
   end if;
   if (select fills_verified from ledger_reporting.venue_reconciliation_days where reporting_day = '2026-09-15') then
     raise exception 'deleting a compared row must make the check stale';
+  end if;
+end $$;
+-- A retried delete (same version, no provenance sent) leaves the stored
+-- tombstone exactly as it was.
+insert into t_marks select 'tombstone_synced', synced_at from public.ledger_trades where source_id = 21;
+select pg_sleep(0.01);
+set role service_role;
+select pg_temp.upsert_bare_tombstone('arbgrid:svc:db1:trades:21', 13);
+reset role;
+do $$ declare r record; begin
+  select venue, order_id, account_ref, recorded_at, deleted, synced_at into r
+  from public.ledger_trades where source_id = 21;
+  if not r.deleted or r.venue is distinct from 'kalshi' or r.order_id is distinct from 'ord-old-targeted'
+     or r.account_ref is distinct from 'k1' or r.recorded_at is null
+     or r.synced_at <> (select at from t_marks where name = 'tombstone_synced') then
+    raise exception 'a replayed tombstone must keep provenance and synced_at: %', r;
   end if;
 end $$;
 

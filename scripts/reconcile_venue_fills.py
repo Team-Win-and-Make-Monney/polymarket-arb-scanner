@@ -51,6 +51,7 @@ from kalshi_fill_collector import (  # noqa: E402
     parse_kalshi_scope,
     read_only_transport,
 )
+from ledger_sync import DEFAULT_RECORDING_LAG  # noqa: E402
 from venue_reconciliation import (  # noqa: E402
     DEFAULT_MAX_SOURCE_AGE_SECONDS,
     REPORTING_TZ,
@@ -104,6 +105,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         lag = _env_seconds("LEDGER_RECON_FINALITY_SECONDS", 900, positive=False)
+        if lag < DEFAULT_RECORDING_LAG.total_seconds():
+            raise ValueError(f"LEDGER_RECON_FINALITY_SECONDS must be at least the "
+                             f"{DEFAULT_RECORDING_LAG.total_seconds():.0f}s recording lag")
         max_age = _env_seconds("LEDGER_RECON_MAX_SOURCE_AGE_SECONDS", DEFAULT_MAX_SOURCE_AGE_SECONDS, positive=True)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)

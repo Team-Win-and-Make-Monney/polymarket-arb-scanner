@@ -78,51 +78,76 @@ create or replace function pg_temp.recon(
   at timestamptz default clock_timestamp(), read_at timestamptz default null,
   order_ids jsonb default '[]',
   sources jsonb default '[{"service": "svc", "source_key": "arbgrid:svc:db1"}]',
-  max_age numeric default 3600)
+  max_age numeric default 3600,
+  -- One matched gate each; the defaults satisfy every gate.
+  counts int[] default '{1,1,1}', miss_ledger jsonb default '[]', miss_venue jsonb default '[]',
+  qty_mm jsonb default '[]', ambiguous jsonb default '[]')
 returns void language sql as $$
   insert into public.ledger_venue_reconciliations (run_id, venue, account_ref, interval_start, interval_end,
     reporting_tz, reporting_day, venue_source, coverage_scope, status, coverage_verified,
     ledger_mirror_verified, incomplete_reasons, venue_order_count, ledger_order_count, matched_order_count,
+    missing_in_ledger, missing_in_venue, qty_mismatch, boundary_ambiguous_orders,
     collector, collector_version, collected_at, checked_at, ledger_read_started_at, ledger_order_ids,
     ledger_sources, max_source_age_seconds)
   values (rid, 'kalshi', acct, d::timestamp at time zone 'America/Detroit',
     (d + 1)::timestamp at time zone 'America/Detroit', 'America/Detroit', d,
-    'kalshi:fills:sha256:0123456789abcdef:' || scope, scope, st, cov, mirror_ok, reasons, 1, 1, 1,
+    'kalshi:fills:sha256:0123456789abcdef:' || scope, scope, st, cov, mirror_ok, reasons,
+    counts[1], counts[2], counts[3], miss_ledger, miss_venue, qty_mm, ambiguous,
     'kalshi_fills', '1', at, at, coalesce(read_at, at), order_ids, sources, max_age);
 $$;
+
+-- Runs stmt and requires it to fail on exactly the named check constraint,
+-- so each case proves the one gate it changes.
+create or replace function pg_temp.expect_check(label text, stmt text,
+  want text default 'ledger_recon_matched_is_verified')
+returns void language plpgsql as $$
+declare got text;
+begin
+  begin
+    execute stmt;
+  exception when check_violation then
+    get stacked diagnostics got = constraint_name;
+    if got is distinct from want then
+      raise exception '% failed on % instead of %', label, got, want;
+    end if;
+    return;
+  end;
+  raise exception '% was accepted', label;
+end $$;
 select pg_temp.recon('run-1', 'matched', '2026-09-28');
 reset role;
 
--- Reconciliation rows cannot claim a match from incomplete evidence.
+-- Reconciliation rows cannot claim a match from incomplete evidence. The
+-- baseline passes every gate; each case changes one gate and must fail on
+-- the matched constraint itself.
+select pg_temp.recon('iso-baseline', 'matched', '2026-08-01');
+delete from public.ledger_venue_reconciliations where run_id = 'iso-baseline';
+select pg_temp.expect_check('bad-1 unverified venue coverage',
+  $q$select pg_temp.recon('bad-1', 'matched', '2026-09-27', cov => false)$q$);
+select pg_temp.expect_check('bad-2 unverified ledger mirror',
+  $q$select pg_temp.recon('bad-2', 'matched', '2026-09-27', mirror_ok => false)$q$);
+select pg_temp.expect_check('bad-3 no account',
+  $q$select pg_temp.recon('bad-3', 'matched', '2026-09-27', acct => null)$q$);
+select pg_temp.expect_check('bad-5 missing_in_venue',
+  $q$select pg_temp.recon('bad-5', 'matched', '2026-09-27', miss_venue => '["B"]')$q$);
+select pg_temp.expect_check('bad-5b missing_in_ledger',
+  $q$select pg_temp.recon('bad-5b', 'matched', '2026-09-27', miss_ledger => '["A"]')$q$);
+select pg_temp.expect_check('bad-5c qty_mismatch',
+  $q$select pg_temp.recon('bad-5c', 'matched', '2026-09-27',
+                          qty_mm => '[{"order_id": "A", "venue": "2", "ledger": "1"}]')$q$);
+select pg_temp.expect_check('bad-5d boundary_ambiguous_orders',
+  $q$select pg_temp.recon('bad-5d', 'matched', '2026-09-27', ambiguous => '["A"]')$q$);
+select pg_temp.expect_check('bad-5e matched_order_count <> venue_order_count',
+  $q$select pg_temp.recon('bad-5e', 'matched', '2026-09-27', counts => '{2,1,1}')$q$);
+select pg_temp.expect_check('bad-5f ledger_order_count > matched_order_count',
+  $q$select pg_temp.recon('bad-5f', 'matched', '2026-09-27', counts => '{1,2,1}')$q$);
+select pg_temp.expect_check('bad-11 no ledger sources',
+  $q$select pg_temp.recon('bad-11', 'matched', '2026-09-27', sources => '[]')$q$);
 do $$
 begin
   begin
-    perform pg_temp.recon('bad-1', 'matched', '2026-09-27', cov => false);
-    raise exception 'matched without verified venue coverage was accepted';
-  exception when check_violation then null;
-  end;
-  begin
-    perform pg_temp.recon('bad-2', 'matched', '2026-09-27', mirror_ok => false);
-    raise exception 'matched without a verified ledger mirror was accepted';
-  exception when check_violation then null;
-  end;
-  begin
-    perform pg_temp.recon('bad-3', 'matched', '2026-09-27', acct => null);
-    raise exception 'matched without an account was accepted';
-  exception when check_violation then null;
-  end;
-  begin
     perform pg_temp.recon('bad-4', 'matched', '2026-09-27', scope => 'whole-account');
     raise exception 'an unknown coverage scope was accepted';
-  exception when check_violation then null;
-  end;
-  begin
-    insert into public.ledger_venue_reconciliations (run_id, venue, account_ref, interval_start, interval_end,
-      venue_source, status, coverage_verified, ledger_mirror_verified, coverage_scope, venue_order_count,
-      ledger_order_count, matched_order_count, missing_in_venue)
-    values ('bad-5', 'kalshi', 'k1', '2026-09-27T04:00:00+00', '2026-09-28T04:00:00+00', 's', 'matched', true,
-      true, 'all_subaccounts', 0, 1, 0, '["B"]');
-    raise exception 'matched with a missing order was accepted';
   exception when check_violation then null;
   end;
   begin
@@ -166,11 +191,6 @@ begin
     values ('bad-10', 'kalshi', 'k1', '2026-09-27T04:00:00+00', '2026-09-28T04:00:00+00', 's', 'matched', true,
       true, 'all_subaccounts', 0, 0, 0, '[{"service": "svc", "source_key": "arbgrid:svc:db1"}]', 3600);
     raise exception 'matched without a mirror read time was accepted';
-  exception when check_violation then null;
-  end;
-  begin
-    perform pg_temp.recon('bad-11', 'matched', '2026-09-27', sources => '[]');
-    raise exception 'matched without the ledger sources it relied on was accepted';
   exception when check_violation then null;
   end;
   begin
@@ -381,6 +401,16 @@ end $$;
 create temp table t_marks (name text primary key, at timestamptz);
 grant all on t_marks to service_role;
 
+-- What the exporter reports after a sync: the source's local live trade
+-- count, which equals the mirror's while nothing is lost in between.
+create or replace function pg_temp.report_local_trades()
+returns void language sql as $$
+  update public.ledger_sync_status s set local_trades_count = (
+    select count(*) from public.ledger_trades t
+    where t.service = s.service and t.db_instance_id = s.db_instance_id and not t.deleted)
+  where s.source_key = 'arbgrid:svc:db1';
+$$;
+
 -- PostgREST-style tombstone that sends no provenance (explicit nulls): the
 -- stored row keeps its venue, order id and time.
 create or replace function pg_temp.upsert_bare_tombstone(k text, ver bigint)
@@ -405,6 +435,7 @@ values
   ('arbgrid:svc:db1:trades:22', 'arbgrid', 'svc', 'db1', 'trades', 22, 10, 'e2', 'kalshi', 'k1', 'live',
    'writer_stamped', '2026-09-01T12:00:00+00', 'filled', 3, 'ord-old-unrelated');
 reset role;
+select pg_temp.report_local_trades();
 select pg_sleep(0.01);
 
 -- 1. A replay of the same version is not a change.
@@ -486,6 +517,7 @@ insert into public.ledger_trades (ledger_key, source_system, service, db_instanc
 values ('arbgrid:svc:db1:trades:23', 'arbgrid', 'svc', 'db1', 'trades', 23, 20, 'e2', 'kalshi', 'k1', 'live',
    'writer_stamped', '2026-09-16T06:00:00+00', 'filled', 1, 'ord-next-day');
 reset role;
+select pg_temp.report_local_trades();
 do $$ begin
   if not (select fills_verified from ledger_reporting.venue_reconciliation_days
           where reporting_day = '2026-09-15') then
@@ -500,6 +532,7 @@ select pg_temp.recon('fence-3', 'matched', '2026-09-15', read_at => (select at f
 set role service_role;
 select pg_temp.upsert_bare_tombstone('arbgrid:svc:db1:trades:21', 13);
 reset role;
+select pg_temp.report_local_trades();
 do $$ declare r record; begin
   select venue, order_id, account_ref, recorded_at, deleted into r
   from public.ledger_trades where source_id = 21;
@@ -569,6 +602,90 @@ reset role;
 do $$ begin
   if (select fills_verified from ledger_reporting.venue_reconciliation_days where reporting_day = '2026-09-15') then
     raise exception 'an unattributable tombstone must make the check stale';
+  end if;
+end $$;
+
+-- ---------------------------------------------------------------------------
+-- mirror_current needs the mirror's live trade count to equal the count the
+-- source reported: a hard delete in the mirror, or a source row that never
+-- arrived, is not a current mirror even though no synced_at moved.
+-- ---------------------------------------------------------------------------
+select pg_temp.report_local_trades();
+insert into t_marks values ('read_5', clock_timestamp());
+select pg_temp.recon('count-1', 'matched', '2026-09-15', read_at => (select at from t_marks where name = 'read_5'),
+                     order_ids => '["ord-in-window"]');
+do $$ begin
+  if not (select fills_verified and mirror_current from ledger_reporting.venue_reconciliation_days
+          where reporting_day = '2026-09-15') then
+    raise exception 'setup: a clean check with equal counts must verify the day';
+  end if;
+end $$;
+-- Hard-delete a compared trade row outside the exporter (no tombstone).
+delete from public.ledger_trades where source_id = 20;
+do $$ declare r record; begin
+  select * into r from ledger_reporting.venue_reconciliation_days where reporting_day = '2026-09-15';
+  if r.fills_verified or r.mirror_current or r.ledger_changed_since_check then
+    raise exception 'a hard-deleted mirror row must end mirror_current without a synced_at change: %', r;
+  end if;
+  if (select mirror_complete from ledger_reporting.sources where source_key = 'arbgrid:svc:db1') then
+    raise exception 'a hard-deleted mirror row must make the source incomplete';
+  end if;
+end $$;
+-- The source reporting a row the mirror never received is the same gap.
+select pg_temp.report_local_trades();
+do $$ begin
+  if not (select mirror_current from ledger_reporting.venue_reconciliation_days
+          where reporting_day = '2026-09-15') then
+    raise exception 'equal counts again must restore mirror_current';
+  end if;
+end $$;
+update public.ledger_sync_status set local_trades_count = local_trades_count + 1
+where source_key = 'arbgrid:svc:db1';
+do $$ begin
+  if (select fills_verified or mirror_current from ledger_reporting.venue_reconciliation_days
+      where reporting_day = '2026-09-15') then
+    raise exception 'a source row missing from the mirror must end mirror_current';
+  end if;
+end $$;
+update public.ledger_sync_status set local_trades_count = null where source_key = 'arbgrid:svc:db1';
+do $$ begin
+  if (select mirror_current from ledger_reporting.venue_reconciliation_days where reporting_day = '2026-09-15') then
+    raise exception 'an unreported local count must not count as current';
+  end if;
+end $$;
+select pg_temp.report_local_trades();
+
+-- A row recorded just past the day's end is in the recording window, so its
+-- later change withdraws the check; one recorded well after does not.
+insert into t_marks values ('read_6', clock_timestamp());
+select pg_temp.recon('window-1', 'matched', '2026-09-15', read_at => (select at from t_marks where name = 'read_6'),
+                     order_ids => '["ord-in-window"]');
+set role service_role;
+insert into public.ledger_trades (ledger_key, source_system, service, db_instance_id, source_table, source_id,
+  source_version, capture_epoch, venue, account_ref, run_mode, mode_evidence, recorded_at, status, fill_qty,
+  order_id)
+values ('arbgrid:svc:db1:trades:24', 'arbgrid', 'svc', 'db1', 'trades', 24, 30, 'e2', 'kalshi', 'k1', 'live',
+   'writer_stamped', '2026-09-16T04:10:00+00', 'filled', 1, 'ord-well-after');
+reset role;
+select pg_temp.report_local_trades();
+do $$ begin
+  if not (select fills_verified from ledger_reporting.venue_reconciliation_days
+          where reporting_day = '2026-09-15') then
+    raise exception 'a row recorded ten minutes after the day must not withdraw it';
+  end if;
+end $$;
+set role service_role;
+insert into public.ledger_trades (ledger_key, source_system, service, db_instance_id, source_table, source_id,
+  source_version, capture_epoch, venue, account_ref, run_mode, mode_evidence, recorded_at, status, fill_qty,
+  order_id)
+values ('arbgrid:svc:db1:trades:25', 'arbgrid', 'svc', 'db1', 'trades', 25, 31, 'e2', 'kalshi', 'k1', 'live',
+   'writer_stamped', '2026-09-16T04:02:00+00', 'filled', 1, 'ord-just-after');
+reset role;
+select pg_temp.report_local_trades();
+do $$ begin
+  if (select fills_verified or not ledger_changed_since_check from ledger_reporting.venue_reconciliation_days
+      where reporting_day = '2026-09-15') then
+    raise exception 'a row recorded inside the recording window after the day must withdraw it';
   end if;
 end $$;
 

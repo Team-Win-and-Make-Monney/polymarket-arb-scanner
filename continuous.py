@@ -3421,8 +3421,11 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                             "call still blocked.")
 
         # After the pilot has stopped writing: export the final tail, then stop.
+        # Bounded: a slow final export finishes on its own thread and never
+        # holds up the feed shutdown below.
         if _ledger_sync_worker is not None:
-            await asyncio.get_running_loop().run_in_executor(None, _ledger_sync_worker.stop)
+            from ledger_sync import stop_ledger_sync_worker
+            await stop_ledger_sync_worker(_ledger_sync_worker, timeout=15.0)
 
         logger.info("Stopping WebSocket feeds...")
         feed_manager.stop()

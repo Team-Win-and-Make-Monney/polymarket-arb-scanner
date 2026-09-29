@@ -138,9 +138,10 @@ class FakeMirror:
         return [dict(r) for r in self.status if r["service"] in services]
 
     def changed_since(self, venue, since, window_since, window_until, order_ids):
-        # window_* here are the reporting day's bounds.
+        # window_* are the reporting day widened by the recording window.
         ids = set(order_ids)
-        self.changed_queries.append({"since": since, "order_ids": sorted(ids)})
+        self.changed_queries.append({"since": since, "order_ids": sorted(ids),
+                                     "window": (window_since, window_until)})
         n = 0
         for r in self.trades:
             synced = r.get("synced_at")
@@ -719,11 +720,13 @@ class TestRunReconciliation:
         assert rec["status"] == "incomplete" and "ledger_unmapped_source" in rec["incomplete_reasons"]
         assert rec["evidence"]["unmapped_ledger_services"] == ["rogue-worker"]
 
-    def test_order_logged_before_the_window_is_found_by_order_id(self):
+    def test_order_logged_days_before_its_venue_fill_is_found_and_not_counted(self):
+        # A ledger row cannot record a fill that happens days later, so the
+        # day's venue fill has no ledger counterpart.
         mirror = _fresh_mirror(trades=[_ledger("o-old", 2.0, recorded="2026-09-20T12:00:00+00:00")])
         rec = _run([_fill("f1", "o-old", "2.00", "2026-09-28T05:00:00Z")], mirror=mirror)
         assert mirror.order_lookups == [["o-old"]]
-        assert rec["status"] == "matched"
+        assert rec["status"] == "mismatched" and rec["missing_in_ledger"] == ["o-old"]
 
     def test_restricted_key_match_is_scoped_to_its_subaccount(self):
         rec = _run(scope=_scope(subaccount=0))
@@ -745,7 +748,7 @@ class TestRunReconciliation:
                                        _ledger("o2", 1.0, n=2)])
         rec = _run([_fill("f1", "o-old", "2.00", "2026-09-28T05:00:00Z"),
                     _fill("f2", "o2", "1.00", "2026-09-28T06:00:00Z")], mirror=mirror)
-        assert rec["status"] == "matched"
+        assert rec["status"] == "mismatched" and rec["missing_in_ledger"] == ["o-old"]
         assert rec["ledger_order_ids"] == ["o-old", "o2"]
         read_started = datetime.fromtimestamp(AFTER_DAY, timezone.utc) - venue_reconciliation.MIRROR_CLOCK_SKEW
         assert rec["ledger_read_started_at"] == read_started.isoformat()
@@ -804,6 +807,32 @@ class TestRunReconciliation:
         assert rec["status"] == "matched", rec["incomplete_reasons"]
         assert rec["ledger_order_ids"] == ["o1"]
 
+    def test_order_filled_across_local_midnight_matches_on_the_days_part(self):
+        # 23:40 Detroit fill of 0.5 today, the other 0.5 after midnight.
+        mirror = _fresh_mirror(trades=[_ledger("o-m", "0.50", recorded="2026-09-29T03:40:05+00:00"),
+                                       _ledger("o-m", "0.50", recorded="2026-09-29T04:30:00+00:00", n=2)])
+        rec = _run([_fill("f1", "o-m", "0.50", "2026-09-29T03:40:00Z")], mirror=mirror)
+        assert rec["status"] == "matched", rec["incomplete_reasons"]
+        assert rec["qty_mismatch"] == [] and rec["boundary_ambiguous_orders"] == []
+
+    def test_fill_recorded_after_local_midnight_is_ambiguous(self):
+        mirror = _fresh_mirror(trades=[_ledger("o-late", "1.00", recorded="2026-09-29T04:00:30+00:00")])
+        rec = _run([_fill("f1", "o-late", "1.00", "2026-09-29T03:59:50Z")], mirror=mirror)
+        assert rec["status"] == "incomplete"
+        assert rec["incomplete_reasons"] == ["ledger_boundary_ambiguous"]
+        assert rec["boundary_ambiguous_orders"] == ["o-late"] and rec["ledger_order_ids"] == ["o-late"]
+        assert rec["evidence"]["recording_lag_seconds"] == 300
+
+    def test_row_in_the_recording_window_written_during_the_read_is_a_change(self):
+        def late_row(m):
+            m.trades.append(_ledger("o-new", 1.0, recorded="2026-09-29T04:02:00+00:00", n=7,
+                                    synced_at=datetime.fromtimestamp(AFTER_DAY, timezone.utc).isoformat()))
+        mirror = _fresh_mirror(trades=[_ledger("o1", 1.0)], after_rows=late_row)
+        rec = _run([_fill("f1", "o1", "1.00", "2026-09-28T05:00:00Z")], mirror=mirror)
+        assert rec["incomplete_reasons"] == ["ledger_mirror_changed_during_read"]
+        assert mirror.changed_queries[0]["window"] == (DAY_START - timedelta(seconds=120),
+                                                       DAY_END + timedelta(seconds=300))
+
     def test_in_day_ledger_order_is_a_dependency_even_without_a_venue_fill(self):
         rec = _run(mirror=_fresh_mirror(trades=[_ledger("o-ledger-only", 1.0)]))
         assert rec["status"] == "mismatched" and rec["ledger_order_ids"] == ["o-ledger-only"]
@@ -830,6 +859,7 @@ class TestRunReconciliation:
 
     @pytest.mark.parametrize("kw", [
         {"finality_lag_seconds": -900}, {"finality_lag_seconds": float("nan")},
+        {"finality_lag_seconds": 299},   # shorter than the recording lag
         {"max_source_age_seconds": 0}, {"max_source_age_seconds": float("inf")},
     ])
     def test_invalid_settings_fail_before_any_read(self, kw):
@@ -1003,6 +1033,7 @@ class TestCli:
     @pytest.mark.parametrize("name,value", [
         ("LEDGER_RECON_FINALITY_SECONDS", "-900"), ("LEDGER_RECON_FINALITY_SECONDS", "nan"),
         ("LEDGER_RECON_FINALITY_SECONDS", "inf"), ("LEDGER_RECON_FINALITY_SECONDS", "soon"),
+        ("LEDGER_RECON_FINALITY_SECONDS", "60"),
         ("LEDGER_RECON_MAX_SOURCE_AGE_SECONDS", "0"), ("LEDGER_RECON_MAX_SOURCE_AGE_SECONDS", "-1"),
         ("LEDGER_RECON_MAX_SOURCE_AGE_SECONDS", "Infinity"),
     ])

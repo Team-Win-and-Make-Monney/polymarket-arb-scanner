@@ -6,6 +6,7 @@ source_version is lower than the stored one (same capture epoch) is ignored.
 """
 
 import os
+import sqlite3
 import sys
 import threading
 import time
@@ -121,6 +122,32 @@ class TestChangeCapture:
         second = TradeDB(path, ledger_capture=True).get_ledger_meta()
         assert first["capture_epoch"] == second["capture_epoch"]
         assert first["db_instance_id"] == second["db_instance_id"]
+
+    def test_missing_epoch_with_triggers_present_starts_a_new_epoch(self, tmp_path):
+        path = str(tmp_path / "t.db")
+        first = TradeDB(path, ledger_capture=True)
+        _trade(first)
+        first.conn.execute("DELETE FROM ledger_meta WHERE key IN ('capture_epoch', 'capture_boundary_trades_id')")
+        first.conn.commit()
+        meta = TradeDB(path, ledger_capture=True).get_ledger_meta()
+        assert meta["capture_epoch"]
+        assert meta["capture_boundary_trades_id"] == "1"
+
+    def test_failed_install_leaves_no_triggers_or_epoch(self, tmp_path, monkeypatch):
+        tdb = TradeDB(str(tmp_path / "t.db"), ledger_capture=False)
+
+        def boom(key, value):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(tdb, "_set_meta_if_absent", boom)
+        with pytest.raises(sqlite3.OperationalError):
+            tdb.enable_ledger_capture()
+        assert not tdb.conn.in_transaction
+        assert not tdb.ledger_capture_installed()
+        assert tdb.conn.execute(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'ledger_outbox' OR name LIKE 'ledger_capture_%'"
+        ).fetchone()[0] == 0
+        assert "capture_epoch" not in tdb.get_ledger_meta()
 
     def test_boundary_records_pre_capture_rows(self, tmp_path):
         path = str(tmp_path / "t.db")
@@ -267,6 +294,29 @@ class TestExporter:
         tdb.conn.commit()
         exporter.sync_once()
         assert remote.rows("ledger_trades", include_deleted=True)[0]["deleted"] is True
+
+    def test_watermark_and_outbox_cleanup_commit_together(self, ledger):
+        tdb, remote, exporter, _ = ledger
+        exporter.sync_once()
+        before = exporter._state()["watermark_seq"]
+        _trade(tdb, run_mode="live")
+        tdb.conn.execute("CREATE TRIGGER fail_cleanup BEFORE DELETE ON ledger_outbox "
+                         "BEGIN SELECT RAISE(ABORT, 'cleanup failed'); END")
+        tdb.conn.commit()
+        with pytest.raises(sqlite3.Error):
+            exporter.sync_once()
+        # The cleanup failed, so the watermark did not move either: the batch
+        # is still pending locally and reported as such.
+        assert exporter._state()["watermark_seq"] == before
+        assert tdb.conn.execute("SELECT COUNT(*) FROM ledger_outbox").fetchone()[0] == 1
+        status = next(iter(remote.tables["ledger_sync_status"].values()))
+        assert status["watermark_seq"] == int(before) and status["pending_changes"] == 1
+        assert "cleanup failed" in status["last_error"]
+        tdb.conn.execute("DROP TRIGGER fail_cleanup")
+        tdb.conn.commit()
+        res = exporter.sync_once()
+        assert res.pending_changes == 0 and int(exporter._state()["watermark_seq"]) > int(before)
+        assert tdb.conn.execute("SELECT COUNT(*) FROM ledger_outbox").fetchone()[0] == 0
 
     def test_failed_upsert_advances_nothing_then_recovers(self, ledger):
         tdb, remote, exporter, _ = ledger
@@ -484,6 +534,66 @@ class TestReconcileFills:
         assert out["status"] == "mismatched" and out["missing_in_ledger"] == ["E"]
         assert out["venue_records_out_of_interval"] == 0
 
+    @staticmethod
+    def _live(oid, qty, at, **kw):
+        return {"venue": "kalshi", "run_mode": "live", "status": "filled", "fill_price": 0.5,
+                "fill_qty": qty, "order_id": oid, "account_ref": "k1", "recorded_at": at, **kw}
+
+    def test_order_filled_across_midnight_compares_only_the_days_part(self):
+        # Order M fills 0.5 on each side of midnight; only today's half is in
+        # the venue's day, so only today's ledger row may be summed.
+        venue = [{"order_id": "M", "qty": "0.50", "fee_usd": 0, "filled_at": "2026-09-28T23:40:00Z"}]
+        ledger = [self._live("M", 0.5, "2026-09-28T23:40:03+00:00"),
+                  self._live("M", 0.5, "2026-09-29T00:20:00+00:00"),
+                  self._live("M", 2.0, "2026-09-27T09:00:00+00:00")]
+        out = self._run(venue=venue, ledger=ledger)
+        assert out["status"] == "matched", out
+        assert out["boundary_ambiguous_orders"] == [] and out["qty_mismatch"] == []
+
+    def test_fill_recorded_just_after_the_day_ends_is_ambiguous_not_missing(self):
+        venue = [{"order_id": "L", "qty": "1.00", "fee_usd": 0, "filled_at": "2026-09-28T23:59:30Z"}]
+        ledger = [self._live("L", 1, "2026-09-29T00:00:20+00:00")]
+        out = self._run(venue=venue, ledger=ledger)
+        assert out["status"] == "incomplete", out
+        assert out["incomplete_reasons"] == ["ledger_boundary_ambiguous"]
+        assert out["boundary_ambiguous_orders"] == ["L"] and out["missing_in_ledger"] == ["L"]
+
+    def test_previous_days_fill_recorded_after_midnight_is_ambiguous_not_extra(self):
+        ledger = [self._live("P", 1, "2026-09-28T00:01:00+00:00")]
+        out = self._run(venue=[], ledger=ledger)
+        assert out["status"] == "incomplete"
+        assert out["incomplete_reasons"] == ["ledger_boundary_ambiguous"]
+        assert out["boundary_ambiguous_orders"] == ["P"]
+
+    def test_ambiguity_window_edges(self):
+        # [b - skew, b + lag) around each boundary; outside it recorded_at decides.
+        cases = {"2026-09-27T23:57:59+00:00": "matched",      # start - 121s: yesterday
+                 "2026-09-27T23:58:00+00:00": "incomplete",   # start - skew
+                 "2026-09-28T00:04:59+00:00": "incomplete",   # start + lag - 1s
+                 "2026-09-29T00:05:00+00:00": "matched"}      # end + lag: tomorrow
+        for at, expected in cases.items():
+            out = self._run(ledger=self.LEDGER + [self._live("Z", 1, at)])
+            assert out["status"] == expected, (at, out)
+        ledger = self.LEDGER + [self._live("Z", 1, "2026-09-28T00:05:00+00:00")]
+        out = self._run(ledger=ledger)          # start + lag: today, and the venue lacks it
+        assert out["status"] == "mismatched" and out["missing_in_venue"] == ["Z"]
+
+    def test_unattributable_rows_near_a_boundary_are_incomplete(self):
+        for kw in ({"run_mode": None}, {"account_ref": None}, {"order_id": ""}):
+            row = self._live("U", 1, "2026-09-29T00:02:00+00:00", **kw)
+            out = self._run(ledger=self.LEDGER + [row])
+            assert out["status"] == "incomplete", kw
+
+    def test_recording_window_settings_must_be_non_negative(self):
+        from datetime import timedelta
+        for kw in ({"recording_lag": timedelta(seconds=-1)}, {"clock_skew": timedelta(seconds=-1)},
+                   {"recording_lag": 300}):
+            with pytest.raises(ValueError):
+                self._run(**kw)
+        zero = self._run(ledger=self.LEDGER + [self._live("Z", 1, "2026-09-29T00:00:00+00:00")],
+                         recording_lag=timedelta(0), clock_skew=timedelta(0))
+        assert zero["status"] == "matched"
+
     def test_missing_venue_qty_is_incomplete_not_matched(self):
         venue = [dict(self.VENUE[0], qty=None), self.VENUE[1]]
         out = self._run(venue=venue)
@@ -608,6 +718,7 @@ class _ScriptedExporter:
             self.ran.set()
 
     def close(self):
+        self.closed_while_active = self.active > 0
         self.closed = True
 
 
@@ -650,12 +761,53 @@ class TestLedgerSyncWorker:
         worker.stop()
         assert exporter.calls == 2 and exporter.closed
 
-    def test_stuck_thread_is_not_closed_under_it(self):
+    def test_slow_export_bounds_stop_and_closes_only_after_it_finishes(self):
+        exporter = _ScriptedExporter(delay=0.3)
+        worker = ledger_sync.LedgerSyncWorker(exporter, 3600)
+        worker.start()
+        began = time.monotonic()
+        assert worker.stop(timeout=0.05) is False
+        assert time.monotonic() - began < 0.25
+        assert not exporter.closed
+        # The in-flight export and the final tail finish on the worker thread,
+        # which then closes the exporter itself, never under an export.
+        assert worker.closed.wait(5)
+        assert exporter.calls == 2 and exporter.closed and not exporter.closed_while_active
+        assert set(exporter.threads) == {"ledger-sync"}
+
+    def test_stop_without_start_still_exports_then_closes(self):
+        exporter = _ScriptedExporter()
+        worker = ledger_sync.LedgerSyncWorker(exporter, 3600)
+        assert worker.stop() is True
+        assert exporter.calls == 1 and exporter.closed
+        worker.start()                      # a stopped worker never restarts
+        assert not worker.alive and exporter.calls == 1
+
+    def test_async_stop_does_not_hold_up_the_rest_of_shutdown(self):
+        import asyncio
+
         exporter = _ScriptedExporter(delay=0.5)
         worker = ledger_sync.LedgerSyncWorker(exporter, 3600)
         worker.start()
-        worker.stop(timeout=0.01)
-        assert not exporter.closed and exporter.calls == 1
+        steps = []
+
+        async def shutdown():
+            steps.append(("ledger", await ledger_sync.stop_ledger_sync_worker(worker, timeout=0.05)))
+            steps.append(("feeds", time.monotonic()))   # stands in for feed_manager.stop()
+
+        began = time.monotonic()
+        asyncio.run(shutdown())
+        assert steps[0] == ("ledger", False) and steps[1][0] == "feeds"
+        assert steps[1][1] - began < 0.4
+        assert worker.closed.wait(5) and not exporter.closed_while_active
+
+    def test_async_stop_never_raises(self):
+        import asyncio
+
+        class Broken:
+            def stop(self, timeout):
+                raise RuntimeError("boom")
+        assert asyncio.run(ledger_sync.stop_ledger_sync_worker(Broken(), timeout=0.01)) is False
 
     def test_start_requires_capture_and_a_client(self, tmp_path):
         path = str(tmp_path / "t.db")
@@ -692,5 +844,6 @@ class TestLedgerSyncWorker:
         pilot_start = src.index("if (config.MM_KALSHI_PILOT_ENABLED")
         assert init < pilot_start
         assert "scan_count % max(1, config.LEDGER_SYNC" not in src
-        cleanup = src.index("_ledger_sync_worker.stop")
+        cleanup = src.index("await stop_ledger_sync_worker(_ledger_sync_worker, timeout=")
         assert src.index('logger.info("Stopping Kalshi MM pilot...")') < cleanup
+        assert cleanup < src.index('logger.info("Stopping WebSocket feeds...")')

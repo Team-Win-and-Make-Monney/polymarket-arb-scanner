@@ -43,7 +43,8 @@ from datetime import date, datetime, timedelta, timezone
 from datetime import time as dt_time
 from zoneinfo import ZoneInfo
 
-from ledger_sync import STATUS_TABLE, _parse_utc, reconcile_fills
+from ledger_sync import (DEFAULT_CLOCK_SKEW, DEFAULT_RECORDING_LAG, STATUS_TABLE, _parse_utc,
+                         reconcile_fills)
 from url_guard import assert_public_url
 
 logger = logging.getLogger(__name__)
@@ -338,12 +339,14 @@ def _read_ledger(mirror, scope, venue: str, start: datetime, end: datetime, venu
     merged = {r.get("ledger_key"): r for r in rows}
     rows = list(merged.values())
     # The result depends on the venue's orders and on ledger rows recorded in
-    # the interval (or undated); rows for other orders outside it do not
-    # change it, so later activity on other days does not withdraw it.
+    # the interval, near enough to a boundary to be ambiguous, or undated;
+    # rows for other orders further out do not change it, so later activity on
+    # other days does not withdraw it.
     relevant = set(venue_order_ids)
+    near_start, near_end = start - DEFAULT_CLOCK_SKEW, end + DEFAULT_RECORDING_LAG
     for r in rows:
         at = _parse_utc(r.get("recorded_at"))
-        if r.get("order_id") and (at is None or start <= at < end):
+        if r.get("order_id") and (at is None or near_start <= at < near_end):
             relevant.add(str(r["order_id"]))
     order_ids = sorted(relevant)
     info["order_ids"] = order_ids
@@ -352,7 +355,7 @@ def _read_ledger(mirror, scope, venue: str, start: datetime, end: datetime, venu
     # may have been written since the read started.
     if _fence(mirror.status_rows(services)) != _fence(status):
         gaps.add("ledger_mirror_changed_during_read")
-    if mirror.changed_since(venue, read_started, start, end, order_ids):
+    if mirror.changed_since(venue, read_started, near_start, near_end, order_ids):
         gaps.add("ledger_mirror_changed_during_read")
 
     unmapped = sorted({r.get("service") for r in rows
@@ -390,6 +393,10 @@ def run_reconciliation(collector, scope, mirror, day: date, *, venue: str, clock
     """
     _check_seconds("finality_lag_seconds", finality_lag_seconds, minimum=0, allow_equal=True)
     _check_seconds("max_source_age_seconds", max_source_age_seconds, minimum=0, allow_equal=False)
+    if finality_lag_seconds < DEFAULT_RECORDING_LAG.total_seconds():
+        # Rows for fills just before the day ends may not be recorded yet.
+        raise ValueError(f"finality_lag_seconds must be at least the "
+                         f"{DEFAULT_RECORDING_LAG.total_seconds():.0f}s recording lag")
     start, end = reporting_day_bounds(day, tz_name)
     try:
         collection = collector.collect(start, end)
@@ -441,6 +448,8 @@ def run_reconciliation(collector, scope, mirror, day: date, *, venue: str, clock
         "unmapped_ledger_services": unmapped,
         "reporting_day_hours": (end - start).total_seconds() / 3600,
         "mirror_clock_skew_seconds": MIRROR_CLOCK_SKEW.total_seconds(),
+        "recording_lag_seconds": DEFAULT_RECORDING_LAG.total_seconds(),
+        "recording_clock_skew_seconds": DEFAULT_CLOCK_SKEW.total_seconds(),
     })
     return {
         **result,

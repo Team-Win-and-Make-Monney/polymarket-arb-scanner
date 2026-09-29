@@ -339,52 +339,71 @@ class TradeDB:
         The triggers run inside the writer's own SQLite transaction, so every
         INSERT/UPDATE/DELETE on trades/positions from any process that writes
         this file is recorded, with no network I/O. When the triggers were not
-        all present already, a new capture epoch is recorded along with the
-        max row ids at that moment: changes before it were never captured, so
-        an exporter must re-snapshot rather than trust the outbox alone.
+        all present already, or no epoch was recorded, a new capture epoch is
+        recorded along with the max row ids at that moment: changes before it
+        were never captured, so an exporter must re-snapshot rather than trust
+        the outbox alone. The whole install is one transaction.
         Never removes triggers; turning the flag off leaves capture in place.
         """
         with self._lock:
-            self._ledger_meta_table()
-            self.conn.execute("""
-                CREATE TABLE IF NOT EXISTS ledger_outbox (
-                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source_table TEXT NOT NULL,
-                    source_id INTEGER NOT NULL,
-                    op TEXT NOT NULL,
-                    changed_at TEXT NOT NULL
-                        DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-                )""")
-            existing = {r[0] for r in self.conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'ledger_capture_%'")}
-            wanted = {}
+            # One BEGIN IMMEDIATE covers the tables, triggers and epoch rows:
+            # a crash part-way leaves nothing behind, and another writer can
+            # never see triggers without the epoch that dates them.
+            if self.conn.in_transaction:
+                self.conn.commit()
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                epoch = self._install_ledger_capture()
+                self.conn.commit()
+            except BaseException:
+                self.conn.rollback()
+                raise
+            return epoch
+
+    def _install_ledger_capture(self) -> str:
+        self._ledger_meta_table()
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS ledger_outbox (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_table TEXT NOT NULL,
+                source_id INTEGER NOT NULL,
+                op TEXT NOT NULL,
+                changed_at TEXT NOT NULL
+                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            )""")
+        existing = {r[0] for r in self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'ledger_capture_%'")}
+        wanted = {}
+        for table in LEDGER_CAPTURED_TABLES:
+            for op, ref in (("insert", "NEW"), ("update", "NEW"), ("delete", "OLD")):
+                wanted[f"ledger_capture_{table}_{op}"] = (
+                    f"CREATE TRIGGER IF NOT EXISTS ledger_capture_{table}_{op} "
+                    f"AFTER {op.upper()} ON {table} BEGIN "
+                    f"INSERT INTO ledger_outbox (source_table, source_id, op) "
+                    f"VALUES ('{table}', {ref}.id, '{op}'); END")
+        has_epoch = self.conn.execute(
+            "SELECT 1 FROM ledger_meta WHERE key = 'capture_epoch'").fetchone() is not None
+        # Missing triggers or a missing epoch both mean capture history can't
+        # be trusted, so start a new epoch and make exporters re-snapshot.
+        fresh = not set(wanted) <= existing or not has_epoch
+        for sql in wanted.values():
+            self.conn.execute(sql)
+        if fresh:
+            epoch = uuid.uuid4().hex
+            now = datetime.now(timezone.utc).isoformat()
+            self.conn.execute(
+                "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('capture_epoch', ?)", (epoch,))
+            self.conn.execute(
+                "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('capture_since', ?)", (now,))
             for table in LEDGER_CAPTURED_TABLES:
-                for op, ref in (("insert", "NEW"), ("update", "NEW"), ("delete", "OLD")):
-                    wanted[f"ledger_capture_{table}_{op}"] = (
-                        f"CREATE TRIGGER IF NOT EXISTS ledger_capture_{table}_{op} "
-                        f"AFTER {op.upper()} ON {table} BEGIN "
-                        f"INSERT INTO ledger_outbox (source_table, source_id, op) "
-                        f"VALUES ('{table}', {ref}.id, '{op}'); END")
-            fresh = not set(wanted) <= existing
-            for sql in wanted.values():
-                self.conn.execute(sql)
-            if fresh:
-                epoch = uuid.uuid4().hex
-                now = datetime.now(timezone.utc).isoformat()
+                max_id = self.conn.execute(f"SELECT COALESCE(MAX(id), 0) FROM {table}").fetchone()[0]
                 self.conn.execute(
-                    "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('capture_epoch', ?)", (epoch,))
-                self.conn.execute(
-                    "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('capture_since', ?)", (now,))
-                for table in LEDGER_CAPTURED_TABLES:
-                    max_id = self.conn.execute(f"SELECT COALESCE(MAX(id), 0) FROM {table}").fetchone()[0]
-                    self.conn.execute(
-                        "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES (?, ?)",
-                        (f"capture_boundary_{table}_id", str(max_id)))
-                logger.info("Ledger change capture installed (epoch %s)", epoch)
-            self._set_meta_if_absent("db_instance_id", uuid.uuid4().hex)
-            self.conn.commit()
-            return self.conn.execute(
-                "SELECT value FROM ledger_meta WHERE key = 'capture_epoch'").fetchone()[0]
+                    "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES (?, ?)",
+                    (f"capture_boundary_{table}_id", str(max_id)))
+            logger.info("Ledger change capture installed (epoch %s)", epoch)
+        self._set_meta_if_absent("db_instance_id", uuid.uuid4().hex)
+        return self.conn.execute(
+            "SELECT value FROM ledger_meta WHERE key = 'capture_epoch'").fetchone()[0]
 
     def log_opportunity(
         self,

@@ -40,7 +40,7 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
 from db import LEDGER_CAPTURED_TABLES, RUN_MODES
@@ -255,12 +255,16 @@ class LedgerExporter:
     def _state(self) -> dict[str, str]:
         return {r["key"]: r["value"] for r in self._conn.execute("SELECT key, value FROM ledger_sync_state")}
 
-    def _save_state(self, updates: dict):
+    def _save_state(self, updates: dict, *, drop_outbox_through: int | None = None):
+        """Persist state keys, and optionally drop exported outbox rows, in one
+        transaction: either both land or neither does."""
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             for key, value in updates.items():
                 self._conn.execute(
                     "INSERT OR REPLACE INTO ledger_sync_state (key, value) VALUES (?, ?)", (key, str(value)))
+            if drop_outbox_through is not None:
+                self._conn.execute("DELETE FROM ledger_outbox WHERE seq <= ?", (drop_outbox_through,))
             self._conn.execute("COMMIT")
         except Exception:
             self._conn.execute("ROLLBACK")
@@ -368,9 +372,8 @@ class LedgerExporter:
             result.exported[table] = result.exported.get(table, 0) + n
         result.tombstones += tombstones
         new_watermark = events[-1]["seq"]
-        self._save_state({"watermark_seq": new_watermark})
-        state["watermark_seq"] = str(new_watermark)
-        self._conn.execute("DELETE FROM ledger_outbox WHERE seq <= ?", (new_watermark,))
+        self._save_state({"watermark_seq": new_watermark}, drop_outbox_through=new_watermark)
+        state["watermark_seq"] = str(new_watermark)   # only once committed
         return len(events) < self._batch_size
 
     # -- status ---------------------------------------------------------------
@@ -483,8 +486,11 @@ class LedgerSyncWorker:
         self._interval = float(interval_seconds)
         self._name = name
         self._stop = threading.Event()
+        self._final_sync = True
         self._thread: threading.Thread | None = None
+        self._state_lock = threading.Lock()
         self._run_lock = threading.Lock()
+        self.closed = threading.Event()
         self.runs = 0
         self.failures = 0
         self.last_error: str | None = None
@@ -509,29 +515,67 @@ class LedgerSyncWorker:
         while not self._stop.is_set():
             self.run_once()
             self._stop.wait(self._interval)
+        self._finish()
+
+    def _finish(self):
+        """Final export, then close, on the worker's own thread: the exporter's
+        SQLite connection is never closed while an export is still using it."""
+        try:
+            if self._final_sync:
+                self.run_once()
+        finally:
+            try:
+                self._exporter.close()
+            except Exception as exc:
+                logger.warning("Trade ledger exporter close failed: %s", exc)
+            self.closed.set()
 
     def start(self) -> None:
-        if self._thread is not None:
-            return
-        self._thread = threading.Thread(target=self._loop, name=self._name, daemon=True)
-        self._thread.start()
+        with self._state_lock:
+            if self._thread is not None or self._stop.is_set():
+                return
+            self._thread = threading.Thread(target=self._loop, name=self._name, daemon=True)
+            self._thread.start()
 
     @property
     def alive(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def stop(self, timeout: float = 10.0, final_sync: bool = True) -> None:
-        """Stop the thread; then, if it exited, export once more so a tail
-        written just before shutdown is not left only in the local file."""
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout)
-            if self._thread.is_alive():
-                logger.warning("Trade ledger sync thread did not stop in %.0fs", timeout)
-                return
-        if final_sync:
-            self.run_once()
-        self._exporter.close()
+    def stop(self, timeout: float = 15.0, final_sync: bool = True) -> bool:
+        """Ask the worker to export the final tail (so rows written just before
+        shutdown are not left only in the local file) and close, waiting at
+        most ``timeout`` seconds in total.
+
+        Returns True when it finished in time. Otherwise it keeps running on
+        its daemon thread and closes the exporter itself when the export ends;
+        the caller's shutdown is never held up by a slow export.
+        """
+        with self._state_lock:
+            if not self._stop.is_set():
+                self._final_sync = final_sync
+                self._stop.set()
+                if self._thread is None:
+                    self._thread = threading.Thread(target=self._finish, name=self._name, daemon=True)
+                    self._thread.start()
+            thread = self._thread
+        thread.join(timeout)
+        if thread.is_alive():
+            logger.warning("Trade ledger sync did not finish in %.0fs; leaving the final "
+                           "export to complete on its own thread", timeout)
+            return False
+        return True
+
+
+async def stop_ledger_sync_worker(worker: LedgerSyncWorker, timeout: float = 15.0) -> bool:
+    """Stop the worker from an event loop without blocking it for longer than
+    ``timeout``; never raises, so the rest of shutdown always runs."""
+    import asyncio
+
+    try:
+        return await asyncio.get_running_loop().run_in_executor(None, lambda: worker.stop(timeout=timeout))
+    except Exception as exc:
+        logger.warning("Trade ledger sync stop failed: %s", exc)
+        return False
 
 
 def start_ledger_sync_worker(db_path: str, *, capture_enabled: bool, interval_seconds: float,
@@ -559,6 +603,12 @@ def start_ledger_sync_worker(db_path: str, *, capture_enabled: bool, interval_se
 RECONCILE_MATCHED = "matched"
 RECONCILE_MISMATCHED = "mismatched"
 RECONCILE_INCOMPLETE = "incomplete"
+# The engine records a fill after the venue executes it. A ledger row recorded
+# at r stands for a venue fill in [r - DEFAULT_RECORDING_LAG, r + DEFAULT_CLOCK_SKEW],
+# so recorded_at attributes it to an interval only when that window does not
+# cross a boundary.
+DEFAULT_RECORDING_LAG = timedelta(seconds=300)
+DEFAULT_CLOCK_SKEW = timedelta(seconds=120)
 
 
 def _dec(value) -> Decimal | None:
@@ -597,7 +647,9 @@ def _parse_utc(value) -> datetime | None:
 
 def reconcile_fills(venue_fills: list[dict], ledger_trades: list[dict], *, venue: str,
                     account_ref: str | None, interval_start, interval_end,
-                    venue_coverage: dict | None, evidence_gaps=()) -> dict:
+                    venue_coverage: dict | None, evidence_gaps=(),
+                    recording_lag: timedelta = DEFAULT_RECORDING_LAG,
+                    clock_skew: timedelta = DEFAULT_CLOCK_SKEW) -> dict:
     """Compare one account's venue fill records for [interval_start, interval_end) with the ledger.
 
     Fails closed: the result is "matched" only when every piece of evidence is
@@ -620,12 +672,18 @@ def reconcile_fills(venue_fills: list[dict], ledger_trades: list[dict], *, venue
         mirror). Each one is an incomplete reason.
 
     Interval bounds and all timestamps are compared as UTC instants, never as
-    strings. Only venue fills inside the interval count. Ledger fills count
-    toward "missing in venue" only when recorded inside the interval; the
-    engine log time can trail the venue fill time, so a boundary straddle is
-    reported as a mismatch rather than hidden.
+    strings. Both sides are scoped to the interval: only venue fills inside it,
+    and only ledger rows recorded inside it, are summed per order. The ledger
+    has no venue fill time, so a row recorded at r stands for a fill anywhere
+    in [r - recording_lag, r + clock_skew]. A row whose window crosses either
+    boundary cannot be attributed; its order is listed in
+    ``boundary_ambiguous_orders`` and the result is incomplete
+    (``ledger_boundary_ambiguous``), never a guessed match or mismatch.
     """
     reasons: set[str] = {str(g) for g in evidence_gaps if g}
+    if not (isinstance(recording_lag, timedelta) and isinstance(clock_skew, timedelta)
+            and recording_lag >= timedelta(0) and clock_skew >= timedelta(0)):
+        raise ValueError("recording_lag and clock_skew must be non-negative timedeltas")
     start = _parse_utc(interval_start)
     end = _parse_utc(interval_end)
     if start is None or end is None or end <= start:
@@ -652,6 +710,12 @@ def reconcile_fills(venue_fills: list[dict], ledger_trades: list[dict], *, venue
 
     def in_interval(ts) -> bool:
         return start is not None and end is not None and start <= ts < end
+
+    def straddles_boundary(ts) -> bool:
+        # The fill window [ts - lag, ts + skew] contains a boundary b with
+        # ts - lag < b, i.e. ts in [b - skew, b + lag).
+        return start is not None and end is not None and any(
+            b - clock_skew <= ts < b + recording_lag for b in (start, end))
 
     # Venue side: every in-interval record must be attributable and complete.
     # venue_qty[order] is None when any of the order's quantities is unknown.
@@ -690,6 +754,7 @@ def reconcile_fills(venue_fills: list[dict], ledger_trades: list[dict], *, venue
     # be one but is not attributable makes the result incomplete.
     ledger_qty: dict[str, Decimal | None] = {}
     ledger_in_interval: set[str] = set()
+    ambiguous: set[str] = set()
     for rec in ledger_trades:
         if rec.get("deleted") or rec.get("venue") != venue:
             continue
@@ -700,7 +765,7 @@ def reconcile_fills(venue_fills: list[dict], ledger_trades: list[dict], *, venue
         if mode == "paper":
             continue
         if mode != "live" or rec.get("account_ref") is None:
-            if recorded_at is None or in_interval(recorded_at):
+            if recorded_at is None or in_interval(recorded_at) or straddles_boundary(recorded_at):
                 reasons.add("ledger_fill_unattributed")
             continue
         if rec.get("account_ref") != account_ref:
@@ -709,16 +774,23 @@ def reconcile_fills(venue_fills: list[dict], ledger_trades: list[dict], *, venue
         if recorded_at is None:
             reasons.add("ledger_record_time_unknown")
         if not oid:
-            if recorded_at is None or in_interval(recorded_at):
+            if recorded_at is None or in_interval(recorded_at) or straddles_boundary(recorded_at):
                 reasons.add("ledger_record_missing_order_id")
+            continue
+        if recorded_at is None:
+            continue
+        if straddles_boundary(recorded_at):
+            ambiguous.add(oid)
+        if not in_interval(recorded_at):
             continue
         qty = _dec(rec.get("fill_qty"))
         if qty is None:
             ledger_qty[oid] = None
         elif ledger_qty.get(oid, Decimal(0)) is not None:
             ledger_qty[oid] = ledger_qty.get(oid, Decimal(0)) + qty
-        if recorded_at is not None and in_interval(recorded_at):
-            ledger_in_interval.add(oid)
+        ledger_in_interval.add(oid)
+    if ambiguous:
+        reasons.add("ledger_boundary_ambiguous")
 
     venue_orders = set(venue_qty)
     missing_in_ledger = sorted(venue_orders - set(ledger_qty))
@@ -756,6 +828,7 @@ def reconcile_fills(venue_fills: list[dict], ledger_trades: list[dict], *, venue
         "missing_in_ledger": missing_in_ledger,
         "missing_in_venue": missing_in_venue,
         "qty_mismatch": qty_mismatch,
+        "boundary_ambiguous_orders": sorted(ambiguous),
         "venue_fees_usd": str(sum(fees, Decimal(0))) if fees_complete else None,
         "fees_complete": fees_complete,
         "incomplete_reasons": sorted(reasons),

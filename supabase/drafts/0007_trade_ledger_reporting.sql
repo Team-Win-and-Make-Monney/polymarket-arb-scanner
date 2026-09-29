@@ -144,6 +144,10 @@ create table if not exists public.ledger_venue_reconciliations (
   missing_in_ledger   jsonb not null default '[]'::jsonb,
   missing_in_venue    jsonb not null default '[]'::jsonb,
   qty_mismatch        jsonb not null default '[]'::jsonb,
+  -- Orders with a ledger row recorded too close to a day boundary to
+  -- attribute to either day; any makes the check incomplete.
+  boundary_ambiguous_orders jsonb not null default '[]'::jsonb
+                        check (jsonb_typeof(boundary_ambiguous_orders) = 'array'),
   venue_fees_usd      numeric check (venue_fees_usd is null
                         or venue_fees_usd not in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)),
   fees_complete       boolean not null default false,
@@ -184,7 +188,7 @@ create table if not exists public.ledger_venue_reconciliations (
       and interval_start is not null and interval_end is not null
       and incomplete_reasons = '[]'::jsonb
       and missing_in_ledger = '[]'::jsonb and missing_in_venue = '[]'::jsonb
-      and qty_mismatch = '[]'::jsonb
+      and qty_mismatch = '[]'::jsonb and boundary_ambiguous_orders = '[]'::jsonb
       and matched_order_count = venue_order_count
       and ledger_order_count <= matched_order_count))
 );
@@ -336,7 +340,7 @@ select run_id, venue, account_ref, interval_start, interval_end, reporting_tz, r
        venue_source, coverage_scope, status, coverage_verified, ledger_mirror_verified,
        incomplete_reasons, venue_order_count, ledger_order_count, matched_order_count,
        venue_records_out_of_interval, missing_in_ledger, missing_in_venue, qty_mismatch,
-       venue_fees_usd, fees_complete, collector, collector_version, collected_at,
+       boundary_ambiguous_orders, venue_fees_usd, fees_complete, collector, collector_version, collected_at,
        ledger_read_started_at, ledger_order_ids, ledger_sources, max_source_age_seconds,
        checked_at, evidence
 from public.ledger_venue_reconciliations;
@@ -350,8 +354,9 @@ from public.ledger_venue_reconciliations;
 --     the result depends on (the venue's orders and the ledger's in-day
 --     orders). Activity for other orders on other days does not withdraw it.
 --   mirror_current: every ledger source the check verified is still the
---     latest instance of its service, fully exported, not failing, and last
---     succeeded within the check's max_source_age_seconds of now. When false,
+--     latest instance of its service, fully exported, not failing, last
+--     succeeded within the check's max_source_age_seconds of now, and its
+--     mirrored live trade count equals the local trade count it reported. When false,
 --     an exporter has stopped or restarted and later corrections may be
 --     unexported, so the result is historical only.
 --   fills_matched_as_of: the mirror read time of a 'matched' check nothing
@@ -386,8 +391,12 @@ cross join lateral (
     where (t.venue = l.venue or (t.deleted and t.venue is null))
       and (t.account_ref = l.account_ref or t.account_ref is null)
       and t.synced_at >= coalesce(l.ledger_read_started_at, l.checked_at)
+      -- In the day, or close enough to a boundary to be ambiguous (the
+      -- recording window: ledger_sync.DEFAULT_CLOCK_SKEW before,
+      -- DEFAULT_RECORDING_LAG after), undated, or a compared order.
       and (t.recorded_at is null
-           or (t.recorded_at >= l.interval_start and t.recorded_at < l.interval_end)
+           or (t.recorded_at >= l.interval_start - interval '120 seconds'
+               and t.recorded_at < l.interval_end + interval '300 seconds')
            or l.ledger_order_ids ? t.order_id)
   ) as changed
 ) stale
@@ -406,6 +415,13 @@ cross join lateral (
            and s.snapshot_complete
            and s.pending_changes = 0
            and s.last_success_at >= now() - make_interval(secs => l.max_source_age_seconds::double precision)
+           -- The mirror still holds every trade the source reports: a
+           -- hard-deleted or missing trade row is not a current mirror.
+           -- (Fills only, so position counts don't gate this.)
+           and s.local_trades_count is not null
+           and s.local_trades_count = (
+             select count(*) from public.ledger_trades t
+             where t.service = s.service and t.db_instance_id = s.db_instance_id and not t.deleted)
            and not exists (
              select 1 from public.ledger_sync_status newer
              where newer.service = s.service and newer.source_key <> s.source_key

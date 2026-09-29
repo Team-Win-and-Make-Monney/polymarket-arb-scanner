@@ -1058,6 +1058,15 @@ WS_ORDERBOOK_MAX_AGE_SECONDS = _env_float("WS_ORDERBOOK_MAX_AGE_SECONDS", "15.0"
 # WS feed stale detection threshold (seconds without any message)
 WS_STALE_FEED_SECONDS = _env_float("WS_STALE_FEED_SECONDS", "120")
 
+# Read WS sockets on a dedicated thread/event loop so synchronous scan stages
+# on the main loop cannot starve them (Polymarket 1013 "slow consumer" closes).
+# Set false to fall back to reading feeds on the main event loop.
+WS_DEDICATED_FEED_THREAD = _env_bool("WS_DEDICATED_FEED_THREAD", "true")
+# Queued WS price updates received longer ago than this are not published as
+# fresh at dispatch (feed-thread receipt time); a non-executable invalidation
+# replaces them, so the caller never keeps an older quote for that key.
+WS_DISPATCH_MAX_AGE_SECONDS = _env_float("WS_DISPATCH_MAX_AGE_SECONDS", "5.0")
+
 # Parallel workers for depth/order book fetches (separate from scan workers)
 DEPTH_FETCH_WORKERS = _env_int("DEPTH_FETCH_WORKERS", "8")
 
@@ -1428,6 +1437,7 @@ def validate_config() -> list[str]:
         "MM_CANARY_MIN_HOURS": MM_CANARY_MIN_HOURS,
         "MM_WS_BOOK_MAX_AGE_SECONDS": MM_WS_BOOK_MAX_AGE_SECONDS,
         "WS_ORDERBOOK_MAX_AGE_SECONDS": WS_ORDERBOOK_MAX_AGE_SECONDS,
+        "WS_DISPATCH_MAX_AGE_SECONDS": WS_DISPATCH_MAX_AGE_SECONDS,
         "CTF_MAX_TRADE_SIZE": CTF_MAX_TRADE_SIZE,
         "INVENTORY_MAX_DELTA_CONTRACTS": INVENTORY_MAX_DELTA_CONTRACTS,
         "INVENTORY_REBALANCE_MAX_COST": INVENTORY_REBALANCE_MAX_COST,

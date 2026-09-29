@@ -1815,8 +1815,8 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
     _feed_health.register_health_callback(_on_feed_health_change)
 
     def on_price_update(platform, ticker, data):
-        data["_ts"] = time.time()
-        _feed_health.record_message(platform)
+        # Age by feed receipt, not delivery: a queued update must not look fresh.
+        data["_ts"] = data.get("_recv_ts") or time.time()
         with _price_cache_lock:
             price_cache[(platform, ticker)] = data
 
@@ -2076,6 +2076,9 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
         kalshi_api_key_id=kalshi_api_key_id,
         kalshi_private_key_path=kalshi_private_key_path,
         kalshi_private_key_base64=kalshi_private_key_base64,
+        # Liveness is every valid WS message, recorded on the feed thread, so
+        # a quiet but healthy book is not reported as a degraded feed.
+        on_feed_message=_feed_health.record_message,
     )
     # Initialize cross-venue delta-neutral inventory balancer
     from inventory_balancer import get_inventory_balancer

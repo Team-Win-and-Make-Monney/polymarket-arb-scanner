@@ -39,7 +39,9 @@ def _task(done=True, cancelled=False, exc=None):
 def _feed_manager():
     import ws_feeds
 
-    fm = ws_feeds.FeedManager(on_price_update=lambda *a, **kw: None)
+    # Direct mode: these tests pin the scan-loop orchestration on one loop.
+    # The dedicated feed-thread path is covered in test_ws_feed_reliability.py.
+    fm = ws_feeds.FeedManager(on_price_update=lambda *a, **kw: None, use_feed_thread=False)
     fm.kalshi_api_key_id = "kid"
     fm.kalshi_private_key = object()
     return fm, ws_feeds

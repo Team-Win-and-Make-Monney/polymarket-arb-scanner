@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import ssl
@@ -47,6 +48,119 @@ _STREAM_LIMIT = 4 * 1024 * 1024  # 4 MiB
 KEEPALIVE_INTERVAL = 10  # seconds between pings
 
 
+# ---------------------------------------------------------------------------
+# Kalshi orderbook message parsing
+# ---------------------------------------------------------------------------
+# Current (2026) Kalshi WS schema, per docs.kalshi.com/websockets/orderbook-updates:
+#   orderbook_snapshot.msg: {"yes_dollars_fp": [["0.0800", "300.00"], ...],
+#                            "no_dollars_fp":  [["0.5400", "20.00"], ...]}
+#   orderbook_delta.msg:    {"price_dollars": "0.9600", "delta_fp": "-54.00", "side": "yes"}
+# Both carry a per-subscription ``sid`` and a strictly increasing ``seq``.
+# Legacy integer-cent fields (``yes``/``no``/``price``/``delta``) are still
+# accepted so a Kalshi rollback cannot silently blank the books again.
+# Internally ladders stay keyed by price in cents (int when whole-cent).
+
+
+class KalshiBookInvalid(Exception):
+    """A Kalshi book can no longer be trusted; the feed must resubscribe for a snapshot."""
+
+
+class KalshiSequenceGap(KalshiBookInvalid):
+    """A Kalshi orderbook delta arrived out of sequence; the book cannot be trusted."""
+
+
+def _kalshi_dollars_to_cents(value) -> int | float | None:
+    """Convert a dollar price ("0.4200") to cents (42); None when invalid or outside 0-100c."""
+    from decimal import Decimal, InvalidOperation
+    try:
+        cents = Decimal(str(value)) * 100
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if not cents.is_finite() or cents < 0 or cents > 100:
+        return None
+    return int(cents) if cents == cents.to_integral_value() else float(cents)
+
+
+def _kalshi_qty(value) -> float | None:
+    """Parse a Kalshi quantity (fixed-point string or number); None when invalid."""
+    try:
+        qty = float(value)
+    except (TypeError, ValueError):
+        return None
+    return qty if math.isfinite(qty) else None
+
+
+def _kalshi_add_qty(previous, delta) -> float:
+    """previous + delta in exact decimal arithmetic, as a float.
+
+    Kalshi quantities are fixed-point decimal strings (2 dp). Adding them as
+    binary floats leaves residue (0.1 + 0.2 - 0.3 is 5.6e-17, not 0), which
+    would keep an exhausted level alive with a phantom size. Each float here
+    came from a short decimal string, so str() recovers it exactly; the sum
+    has no more places than its inputs, and no real fraction is rounded away.
+    """
+    from decimal import Decimal
+    return float(Decimal(str(previous or 0)) + Decimal(str(delta)))
+
+
+def _parse_kalshi_ladder(msg: dict, side: str) -> dict:
+    """Return {price_cents: qty} for one side of a Kalshi snapshot (either schema)."""
+    for key in (f"{side}_dollars_fp", f"{side}_dollars"):
+        if key in msg:
+            ladder = {}
+            for level in msg.get(key) or []:
+                if not isinstance(level, (list, tuple)) or len(level) < 2:
+                    continue
+                price = _kalshi_dollars_to_cents(level[0])
+                qty = _kalshi_qty(level[1])
+                if price is not None and qty is not None and qty > 0:
+                    ladder[price] = qty
+            return ladder
+    return {
+        int(level[0]): level[1]
+        for level in (msg.get(side) or [])
+        if isinstance(level, (list, tuple)) and len(level) >= 2
+    }
+
+
+def _parse_kalshi_delta(msg: dict) -> tuple[str, int | float, float] | None:
+    """Return (side, price_cents, delta_qty) from a Kalshi delta (either schema), or None."""
+    side = msg.get("side")
+    if side not in ("yes", "no"):
+        return None
+    if "price_dollars" in msg:
+        price = _kalshi_dollars_to_cents(msg.get("price_dollars"))
+    elif isinstance(msg.get("price"), (int, float)):
+        price = int(msg["price"])
+    else:
+        price = None
+    if "delta_fp" in msg:
+        delta = _kalshi_qty(msg.get("delta_fp"))
+    elif isinstance(msg.get("delta"), (int, float)):
+        delta = msg["delta"]
+    else:
+        delta = None
+    if price is None or delta is None:
+        return None
+    return side, price, delta
+
+
+def _dispatch_max_age_default() -> float:
+    try:
+        from config import WS_DISPATCH_MAX_AGE_SECONDS
+        return float(WS_DISPATCH_MAX_AGE_SECONDS)
+    except Exception:
+        return 5.0
+
+
+def _feed_thread_default() -> bool:
+    try:
+        from config import WS_DEDICATED_FEED_THREAD
+        return bool(WS_DEDICATED_FEED_THREAD)
+    except Exception:
+        return True
+
+
 class FeedManager:
     """Manages WebSocket connections to both platforms for real-time price feeds."""
 
@@ -59,10 +173,17 @@ class FeedManager:
         betfair_app_key: str | None = None,
         betfair_session_token: str | None = None,
         price_cache: dict | None = None,
+        on_feed_message: Callable[[str], None] | None = None,
+        use_feed_thread: bool | None = None,
     ):
         """
         Args:
             on_price_update: Callback(platform, ticker/token_id, price_data)
+            on_feed_message: Optional callback(platform) fired for every valid market-data
+                message, including ones that leave the book unchanged. It runs on the
+                feed thread, so it must be thread-safe (FeedHealthTracker.record_message is).
+            use_feed_thread: Read sockets on a dedicated thread/event loop so a blocked
+                caller loop cannot stall them (default: config WS_DEDICATED_FEED_THREAD).
             kalshi_api_key_id: Kalshi API key ID for WS auth
             kalshi_private_key_path: Path to Kalshi RSA private key PEM file
             kalshi_private_key_base64: Base64-encoded RSA private key (alternative to path)
@@ -71,6 +192,38 @@ class FeedManager:
             price_cache: Optional shared dict for marking stale prices (keyed by (platform, ticker))
         """
         self.on_price_update = on_price_update
+        self.on_feed_message = on_feed_message
+        self._use_feed_thread = _feed_thread_default() if use_feed_thread is None else bool(use_feed_thread)
+        # Dedicated feed loop/thread (see run()) and the caller loop that
+        # on_price_update is marshalled back onto. Both stay None in direct mode.
+        self._feed_loop: asyncio.AbstractEventLoop | None = None
+        self._feed_thread: threading.Thread | None = None
+        self._dispatch_loop: asyncio.AbstractEventLoop | None = None
+        # Latest-wins pending updates per (platform, key); coalesces only while
+        # the caller loop is behind, so memory is bounded by subscribed markets.
+        # Each entry is (data, platform_generation, key_generation); an entry whose
+        # generation no longer matches was queued before an invalidation.
+        self._pending_updates: dict[tuple[str, str], tuple[dict, int, int]] = {}
+        self._pending_lock = threading.Lock()
+        self._drain_scheduled = False
+        self._platform_gen: dict[str, int] = {}
+        self._key_gen: dict[tuple[str, str], int] = {}
+        # Keys per platform whose last emitted update may carry executable prices
+        # (queued or delivered). A reset publishes an invalidation for each, so
+        # the caller's cache never keeps a quote from a dropped connection.
+        self._downstream_keys: dict[str, set[str]] = {}
+        # Queued updates older than this (by feed-thread receipt time) are dropped
+        # at drain instead of being published as if fresh. Invalidations never expire.
+        self._dispatch_max_age = _dispatch_max_age_default()
+        self.dropped_expired_updates = 0
+        self.dropped_invalidated_updates = 0
+        # Guards book dicts, which the feed thread writes while scans/executor read.
+        self._book_lock = threading.RLock()
+        # Guards subscription lists shared between the caller and the feed thread.
+        self._subs_lock = threading.Lock()
+        # Kalshi per-subscription sequence tracking: sid -> last seq / ticker.
+        self._kalshi_seq: dict[int, int] = {}
+        self._kalshi_sid_ticker: dict[int, str] = {}
         self._price_cache = price_cache or {}
         self._price_cache_lock = threading.Lock()
         self.kalshi_api_key_id = kalshi_api_key_id
@@ -97,7 +250,7 @@ class FeedManager:
         self._pending_betfair_subs: list[str] = []
         self._kalshi_ws = None
         self._kalshi_task_started = False
-        self._kalshi_late_task: asyncio.Task | None = None
+        self._kalshi_late_task = None  # asyncio.Task, or concurrent Future on the feed loop
         # Per-ticker Kalshi book state: {ticker: {"yes": {price_cents: qty}, "no": {...}}}.
         # Needed because orderbook_delta messages carry single-level changes, not ladders.
         self._kalshi_books: dict[str, dict[str, dict[int, float]]] = {}
@@ -132,26 +285,27 @@ class FeedManager:
 
         New tokens/tickers are queued and sent on the next message loop iteration.
         """
-        if poly_token_ids:
-            new_poly = [t for t in poly_token_ids if t and t not in self._poly_token_ids]
-            if new_poly:
-                self._poly_token_ids.extend(new_poly)
-                self._pending_poly_subs.extend(new_poly)
-                logger.info("Queued %d new Polymarket subscriptions.", len(new_poly))
+        with self._subs_lock:
+            if poly_token_ids:
+                new_poly = [t for t in poly_token_ids if t and t not in self._poly_token_ids]
+                if new_poly:
+                    self._poly_token_ids.extend(new_poly)
+                    self._pending_poly_subs.extend(new_poly)
+                    logger.info("Queued %d new Polymarket subscriptions.", len(new_poly))
 
-        if kalshi_tickers:
-            new_kalshi = [t for t in kalshi_tickers if t and t not in self._kalshi_tickers]
-            if new_kalshi:
-                self._kalshi_tickers.extend(new_kalshi)
-                self._pending_kalshi_subs.extend(new_kalshi)
-                logger.info("Queued %d new Kalshi subscriptions.", len(new_kalshi))
+            if kalshi_tickers:
+                new_kalshi = [t for t in kalshi_tickers if t and t not in self._kalshi_tickers]
+                if new_kalshi:
+                    self._kalshi_tickers.extend(new_kalshi)
+                    self._pending_kalshi_subs.extend(new_kalshi)
+                    logger.info("Queued %d new Kalshi subscriptions.", len(new_kalshi))
 
-        if betfair_market_ids:
-            new_bf = [m for m in betfair_market_ids if m and m not in self._betfair_market_ids]
-            if new_bf:
-                self._betfair_market_ids.extend(new_bf)
-                self._pending_betfair_subs.extend(new_bf)
-                logger.info("Queued %d new Betfair subscriptions.", len(new_bf))
+            if betfair_market_ids:
+                new_bf = [m for m in betfair_market_ids if m and m not in self._betfair_market_ids]
+                if new_bf:
+                    self._betfair_market_ids.extend(new_bf)
+                    self._pending_betfair_subs.extend(new_bf)
+                    logger.info("Queued %d new Betfair subscriptions.", len(new_bf))
 
     def prune_subscriptions(self, active_poly_token_ids: list[str] | None = None,
                             active_kalshi_tickers: list[str] | None = None,
@@ -168,35 +322,273 @@ class FeedManager:
             active_kalshi_tickers: Currently active Kalshi tickers.
             active_betfair_market_ids: Currently active Betfair market IDs.
         """
-        pruned = 0
-        if active_poly_token_ids is not None:
-            active_set = set(active_poly_token_ids)
-            before = len(self._poly_token_ids)
-            self._poly_token_ids = [t for t in self._poly_token_ids if t in active_set]
-            self._pending_poly_subs = [t for t in self._pending_poly_subs if t in active_set]
-            pruned += before - len(self._poly_token_ids)
+        with self._subs_lock:
+            pruned = 0
+            if active_poly_token_ids is not None:
+                active_set = set(active_poly_token_ids)
+                before = len(self._poly_token_ids)
+                self._poly_token_ids = [t for t in self._poly_token_ids if t in active_set]
+                self._pending_poly_subs = [t for t in self._pending_poly_subs if t in active_set]
+                pruned += before - len(self._poly_token_ids)
 
-        if active_kalshi_tickers is not None:
-            active_set = set(active_kalshi_tickers)
-            before = len(self._kalshi_tickers)
-            self._kalshi_tickers = [t for t in self._kalshi_tickers if t in active_set]
-            self._pending_kalshi_subs = [t for t in self._pending_kalshi_subs if t in active_set]
-            pruned += before - len(self._kalshi_tickers)
+            if active_kalshi_tickers is not None:
+                active_set = set(active_kalshi_tickers)
+                before = len(self._kalshi_tickers)
+                self._kalshi_tickers = [t for t in self._kalshi_tickers if t in active_set]
+                self._pending_kalshi_subs = [t for t in self._pending_kalshi_subs if t in active_set]
+                pruned += before - len(self._kalshi_tickers)
 
-        if active_betfair_market_ids is not None:
-            active_set = set(active_betfair_market_ids)
-            before = len(self._betfair_market_ids)
-            self._betfair_market_ids = [m for m in self._betfair_market_ids if m in active_set]
-            self._pending_betfair_subs = [m for m in self._pending_betfair_subs if m in active_set]
-            pruned += before - len(self._betfair_market_ids)
+            if active_betfair_market_ids is not None:
+                active_set = set(active_betfair_market_ids)
+                before = len(self._betfair_market_ids)
+                self._betfair_market_ids = [m for m in self._betfair_market_ids if m in active_set]
+                self._pending_betfair_subs = [m for m in self._pending_betfair_subs if m in active_set]
+                pruned += before - len(self._betfair_market_ids)
 
-        if pruned:
-            logger.info("Pruned %d stale WS subscriptions (%d Kalshi, %d Poly, %d Betfair remain).",
-                        pruned, len(self._kalshi_tickers), len(self._poly_token_ids),
-                        len(self._betfair_market_ids))
+            if pruned:
+                logger.info("Pruned %d stale WS subscriptions (%d Kalshi, %d Poly, %d Betfair remain).",
+                            pruned, len(self._kalshi_tickers), len(self._poly_token_ids),
+                            len(self._betfair_market_ids))
 
     async def run(self):
-        """Run all feed connections concurrently with auto-reconnect."""
+        """Run all feed connections concurrently with auto-reconnect.
+
+        With the dedicated feed thread (default), sockets are read on their own
+        event loop so a caller loop blocked by synchronous scan stages cannot
+        starve them (Polymarket closes a lagging reader with 1013 "slow
+        consumer"). on_price_update is marshalled back onto the caller's loop,
+        so callbacks keep running on the same thread as before.
+        """
+        if not self._use_feed_thread:
+            await self._run_feeds()
+            return
+        self._dispatch_loop = asyncio.get_running_loop()
+        future = asyncio.run_coroutine_threadsafe(self._run_feeds(), self._ensure_feed_loop())
+        wrapped = asyncio.wrap_future(future)
+        try:
+            # asyncio.wait never raises for the awaited future, so a
+            # CancelledError here can only be the caller cancelling this task:
+            # that propagates. (Works on 3.10, which has no Task.cancelling().)
+            await asyncio.wait({wrapped})
+        finally:
+            if not future.done():
+                future.cancel()
+        if wrapped.cancelled():
+            # stop() cancelled the feed tasks on the feed loop: an internal
+            # shutdown, so return normally rather than raise into the caller.
+            return
+        wrapped.result()  # re-raise a feed failure
+
+    def _ensure_feed_loop(self) -> asyncio.AbstractEventLoop:
+        """Start (once) the daemon thread that owns the feed event loop."""
+        if self._feed_loop is not None and not self._feed_loop.is_closed():
+            return self._feed_loop
+        loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        def _serve():
+            asyncio.set_event_loop(loop)
+            loop.call_soon(ready.set)
+            try:
+                loop.run_forever()
+            finally:
+                loop.close()
+
+        thread = threading.Thread(target=_serve, name="ws-feeds", daemon=True)
+        thread.start()
+        ready.wait(timeout=5)
+        self._feed_loop = loop
+        self._feed_thread = thread
+        return loop
+
+    def _shutdown_feed_loop(self) -> None:
+        """Cancel every feed task on the feed loop, then stop it."""
+        loop = self._feed_loop
+        self._feed_loop = None
+        if loop is None or loop.is_closed():
+            return
+
+        async def _cancel_all():
+            tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            loop.stop()
+
+        try:
+            asyncio.run_coroutine_threadsafe(_cancel_all(), loop)
+        except RuntimeError as exc:
+            # The feed loop closed between the check above and scheduling: its
+            # tasks are already gone, so there is nothing left to cancel.
+            logger.debug("Feed loop already closed at shutdown: %s", exc)
+
+    def _emit_price_update(self, platform: str, key: str, data: dict) -> None:
+        """Deliver a price update to on_price_update on the caller's loop.
+
+        Every payload carries ``_recv_ts``, the local receipt time stamped
+        here at ingress (never taken from the feed), so the caller can age it
+        by when it was received rather than when it was delivered. Direct call when no dispatch loop is set (tests,
+        use_feed_thread=False). Otherwise updates queue latest-wins per
+        (platform, key) and one drain is scheduled; coalescing only happens
+        while the caller loop is behind.
+        """
+        # _recv_ts is reserved: stamp the local receipt time here, at ingress,
+        # overwriting any feed-supplied value (a future or non-numeric one
+        # would bypass or break the freshness check). A copy, so a raw event
+        # or shared cache dict is never mutated.
+        data = {**data, "_recv_ts": time.time()}
+        loop = self._dispatch_loop
+        # Tracking the key and queueing the update happen under one lock, so a
+        # drain never sees a key tracked without its queued update.
+        with self._pending_lock:
+            keys = self._downstream_keys.setdefault(platform, set())
+            if data.get("_invalidated"):
+                keys.discard(key)
+            else:
+                keys.add(key)
+            if loop is not None:
+                self._pending_updates[(platform, key)] = (
+                    data, self._platform_gen.get(platform, 0), self._key_gen.get((platform, key), 0))
+                if self._drain_scheduled:
+                    return
+                self._drain_scheduled = True
+        if loop is None:
+            self.on_price_update(platform, key, data)
+            return
+        try:
+            loop.call_soon_threadsafe(self._drain_price_updates)
+        except RuntimeError:
+            # Caller loop closed (shutdown): drop the pending batch.
+            with self._pending_lock:
+                self._pending_updates.clear()
+                self._drain_scheduled = False
+
+    def _drain_price_updates(self) -> None:
+        """Run on the caller loop: deliver each pending update that is still valid.
+
+        Dropped: entries queued before an invalidation of their platform or key
+        (generation mismatch). Invalidations are always delivered: they carry
+        no executable price, so they can never be stale or unsafe.
+
+        An entry received more than ``_dispatch_max_age`` seconds ago is not
+        delivered as a price. An invalidation stamped with the current time is
+        delivered in its place, because the caller may still hold an older
+        executable quote for the key that this tick was meant to replace. A
+        newer tick for the key that arrived after this batch was taken is left
+        queued and still tracked, so the next drain delivers it.
+        """
+        with self._pending_lock:
+            batch = self._pending_updates
+            self._pending_updates = {}
+            self._drain_scheduled = False
+        now = time.time()
+        for (platform, key), (data, platform_gen, key_gen) in batch.items():
+            invalidation = bool(data.get("_invalidated"))
+            with self._pending_lock:
+                current = (platform_gen == self._platform_gen.get(platform, 0)
+                           and key_gen == self._key_gen.get((platform, key), 0))
+            if not current and not invalidation:
+                self.dropped_invalidated_updates += 1
+                continue
+            if (not invalidation
+                    and now - data.get("_recv_ts", now) > self._dispatch_max_age):
+                self.dropped_expired_updates += 1
+                logger.debug("Expired %s %s update received %.1fs ago; invalidating", platform, key,
+                             now - data["_recv_ts"])
+                with self._pending_lock:
+                    if (platform, key) not in self._pending_updates:
+                        self._downstream_keys.get(platform, set()).discard(key)
+                data = self._invalidation_payload(platform, key)
+                data["_recv_ts"] = now
+            try:
+                self.on_price_update(platform, key, data)
+            except Exception:
+                logger.exception("on_price_update failed for %s %s", platform, key)
+
+    def _invalidate_updates(self, platform: str, keys: list[str] | None = None) -> None:
+        """Discard queued price updates for a platform (or some keys) and bump their generation.
+
+        Queued invalidations are kept: dropping one would leave the caller's
+        cache holding the executable quote it was meant to overwrite.
+        """
+        with self._pending_lock:
+            if keys is None:
+                self._platform_gen[platform] = self._platform_gen.get(platform, 0) + 1
+                pending_keys = [k for k in self._pending_updates if k[0] == platform]
+            else:
+                for key in keys:
+                    self._key_gen[(platform, key)] = self._key_gen.get((platform, key), 0) + 1
+                pending_keys = [(platform, key) for key in keys if (platform, key) in self._pending_updates]
+            for pending_key in pending_keys:
+                data = self._pending_updates[pending_key][0]
+                if data.get("_invalidated"):
+                    self._pending_updates[pending_key] = (
+                        data, self._platform_gen.get(platform, 0), self._key_gen.get(pending_key, 0))
+                else:
+                    del self._pending_updates[pending_key]
+
+    @staticmethod
+    def _invalidation_payload(platform: str, key: str) -> dict:
+        """A price update with no executable price, replacing the caller's cache entry."""
+        if platform == "betfair":
+            return {"market_id": key, "runners": {}, "_invalidated": True}
+        if platform == "kalshi":
+            return {
+                "market_ticker": key,
+                "yes_ask": None, "no_ask": None,
+                "yes_ask_size": 0, "no_ask_size": 0,
+                "_invalidated": True,
+            }
+        return {
+            "event_type": "invalidated",
+            "asset_id": key,
+            "best_ask": None, "best_bid": None,
+            "best_ask_size": 0, "best_bid_size": 0,
+            "_invalidated": True,
+        }
+
+    def _publish_invalidations(self, platform: str, keys) -> None:
+        """Overwrite downstream prices for keys with non-executable ones."""
+        for key in keys:
+            self._emit_price_update(platform, key, self._invalidation_payload(platform, key))
+
+    def _publish_kalshi_invalidation(self, tickers: list[str]) -> None:
+        self._publish_invalidations("kalshi", tickers)
+
+    def _reset_downstream(self, platform: str, book_keys: list[str], publish_invalidation: bool) -> None:
+        """Drop queued prices for a platform; optionally invalidate every key that may be live downstream."""
+        with self._pending_lock:
+            live = set(self._downstream_keys.get(platform, ())) | set(book_keys)
+        self._invalidate_updates(platform)
+        if publish_invalidation and live:
+            self._publish_invalidations(platform, sorted(live))
+
+    def _invalidate_kalshi_ticker(self, ticker: str, sid: int | None = None) -> None:
+        """Drop one ticker's book and anything queued from it, then publish no prices."""
+        with self._book_lock:
+            self._kalshi_books.pop(ticker, None)
+            self._kalshi_book_times.pop(ticker, None)
+            if sid is not None:
+                self._kalshi_seq.pop(sid, None)
+        self._invalidate_updates("kalshi", [ticker])
+        self._publish_kalshi_invalidation([ticker])
+
+    def _on_betfair_update(self, platform: str, market_id: str, data: dict) -> None:
+        """Betfair price ingress. Liveness is recorded per message by BetfairFeed.on_message."""
+        self._emit_price_update(platform, market_id, data)
+
+    def _note_feed_message(self, platform: str) -> None:
+        """Record liveness for a valid market-data message (book changed or not)."""
+        now = time.time()
+        self._last_message_time[platform] = now
+        if self.on_feed_message is not None:
+            try:
+                self.on_feed_message(platform)
+            except Exception as exc:
+                logger.debug("on_feed_message failed for %s: %s", platform, exc)
+
+    async def _run_feeds(self):
+        """Run every configured feed until stopped (runs on the feed loop when threaded)."""
         self._running = True
         tasks = []
         if self._kalshi_tickers and self.kalshi_api_key_id and self.kalshi_private_key:
@@ -226,7 +618,7 @@ class FeedManager:
         with zero Kalshi tickers and never spawns _run_kalshi. Once re-auth
         succeeds and tickers arrive via update_subscriptions, this spawns the
         feed task into the running loop. Idempotent; returns True only when a
-        task was actually started. Must be called from the event loop thread.
+        task was actually started. Must be called from the caller event loop thread.
         """
         if self._kalshi_task_started:
             return False
@@ -237,8 +629,12 @@ class FeedManager:
         # _connect_kalshi's initial loop subscribes everything already in
         # _kalshi_tickers; drop queued pending subs to avoid a duplicate
         # subscribe message right after connect.
-        self._pending_kalshi_subs.clear()
-        self._kalshi_late_task = asyncio.create_task(self._run_kalshi())
+        with self._subs_lock:
+            self._pending_kalshi_subs.clear()
+        if self._feed_loop is not None and not self._feed_loop.is_closed():
+            self._kalshi_late_task = asyncio.run_coroutine_threadsafe(self._run_kalshi(), self._feed_loop)
+        else:
+            self._kalshi_late_task = asyncio.create_task(self._run_kalshi())
         logger.info("Kalshi WS feed started late (%d tickers) after re-auth.",
                     len(self._kalshi_tickers))
         return True
@@ -320,48 +716,55 @@ class FeedManager:
 
     def get_kalshi_orderbook(self, ticker: str) -> dict | None:
         """Return the reconstructed Kalshi orderbook for ticker in standard format."""
-        book = self._kalshi_books.get(ticker)
-        if book is None:
-            return None
-        return {
-            "orderbook": {
-                "yes": [[p, q] for p, q in sorted(book.get("yes", {}).items())],
-                "no": [[p, q] for p, q in sorted(book.get("no", {}).items())],
+        with self._book_lock:
+            book = self._kalshi_books.get(ticker)
+            if book is None:
+                return None
+            return {
+                "orderbook": {
+                    "yes": [[p, q] for p, q in sorted(book.get("yes", {}).items())],
+                    "no": [[p, q] for p, q in sorted(book.get("no", {}).items())],
+                }
             }
-        }
 
     def get_kalshi_orderbook_age(self, ticker: str) -> float | None:
         """Return the age in seconds of the cached Kalshi orderbook, or None."""
-        t = self._kalshi_book_times.get(ticker)
+        with self._book_lock:
+            t = self._kalshi_book_times.get(ticker)
         return (time.time() - t) if t is not None else None
 
     def get_polymarket_orderbook(self, token_id: str) -> dict | None:
         """Return the cached Polymarket orderbook for token_id in standard format."""
-        book = self._poly_books.get(token_id)
-        if book is None:
-            return None
-        return {
-            "bids": list(book.get("bids", [])),
-            "asks": list(book.get("asks", [])),
-        }
+        with self._book_lock:
+            book = self._poly_books.get(token_id)
+            if book is None:
+                return None
+            return {
+                "bids": list(book.get("bids", [])),
+                "asks": list(book.get("asks", [])),
+            }
 
     def get_polymarket_orderbook_age(self, token_id: str) -> float | None:
         """Return the age in seconds of the cached Polymarket orderbook, or None."""
-        t = self._poly_book_times.get(token_id)
+        with self._book_lock:
+            t = self._poly_book_times.get(token_id)
         return (time.time() - t) if t is not None else None
 
     def get_orderbook(self, platform: str, key: str) -> tuple[dict | None, float | None]:
         """Return (orderbook_dict, age_seconds) for platform and identifier, or (None, None)."""
         platform_lower = str(platform).lower()
-        if platform_lower == "kalshi":
-            book = self.get_kalshi_orderbook(key)
-            age = self.get_kalshi_orderbook_age(key)
-            return (book, age) if book is not None else (None, None)
-        elif platform_lower == "polymarket":
-            book = self.get_polymarket_orderbook(key)
-            age = self.get_polymarket_orderbook_age(key)
-            return (book, age) if book is not None else (None, None)
-        return None, None
+        if platform_lower not in ("kalshi", "polymarket"):
+            return None, None
+        # One lock hold for both reads, so a reset and fresh snapshot between
+        # them can't pair the old book with the new book's timestamp.
+        with self._book_lock:
+            if platform_lower == "kalshi":
+                book = self.get_kalshi_orderbook(key)
+                age = self.get_kalshi_orderbook_age(key)
+            else:
+                book = self.get_polymarket_orderbook(key)
+                age = self.get_polymarket_orderbook_age(key)
+        return (book, age) if book is not None else (None, None)
 
     def stop(self):
         """Signal feeds to stop."""
@@ -370,6 +773,7 @@ class FeedManager:
             self._betfair_feed.stop()
         self._reset_kalshi_books()
         self._reset_poly_books()
+        self._shutdown_feed_loop()
 
     async def _run_betfair(self):
         """Maintain Betfair Stream API connection with auto-reconnect and exponential backoff."""
@@ -380,7 +784,8 @@ class FeedManager:
             app_key=self._betfair_app_key,
             session_token=self._betfair_session_token,
             market_ids=list(self._betfair_market_ids),
-            on_price_update=self.on_price_update,
+            on_price_update=self._on_betfair_update,
+            on_message=lambda: self._note_feed_message("betfair"),
             cache=cache,
             host=BETFAIR_STREAM_HOST,
             port=BETFAIR_STREAM_PORT,
@@ -399,10 +804,13 @@ class FeedManager:
                     await asyncio.sleep(jittered)
                     delay = min(delay * 2, RECONNECT_MAX_DELAY)
 
-            # Pick up any dynamically queued betfair subs
-            while self._pending_betfair_subs:
-                mid = self._pending_betfair_subs.pop(0)
-                feed.add_market_ids([mid])
+            # Pick up any dynamically queued betfair subs. prune_subscriptions()
+            # can replace the list from another thread, so drain it under the lock.
+            with self._subs_lock:
+                pending_bf = list(self._pending_betfair_subs)
+                self._pending_betfair_subs.clear()
+            if pending_bf:
+                feed.add_market_ids(pending_bf)
 
         self._betfair_feed = None
 
@@ -416,6 +824,9 @@ class FeedManager:
                 await self._connect_kalshi()
                 delay = RECONNECT_DELAY  # Reset backoff on successful connection
             except Exception as e:
+                # The connection is gone: nothing from it may be served while
+                # we back off, so drop books and queued updates now.
+                self._reset_kalshi_books()
                 if self._running:
                     if _ws_metrics:
                         _ws_metrics.inc("ws_reconnections", {"platform": "kalshi"})
@@ -450,41 +861,31 @@ class FeedManager:
             connect_kwargs["sock"] = sock
 
         async with websockets.connect(KALSHI_WS_URL, **connect_kwargs) as ws:
-            logger.info("Kalshi connected. Subscribing to %d tickers...", len(self._kalshi_tickers))
+            with self._subs_lock:
+                tickers = list(self._kalshi_tickers)
+            logger.info("Kalshi connected. Subscribing to %d tickers...", len(tickers))
             self._reset_kalshi_books()
 
             # Subscribe to orderbook updates for each ticker
-            for ticker in self._kalshi_tickers:
-                sub_msg = {
-                    "id": 1,
-                    "cmd": "subscribe",
-                    "params": {
-                        "channels": ["orderbook_delta"],
-                        "market_tickers": [ticker],
-                    },
-                }
-                await ws.send(json.dumps(sub_msg))
+            for ticker in tickers:
+                await ws.send(json.dumps(self._kalshi_subscribe_msg(ticker)))
 
             self._kalshi_ws = ws
 
             # Read messages with keepalive
             while self._running:
                 # Send any pending subscriptions
-                while self._pending_kalshi_subs:
-                    ticker = self._pending_kalshi_subs.pop(0)
-                    sub_msg = {
-                        "id": 1,
-                        "cmd": "subscribe",
-                        "params": {
-                            "channels": ["orderbook_delta"],
-                            "market_tickers": [ticker],
-                        },
-                    }
-                    await ws.send(json.dumps(sub_msg))
+                with self._subs_lock:
+                    pending = list(self._pending_kalshi_subs)
+                    self._pending_kalshi_subs.clear()
+                for ticker in pending:
+                    await ws.send(json.dumps(self._kalshi_subscribe_msg(ticker)))
 
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=KEEPALIVE_INTERVAL)
                     data = json.loads(raw)
+                    # KalshiSequenceGap propagates out so _run_kalshi reconnects,
+                    # which resets every book and resubscribes for fresh snapshots.
                     self._handle_kalshi_message(data)
                 except asyncio.TimeoutError:
                     # Send ping to keep connection alive
@@ -496,23 +897,47 @@ class FeedManager:
 
             self._kalshi_ws = None
 
-    def _reset_kalshi_books(self):
+    @staticmethod
+    def _kalshi_subscribe_msg(ticker: str) -> dict:
+        return {
+            "id": 1,
+            "cmd": "subscribe",
+            "params": {
+                "channels": ["orderbook_delta"],
+                "market_tickers": [ticker],
+            },
+        }
+
+    def _reset_kalshi_books(self, publish_invalidation: bool = True):
         """Drop all cached Kalshi book state.
 
-        Called on (re)connect: after a connection gap the cached ladders are
-        stale, and deltas must not be applied until a fresh snapshot arrives.
+        Called on (re)connect and disconnect: after a connection gap the cached
+        ladders are stale, and deltas must not be applied until a fresh
+        snapshot arrives. Queued price updates from the old connection are
+        discarded (queued invalidations are kept); with publish_invalidation,
+        every ticker that had a book or may hold an executable quote downstream
+        gets a non-executable price published.
         """
-        self._kalshi_books.clear()
-        self._kalshi_book_times.clear()
+        with self._book_lock:
+            tickers = list(self._kalshi_books)
+            self._kalshi_books.clear()
+            self._kalshi_book_times.clear()
+            self._kalshi_seq.clear()
+            self._kalshi_sid_ticker.clear()
+        self._reset_downstream("kalshi", tickers, publish_invalidation)
 
-    def _reset_poly_books(self):
+    def _reset_poly_books(self, publish_invalidation: bool = True):
         """Drop all cached Polymarket book state.
 
-        Called on (re)connect: after a connection gap the cached books are
-        stale, and fresh book snapshots must arrive.
+        Called on (re)connect and disconnect: after a connection gap the cached
+        books are stale, and fresh book snapshots must arrive. Same downstream
+        invalidation as _reset_kalshi_books.
         """
-        self._poly_books.clear()
-        self._poly_book_times.clear()
+        with self._book_lock:
+            tokens = list(self._poly_books)
+            self._poly_books.clear()
+            self._poly_book_times.clear()
+        self._reset_downstream("polymarket", tokens, publish_invalidation)
 
     def _handle_kalshi_message(self, data: dict):
         """Process a Kalshi WebSocket message.
@@ -520,74 +945,104 @@ class FeedManager:
         Normalises orderbook snapshots/deltas into a scan-friendly format
         with ``yes_ask``, ``no_ask``, ``yes_ask_size``, ``no_ask_size`` etc.
         so the scan modules can consume cached prices directly.
+
+        Raises:
+            KalshiSequenceGap: a delta skipped a ``seq`` for its subscription.
+                The ticker's book is dropped first so nothing reads it.
         """
         if _ws_metrics:
             _ws_metrics.inc("ws_messages_received", {"platform": "kalshi"})
         msg_type = data.get("type", "")
-        if msg_type == "orderbook_snapshot" or msg_type == "orderbook_delta":
-            msg = data.get("msg", {})
-            ticker = msg.get("market_ticker", "")
-            if not ticker:
-                return
+        if msg_type == "error":
+            logger.warning("Kalshi WS error message: %s", data.get("msg"))
+            return
+        if msg_type not in ("orderbook_snapshot", "orderbook_delta"):
+            return
+        msg = data.get("msg", {})
+        ticker = msg.get("market_ticker", "")
+        if not ticker:
+            return
 
-            # Kalshi WS "yes"/"no" ladders are BID ladders ([price_cents, qty],
-            # ascending); the executable ask for one side is 100c minus the best
-            # bid on the opposite side. Deltas carry a single (side, price, delta)
-            # change, so a per-ticker book is maintained across messages.
+        # Kalshi WS "yes"/"no" ladders are BID ladders (ascending); the
+        # executable ask for one side is 100c minus the best bid on the
+        # opposite side. Deltas carry a single (side, price, delta) change, so
+        # a per-ticker book is maintained across messages.
+        sid = data.get("sid")
+        seq = data.get("seq")
+        track_seq = isinstance(sid, int) and isinstance(seq, int)
+        invalid: type[KalshiBookInvalid] | None = None
+        reason = ""
+        with self._book_lock:
             book = self._kalshi_books.get(ticker)
             book_changed = False
             if msg_type == "orderbook_snapshot":
-                book = {"yes": {}, "no": {}}
+                book = {"yes": _parse_kalshi_ladder(msg, "yes"), "no": _parse_kalshi_ladder(msg, "no")}
                 self._kalshi_books[ticker] = book
                 book_changed = True
-                for side in ("yes", "no"):
-                    ladder = msg.get(side) or []
-                    book[side] = {
-                        int(level[0]): level[1]
-                        for level in ladder
-                        if isinstance(level, (list, tuple)) and len(level) >= 2
-                    }
-            elif book is not None:
-                side = msg.get("side")
-                price = msg.get("price")
-                delta = msg.get("delta")
-                if side in ("yes", "no") and isinstance(price, (int, float)) and isinstance(delta, (int, float)):
-                    levels = book[side]
-                    level = int(price)
-                    previous_qty = levels.get(level)
-                    qty = (previous_qty or 0) + delta
-                    if qty > 0:
-                        if previous_qty != qty:
-                            levels[level] = qty
-                            book_changed = True
-                    elif level in levels:
-                        levels.pop(level)
-                        book_changed = True
-
-            normalised = dict(msg)  # keep raw fields for backward compat
-            for side, opposite in (("yes", "no"), ("no", "yes")):
-                # A delta before the ticker's snapshot leaves book=None: the
-                # ladder is unknown, so publish no executable prices at all.
-                opposite_levels = book[opposite] if book is not None else {}
-                if opposite_levels:
-                    best_bid = max(opposite_levels)
-                    normalised[f"{side}_ask"] = (100 - best_bid) / 100.0
-                    normalised[f"{side}_ask_size"] = opposite_levels[best_bid]
+                if track_seq:
+                    self._kalshi_seq[sid] = seq
+                    self._kalshi_sid_ticker[sid] = ticker
+            else:
+                parsed = _parse_kalshi_delta(msg)
+                if track_seq and sid in self._kalshi_seq and seq != self._kalshi_seq[sid] + 1:
+                    invalid = KalshiSequenceGap
+                    reason = f"sid={sid}: expected seq {self._kalshi_seq[sid] + 1}, got {seq}"
+                elif parsed is None and book is not None:
+                    # An unknown level change on a live book: the book is no
+                    # longer known, so it must not keep being served.
+                    invalid = KalshiBookInvalid
+                    reason = f"unparsable delta on a live book: {msg}"
                 else:
-                    normalised[f"{side}_ask"] = None
-                    normalised[f"{side}_ask_size"] = 0
+                    if track_seq and sid in self._kalshi_seq:
+                        self._kalshi_seq[sid] = seq
+                    if parsed is None:
+                        logger.debug("Kalshi delta for %s has no usable side/price/delta: %s", ticker, msg)
+                    elif book is not None:
+                        side, level, delta = parsed
+                        levels = book[side]
+                        previous_qty = levels.get(level)
+                        qty = _kalshi_add_qty(previous_qty, delta)
+                        if qty > 0:
+                            if previous_qty != qty:
+                                levels[level] = qty
+                                book_changed = True
+                        elif level in levels:
+                            levels.pop(level)
+                            book_changed = True
 
-            if book is not None:
-                if book_changed:
-                    self._kalshi_book_times[ticker] = time.time()
-                normalised["orderbook"] = {
-                    "yes": [[p, q] for p, q in sorted(book.get("yes", {}).items())],
-                    "no": [[p, q] for p, q in sorted(book.get("no", {}).items())],
-                }
+            if invalid is None:
+                normalised = dict(msg)  # keep raw fields for backward compat
+                for side, opposite in (("yes", "no"), ("no", "yes")):
+                    # A delta before the ticker's snapshot leaves book=None: the
+                    # ladder is unknown, so publish no executable prices at all.
+                    opposite_levels = book[opposite] if book is not None else {}
+                    if opposite_levels:
+                        best_bid = max(opposite_levels)
+                        normalised[f"{side}_ask"] = (100 - best_bid) / 100.0
+                        normalised[f"{side}_ask_size"] = opposite_levels[best_bid]
+                    else:
+                        normalised[f"{side}_ask"] = None
+                        normalised[f"{side}_ask_size"] = 0
 
-            self._last_message_time["kalshi"] = time.time()
-            if book is None or book_changed:
-                self.on_price_update("kalshi", ticker, normalised)
+                if book is not None:
+                    if book_changed:
+                        self._kalshi_book_times[ticker] = time.time()
+                    normalised["orderbook"] = {
+                        "yes": [[p, q] for p, q in sorted(book.get("yes", {}).items())],
+                        "no": [[p, q] for p, q in sorted(book.get("no", {}).items())],
+                    }
+
+        if invalid is not None:
+            # Drop the book and anything queued from it, publish no prices,
+            # then raise so _run_kalshi reconnects and resubscribes.
+            self._invalidate_kalshi_ticker(ticker, sid if track_seq else None)
+            if _ws_metrics:
+                _ws_metrics.inc("ws_book_invalidations", {"platform": "kalshi"})
+            raise invalid(f"Kalshi {ticker} {reason}")
+
+        self._note_feed_message("kalshi")
+        if book is None or book_changed:
+            self._emit_price_update("kalshi", ticker, normalised)
 
     async def _run_polymarket(self):
         """Maintain Polymarket WebSocket connection with auto-reconnect and exponential backoff."""
@@ -599,6 +1054,7 @@ class FeedManager:
                 await self._connect_polymarket()
                 delay = RECONNECT_DELAY  # Reset backoff on successful connection
             except Exception as e:
+                self._reset_poly_books()
                 if self._running:
                     if _ws_metrics:
                         _ws_metrics.inc("ws_reconnections", {"platform": "polymarket"})
@@ -624,14 +1080,16 @@ class FeedManager:
             connect_kwargs["sock"] = sock
 
         async with websockets.connect(POLYMARKET_WS_URL, **connect_kwargs) as ws:
-            logger.info("Polymarket connected. Subscribing to %d tokens...", len(self._poly_token_ids))
+            with self._subs_lock:
+                token_ids = list(self._poly_token_ids)
+            logger.info("Polymarket connected. Subscribing to %d tokens...", len(token_ids))
             self._reset_poly_books()
 
             # ---- Initial subscription (first batch uses "type": "market") ----
             batch_size = 100
             first_batch = True
-            for i in range(0, len(self._poly_token_ids), batch_size):
-                batch = self._poly_token_ids[i:i + batch_size]
+            for i in range(0, len(token_ids), batch_size):
+                batch = token_ids[i:i + batch_size]
                 if first_batch:
                     sub_msg = {
                         "assets_ids": batch,
@@ -648,18 +1106,19 @@ class FeedManager:
                     }
                 await ws.send(json.dumps(sub_msg))
                 # Small delay between batches to avoid server rejection
-                if i + batch_size < len(self._poly_token_ids):
+                if i + batch_size < len(token_ids):
                     await asyncio.sleep(0.5)
 
             logger.info("Polymarket subscription sent (%d batches).",
-                        (len(self._poly_token_ids) + batch_size - 1) // batch_size)
+                        (len(token_ids) + batch_size - 1) // batch_size)
             self._poly_ws = ws
 
             while self._running:
                 # Send any pending dynamic subscriptions (always use "operation")
-                if self._pending_poly_subs:
+                with self._subs_lock:
                     pending = list(self._pending_poly_subs)
                     self._pending_poly_subs.clear()
+                if pending:
                     for i in range(0, len(pending), batch_size):
                         batch = pending[i:i + batch_size]
                         sub_msg = {
@@ -674,6 +1133,7 @@ class FeedManager:
                     raw = await asyncio.wait_for(ws.recv(), timeout=KEEPALIVE_INTERVAL)
                     # Server responds to PING with PONG (literal strings)
                     if raw == "PONG":
+                        self._note_feed_message("polymarket")
                         continue
                     data = json.loads(raw)
                     self._handle_polymarket_message(data)
@@ -695,7 +1155,7 @@ class FeedManager:
         ``best_bid_size``, and ``best_ask_size`` fields so CLOB refinement
         can skip REST fetches when fresh WS data is available.
         """
-        self._last_message_time["polymarket"] = time.time()
+        self._note_feed_message("polymarket")
         if _ws_metrics:
             _ws_metrics.inc("ws_messages_received", {"platform": "polymarket"})
         # Polymarket sends arrays of events
@@ -722,9 +1182,10 @@ class FeedManager:
                                 normalised["best_ask"] = float(ba)
                         except (ValueError, TypeError):
                             pass
-                        self._poly_books.pop(aid, None)
-                        self._poly_book_times.pop(aid, None)
-                        self.on_price_update("polymarket", aid, normalised)
+                        with self._book_lock:
+                            self._poly_books.pop(aid, None)
+                            self._poly_book_times.pop(aid, None)
+                        self._emit_price_update("polymarket", aid, normalised)
                 continue
 
             if event_type == "book":
@@ -733,8 +1194,9 @@ class FeedManager:
                 asks = event.get("asks", [])
                 bids = event.get("bids", [])
                 if isinstance(asks, list) and isinstance(bids, list):
-                    self._poly_books[asset_id] = {"bids": list(bids), "asks": list(asks)}
-                    self._poly_book_times[asset_id] = time.time()
+                    with self._book_lock:
+                        self._poly_books[asset_id] = {"bids": list(bids), "asks": list(asks)}
+                        self._poly_book_times[asset_id] = time.time()
                     normalised["orderbook"] = {"bids": list(bids), "asks": list(asks)}
                 if asks and isinstance(asks, list):
                     try:
@@ -750,7 +1212,7 @@ class FeedManager:
                         normalised["best_bid_size"] = float(best_bid_entry.get("size", 0))
                     except (ValueError, TypeError, IndexError):
                         pass
-                self.on_price_update("polymarket", asset_id, normalised)
+                self._emit_price_update("polymarket", asset_id, normalised)
             elif event_type == "best_bid_ask":
                 # Direct best bid/ask update (requires custom_feature_enabled)
                 normalised = {"event_type": "best_bid_ask", "asset_id": asset_id}
@@ -763,10 +1225,10 @@ class FeedManager:
                         normalised["best_ask"] = float(ba)
                 except (ValueError, TypeError):
                     pass
-                self.on_price_update("polymarket", asset_id, normalised)
+                self._emit_price_update("polymarket", asset_id, normalised)
             else:
                 # last_trade_price, tick_size_change, etc. — store as-is
-                self.on_price_update("polymarket", asset_id, event)
+                self._emit_price_update("polymarket", asset_id, event)
 
 
 # ---------------------------------------------------------------------------
@@ -978,6 +1440,7 @@ class BetfairFeed:
         host: str = "stream-api.betfair.com",
         port: int = 443,
         heartbeat_ms: int = 5000,
+        on_message: Callable[[], None] | None = None,
     ):
         """
         Args:
@@ -989,7 +1452,10 @@ class BetfairFeed:
             host: Stream API hostname.
             port: Stream API port.
             heartbeat_ms: Server heartbeat interval in milliseconds.
+            on_message: Called for every valid stream message (market changes,
+                heartbeats and SUCCESS status), whether or not prices changed.
         """
+        self._on_message = on_message
         self._app_key = app_key
         self._session_token = session_token
         self._market_ids = list(market_ids)
@@ -1128,16 +1594,28 @@ class BetfairFeed:
         """Route an incoming stream message to the appropriate handler."""
         op = msg.get("op", "")
         if op == "mcm":
+            self._note_message()
             self._handle_mcm(msg)
         elif op == "status":
             status = msg.get("statusCode", "")
             if status != "SUCCESS":
                 logger.warning("Betfair stream status: %s — %s",
                                status, msg.get("errorMessage", ""))
+            else:
+                self._note_message()
         elif op == "connection":
             pass  # Already handled during connect
         else:
             logger.debug("Betfair stream: unhandled op=%s", op)
+
+    def _note_message(self):
+        """Report a valid message for liveness; a failing hook never breaks the stream."""
+        if self._on_message is None:
+            return
+        try:
+            self._on_message()
+        except Exception as exc:
+            logger.debug("Betfair on_message failed: %s", exc)
 
     def _handle_mcm(self, msg: dict):
         """Handle a market change message (mcm).

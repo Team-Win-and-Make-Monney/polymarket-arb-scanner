@@ -9,6 +9,7 @@ import json
 import logging
 import threading
 import time
+from decimal import Decimal, InvalidOperation
 
 from config import (
     INVENTORY_BALANCER_ENABLED,
@@ -21,6 +22,80 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Live rebalance fill confirmation
+# ---------------------------------------------------------------------------
+# A rebalance order is recorded as filled, and inventory moves, only on the
+# venue's own confirmation of a match with a valid executed quantity. The
+# requested size is never assumed filled.
+FILL_CONFIRMED = "filled"
+FILL_NONE = "not_filled"          # the venue confirms nothing executed
+FILL_UNCONFIRMED = "fill_unconfirmed"  # accepted, but the fill is not established
+REBALANCE_OPP_TYPE = "InventoryRebalance"
+# An accepted order whose fill is unconfirmed is logged as a 'pending' trade,
+# which crash recovery (recovery.py) reconciles against the venue. Its market
+# takes no further rebalance until that row leaves 'pending'.
+REBALANCE_BLOCKED = "unresolved_order_pending"
+
+
+def _positive_qty(value, limit: float) -> Decimal | None:
+    """An executed quantity as an exact Decimal: finite, > 0 and <= limit; else None."""
+    if value is None or isinstance(value, bool) or value == "":
+        return None
+    try:
+        qty = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if not qty.is_finite() or qty <= 0 or qty > Decimal(str(limit)):
+        return None
+    return qty
+
+
+def _zero_qty(value) -> bool:
+    try:
+        return value is not None and value != "" and Decimal(str(value)) == 0
+    except (InvalidOperation, ValueError, TypeError):
+        return False
+
+
+def kalshi_rebalance_fill(order: dict, requested: float) -> tuple[str, float | None]:
+    """(state, filled contracts) from a ``kalshi_api.place_order`` order object.
+
+    ``place_order`` normalizes a V2 response to status ``executed`` only when
+    something filled and nothing remains. The quantity comes from
+    ``fill_count_fp`` (fixed-point string), else ``fill_count``, kept exact
+    so a fractional fill is not rounded.
+    """
+    status = str(order.get("status") or "").lower()
+    raw = order.get("fill_count_fp", order.get("fill_count"))
+    if status == "executed":
+        qty = _positive_qty(raw, requested)
+        if qty is not None:
+            return FILL_CONFIRMED, float(qty)
+        return FILL_UNCONFIRMED, None
+    if status in ("canceled", "cancelled", "expired", "rejected") and (raw is None or _zero_qty(raw)):
+        return FILL_NONE, None
+    return FILL_UNCONFIRMED, None
+
+
+def polymarket_rebalance_fill(resp: dict, requested: float) -> tuple[str, float | None]:
+    """(state, filled shares) from a Polymarket CLOB BUY order response.
+
+    Per the CLOB docs, ``status`` is ``matched`` when the order matched
+    immediately, ``live`` when it rests, and ``delayed`` when matching has not
+    happened yet; for a BUY, ``takingAmount`` is the shares received.
+    ``success`` alone only means the order was accepted.
+    """
+    status = str(resp.get("status") or "").lower()
+    if status == "matched":
+        qty = _positive_qty(resp.get("takingAmount"), requested)
+        if qty is not None:
+            return FILL_CONFIRMED, float(qty)
+        return FILL_UNCONFIRMED, None
+    if status == "unmatched":
+        return FILL_NONE, None
+    return FILL_UNCONFIRMED, None
 
 
 
@@ -84,6 +159,9 @@ class InventoryBalancer:
         self._db_synced_markets: set[str] = set()
         # Per-market rebalance timestamps for cooldown enforcement
         self._last_rebalance_time: dict[str, float] = {}
+        # Unconfirmed live orders that could not be logged as pending trades;
+        # their markets stay blocked for this process's lifetime.
+        self._unlogged_unresolved: dict[str, str] = {}
         self._lock = threading.Lock()
 
     def is_cooldown_active(self, market_key: str, now: float | None = None) -> bool:
@@ -100,6 +178,70 @@ class InventoryBalancer:
         t = time.time() if timestamp is None else timestamp
         with self._lock:
             self._last_rebalance_time[resolved] = t
+
+    def unresolved_rebalance_order(self, market_key: str, trade_db=None) -> str | None:
+        """The order id of an unresolved live rebalance order on this market, else None.
+
+        Unresolved means an unconfirmed order kept in memory because it could
+        not be logged, or a 'pending' rebalance trade in ``trade_db``. A failed
+        ledger query counts as unresolved ("unknown"), so the market stays blocked.
+        """
+        resolved = self._resolve_market_key(market_key)
+        with self._lock:
+            unlogged = self._unlogged_unresolved.get(resolved)
+        if unlogged is not None:
+            return unlogged
+        if trade_db is None or not hasattr(trade_db, "get_pending_trades_by_type"):
+            return None
+        try:
+            rows = trade_db.get_pending_trades_by_type(REBALANCE_OPP_TYPE)
+            for row in rows:
+                if self._resolve_market_key(str(row.get("market") or "")) == resolved:
+                    return str(row.get("order_id") or "")
+        except Exception as e:
+            logger.warning("Pending rebalance lookup failed for %s; keeping it blocked: %s", market_key, e)
+            return "unknown"
+        return None
+
+    def _record_unresolved_order(self, m_key: str, venue: str, outcome: str, size: float,
+                                 price: float, est_cost: float, order_id: str, trade_db) -> None:
+        """Log an accepted, unconfirmed live order as a pending trade for recovery.
+
+        If it can't be logged (no order id, no ledger, or a write error), the
+        market is blocked in memory instead, since recovery could not resolve it.
+        """
+        if order_id and trade_db is not None and hasattr(trade_db, "log_trade"):
+            try:
+                opp_id = trade_db.log_opportunity(
+                    opp_type=REBALANCE_OPP_TYPE,
+                    market=m_key,
+                    prices=json.dumps({f"{outcome}_ask": price}),
+                    total_cost=est_cost,
+                    net_profit=0.0,
+                    net_roi=0.0,
+                    depth=size,
+                    action="pending",
+                )
+                if opp_id:
+                    trade_db.log_trade(
+                        opportunity_id=opp_id,
+                        platform=venue,
+                        side="BUY",
+                        price=price,
+                        size=size,
+                        status="pending",
+                        order_id=order_id,
+                        outcome=outcome,
+                        run_mode="live",
+                    )
+                    return
+            except Exception as e:
+                logger.warning("Failed to log unconfirmed rebalance order %s for %s: %s", order_id, m_key, e)
+        logger.error("Unconfirmed rebalance order %r for %s is not in the ledger; market blocked until restart",
+                     order_id, m_key)
+        resolved = self._resolve_market_key(m_key)
+        with self._lock:
+            self._unlogged_unresolved[resolved] = order_id
 
 
     def register_ticker_alias(self, ticker: str, market_key: str) -> None:
@@ -532,7 +674,24 @@ class InventoryBalancer:
                 })
                 continue
 
-            # 3. Dry-Run path
+            # 3. An earlier unconfirmed live order on this market is unresolved
+            if not dry_run:
+                blocking = self.unresolved_rebalance_order(m_key, trade_db)
+                if blocking is not None:
+                    logger.warning("Rebalance blocked for %s: order %r is unresolved", m_key, blocking)
+                    results.append({
+                        "market_key": m_key,
+                        "venue": venue,
+                        "outcome": outcome,
+                        "size": size,
+                        "price": price,
+                        "executed": False,
+                        "status": REBALANCE_BLOCKED,
+                        "order_id": blocking,
+                    })
+                    continue
+
+            # 4. Dry-Run path
             if dry_run:
                 order_id = f"dry_run_rebal_{m_key}_{int(now)}"
                 logger.info(
@@ -565,6 +724,7 @@ class InventoryBalancer:
                                 fill_price=price,
                                 order_id=order_id,
                                 outcome=outcome,
+                                run_mode="paper",
                             )
                     except Exception as e:
                         logger.debug("Failed to record dry-run rebalance in trade_db: %s", e)
@@ -584,7 +744,7 @@ class InventoryBalancer:
                 })
                 continue
 
-            # 4. Live execution path
+            # 5. Live execution path
             if venue == "kalshi":
                 from kalshi_policy import live_kalshi_submit_allowed
                 # Kalshi order submission policy guard
@@ -627,10 +787,34 @@ class InventoryBalancer:
                         reducing=True,
                     )
                     order_obj = resp.get("order") if resp else None
-                    if order_obj:
+                    fill_state, filled = (kalshi_rebalance_fill(order_obj, int(size))
+                                          if order_obj else (None, None))
+                    if order_obj and fill_state != FILL_CONFIRMED:
+                        # Accepted but not (or not provably) filled: keep the
+                        # cooldown so it is not resubmitted, move no inventory.
+                        # An unconfirmed order stays pending for recovery.
                         order_id = order_obj.get("order_id", "")
                         self.record_rebalance_time(m_key, now)
-                        self.update_position(m_key, "kalshi", outcome, "buy", float(int(size)))
+                        if fill_state == FILL_UNCONFIRMED:
+                            self._record_unresolved_order(m_key, "kalshi", outcome, float(int(size)), price,
+                                                          est_cost, order_id, trade_db)
+                        logger.warning(
+                            "Kalshi rebalance order %s for %s not recorded as filled (%s, status=%r)",
+                            order_id, m_key, fill_state, order_obj.get("status"))
+                        results.append({
+                            "market_key": m_key,
+                            "venue": venue,
+                            "outcome": outcome,
+                            "size": size,
+                            "price": price,
+                            "executed": False,
+                            "status": fill_state,
+                            "order_id": order_id,
+                        })
+                    elif order_obj:
+                        order_id = order_obj.get("order_id", "")
+                        self.record_rebalance_time(m_key, now)
+                        self.update_position(m_key, "kalshi", outcome, "buy", filled)
                         if trade_db and hasattr(trade_db, "log_opportunity"):
                             try:
                                 opp_id = trade_db.log_opportunity(
@@ -654,6 +838,8 @@ class InventoryBalancer:
                                         fill_price=price,
                                         order_id=order_id,
                                         outcome=outcome,
+                                        run_mode="live",
+                                        fill_qty=filled,
                                     )
                             except Exception as e:
                                 logger.debug("TradeDB error during live rebalance: %s", e)
@@ -664,7 +850,7 @@ class InventoryBalancer:
                             "action": "rebalance_buy",
                             "outcome": outcome,
                             "side": side,
-                            "size": float(int(size)),
+                            "size": filled,
                             "price": price,
                             "cost": est_cost,
                             "status": "filled",
@@ -723,10 +909,32 @@ class InventoryBalancer:
                         size=size,
                         order_type="FOK",
                     )
-                    if resp and resp.get("success"):
+                    accepted = bool(resp and resp.get("success"))
+                    fill_state, filled = (polymarket_rebalance_fill(resp, size)
+                                          if accepted else (None, None))
+                    if accepted and fill_state != FILL_CONFIRMED:
                         order_id = resp.get("orderID", resp.get("order_id", ""))
                         self.record_rebalance_time(m_key, now)
-                        self.update_position(m_key, "polymarket", outcome, "buy", size)
+                        if fill_state == FILL_UNCONFIRMED:
+                            self._record_unresolved_order(m_key, "polymarket", outcome, size, price,
+                                                          est_cost, order_id, trade_db)
+                        logger.warning(
+                            "Polymarket rebalance order %s for %s not recorded as filled (%s, status=%r)",
+                            order_id, m_key, fill_state, resp.get("status"))
+                        results.append({
+                            "market_key": m_key,
+                            "venue": venue,
+                            "outcome": outcome,
+                            "size": size,
+                            "price": price,
+                            "executed": False,
+                            "status": fill_state,
+                            "order_id": order_id,
+                        })
+                    elif accepted:
+                        order_id = resp.get("orderID", resp.get("order_id", ""))
+                        self.record_rebalance_time(m_key, now)
+                        self.update_position(m_key, "polymarket", outcome, "buy", filled)
                         if trade_db and hasattr(trade_db, "log_opportunity"):
                             try:
                                 opp_id = trade_db.log_opportunity(
@@ -750,6 +958,8 @@ class InventoryBalancer:
                                         fill_price=price,
                                         order_id=order_id,
                                         outcome=outcome,
+                                        run_mode="live",
+                                        fill_qty=filled,
                                     )
                             except Exception as e:
                                 logger.debug("TradeDB error during live Polymarket rebalance: %s", e)
@@ -760,7 +970,7 @@ class InventoryBalancer:
                             "action": "rebalance_buy",
                             "outcome": outcome,
                             "side": side,
-                            "size": size,
+                            "size": filled,
                             "price": price,
                             "cost": est_cost,
                             "status": "filled",

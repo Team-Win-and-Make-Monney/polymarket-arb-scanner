@@ -2405,6 +2405,10 @@ class KalshiMMPilot:
                 side=f"{event.action}_{event.side}", price=side_price,
                 size=event.count * side_price, status="filled",
                 fill_price=side_price, order_id=event.order_id,
+                # Dry-run (D0) fills are simulated but logged as "filled".
+                run_mode="paper" if self.dry_run else "live",
+                # Contracts in this fill; venue reconciliation sums them per order.
+                fill_qty=float(event.count),
             )
         except Exception:
             logger.exception("MM pilot fill DB log failed")

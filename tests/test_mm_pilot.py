@@ -701,6 +701,63 @@ class TestDryRunIsolation:
         assert client.place_order_calls == 0
         assert client.cancel_order_calls == 0
 
+    def test_simulated_fill_is_logged_as_paper_with_its_quantity(self, pilot_env, clock):
+        pilot = build_pilot(clock, client=FakeKalshiClient(), dry_run=True)
+        pilot._db = MagicMock()
+        pilot._db.log_opportunity.return_value = 7
+        pilot.place_pilot_order(TICKER, "yes", "buy", 4, 0.49, purpose="quote_bid")
+        pilot.update_book(TICKER, make_book(yes_bid=0.10, no_bid=0.88))
+        assert len(pilot.poll_fills()) == 1
+        kwargs = pilot._db.log_trade.call_args.kwargs
+        assert kwargs["run_mode"] == "paper" and kwargs["fill_qty"] == 4.0
+        assert kwargs["status"] == "filled" and kwargs["order_id"].startswith("dry_")
+
+    def test_pilot_fills_reach_the_ledger_mirror_via_the_sync_worker(self, pilot_env, clock, tmp_path,
+                                                                     monkeypatch):
+        # --mode mm-pilot runs the pilot inside continuous.py on the same
+        # TradeDB, so the ledger worker continuous.py starts exports its fills.
+        import ledger_sync
+        from db import TradeDB
+
+        monkeypatch.delenv("LEDGER_ACCOUNT_REFS", raising=False)
+        path = str(tmp_path / "trades.db")
+        tdb = TradeDB(path, ledger_capture=True)
+        pilot = build_pilot(clock, client=FakeKalshiClient(), dry_run=True)
+        pilot._db = tdb
+        pilot.place_pilot_order(TICKER, "yes", "buy", 4, 0.49, purpose="quote_bid")
+        pilot.update_book(TICKER, make_book(yes_bid=0.10, no_bid=0.88))
+        assert len(pilot.poll_fills()) == 1
+
+        store: dict = {}
+
+        class _Mirror:
+            def table(self, name):
+                rows = store.setdefault(name, {})
+
+                class _Q:
+                    def upsert(self, records, on_conflict=""):
+                        self.records, self.key = records, on_conflict
+                        return self
+
+                    def execute(self):
+                        for rec in self.records:
+                            rows.setdefault(rec[self.key], {}).update(rec)
+                return _Q()
+
+        worker = ledger_sync.start_ledger_sync_worker(
+            path, capture_enabled=True, interval_seconds=3600, service="kalshi-mm-pilot",
+            client_factory=_Mirror)
+        worker.stop()   # joins the thread, then exports the final tail
+        tdb.close()
+        assert worker.last_error is None
+        trades = list(store["ledger_trades"].values())
+        assert len(trades) == 1
+        t = trades[0]
+        assert t["service"] == "kalshi-mm-pilot" and t["venue"] == "kalshi"
+        assert t["run_mode"] == "paper" and t["fill_qty"] == 4.0 and t["order_id"].startswith("dry_")
+        status = list(store["ledger_sync_status"].values())[0]
+        assert status["service"] == "kalshi-mm-pilot" and status["pending_changes"] == 0
+
     def test_simulated_fill_runs_the_full_pipeline(self, pilot_env, clock):
         client = FakeKalshiClient()
         hedger = RecordingHedger()

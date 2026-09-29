@@ -557,7 +557,7 @@ class TestAutomatedInventoryRebalanceExecution:
         balancer = InventoryBalancer()
         mock_kalshi = MagicMock()
         mock_kalshi.place_order.return_value = {
-            "order": {"order_id": "k_order_999", "status": "executed"}
+            "order": {"order_id": "k_order_999", "status": "executed", "fill_count_fp": "10.00"}
         }
         mock_db = MagicMock()
         mock_db.log_opportunity.return_value = 101
@@ -590,15 +590,17 @@ class TestAutomatedInventoryRebalanceExecution:
         # Position updated in balancer
         assert balancer.get_delta("KXTEST-26SEP28") == -10.0
 
-        # DB logged filled trade
+        # DB logged filled trade with the venue's executed quantity
         mock_db.log_trade.assert_called_once()
         assert mock_db.log_trade.call_args[1]["status"] == "filled"
+        assert mock_db.log_trade.call_args[1]["fill_qty"] == 10.0
 
     def test_execute_rebalancing_polymarket_live_success(self):
         """Live Polymarket order places successfully with valid client."""
         balancer = InventoryBalancer()
         mock_pm = MagicMock()
-        mock_pm.place_order.return_value = {"success": True, "orderID": "pm_order_888"}
+        mock_pm.place_order.return_value = {"success": True, "orderID": "pm_order_888", "status": "matched",
+                                            "makingAmount": "15", "takingAmount": "25"}
         mock_db = MagicMock()
         mock_db.log_opportunity.return_value = 102
 
@@ -629,6 +631,7 @@ class TestAutomatedInventoryRebalanceExecution:
 
         # Position updated in balancer
         assert balancer.get_delta("0xpm_condition_abc") == 25.0
+        assert mock_db.log_trade.call_args[1]["fill_qty"] == 25.0
         mock_pm.place_order.assert_called_once_with(
             token_id="tok_123",
             side="BUY",
@@ -636,3 +639,320 @@ class TestAutomatedInventoryRebalanceExecution:
             size=25.0,
             order_type="FOK",
         )
+
+
+class TestLiveRebalanceFillConfirmation:
+    """A live rebalance is recorded as filled, and moves inventory, only on the
+    venue's confirmed match with a valid executed quantity."""
+
+    KALSHI_PROP = {
+        "market_key": "KXTEST-26SEP28", "action": "rebalance_buy", "target_venue": "kalshi",
+        "side": "buy", "outcome": "yes", "size": 10.0, "price": 0.40, "estimated_cost": 4.0,
+    }
+    PM_PROP = {
+        "market_key": "0xpm_condition_abc", "token_id": "tok_123", "action": "rebalance_buy",
+        "target_venue": "polymarket", "side": "buy", "outcome": "yes", "size": 25.0, "price": 0.60,
+        "estimated_cost": 15.0,
+    }
+
+    def _kalshi(self, order):
+        balancer = InventoryBalancer(rebalance_cooldown_sec=60.0)
+        client = MagicMock()
+        client.place_order.return_value = {"order": order} if order is not None else None
+        db = MagicMock()
+        db.log_opportunity.return_value = 7
+        with patch("kalshi_policy.live_kalshi_submit_allowed", return_value=True):
+            results = balancer.execute_rebalancing_proposals(
+                [dict(self.KALSHI_PROP)], dry_run=False, kalshi_client=client, trade_db=db)
+        return balancer, db, results[0]
+
+    def _pm(self, resp):
+        balancer = InventoryBalancer(rebalance_cooldown_sec=60.0)
+        client = MagicMock()
+        client.place_order.return_value = resp
+        db = MagicMock()
+        db.log_opportunity.return_value = 8
+        results = balancer.execute_rebalancing_proposals(
+            [dict(self.PM_PROP)], dry_run=False, polymarket_client=client, trade_db=db)
+        return balancer, db, results[0]
+
+    @pytest.mark.parametrize("order, state", [
+        ({"order_id": "k1", "status": "canceled", "fill_count_fp": "0.00"}, "not_filled"),
+        ({"order_id": "k1", "status": "canceled"}, "not_filled"),
+        ({"order_id": "k1", "status": "rejected", "fill_count": 0}, "not_filled"),
+        ({"order_id": "k1", "status": "resting", "fill_count_fp": "3.00"}, "fill_unconfirmed"),
+        ({"order_id": "k1", "status": "executed"}, "fill_unconfirmed"),
+        ({"order_id": "k1", "status": "executed", "fill_count_fp": "0.00"}, "fill_unconfirmed"),
+        ({"order_id": "k1", "status": "executed", "fill_count_fp": "NaN"}, "fill_unconfirmed"),
+        ({"order_id": "k1", "status": "executed", "fill_count_fp": "11.00"}, "fill_unconfirmed"),
+        ({"order_id": "k1", "status": "executed", "fill_count": True}, "fill_unconfirmed"),
+        ({"order_id": "k1", "status": "canceled", "fill_count_fp": "4.00"}, "fill_unconfirmed"),
+        ({"order_id": "k1"}, "fill_unconfirmed"),
+    ])
+    def test_kalshi_unfilled_or_ambiguous_is_not_a_fill(self, order, state):
+        balancer, db, res = self._kalshi(order)
+        assert res["executed"] is False and res["status"] == state
+        assert res["order_id"] == "k1"
+        assert balancer.get_delta("KXTEST-26SEP28") == 0.0
+        if state == "not_filled":
+            db.log_trade.assert_not_called()
+            db.log_opportunity.assert_not_called()
+        else:
+            # Unconfirmed: logged as a pending trade for recovery, never as a fill.
+            kw = db.log_trade.call_args[1]
+            assert kw["status"] == "pending" and kw["order_id"] == "k1" and kw["run_mode"] == "live"
+            assert kw["platform"] == "kalshi" and kw["size"] == 10.0 and "fill_qty" not in kw
+        # The accepted order still starts the cooldown, so it is not resubmitted.
+        assert balancer.is_cooldown_active("KXTEST-26SEP28") is True
+
+    def test_kalshi_no_order_is_order_failed(self):
+        balancer, db, res = self._kalshi(None)
+        assert res["status"] == "order_failed" and res["executed"] is False
+        assert balancer.is_cooldown_active("KXTEST-26SEP28") is False
+        db.log_trade.assert_not_called()
+
+    @pytest.mark.parametrize("order, qty", [
+        ({"order_id": "k1", "status": "executed", "fill_count_fp": "10.00"}, 10.0),
+        ({"order_id": "k1", "status": "executed", "fill_count_fp": "3.00"}, 3.0),    # partial
+        ({"order_id": "k1", "status": "executed", "fill_count_fp": "2.57"}, 2.57),   # fractional
+        ({"order_id": "k1", "status": "executed", "fill_count": 4.0}, 4.0),          # V2 normalized
+        ({"order_id": "k1", "status": "EXECUTED", "fill_count": "6"}, 6.0),
+    ])
+    def test_kalshi_confirmed_fill_records_the_executed_quantity(self, order, qty):
+        balancer, db, res = self._kalshi(order)
+        assert res["executed"] is True and res["status"] == "filled"
+        assert res["size"] == qty
+        assert balancer.get_delta("KXTEST-26SEP28") == qty
+        kw = db.log_trade.call_args[1]
+        assert kw["status"] == "filled" and kw["fill_qty"] == qty and kw["run_mode"] == "live"
+        assert kw["size"] == 10.0  # what was requested stays the order size
+
+    @pytest.mark.parametrize("resp, state", [
+        ({"success": True, "orderID": "p1"}, "fill_unconfirmed"),
+        ({"success": True, "orderID": "p1", "status": "live"}, "fill_unconfirmed"),
+        ({"success": True, "orderID": "p1", "status": "delayed", "makingAmount": "", "takingAmount": ""},
+         "fill_unconfirmed"),
+        ({"success": True, "orderID": "p1", "status": "unmatched"}, "not_filled"),
+        ({"success": True, "orderID": "p1", "status": "matched"}, "fill_unconfirmed"),
+        ({"success": True, "orderID": "p1", "status": "matched", "takingAmount": "0"}, "fill_unconfirmed"),
+        ({"success": True, "orderID": "p1", "status": "matched", "takingAmount": "inf"}, "fill_unconfirmed"),
+        ({"success": True, "orderID": "p1", "status": "matched", "takingAmount": "30"}, "fill_unconfirmed"),
+    ])
+    def test_polymarket_success_alone_is_not_a_fill(self, resp, state):
+        balancer, db, res = self._pm(resp)
+        assert res["executed"] is False and res["status"] == state
+        assert res["order_id"] == "p1"
+        assert balancer.get_delta("0xpm_condition_abc") == 0.0
+        if state == "not_filled":
+            db.log_trade.assert_not_called()
+        else:
+            kw = db.log_trade.call_args[1]
+            assert kw["status"] == "pending" and kw["order_id"] == "p1" and kw["run_mode"] == "live"
+            assert kw["platform"] == "polymarket" and "fill_qty" not in kw
+        assert balancer.is_cooldown_active("0xpm_condition_abc") is True
+
+    @pytest.mark.parametrize("resp", [None, {"success": False, "errorMsg": "not enough balance / allowance"}])
+    def test_polymarket_rejected_is_order_failed(self, resp):
+        balancer, db, res = self._pm(resp)
+        assert res["status"] == "order_failed" and res["executed"] is False
+        assert balancer.get_delta("0xpm_condition_abc") == 0.0
+        db.log_trade.assert_not_called()
+
+    @pytest.mark.parametrize("taking, qty", [("25", 25.0), ("12.5", 12.5), ("0.123456", 0.123456)])
+    def test_polymarket_matched_records_shares_received(self, taking, qty):
+        balancer, db, res = self._pm({"success": True, "orderID": "p1", "status": "MATCHED",
+                                      "makingAmount": "1", "takingAmount": taking})
+        assert res["executed"] is True and res["status"] == "filled" and res["size"] == qty
+        assert balancer.get_delta("0xpm_condition_abc") == qty
+        kw = db.log_trade.call_args[1]
+        assert kw["fill_qty"] == qty and kw["status"] == "filled" and kw["run_mode"] == "live"
+
+    def test_fill_rows_reach_a_real_ledger_with_quantity(self, tmp_path):
+        """End to end with a real TradeDB: the mirrored row carries fill_qty."""
+        from db import TradeDB
+        tdb = TradeDB(str(tmp_path / "t.db"))
+        balancer = InventoryBalancer()
+        client = MagicMock()
+        client.place_order.return_value = {"order": {"order_id": "k9", "status": "executed",
+                                                     "fill_count_fp": "2.50"}}
+        with patch("kalshi_policy.live_kalshi_submit_allowed", return_value=True):
+            balancer.execute_rebalancing_proposals(
+                [dict(self.KALSHI_PROP)], dry_run=False, kalshi_client=client, trade_db=tdb)
+        row = tdb.conn.execute("SELECT status, fill_qty, order_id, run_mode FROM trades").fetchone()
+        assert tuple(row) == ("filled", 2.5, "k9", "live")
+
+
+class TestUnresolvedRebalanceOrders:
+    """An accepted live rebalance order whose fill is unconfirmed is logged as a
+    pending trade, and its market takes no further rebalance until recovery
+    resolves that trade."""
+
+    KALSHI_PROP = TestLiveRebalanceFillConfirmation.KALSHI_PROP
+    PM_PROP = TestLiveRebalanceFillConfirmation.PM_PROP
+
+    def _run_kalshi(self, balancer, client, tdb):
+        with patch("kalshi_policy.live_kalshi_submit_allowed", return_value=True):
+            return balancer.execute_rebalancing_proposals(
+                [dict(self.KALSHI_PROP)], dry_run=False, kalshi_client=client, trade_db=tdb)[0]
+
+    def _run_pm(self, balancer, client, tdb):
+        return balancer.execute_rebalancing_proposals(
+            [dict(self.PM_PROP)], dry_run=False, polymarket_client=client, trade_db=tdb)[0]
+
+    def _kalshi_client(self, order):
+        client = MagicMock()
+        client.place_order.return_value = {"order": order}
+        return client
+
+    def test_kalshi_unconfirmed_blocks_until_recovery_confirms_the_fill(self, tmp_path):
+        from db import TradeDB
+        from recovery import reconcile_orphaned_positions
+        tdb = TradeDB(str(tmp_path / "t.db"))
+        balancer = InventoryBalancer(rebalance_cooldown_sec=0.0)
+        client = self._kalshi_client({"order_id": "k1", "status": "resting"})
+
+        assert self._run_kalshi(balancer, client, tdb)["status"] == "fill_unconfirmed"
+        row = tdb.conn.execute("SELECT status, order_id, platform, run_mode, fill_qty FROM trades").fetchone()
+        assert tuple(row) == ("pending", "k1", "kalshi", "live", None)
+        assert [r["order_id"] for r in tdb.get_pending_trades()] == ["k1"]
+
+        # The cooldown has lapsed, but the unresolved order still blocks the market.
+        res = self._run_kalshi(balancer, client, tdb)
+        assert res["status"] == "unresolved_order_pending" and res["order_id"] == "k1"
+        assert client.place_order.call_count == 1
+
+        # A restart keeps the block: it comes from the ledger, not from memory.
+        assert self._run_kalshi(InventoryBalancer(rebalance_cooldown_sec=0.0), client, tdb)["status"] == \
+            "unresolved_order_pending"
+
+        # Recovery still sees it resting: it stays blocked.
+        client.get_order_status.return_value = {"status": "resting"}
+        reconcile_orphaned_positions(tdb, kalshi_client=client)
+        assert self._run_kalshi(balancer, client, tdb)["status"] == "unresolved_order_pending"
+
+        # Recovery confirms the fill: the market is released.
+        client.get_order_status.return_value = {"status": "executed"}
+        reconcile_orphaned_positions(tdb, kalshi_client=client)
+        assert tdb.get_pending_trades() == []
+        client.place_order.return_value = {"order": {"order_id": "k2", "status": "executed",
+                                                     "fill_count_fp": "10.00"}}
+        assert self._run_kalshi(balancer, client, tdb)["status"] == "filled"
+        assert client.place_order.call_count == 2
+
+    def test_polymarket_unconfirmed_blocks_until_recovery_resolves_it(self, tmp_path):
+        from db import TradeDB
+        from recovery import reconcile_orphaned_positions
+        tdb = TradeDB(str(tmp_path / "t.db"))
+        balancer = InventoryBalancer(rebalance_cooldown_sec=0.0)
+        client = MagicMock()
+        client.place_order.return_value = {"success": True, "orderID": "p1", "status": "live"}
+
+        assert self._run_pm(balancer, client, tdb)["status"] == "fill_unconfirmed"
+        row = tdb.conn.execute("SELECT status, order_id, platform FROM trades").fetchone()
+        assert tuple(row) == ("pending", "p1", "polymarket")
+        assert self._run_pm(balancer, client, tdb)["status"] == "unresolved_order_pending"
+        assert client.place_order.call_count == 1
+
+        client.get_order_status.return_value = {"status": "canceled"}
+        reconcile_orphaned_positions(tdb, pm_trader=client)
+        client.place_order.return_value = {"success": True, "orderID": "p2", "status": "unmatched"}
+        assert self._run_pm(balancer, client, tdb)["status"] == "not_filled"
+        assert client.place_order.call_count == 2
+
+    def test_block_is_per_market(self, tmp_path):
+        from db import TradeDB
+        tdb = TradeDB(str(tmp_path / "t.db"))
+        balancer = InventoryBalancer(rebalance_cooldown_sec=0.0)
+        client = self._kalshi_client({"order_id": "k1", "status": "resting"})
+        self._run_kalshi(balancer, client, tdb)
+        other = dict(self.KALSHI_PROP, market_key="KXOTHER-26SEP28")
+        client.place_order.return_value = {"order": {"order_id": "k2", "status": "executed",
+                                                     "fill_count_fp": "10.00"}}
+        with patch("kalshi_policy.live_kalshi_submit_allowed", return_value=True):
+            res = balancer.execute_rebalancing_proposals(
+                [other], dry_run=False, kalshi_client=client, trade_db=tdb)[0]
+        assert res["status"] == "filled"
+
+    @pytest.mark.parametrize("order", [
+        {"order_id": "k1", "status": "canceled", "fill_count_fp": "0.00"},
+        {"order_id": "k1", "status": "rejected", "fill_count": 0},
+    ])
+    def test_confirmed_no_fill_does_not_block(self, tmp_path, order):
+        from db import TradeDB
+        tdb = TradeDB(str(tmp_path / "t.db"))
+        balancer = InventoryBalancer(rebalance_cooldown_sec=0.0)
+        client = self._kalshi_client(order)
+        assert self._run_kalshi(balancer, client, tdb)["status"] == "not_filled"
+        assert tdb.conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 0
+        assert self._run_kalshi(balancer, client, tdb)["status"] == "not_filled"
+        assert client.place_order.call_count == 2
+
+    def test_unlogged_unconfirmed_order_blocks_in_memory(self):
+        """With no ledger to hold it, the market stays blocked for this process."""
+        balancer = InventoryBalancer(rebalance_cooldown_sec=0.0)
+        client = self._kalshi_client({"order_id": "k1", "status": "resting"})
+        assert self._run_kalshi(balancer, client, None)["status"] == "fill_unconfirmed"
+        res = self._run_kalshi(balancer, client, None)
+        assert res["status"] == "unresolved_order_pending" and res["order_id"] == "k1"
+        assert client.place_order.call_count == 1
+
+    def test_unconfirmed_order_without_an_id_blocks_in_memory(self):
+        balancer = InventoryBalancer(rebalance_cooldown_sec=0.0)
+        client = self._kalshi_client({"status": "resting"})
+        db = MagicMock()
+        db.log_opportunity.return_value = 7
+        self._run_kalshi(balancer, client, db)
+        db.log_trade.assert_not_called()
+        assert self._run_kalshi(balancer, client, db)["status"] == "unresolved_order_pending"
+        assert client.place_order.call_count == 1
+
+    def test_failed_pending_write_blocks_in_memory(self):
+        balancer = InventoryBalancer(rebalance_cooldown_sec=0.0)
+        client = MagicMock()
+        client.place_order.return_value = {"success": True, "orderID": "p1", "status": "delayed"}
+        db = MagicMock()
+        db.log_opportunity.return_value = 8
+        db.log_trade.side_effect = RuntimeError("disk full")
+        db.get_pending_trades_by_type.return_value = []
+        assert self._run_pm(balancer, client, db)["status"] == "fill_unconfirmed"
+        assert self._run_pm(balancer, client, db)["status"] == "unresolved_order_pending"
+        assert client.place_order.call_count == 1
+
+    def test_failed_ledger_lookup_fails_closed(self):
+        balancer = InventoryBalancer(rebalance_cooldown_sec=0.0)
+        client = self._kalshi_client({"order_id": "k1", "status": "executed", "fill_count_fp": "10.00"})
+        db = MagicMock()
+        db.get_pending_trades_by_type.side_effect = RuntimeError("database is locked")
+        res = self._run_kalshi(balancer, client, db)
+        assert res["status"] == "unresolved_order_pending" and res["order_id"] == "unknown"
+        client.place_order.assert_not_called()
+
+    def test_ledger_lookup_matches_a_ticker_alias(self, tmp_path):
+        from db import TradeDB
+        tdb = TradeDB(str(tmp_path / "t.db"))
+        balancer = InventoryBalancer(rebalance_cooldown_sec=0.0)
+        balancer.register_ticker_alias("KXTEST-26SEP28", "market-key-1")
+        client = self._kalshi_client({"order_id": "k1", "status": "resting"})
+        self._run_kalshi(balancer, client, tdb)
+        assert balancer.unresolved_rebalance_order("market-key-1", tdb) == "k1"
+
+    def test_dry_run_is_not_blocked(self, tmp_path):
+        from db import TradeDB
+        tdb = TradeDB(str(tmp_path / "t.db"))
+        balancer = InventoryBalancer(rebalance_cooldown_sec=0.0)
+        self._run_kalshi(balancer, self._kalshi_client({"order_id": "k1", "status": "resting"}), tdb)
+        res = balancer.execute_rebalancing_proposals([dict(self.KALSHI_PROP)], dry_run=True, trade_db=tdb)[0]
+        assert res["status"] == "dry_run"
+
+
+class TestPendingTradesByType:
+    def test_returns_pending_trades_of_that_type_with_their_market(self, tmp_path):
+        from db import TradeDB
+        tdb = TradeDB(str(tmp_path / "t.db"))
+        rebal = tdb.log_opportunity("InventoryRebalance", "MKT-A", "{}", 1.0, 0.0, 0.0, 1.0, "pending")
+        other = tdb.log_opportunity("binary", "MKT-B", "{}", 1.0, 0.0, 0.0, 1.0, "executed")
+        tdb.log_trade(rebal, "kalshi", "BUY", 0.4, 10, "pending", order_id="k1")
+        tdb.log_trade(rebal, "kalshi", "BUY", 0.4, 10, "filled", order_id="k0")
+        tdb.log_trade(other, "kalshi", "BUY", 0.4, 10, "pending", order_id="k2")
+        rows = tdb.get_pending_trades_by_type("InventoryRebalance")
+        assert [(r["order_id"], r["market"]) for r in rows] == [("k1", "MKT-A")]

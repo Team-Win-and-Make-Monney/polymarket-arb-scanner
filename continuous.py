@@ -1628,6 +1628,22 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
     except Exception as exc:
         logger.warning("Opportunity Supabase sync init failed: %s", exc)
 
+    # Mirror the trade ledger (trades/positions incl. settlements, corrections
+    # and deletes) to Supabase for reporting. Opt-in; failures only log. The
+    # exporter runs on its own thread, so it also covers --mode mm-pilot,
+    # where the Kalshi MM pilot writes this same trades.db.
+    _ledger_sync_worker = None
+    try:
+        if config.LEDGER_SYNC_ENABLED:
+            from ledger_sync import start_ledger_sync_worker
+            _ledger_sync_worker = start_ledger_sync_worker(
+                db.db_path, capture_enabled=config.LEDGER_CAPTURE_ENABLED,
+                interval_seconds=config.LEDGER_SYNC_INTERVAL_SECONDS,
+                batch_size=config.LEDGER_SYNC_BATCH_SIZE)
+            logger.info("Trade ledger Supabase sync active (every %.0fs)", config.LEDGER_SYNC_INTERVAL_SECONDS)
+    except Exception as exc:
+        logger.warning("Trade ledger Supabase sync init failed (sync disabled): %s", exc)
+
     # Paper-trading window tracker: daily digest + one-time completion alert.
     _paper_tracker = None
     try:
@@ -3403,6 +3419,13 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                             "MM pilot thread remains alive after forced "
                             "stop; cancellation retries exhausted or venue "
                             "call still blocked.")
+
+        # After the pilot has stopped writing: export the final tail, then stop.
+        # Bounded: a slow final export finishes on its own thread and never
+        # holds up the feed shutdown below.
+        if _ledger_sync_worker is not None:
+            from ledger_sync import stop_ledger_sync_worker
+            await stop_ledger_sync_worker(_ledger_sync_worker, timeout=15.0)
 
         logger.info("Stopping WebSocket feeds...")
         feed_manager.stop()

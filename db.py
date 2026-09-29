@@ -2,27 +2,86 @@
 
 import json
 import logging
+import os
+import re
 import sqlite3
 import threading
+import uuid
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Ledger provenance and change capture (see docs/LEDGER-REPORTING.md)
+# ---------------------------------------------------------------------------
+
+# Execution mode a writer asserts for a trade/position row. NULL means the
+# writer did not say: the row's mode is unknown and must never be inferred from
+# the process's current DRY_RUN or account configuration.
+RUN_MODES = ("paper", "live")
+
+# Tables whose every INSERT/UPDATE/DELETE is recorded in ledger_outbox, so an
+# exporter sees settlements, fill corrections and deletes, not only new ids.
+LEDGER_CAPTURED_TABLES = ("trades", "positions")
+
+_ACCOUNT_LABEL_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+def parse_account_refs(raw: str | None) -> dict[str, str]:
+    """Parse LEDGER_ACCOUNT_REFS: a JSON map of platform -> non-secret account label.
+
+    Labels are opaque names chosen by the operator (e.g. "kalshi-main"), never
+    credentials or account numbers. Invalid entries are dropped with a warning,
+    so those platforms' rows stay account-unknown.
+    """
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        logger.warning("LEDGER_ACCOUNT_REFS is not valid JSON; account refs disabled")
+        return {}
+    if not isinstance(parsed, dict):
+        logger.warning("LEDGER_ACCOUNT_REFS must be a JSON object; account refs disabled")
+        return {}
+    refs = {}
+    for platform, label in parsed.items():
+        if isinstance(platform, str) and isinstance(label, str) and _ACCOUNT_LABEL_RE.match(label):
+            refs[platform.lower()] = label
+        else:
+            logger.warning("Ignoring invalid LEDGER_ACCOUNT_REFS entry for %r", platform)
+    return refs
+
+
+def _check_run_mode(run_mode: str | None) -> str | None:
+    if run_mode is not None and run_mode not in RUN_MODES:
+        raise ValueError(f"run_mode must be one of {RUN_MODES} or None, got {run_mode!r}")
+    return run_mode
 
 
 class TradeDB:
     """Thread-safe SQLite database for logging opportunities and trades."""
 
-    def __init__(self, db_path: str | None = None):
+    def __init__(self, db_path: str | None = None, ledger_capture: bool | None = None):
         if db_path is None:
-            import os
             data_dir = os.getenv("DATA_DIR", ".")
             db_path = os.path.join(data_dir, "trades.db")
+        self.db_path = db_path
         self._lock = threading.Lock()
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         # WAL mode allows concurrent reads while writing
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self._account_refs = parse_account_refs(os.getenv("LEDGER_ACCOUNT_REFS"))
         self._create_tables()
+        if ledger_capture is None:
+            ledger_capture = _env_flag("LEDGER_CAPTURE_ENABLED")
+        if ledger_capture:
+            self.enable_ledger_capture()
 
     def _create_tables(self):
         self.conn.executescript("""
@@ -237,6 +296,134 @@ class TradeDB:
             except sqlite3.OperationalError:
                 logger.debug("Migration: %s column already exists on jev_decisions", col)
 
+        # Ledger provenance: stamped at insert by the writer. Existing rows keep
+        # NULL (unknown); nothing back-fills them from today's configuration.
+        for table in LEDGER_CAPTURED_TABLES:
+            for col in ("run_mode", "account_ref"):
+                try:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+                    self.conn.commit()
+                except sqlite3.OperationalError:
+                    logger.debug("Migration: %s column already exists on %s", col, table)
+
+    # -----------------------------------------------------------------------
+    # Ledger change capture
+    # -----------------------------------------------------------------------
+
+    def _ledger_meta_table(self):
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS ledger_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+
+    def _set_meta_if_absent(self, key: str, value: str):
+        self.conn.execute("INSERT OR IGNORE INTO ledger_meta (key, value) VALUES (?, ?)", (key, value))
+
+    def get_ledger_meta(self) -> dict[str, str]:
+        """ledger_meta as a dict (empty if capture was never enabled on this file)."""
+        with self._lock:
+            try:
+                rows = self.conn.execute("SELECT key, value FROM ledger_meta").fetchall()
+            except sqlite3.OperationalError:
+                return {}
+            return {r["key"]: r["value"] for r in rows}
+
+    def ledger_capture_installed(self) -> bool:
+        with self._lock:
+            names = {r[0] for r in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'ledger_capture_%'")}
+        return names == {f"ledger_capture_{t}_{op}" for t in LEDGER_CAPTURED_TABLES
+                         for op in ("insert", "update", "delete")}
+
+    def enable_ledger_capture(self) -> str:
+        """Install the ledger_outbox triggers; return the current capture epoch.
+
+        The triggers run inside the writer's own SQLite transaction, so every
+        INSERT/UPDATE/DELETE on trades/positions from any process that writes
+        this file is recorded, with no network I/O. When the triggers were not
+        all present already, or no epoch was recorded, a new capture epoch is
+        recorded along with the max row ids at that moment: changes before it
+        were never captured, so an exporter must re-snapshot rather than trust
+        the outbox alone. Each new epoch also gets a new db_instance_id, and every
+        earlier id of this file is kept in superseded_db_instance_ids, so the
+        re-snapshot is a separate mirror generation that supersedes all earlier
+        ones (even those never exported) instead of overwriting them row by row. The whole install is one transaction.
+        Never removes triggers; turning the flag off leaves capture in place.
+        """
+        with self._lock:
+            # One BEGIN IMMEDIATE covers the tables, triggers and epoch rows:
+            # a crash part-way leaves nothing behind, and another writer can
+            # never see triggers without the epoch that dates them.
+            if self.conn.in_transaction:
+                self.conn.commit()
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                epoch = self._install_ledger_capture()
+                self.conn.commit()
+            except BaseException:
+                self.conn.rollback()
+                raise
+            return epoch
+
+    def _install_ledger_capture(self) -> str:
+        self._ledger_meta_table()
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS ledger_outbox (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_table TEXT NOT NULL,
+                source_id INTEGER NOT NULL,
+                op TEXT NOT NULL,
+                changed_at TEXT NOT NULL
+                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            )""")
+        existing = {r[0] for r in self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'ledger_capture_%'")}
+        wanted = {}
+        for table in LEDGER_CAPTURED_TABLES:
+            for op, ref in (("insert", "NEW"), ("update", "NEW"), ("delete", "OLD")):
+                wanted[f"ledger_capture_{table}_{op}"] = (
+                    f"CREATE TRIGGER IF NOT EXISTS ledger_capture_{table}_{op} "
+                    f"AFTER {op.upper()} ON {table} BEGIN "
+                    f"INSERT INTO ledger_outbox (source_table, source_id, op) "
+                    f"VALUES ('{table}', {ref}.id, '{op}'); END")
+        has_epoch = self.conn.execute(
+            "SELECT 1 FROM ledger_meta WHERE key = 'capture_epoch'").fetchone() is not None
+        # Missing triggers or a missing epoch both mean capture history can't
+        # be trusted, so start a new epoch and make exporters re-snapshot.
+        fresh = not set(wanted) <= existing or not has_epoch
+        for sql in wanted.values():
+            self.conn.execute(sql)
+        if fresh:
+            epoch = uuid.uuid4().hex
+            now = datetime.now(timezone.utc).isoformat()
+            self.conn.execute(
+                "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('capture_epoch', ?)", (epoch,))
+            self.conn.execute(
+                "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('capture_since', ?)", (now,))
+            for table in LEDGER_CAPTURED_TABLES:
+                max_id = self.conn.execute(f"SELECT COALESCE(MAX(id), 0) FROM {table}").fetchone()[0]
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES (?, ?)",
+                    (f"capture_boundary_{table}_id", str(max_id)))
+            # A new generation: rows mirrored under an earlier id may be stale
+            # (deleted or changed while uncaptured), so they are never reused.
+            # The full ancestry is kept, so a generation that was never
+            # exported can't break the chain back to one that was.
+            meta = dict(self.conn.execute(
+                "SELECT key, value FROM ledger_meta WHERE key IN "
+                "('db_instance_id', 'superseded_db_instance_ids')").fetchall())
+            ancestry = json.loads(meta.get("superseded_db_instance_ids", "[]"))
+            if meta.get("db_instance_id") and meta["db_instance_id"] not in ancestry:
+                ancestry.append(meta["db_instance_id"])
+            self.conn.execute(
+                "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('superseded_db_instance_ids', ?)",
+                (json.dumps(ancestry),))
+            self.conn.execute(
+                "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('db_instance_id', ?)",
+                (uuid.uuid4().hex,))
+            logger.info("Ledger change capture installed (epoch %s)", epoch)
+        self._set_meta_if_absent("db_instance_id", uuid.uuid4().hex)
+        return self.conn.execute(
+            "SELECT value FROM ledger_meta WHERE key = 'capture_epoch'").fetchone()[0]
+
     def log_opportunity(
         self,
         opp_type: str,
@@ -280,17 +467,25 @@ class TradeDB:
         fill_price: float | None = None,
         order_id: str | None = None,
         outcome: str | None = None,
+        run_mode: str | None = None,
+        fill_qty: float | None = None,
     ) -> int | None:
         """Log a trade leg. Returns the trade ID.
 
         outcome is the traded market outcome (e.g. "yes"/"no") — distinct
         from side (BUY/SELL) so settlement can score Polymarket BUY_NO legs.
+        run_mode is the writer's own "paper"/"live" assertion for this row;
+        omitted, the row's mode is unknown. fill_qty is the filled contract
+        count when the writer already knows it (venue reconciliation compares
+        it per order); omitted, it stays unknown.
         """
+        _check_run_mode(run_mode)
         with self._lock:
             cur = self.conn.execute(
                 """INSERT INTO trades
-                   (opportunity_id, timestamp, platform, side, price, size, status, fill_price, order_id, outcome)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (opportunity_id, timestamp, platform, side, price, size, status, fill_price, order_id, outcome,
+                    run_mode, account_ref, fill_qty)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     opportunity_id,
                     datetime.now(timezone.utc).isoformat(),
@@ -302,6 +497,9 @@ class TradeDB:
                     fill_price,
                     order_id,
                     outcome,
+                    run_mode,
+                    self._account_refs.get(str(platform).lower()),
+                    fill_qty,
                 ),
             )
             self.conn.commit()
@@ -431,18 +629,22 @@ class TradeDB:
         platform: str,
         expected_pnl: float,
         market_ticker: str | None = None,
+        run_mode: str | None = None,
     ) -> int | None:
         """Create an open position after a trade is filled. Returns position ID.
 
         market_ticker is the platform-native id used for settlement lookups
         (e.g. a Kalshi ticker). When omitted, settlement falls back to
         market_identifier, which only works if that already holds a ticker.
+        run_mode: as for log_trade.
         """
+        _check_run_mode(run_mode)
         with self._lock:
             cur = self.conn.execute(
                 """INSERT INTO positions
-                   (opportunity_id, market_identifier, platform, entry_timestamp, status, expected_pnl, market_ticker)
-                   VALUES (?, ?, ?, ?, 'open', ?, ?)""",
+                   (opportunity_id, market_identifier, platform, entry_timestamp, status, expected_pnl, market_ticker,
+                    run_mode, account_ref)
+                   VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?)""",
                 (
                     opportunity_id,
                     market_identifier,
@@ -450,6 +652,8 @@ class TradeDB:
                     datetime.now(timezone.utc).isoformat(),
                     expected_pnl,
                     market_ticker,
+                    run_mode,
+                    self._account_refs.get(str(platform).lower()),
                 ),
             )
             self.conn.commit()
@@ -520,6 +724,17 @@ class TradeDB:
         with self._lock:
             rows = self.conn.execute(
                 "SELECT * FROM trades WHERE status = 'pending' ORDER BY id"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_pending_trades_by_type(self, opp_type: str) -> list[dict]:
+        """Pending trades whose opportunity has ``opp_type``, each with that opportunity's ``market``."""
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT t.*, o.market AS market FROM trades t
+                   JOIN opportunities o ON o.id = t.opportunity_id
+                   WHERE t.status = 'pending' AND o.type = ? ORDER BY t.id""",
+                (opp_type,),
             ).fetchall()
             return [dict(r) for r in rows]
 

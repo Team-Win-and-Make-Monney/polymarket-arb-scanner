@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import ssl
@@ -86,7 +87,7 @@ def _kalshi_qty(value) -> float | None:
         qty = float(value)
     except (TypeError, ValueError):
         return None
-    return qty if qty == qty and qty not in (float("inf"), float("-inf")) else None
+    return qty if math.isfinite(qty) else None
 
 
 def _parse_kalshi_ladder(msg: dict, side: str) -> dict:
@@ -394,8 +395,10 @@ class FeedManager:
 
         try:
             asyncio.run_coroutine_threadsafe(_cancel_all(), loop)
-        except RuntimeError:
-            pass
+        except RuntimeError as exc:
+            # The feed loop closed between the check above and scheduling: its
+            # tasks are already gone, so there is nothing left to cancel.
+            logger.debug("Feed loop already closed at shutdown: %s", exc)
 
     def _emit_price_update(self, platform: str, key: str, data: dict) -> None:
         """Deliver a price update to on_price_update on the caller's loop.

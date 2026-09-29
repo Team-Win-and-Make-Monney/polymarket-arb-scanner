@@ -28,13 +28,13 @@ mock_kalshi._load_private_key = MagicMock(return_value=None)
 sys.modules["kalshi_api"] = mock_kalshi
 
 import ws_feeds  # noqa: E402
-from ws_feeds import (  # noqa: E402
-    FeedManager,
-    FeedHealthTracker,
-    KalshiBookInvalid,
-    KalshiSequenceGap,
-    _kalshi_dollars_to_cents,
-)
+
+# One import style: tests also monkeypatch attributes on the module itself.
+FeedManager = ws_feeds.FeedManager
+FeedHealthTracker = ws_feeds.FeedHealthTracker
+KalshiBookInvalid = ws_feeds.KalshiBookInvalid
+KalshiSequenceGap = ws_feeds.KalshiSequenceGap
+_kalshi_dollars_to_cents = ws_feeds._kalshi_dollars_to_cents
 
 if _original_kalshi is not None:
     sys.modules["kalshi_api"] = _original_kalshi
@@ -337,7 +337,7 @@ class TestDedicatedFeedThread:
             blocked_from = time.monotonic()
             time.sleep(0.4)  # synchronous scan stage blocking the caller loop
             blocked_to = time.monotonic()
-            await task
+            await asyncio.gather(task)
             await asyncio.sleep(0.05)
             return caller, blocked_from, blocked_to
 
@@ -405,7 +405,7 @@ class TestDedicatedFeedThread:
             thread = fm._feed_thread
             fm.stop()
             with pytest.raises(asyncio.CancelledError):
-                await task
+                await asyncio.gather(task)
             return thread
 
         thread = asyncio.run(main())

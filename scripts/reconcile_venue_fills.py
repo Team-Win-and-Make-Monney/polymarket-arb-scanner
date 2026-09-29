@@ -17,7 +17,7 @@ Environment:
   SUPABASE_URL + SUPABASE_SERVICE_KEY
                         existing backend credential for the mirror
   LEDGER_RECON_FINALITY_SECONDS  seconds after a day ends before it is checked
-                                 (default 900; finite, >= 0)
+                                 (default 900; finite, >= 300, the recording lag)
   LEDGER_RECON_MAX_SOURCE_AGE_SECONDS
                                  a ledger source must have exported successfully
                                  within this many seconds (default 3600; finite, > 0)

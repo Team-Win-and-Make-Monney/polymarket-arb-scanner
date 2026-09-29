@@ -628,6 +628,15 @@ class TestMirrorSources:
         retired = _status("arb-scanner", db="old", success=(DAY_START - timedelta(days=3)).isoformat())
         assert "ledger_mirror_source_changed" not in self._check([retired, new])
 
+    def test_superseded_generation_is_never_current(self):
+        # The earlier capture generation of the same DB file, even with a
+        # later (delayed) status, is neither current nor a source change.
+        later = (DAY_END + timedelta(minutes=45)).isoformat()
+        old = _status("arb-scanner", db="g1", success=later, snapshot_complete=False)
+        new = _status("arb-scanner", db="g2", supersedes_db_instance_id="g1")
+        assert self._check([old, new]) == set()
+        assert "ledger_mirror_incomplete" in self._check([old, dict(new, supersedes_db_instance_id=None)])
+
 
 # ---------------------------------------------------------------------------
 # End-to-end reconciliation runs
@@ -694,6 +703,24 @@ class TestRunReconciliation:
     def test_venue_fill_missing_from_ledger_is_mismatched(self):
         rec = _run([_fill("f1", "o1", "1.00", "2026-09-28T05:00:00Z")])
         assert rec["status"] == "mismatched" and rec["missing_in_ledger"] == ["o1"]
+
+    def test_superseded_generation_rows_are_ignored(self):
+        # g1 is the earlier capture generation of the pilot's DB file. It still
+        # holds o1 (the same fill the new generation re-exported) and o2 (a row
+        # deleted locally before the re-snapshot). Neither may count.
+        later = (DAY_END + timedelta(minutes=45)).isoformat()
+        status = [_status("arb-scanner"), _status("kalshi-mm-pilot", db="g1", success=later),
+                  _status("kalshi-mm-pilot", db="g2", supersedes_db_instance_id="g1")]
+        counts = {r["source_key"]: {"trades": 3, "positions": 1} for r in status}
+        trades = [_ledger("o1", 1.0, n=1, db_instance_id="g1", ledger_key="arbgrid:kalshi-mm-pilot:g1:trades:1"),
+                  _ledger("o2", 1.0, n=2, db_instance_id="g1", ledger_key="arbgrid:kalshi-mm-pilot:g1:trades:2"),
+                  _ledger("o1", 1.0, n=1, db_instance_id="g2", ledger_key="arbgrid:kalshi-mm-pilot:g2:trades:1")]
+        mirror = FakeMirror(status=status, counts=counts, trades=trades)
+        rec = _run([_fill("f1", "o1", "1.00", "2026-09-28T05:00:00Z")], mirror=mirror)
+        assert rec["status"] == "matched", rec["incomplete_reasons"]
+        assert rec["missing_in_venue"] == [] and rec["qty_mismatch"] == []
+        assert {s["source_key"] for s in rec["ledger_sources"]} == {
+            "arbgrid:arb-scanner:db1", "arbgrid:kalshi-mm-pilot:g2"}
 
     def test_ledger_correction_then_rerun_matches(self):
         mirror = _fresh_mirror(trades=[_ledger("o1", 1.0)])

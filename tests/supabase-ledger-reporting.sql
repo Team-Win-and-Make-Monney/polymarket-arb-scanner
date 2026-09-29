@@ -22,11 +22,11 @@ returns void language sql as $$
 $$;
 
 set role service_role;
-select pg_temp.upsert_trade('arbgrid:svc:db1:trades:1', 5, 'e1', 'pending', 'live', 'k1');
-select pg_temp.upsert_trade('arbgrid:svc:db1:trades:1', 5, 'e1', 'pending', 'live', 'k1');  -- replay
-select pg_temp.upsert_trade('arbgrid:svc:db1:trades:1', 9, 'e1', 'filled', 'live', 'k1');   -- newer
-select pg_temp.upsert_trade('arbgrid:svc:db1:trades:1', 7, 'e1', 'pending', 'live', 'k1');  -- stale retry
-select pg_temp.upsert_trade('arbgrid:svc:db1:trades:2', 3, 'e1', 'filled', 'unknown', null);
+select pg_temp.upsert_trade('arbgrid:svc:db1:trades:1', 5, 'e2', 'pending', 'live', 'k1');
+select pg_temp.upsert_trade('arbgrid:svc:db1:trades:1', 5, 'e2', 'pending', 'live', 'k1');  -- replay
+select pg_temp.upsert_trade('arbgrid:svc:db1:trades:1', 9, 'e2', 'filled', 'live', 'k1');   -- newer
+select pg_temp.upsert_trade('arbgrid:svc:db1:trades:1', 7, 'e2', 'pending', 'live', 'k1');  -- stale retry
+select pg_temp.upsert_trade('arbgrid:svc:db1:trades:2', 3, 'e2', 'filled', 'unknown', null);
 reset role;
 
 do $$ begin
@@ -39,14 +39,23 @@ do $$ begin
   end if;
 end $$;
 
--- A new capture epoch (re-snapshot) replaces rows even at a lower seq.
+-- A key belongs to one capture epoch (each epoch writes under its own
+-- db_instance_id): a write carrying another epoch is refused, whatever its
+-- version, and the stored row is unchanged.
 set role service_role;
-select pg_temp.upsert_trade('arbgrid:svc:db1:trades:1', 2, 'e2', 'filled', 'live', 'k1');
-select pg_temp.upsert_trade('arbgrid:svc:db1:trades:2', 2, 'e2', 'filled', 'unknown', null, true);  -- tombstone
+do $$ begin
+  begin
+    perform pg_temp.upsert_trade('arbgrid:svc:db1:trades:1', 99, 'e1', 'pending', 'live', 'k1');
+    raise exception 'a write from another capture epoch was accepted';
+  exception when check_violation then null;
+  end;
+end $$;
+select pg_temp.upsert_trade('arbgrid:svc:db1:trades:2', 4, 'e2', 'filled', 'unknown', null, true);  -- tombstone
 reset role;
 do $$ begin
-  if (select capture_epoch from public.ledger_trades where source_id = 1) <> 'e2' then
-    raise exception 'new epoch did not replace row';
+  if (select (capture_epoch, source_version, status) from public.ledger_trades where source_id = 1)
+     is distinct from ('e2'::text, 9::bigint, 'filled'::text) then
+    raise exception 'a refused other-epoch write changed the row';
   end if;
 end $$;
 
@@ -372,7 +381,7 @@ do $$ begin
   end if;
 end $$;
 set role service_role;
-select pg_temp.upsert_trade('arbgrid:svc:db1:trades:1', 3, 'e2', 'filled', 'live', 'k1');  -- correction
+select pg_temp.upsert_trade('arbgrid:svc:db1:trades:1', 10, 'e2', 'filled', 'live', 'k1');  -- correction
 reset role;
 do $$ begin
   if (select fills_verified or not ledger_changed_since_check from ledger_reporting.venue_reconciliation_days
@@ -565,8 +574,12 @@ end $$;
 insert into t_marks values ('read_4', clock_timestamp());
 select pg_temp.recon('fence-4', 'matched', '2026-09-15', read_at => (select at from t_marks where name = 'read_4'),
                      order_ids => '["ord-in-window", "ord-old-targeted"]');
+-- Rewinding the times stands in for two hours passing; the status guard
+-- (which ignores an older attempt) is bypassed for this fixture edit only.
+alter table public.ledger_sync_status disable trigger ledger_sync_status_guard;
 update public.ledger_sync_status set last_attempt_at = now() - interval '2 hours',
   last_success_at = now() - interval '2 hours';
+alter table public.ledger_sync_status enable trigger ledger_sync_status_guard;
 do $$ declare r record; begin
   select * into r from ledger_reporting.venue_reconciliation_days where reporting_day = '2026-09-15';
   if r.fills_verified or r.mirror_current or r.fills_matched_as_of is null then
@@ -688,5 +701,199 @@ do $$ begin
     raise exception 'a row recorded inside the recording window after the day must withdraw it';
   end if;
 end $$;
+
+-- ---------------------------------------------------------------------------
+-- Capture generations. A new epoch of the same DB file writes under a new
+-- db_instance_id and its status row names the one it supersedes. Service
+-- gsvc, venue gvenue and account gk are used only here.
+-- ---------------------------------------------------------------------------
+create or replace function pg_temp.gen_trade(inst text, id bigint, ver bigint, epoch text)
+returns void language sql as $$
+  insert into public.ledger_trades (ledger_key, source_system, service, db_instance_id, source_table,
+    source_id, source_version, capture_epoch, venue, account_ref, run_mode, mode_evidence, recorded_at,
+    status, fill_qty, order_id)
+  values ('arbgrid:gsvc:' || inst || ':trades:' || id, 'arbgrid', 'gsvc', inst, 'trades', id, ver, epoch,
+    'gvenue', 'gk', 'live', 'writer_stamped', '2026-09-10T12:00:00+00', 'filled', 1, 'gord-' || id)
+  on conflict (ledger_key) do update set source_version = excluded.source_version,
+    capture_epoch = excluded.capture_epoch, status = excluded.status, fill_qty = excluded.fill_qty;
+$$;
+create or replace function pg_temp.gen_position(inst text, id bigint, ver bigint, epoch text, pnl numeric)
+returns void language sql as $$
+  insert into public.ledger_positions (ledger_key, source_system, service, db_instance_id, source_table,
+    source_id, source_version, capture_epoch, venue, account_ref, run_mode, mode_evidence, status,
+    settled_at, realized_pnl)
+  values ('arbgrid:gsvc:' || inst || ':positions:' || id, 'arbgrid', 'gsvc', inst, 'positions', id, ver,
+    epoch, 'gvenue', 'gk', 'live', 'writer_stamped', 'settled', '2026-09-10T12:00:00+00', pnl)
+  on conflict (ledger_key) do update set source_version = excluded.source_version,
+    capture_epoch = excluded.capture_epoch, realized_pnl = excluded.realized_pnl;
+$$;
+-- PostgREST merge-duplicates upsert of the columns the exporter sends.
+create or replace function pg_temp.gen_status(inst text, epoch text, supersedes text, complete boolean,
+  attempt timestamptz, success timestamptz, trades bigint, positions bigint)
+returns void language sql as $$
+  insert into public.ledger_sync_status (source_key, source_system, service, db_instance_id, capture_epoch,
+    supersedes_db_instance_id, capture_since, snapshot_complete, pending_changes, local_trades_count,
+    local_positions_count, last_attempt_at, last_success_at, last_error)
+  values ('arbgrid:gsvc:' || inst, 'arbgrid', 'gsvc', inst, epoch, supersedes, '2026-09-01T00:00:00+00',
+    complete, 0, trades, positions, attempt, success, null)
+  on conflict (source_key) do update set db_instance_id = excluded.db_instance_id,
+    capture_epoch = excluded.capture_epoch, supersedes_db_instance_id = excluded.supersedes_db_instance_id,
+    snapshot_complete = excluded.snapshot_complete, local_trades_count = excluded.local_trades_count,
+    local_positions_count = excluded.local_positions_count, last_attempt_at = excluded.last_attempt_at,
+    last_success_at = excluded.last_success_at;
+$$;
+create or replace function pg_temp.gen_trade_ids()
+returns text language sql as $$
+  select coalesce(string_agg(db_instance_id || ':' || source_id, ',' order by source_id), '')
+  from ledger_reporting.trades where service = 'gsvc';
+$$;
+create or replace function pg_temp.gen_pnl()
+returns numeric language sql as $$
+  select realized_pnl_sum from ledger_reporting.realized_pnl_daily where venue = 'gvenue';
+$$;
+create or replace function pg_temp.gen_complete(inst text)
+returns boolean language sql as $$
+  select mirror_complete from ledger_reporting.sources where source_key = 'arbgrid:gsvc:' || inst;
+$$;
+
+-- Generation g1 (epoch f1): trades 1, 2, 3; positions 1 (pnl 1) and 2 (pnl 5).
+set role service_role;
+select pg_temp.gen_trade('g1', 1, 5, 'f1'), pg_temp.gen_trade('g1', 2, 5, 'f1'), pg_temp.gen_trade('g1', 3, 5, 'f1');
+select pg_temp.gen_position('g1', 1, 5, 'f1', 1), pg_temp.gen_position('g1', 2, 5, 'f1', 5);
+insert into public.ledger_positions (ledger_key, source_system, service, db_instance_id, source_table,
+  source_id, source_version, capture_epoch, venue, account_ref, run_mode, mode_evidence, status, settled_at)
+values ('arbgrid:gsvc:g1:positions:3', 'arbgrid', 'gsvc', 'g1', 'positions', 3, 5, 'f1', 'gvenue', null,
+  'unknown', 'none', 'settled', '2026-09-10T12:00:00+00');
+select pg_temp.gen_status('g1', 'f1', null, true, now() - interval '10 minutes', now() - interval '10 minutes', 3, 3);
+reset role;
+do $$ begin
+  if pg_temp.gen_trade_ids() <> 'g1:1,g1:2,g1:3' or not pg_temp.gen_complete('g1') or pg_temp.gen_pnl() <> 6
+     or not exists (select 1 from ledger_reporting.unattributed_settlements_daily where venue = 'gvenue') then
+    raise exception 'setup: generation g1 should be complete: %, %', pg_temp.gen_trade_ids(), pg_temp.gen_pnl();
+  end if;
+end $$;
+
+-- Capture was lost; locally trade 3 and position 2 were deleted and trade 4
+-- added while nothing was captured. The recovery epoch f2 starts generation
+-- g2 and publishes its incomplete status before any of its rows.
+set role service_role;
+select pg_temp.gen_status('g2', 'f2', 'g1', false, now() - interval '5 minutes', null, 3, 1);
+reset role;
+do $$ begin
+  if pg_temp.gen_trade_ids() <> '' or pg_temp.gen_pnl() is not null
+     or exists (select 1 from ledger_reporting.positions where service = 'gsvc')
+     or exists (select 1 from ledger_reporting.unattributed_settlements_daily where venue = 'gvenue') then
+    raise exception 'a superseded generation must leave the views at once: %', pg_temp.gen_trade_ids();
+  end if;
+  if pg_temp.gen_complete('g1') or not (select superseded from ledger_reporting.sources
+                                        where source_key = 'arbgrid:gsvc:g1') then
+    raise exception 'a superseded generation must not be complete';
+  end if;
+  if pg_temp.gen_complete('g2') then
+    raise exception 'a new generation must be incomplete before its snapshot';
+  end if;
+end $$;
+
+-- The snapshot arrives: trades 1, 2, 4 (the same count as g1, other rows)
+-- and position 1. Still incomplete until the snapshot is reported done.
+set role service_role;
+select pg_temp.gen_trade('g2', 1, 2, 'f2'), pg_temp.gen_trade('g2', 2, 2, 'f2'), pg_temp.gen_trade('g2', 4, 2, 'f2');
+select pg_temp.gen_position('g2', 1, 2, 'f2', 1);
+reset role;
+do $$ begin
+  if pg_temp.gen_complete('g2') then
+    raise exception 'a new generation must stay incomplete until its snapshot is published';
+  end if;
+end $$;
+set role service_role;
+select pg_temp.gen_status('g2', 'f2', 'g1', true, now() - interval '4 minutes', now() - interval '4 minutes', 3, 1);
+reset role;
+do $$ declare r record; begin
+  if pg_temp.gen_trade_ids() <> 'g2:1,g2:2,g2:4' then
+    raise exception 'equal count with changed membership must show only the new set: %', pg_temp.gen_trade_ids();
+  end if;
+  select * into r from ledger_reporting.sources where source_key = 'arbgrid:gsvc:g2';
+  if not r.mirror_complete or r.mirror_trades_count <> 3 or r.mirror_positions_count <> 1
+     or r.mirror_trades_count <> (select count(*) from ledger_reporting.trades where service = 'gsvc')
+     or r.mirror_positions_count <> (select count(*) from ledger_reporting.positions where service = 'gsvc') then
+    raise exception 'sources and row views must count the same generation: %', r;
+  end if;
+  if pg_temp.gen_pnl() <> 1 then
+    raise exception 'a position deleted before the re-snapshot must not count: %', pg_temp.gen_pnl();
+  end if;
+end $$;
+select pg_temp.recon('gen-g2', 'matched', '2026-09-10', acct => 'gk',
+                     sources => '[{"service": "gsvc", "source_key": "arbgrid:gsvc:g2"}]');
+select pg_temp.recon('gen-g1', 'matched', '2026-09-11', acct => 'gk',
+                     sources => '[{"service": "gsvc", "source_key": "arbgrid:gsvc:g1"}]');
+do $$ begin
+  if not (select mirror_current from ledger_reporting.venue_reconciliation_days
+          where account_ref = 'gk' and reporting_day = '2026-09-10') then
+    raise exception 'setup: a check on the current generation should be current';
+  end if;
+end $$;
+
+-- Delayed writes from generation g1, including a status stamped later than
+-- g2's and one that no longer names a supersession, change nothing current.
+set role service_role;
+select pg_temp.gen_trade('g1', 3, 50, 'f1'), pg_temp.gen_trade('g1', 5, 50, 'f1');
+select pg_temp.gen_position('g1', 2, 50, 'f1', 5);
+select pg_temp.gen_status('g1', 'f1', null, true, now() + interval '1 hour', now() + interval '1 hour', 4, 2);
+reset role;
+do $$ begin
+  if pg_temp.gen_trade_ids() <> 'g2:1,g2:2,g2:4' or pg_temp.gen_pnl() <> 1 then
+    raise exception 'delayed previous-generation rows must stay retired: %, %',
+      pg_temp.gen_trade_ids(), pg_temp.gen_pnl();
+  end if;
+  if pg_temp.gen_complete('g1') or not pg_temp.gen_complete('g2') then
+    raise exception 'a delayed previous-generation status must not make it current';
+  end if;
+  if not (select mirror_current from ledger_reporting.venue_reconciliation_days
+          where account_ref = 'gk' and reporting_day = '2026-09-10')
+     or (select mirror_current from ledger_reporting.venue_reconciliation_days
+         where account_ref = 'gk' and reporting_day = '2026-09-11') then
+    raise exception 'only checks on the current generation may be current';
+  end if;
+end $$;
+
+-- A delayed older status of g2 itself is ignored, and g2 keeps naming g1.
+set role service_role;
+select pg_temp.gen_status('g2', 'f2', null, false, now() - interval '5 minutes', null, 3, 1);
+reset role;
+do $$ begin
+  if not pg_temp.gen_complete('g2') or pg_temp.gen_trade_ids() <> 'g2:1,g2:2,g2:4' then
+    raise exception 'an older status must not replace a newer one';
+  end if;
+end $$;
+set role service_role;
+select pg_temp.gen_status('g2', 'f2', null, true, now() - interval '3 minutes', now() - interval '3 minutes', 3, 1);
+reset role;
+do $$ begin
+  if (select supersedes_db_instance_id from public.ledger_sync_status where source_key = 'arbgrid:gsvc:g2') <> 'g1'
+     or pg_temp.gen_trade_ids() <> 'g2:1,g2:2,g2:4' then
+    raise exception 'a superseded generation must stay superseded';
+  end if;
+end $$;
+
+-- A status row is one generation, and never supersedes itself.
+set role service_role;
+do $$ begin
+  begin
+    perform pg_temp.gen_status('g2', 'f3', 'g1', true, now(), now(), 3, 1);
+    raise exception 'a status row changed its capture epoch';
+  exception when check_violation then null;
+  end;
+  begin
+    perform pg_temp.gen_status('g3', 'f3', 'g3', false, now(), null, 0, 0);
+    raise exception 'a self-superseding status was accepted';
+  exception when check_violation then null;
+  end;
+  begin
+    perform pg_temp.gen_trade('g2', 1, 99, 'f1');
+    raise exception 'a previous-epoch write to a new-generation key was accepted';
+  exception when check_violation then null;
+  end;
+end $$;
+reset role;
 
 select 'ledger reporting assertions passed' as result;

@@ -1,8 +1,10 @@
 """Tests for the trade-ledger reporting mirror (db change capture + ledger_sync).
 
 The fake Supabase client mirrors the draft migration's semantics: upsert on
-ledger_key/source_key merges only the columns sent, and a record whose
-source_version is lower than the stored one (same capture epoch) is ignored.
+ledger_key/source_key merges only the columns sent, a record whose
+source_version is lower than the stored one is ignored, a record carrying
+another capture epoch than its stored key is refused, and a status older than
+the stored one is ignored. ``current`` applies the views' superseded filter.
 """
 
 import os
@@ -49,13 +51,43 @@ class FakeRemote:
         for row in rows:
             key = row[on_conflict]
             old = store.get(key)
-            if (old is not None and name != "ledger_sync_status"
-                    and old.get("capture_epoch") == row.get("capture_epoch")
-                    and row["source_version"] < old["source_version"]):
-                continue  # version guard
+            if old is not None and name != "ledger_sync_status":
+                if row.get("capture_epoch") != old.get("capture_epoch"):
+                    raise RuntimeError(f"{key} belongs to epoch {old.get('capture_epoch')}")
+                if row["source_version"] < old["source_version"]:
+                    continue  # version guard
+            if old is not None and name == "ledger_sync_status":
+                if (row.get("db_instance_id"), row.get("capture_epoch")) != (
+                        old.get("db_instance_id"), old.get("capture_epoch")):
+                    raise RuntimeError(f"{key} belongs to another generation")
+                if row["last_attempt_at"] < old["last_attempt_at"]:
+                    continue  # status guard: keep the newer status
+                row = dict(row, supersedes_db_instance_id=(
+                    old.get("supersedes_db_instance_id") or row.get("supersedes_db_instance_id")))
             merged = dict(old or {})
             merged.update(row)
             store[key] = merged
+
+    def superseded(self):
+        return {(r["service"], r["supersedes_db_instance_id"]) for r in self.tables["ledger_sync_status"].values()
+                if r.get("supersedes_db_instance_id")}
+
+    def current(self, name):
+        """Live rows as the reporting views select them: no superseded generation."""
+        gone = self.superseded()
+        return [r for r in self.rows(name) if (r["service"], r["db_instance_id"]) not in gone]
+
+    def mirror_complete(self, source_key):
+        """ledger_reporting.sources.mirror_complete for one source."""
+        s = self.tables["ledger_sync_status"][source_key]
+        counts = {t: sum(1 for r in self.rows(f"ledger_{t}")
+                         if (r["service"], r["db_instance_id"]) == (s["service"], s["db_instance_id"]))
+                  for t in ("trades", "positions")}
+        return ((s["service"], s["db_instance_id"]) not in self.superseded()
+                and s.get("last_error") is None and s.get("last_success_at") is not None
+                and s["last_success_at"] >= s["last_attempt_at"] and s["snapshot_complete"]
+                and s["pending_changes"] == 0 and counts["trades"] == s["local_trades_count"]
+                and counts["positions"] == s["local_positions_count"])
 
     def rows(self, name, include_deleted=False):
         return sorted((r for r in self.tables[name].values() if include_deleted or not r.get("deleted")),
@@ -451,6 +483,175 @@ class TestExporter:
         with pytest.raises(RuntimeError):
             exporter.sync_once()
         assert _trade(tdb, run_mode="live")  # the order path's local write still works
+
+
+def _lose_capture(tdb, how):
+    """Break capture the two ways a reinstall recovers from."""
+    if how == "triggers":
+        for name in ("insert", "update", "delete"):
+            tdb.conn.execute(f"DROP TRIGGER ledger_capture_trades_{name}")
+            tdb.conn.execute(f"DROP TRIGGER ledger_capture_positions_{name}")
+    else:
+        tdb.conn.execute("DELETE FROM ledger_meta WHERE key = 'capture_epoch'")
+    tdb.conn.commit()
+
+
+def _source_key(meta):
+    return f"arbgrid:arb-scanner:{meta['db_instance_id']}"
+
+
+class TestCaptureGenerations:
+    """A new capture epoch is a new mirror generation that supersedes the old one."""
+
+    def _regenerate(self, tdb, path, how, uncaptured=None):
+        old = tdb.get_ledger_meta()
+        _lose_capture(tdb, how)
+        if uncaptured:
+            uncaptured()
+        TradeDB(path, ledger_capture=True).close()
+        return old, tdb.get_ledger_meta()
+
+    @pytest.mark.parametrize("how", ["triggers", "epoch"])
+    def test_new_epoch_rotates_the_instance_id(self, tmp_path, how):
+        path = str(tmp_path / "t.db")
+        tdb = TradeDB(path, ledger_capture=True)
+        first = tdb.get_ledger_meta()
+        assert "previous_db_instance_id" not in first
+        TradeDB(path, ledger_capture=True).close()  # plain reinstall: same generation
+        assert tdb.get_ledger_meta()["db_instance_id"] == first["db_instance_id"]
+        old, new = self._regenerate(tdb, path, how)
+        assert new["capture_epoch"] != old["capture_epoch"]
+        assert new["db_instance_id"] != old["db_instance_id"]
+        assert new["previous_db_instance_id"] == old["db_instance_id"]
+        tdb.close()
+
+    @pytest.mark.parametrize("how", ["triggers", "epoch"])
+    def test_rows_deleted_before_the_resnapshot_are_retired(self, ledger, how):
+        tdb, remote, exporter, path = ledger
+        ids = [_trade(tdb, run_mode="live") for _ in range(3)]
+        pos = [tdb.create_position(1, f"M{i}", "kalshi", expected_pnl=0.1, run_mode="live") for i in range(2)]
+        exporter.sync_once()
+
+        def delete_while_uncaptured():
+            tdb.conn.execute("DELETE FROM trades WHERE id = ?", (ids[1],))
+            tdb.conn.execute("DELETE FROM positions WHERE id = ?", (pos[0],))
+            tdb.conn.commit()
+
+        old, new = self._regenerate(tdb, path, how, delete_while_uncaptured)
+        assert exporter.sync_once().snapshot_complete
+        assert [r["source_id"] for r in remote.current("ledger_trades")] == [ids[0], ids[2]]
+        assert [r["source_id"] for r in remote.current("ledger_positions")] == [pos[1]]
+        # The old generation still holds the deleted rows, but nothing selects it.
+        assert ids[1] in [r["source_id"] for r in remote.rows("ledger_trades")
+                          if r["db_instance_id"] == old["db_instance_id"]]
+        status = remote.tables["ledger_sync_status"][_source_key(new)]
+        assert status["supersedes_db_instance_id"] == old["db_instance_id"]
+        assert remote.mirror_complete(_source_key(new))
+        assert not remote.mirror_complete(_source_key(old))
+
+    def test_equal_count_with_changed_membership_shows_only_the_new_set(self, ledger):
+        tdb, remote, exporter, path = ledger
+        ids = [_trade(tdb, run_mode="live") for _ in range(3)]
+        exporter.sync_once()
+        added = []
+
+        def swap_while_uncaptured():
+            tdb.conn.execute("DELETE FROM trades WHERE id = ?", (ids[2],))
+            tdb.conn.commit()
+            added.append(_trade(tdb, run_mode="live"))
+
+        old, new = self._regenerate(tdb, path, "triggers", swap_while_uncaptured)
+        exporter.sync_once()
+        assert [r["source_id"] for r in remote.current("ledger_trades")] == [ids[0], ids[1], added[0]]
+        assert {r["db_instance_id"] for r in remote.current("ledger_trades")} == {new["db_instance_id"]}
+        assert remote.tables["ledger_sync_status"][_source_key(new)]["local_trades_count"] == 3
+        assert remote.mirror_complete(_source_key(new))
+
+    def test_status_is_published_before_any_row_of_the_new_generation(self, ledger):
+        tdb, remote, exporter, path = ledger
+        _trade(tdb, run_mode="live")
+        exporter.sync_once()
+        old, new = self._regenerate(tdb, path, "triggers")
+        seen = []
+        remote.fail_on = lambda name, rows: seen.append((name, [dict(r) for r in rows])) and False
+        exporter.sync_once()
+        name, rows = seen[0]
+        assert name == "ledger_sync_status"
+        assert rows[0]["source_key"] == _source_key(new)
+        assert rows[0]["supersedes_db_instance_id"] == old["db_instance_id"]
+        assert rows[0]["snapshot_complete"] is False and "last_success_at" not in rows[0]
+        assert "ledger_trades" in [n for n, _ in seen[1:]]
+
+    def test_failed_status_publication_pushes_no_rows(self, ledger):
+        tdb, remote, exporter, path = ledger
+        _trade(tdb, run_mode="live")
+        exporter.sync_once()
+        old, new = self._regenerate(tdb, path, "triggers")
+        remote.fail_on = lambda name, rows: name == "ledger_sync_status"
+        with pytest.raises(RuntimeError):
+            exporter.sync_once()
+        assert not [r for r in remote.rows("ledger_trades") if r["db_instance_id"] == new["db_instance_id"]]
+        # Until the new generation is published, the old one stays as it was.
+        assert remote.mirror_complete(_source_key(old))
+        remote.fail_on = None
+        exporter.sync_once()
+        assert remote.mirror_complete(_source_key(new)) and not remote.mirror_complete(_source_key(old))
+
+    def test_new_generation_stays_incomplete_until_its_snapshot_is_exported(self, tmp_path):
+        path = str(tmp_path / "t.db")
+        tdb = TradeDB(path, ledger_capture=True)
+        ids = [_trade(tdb, run_mode="live") for _ in range(4)]
+        remote = FakeRemote()
+        exporter = LedgerExporter(remote, path, service="arb-scanner", batch_size=1, max_batches=1)
+        while not exporter.sync_once().snapshot_complete:
+            pass
+        old, new = self._regenerate(tdb, path, "triggers")
+        res = exporter.sync_once()
+        assert not res.snapshot_complete
+        assert not remote.mirror_complete(_source_key(new))
+        current = remote.current("ledger_trades")
+        assert len(current) < len(ids)  # partial, and never mixed with the old generation
+        assert {r["db_instance_id"] for r in current} <= {new["db_instance_id"]}
+        for _ in range(10):
+            if exporter.sync_once().snapshot_complete:
+                break
+        assert remote.mirror_complete(_source_key(new))
+        assert [r["source_id"] for r in remote.current("ledger_trades")] == ids
+        exporter.close()
+        tdb.close()
+
+    def test_delayed_previous_generation_writes_change_nothing_current(self, ledger):
+        tdb, remote, exporter, path = ledger
+        tid = _trade(tdb, run_mode="live")
+        pid = tdb.create_position(1, "M", "kalshi", expected_pnl=0.1, run_mode="live")
+        exporter.sync_once()
+        old_trades = [dict(r) for r in remote.rows("ledger_trades")]
+        old_positions = [dict(r) for r in remote.rows("ledger_positions")]
+        old_status = dict(remote.tables["ledger_sync_status"][_source_key(tdb.get_ledger_meta())])
+
+        def delete_while_uncaptured():
+            tdb.conn.execute("DELETE FROM trades WHERE id = ?", (tid,))
+            tdb.conn.execute("DELETE FROM positions WHERE id = ?", (pid,))
+            tdb.conn.commit()
+
+        old, new = self._regenerate(tdb, path, "triggers", delete_while_uncaptured)
+        exporter.sync_once()
+        new_status = dict(remote.tables["ledger_sync_status"][_source_key(new)])
+        # Old-generation writes that arrive late, even ones stamped later.
+        remote.apply("ledger_trades", [dict(r, source_version=r["source_version"] + 100, status="filled")
+                                       for r in old_trades], "ledger_key")
+        remote.apply("ledger_positions", [dict(r, source_version=r["source_version"] + 100)
+                                          for r in old_positions], "ledger_key")
+        remote.apply("ledger_sync_status", [dict(old_status, last_attempt_at="9999-01-01T00:00:00+00:00",
+                                                 last_success_at="9999-01-01T00:00:00+00:00",
+                                                 supersedes_db_instance_id=None)], "source_key")
+        assert remote.current("ledger_trades") == [] and remote.current("ledger_positions") == []
+        assert not remote.mirror_complete(_source_key(old))
+        assert remote.mirror_complete(_source_key(new))
+        # A delayed status of the new generation itself cannot roll it back.
+        remote.apply("ledger_sync_status", [dict(new_status, last_attempt_at="2000-01-01T00:00:00+00:00",
+                                                 snapshot_complete=False)], "source_key")
+        assert remote.mirror_complete(_source_key(new))
 
 
 class TestReconcileFills:

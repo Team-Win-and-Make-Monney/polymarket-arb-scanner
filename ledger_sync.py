@@ -14,6 +14,14 @@ updates on rows already exported. The first sync of a capture epoch pages a
 full snapshot first, because changes made before the triggers existed were
 never captured.
 
+Generations: every new capture epoch comes with a new ``db_instance_id``
+(see ``TradeDB.enable_ledger_capture``), so its snapshot is written under new
+keys and never merges with rows the previous epoch left behind, including
+rows deleted while nothing was captured. Its status row names the id it
+replaces (``supersedes_db_instance_id``) and is published, incomplete, before
+any of its rows, so the reporting views drop the old generation first and
+report the new one as incomplete until its snapshot has been exported.
+
 Versioning: each exported record carries ``source_version``, the highest
 outbox ``seq`` visible when the row was read (in the same read transaction),
 so the data includes every change up to that seq. The remote tables keep the
@@ -397,6 +405,7 @@ class LedgerExporter:
             "service": self._service,
             "db_instance_id": meta.get("db_instance_id"),
             "capture_epoch": meta.get("capture_epoch"),
+            "supersedes_db_instance_id": meta.get("previous_db_instance_id"),
             "capture_since": meta.get("capture_since"),
             "capture_boundary_trades_id": int(meta.get("capture_boundary_trades_id", 0)),
             "capture_boundary_positions_id": int(meta.get("capture_boundary_positions_id", 0)),
@@ -429,6 +438,11 @@ class LedgerExporter:
             fresh = {"synced_epoch": meta["capture_epoch"], "watermark_seq": head, "snapshot_complete": 0}
             self._save_state(fresh)
             state = {k: str(v) for k, v in fresh.items()}
+        if state.get("snapshot_complete") != "1":
+            # Publish the incomplete status before any snapshot row, so the
+            # generation this one supersedes is retired first and this one is
+            # never read as complete mid-snapshot. Nothing is pushed if it fails.
+            self._report_status(meta, state, ok=False, error=None, raise_errors=True)
         ctx = self._context(meta)
         result = SyncResult()
         error = None

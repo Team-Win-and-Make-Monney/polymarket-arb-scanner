@@ -63,7 +63,8 @@ MIRROR_CLOCK_SKEW = timedelta(seconds=120)
 # evidence, even for a long-finished day: corrections may be unexported.
 DEFAULT_MAX_SOURCE_AGE_SECONDS = 3600
 # Status fields that must not move between the fence reads.
-_FENCE_FIELDS = ("source_key", "db_instance_id", "capture_epoch", "watermark_seq", "pending_changes",
+_FENCE_FIELDS = ("source_key", "db_instance_id", "capture_epoch", "supersedes_db_instance_id",
+                 "watermark_seq", "pending_changes",
                  "snapshot_complete", "local_trades_count", "local_positions_count",
                  "last_attempt_at", "last_success_at", "last_error")
 
@@ -104,7 +105,9 @@ def check_mirror_sources(status_rows: list[dict], mirror_counts: dict, services,
 
     mirror_counts maps source_key -> {"trades": n, "positions": n}, or None when
     the count could not be read. A source must have succeeded after the day
-    plus the finality lag AND within max_source_age_seconds of now.
+    plus the finality lag AND within max_source_age_seconds of now. An
+    instance another status row supersedes (an earlier capture generation of
+    the same DB file) is never a candidate; see superseded_instances.
     """
     _check_seconds("finality_lag_seconds", finality_lag_seconds, minimum=0, allow_equal=True)
     _check_seconds("max_source_age_seconds", max_source_age_seconds, minimum=0, allow_equal=False)
@@ -112,8 +115,10 @@ def check_mirror_sources(status_rows: list[dict], mirror_counts: dict, services,
     evidence: list[dict] = []
     fresh_after = interval_end + timedelta(seconds=finality_lag_seconds)
     recent_after = now - timedelta(seconds=max_source_age_seconds)
+    superseded = superseded_instances(status_rows)
     for service in services:
-        rows = [r for r in status_rows if r.get("service") == service]
+        rows = [r for r in status_rows if r.get("service") == service
+                and (service, r.get("db_instance_id")) not in superseded]
         item = {"service": service, "instances": len(rows), "problems": []}
         evidence.append(item)
         if not rows:
@@ -154,6 +159,16 @@ def check_mirror_sources(status_rows: list[dict], mirror_counts: dict, services,
         item["last_success_at"] = current.get("last_success_at")
         gaps.update(problems)
     return gaps, evidence
+
+
+def superseded_instances(status_rows: list[dict]) -> set[tuple[str, str]]:
+    """(service, db_instance_id) pairs replaced by a later capture generation.
+
+    Their mirrored rows may include rows deleted or changed while nothing was
+    captured, so they are excluded everywhere, as in the reporting views.
+    """
+    return {(r.get("service"), r["supersedes_db_instance_id"]) for r in status_rows
+            if r.get("supersedes_db_instance_id")}
 
 
 # ---------------------------------------------------------------------------
@@ -331,11 +346,16 @@ def _read_ledger(mirror, scope, venue: str, start: datetime, end: datetime, venu
     info["status_rows"] = status
     info["counts"] = counts
     window_since, window_until = start - LEDGER_WINDOW_BEFORE, end + LEDGER_WINDOW_AFTER
-    rows = mirror.ledger_trades(venue, window_since, window_until)
+    superseded = superseded_instances(status)
+
+    def current(found: list[dict]) -> list[dict]:
+        return [r for r in found if (r.get("service"), r.get("db_instance_id")) not in superseded]
+
+    rows = current(mirror.ledger_trades(venue, window_since, window_until))
     have = {str(r.get("order_id")) for r in rows if r.get("order_id")}
     missing = [oid for oid in venue_order_ids if oid not in have]
     if missing:
-        rows.extend(mirror.ledger_trades_for_orders(venue, missing))
+        rows.extend(current(mirror.ledger_trades_for_orders(venue, missing)))
     merged = {r.get("ledger_key"): r for r in rows}
     rows = list(merged.values())
     # The result depends on the venue's orders and on ledger rows recorded in

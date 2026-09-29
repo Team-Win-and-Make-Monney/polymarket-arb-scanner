@@ -342,7 +342,10 @@ class TradeDB:
         all present already, or no epoch was recorded, a new capture epoch is
         recorded along with the max row ids at that moment: changes before it
         were never captured, so an exporter must re-snapshot rather than trust
-        the outbox alone. The whole install is one transaction.
+        the outbox alone. Each new epoch also gets a new db_instance_id, with
+        the old one kept as previous_db_instance_id, so the re-snapshot is a
+        separate mirror generation that supersedes the old one instead of
+        overwriting it row by row. The whole install is one transaction.
         Never removes triggers; turning the flag off leaves capture in place.
         """
         with self._lock:
@@ -400,6 +403,19 @@ class TradeDB:
                 self.conn.execute(
                     "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES (?, ?)",
                     (f"capture_boundary_{table}_id", str(max_id)))
+            # A new generation: rows mirrored under the old id may be stale
+            # (deleted or changed while uncaptured), so they are never reused.
+            previous = self.conn.execute(
+                "SELECT value FROM ledger_meta WHERE key = 'db_instance_id'").fetchone()
+            self.conn.execute(
+                "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('db_instance_id', ?)",
+                (uuid.uuid4().hex,))
+            if previous is not None:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO ledger_meta (key, value) VALUES ('previous_db_instance_id', ?)",
+                    (previous[0],))
+            else:
+                self.conn.execute("DELETE FROM ledger_meta WHERE key = 'previous_db_instance_id'")
             logger.info("Ledger change capture installed (epoch %s)", epoch)
         self._set_meta_if_absent("db_instance_id", uuid.uuid4().hex)
         return self.conn.execute(

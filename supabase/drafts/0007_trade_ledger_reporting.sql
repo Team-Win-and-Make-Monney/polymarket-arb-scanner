@@ -103,6 +103,9 @@ create table if not exists public.ledger_sync_status (
   service                       text not null,
   db_instance_id                text,
   capture_epoch                 text,
+  -- The db_instance_id of the capture generation this one replaced (same DB
+  -- file, earlier epoch). The replaced generation is excluded from every view.
+  supersedes_db_instance_id     text,
   capture_since                 timestamptz,
   capture_boundary_trades_id    bigint,
   capture_boundary_positions_id bigint,
@@ -117,8 +120,14 @@ create table if not exists public.ledger_sync_status (
   last_success_at               timestamptz,
   last_error                    text,
   exporter_version              text,
-  synced_at                     timestamptz not null default now()
+  synced_at                     timestamptz not null default now(),
+  constraint ledger_sync_status_not_self_superseding
+    check (supersedes_db_instance_id is distinct from db_instance_id)
 );
+
+create index if not exists ledger_sync_status_supersedes_idx
+  on public.ledger_sync_status (service, supersedes_db_instance_id)
+  where supersedes_db_instance_id is not null;
 
 -- One row per venue check, written by scripts/reconcile_venue_fills.py
 -- (venue_reconciliation.run_reconciliation) with read-only venue access.
@@ -199,6 +208,9 @@ create index if not exists ledger_venue_recon_day_idx
 -- ---------------------------------------------------------------------------
 -- Version guard: an older export never overwrites a newer one
 -- ---------------------------------------------------------------------------
+-- Each capture epoch writes under its own db_instance_id, so a ledger_key
+-- belongs to exactly one epoch. A write carrying another epoch (for example
+-- a delayed write from an earlier generation) is refused, never merged.
 
 create or replace function public.ledger_version_guard()
 returns trigger
@@ -207,11 +219,15 @@ set search_path = ''
 as $$
 begin
   if tg_op = 'UPDATE' then
-    if new.capture_epoch = old.capture_epoch and new.source_version < old.source_version then
+    if new.capture_epoch is distinct from old.capture_epoch then
+      raise exception 'ledger row % belongs to capture epoch %, not %',
+        old.ledger_key, old.capture_epoch, new.capture_epoch
+        using errcode = 'check_violation';
+    end if;
+    if new.source_version < old.source_version then
       return null;  -- keep the stored, newer row
     end if;
-    if new.capture_epoch = old.capture_epoch and new.source_version = old.source_version
-       and new.deleted = old.deleted then
+    if new.source_version = old.source_version and new.deleted = old.deleted then
       -- A replay of the same version carries the same source state: keep the
       -- stored row as it is (its tombstone provenance and synced_at too), so
       -- a retry neither erases provenance nor makes venue checks look stale.
@@ -235,19 +251,33 @@ begin
 end;
 $$;
 
-create or replace function public.ledger_touch_synced_at()
+-- Sync status: a source_key is one generation, a delayed older status never
+-- replaces a newer one, and a generation once superseded stays superseded.
+create or replace function public.ledger_status_guard()
 returns trigger
 language plpgsql
 set search_path = ''
 as $$
 begin
+  if tg_op = 'UPDATE' then
+    if new.db_instance_id is distinct from old.db_instance_id
+       or new.capture_epoch is distinct from old.capture_epoch then
+      raise exception 'sync status % belongs to instance % epoch %, not % epoch %',
+        old.source_key, old.db_instance_id, old.capture_epoch, new.db_instance_id, new.capture_epoch
+        using errcode = 'check_violation';
+    end if;
+    if new.last_attempt_at < old.last_attempt_at then
+      return null;  -- keep the stored, newer status
+    end if;
+    new.supersedes_db_instance_id := coalesce(old.supersedes_db_instance_id, new.supersedes_db_instance_id);
+  end if;
   new.synced_at := now();
   return new;
 end;
 $$;
 
 revoke all on function public.ledger_version_guard() from public, anon, authenticated;
-revoke all on function public.ledger_touch_synced_at() from public, anon, authenticated;
+revoke all on function public.ledger_status_guard() from public, anon, authenticated;
 
 drop trigger if exists ledger_trades_version_guard on public.ledger_trades;
 create trigger ledger_trades_version_guard
@@ -260,9 +290,10 @@ create trigger ledger_positions_version_guard
   for each row execute function public.ledger_version_guard();
 
 drop trigger if exists ledger_sync_status_touch on public.ledger_sync_status;
-create trigger ledger_sync_status_touch
+drop trigger if exists ledger_sync_status_guard on public.ledger_sync_status;
+create trigger ledger_sync_status_guard
   before insert or update on public.ledger_sync_status
-  for each row execute function public.ledger_touch_synced_at();
+  for each row execute function public.ledger_status_guard();
 
 -- Deny-by-default: RLS on, no policies, no client-role grants.
 alter table public.ledger_trades enable row level security;
@@ -286,10 +317,16 @@ begin
   end if;
 end $$;
 
--- Per-source mirror state. mirror_complete means: the latest attempt
--- succeeded, the snapshot finished and nothing captured is still pending,
--- and the mirror's live row counts equal the local counts reported. It says
--- nothing about the venue account; see venue_reconciliations.
+-- Per-source mirror state. mirror_complete means: the source is not
+-- superseded by a later capture generation, the latest attempt succeeded,
+-- the snapshot finished and nothing captured is still pending, and the
+-- mirror's live row counts equal the local counts reported. It says nothing
+-- about the venue account; see venue_reconciliations.
+--
+-- Superseded: another status row of the same service names this
+-- db_instance_id in supersedes_db_instance_id. Every view below drops a
+-- superseded generation's rows, so counts and rows always come from the
+-- same generation.
 create or replace view ledger_reporting.sources as
 select
   s.source_key, s.service, s.db_instance_id, s.capture_epoch, s.capture_since,
@@ -298,14 +335,21 @@ select
   s.last_error, s.local_trades_count, s.local_positions_count,
   t.mirror_trades_count, p.mirror_positions_count,
   extract(epoch from (now() - s.last_success_at))::bigint as seconds_since_success,
-  (s.last_error is null
+  (not g.superseded
+   and s.last_error is null
    and s.last_success_at is not null
    and s.last_success_at >= s.last_attempt_at
    and s.snapshot_complete
    and s.pending_changes = 0
    and t.mirror_trades_count = s.local_trades_count
-   and p.mirror_positions_count = s.local_positions_count) as mirror_complete
+   and p.mirror_positions_count = s.local_positions_count) as mirror_complete,
+  g.superseded
 from public.ledger_sync_status s
+cross join lateral (
+  select exists (
+    select 1 from public.ledger_sync_status n
+    where n.service = s.service and n.supersedes_db_instance_id = s.db_instance_id) as superseded
+) g
 left join lateral (
   select count(*) as mirror_trades_count from public.ledger_trades lt
   where lt.service = s.service and lt.db_instance_id = s.db_instance_id and not lt.deleted
@@ -322,8 +366,11 @@ select
   pre_capture, opportunity_id, recorded_at, side, outcome, order_price, size,
   status, fill_price, fill_qty, slippage, order_id, client_order_id,
   fee_usd, fee_status, source_changed_at, synced_at
-from public.ledger_trades
-where not deleted;
+from public.ledger_trades t
+where not t.deleted
+  and not exists (
+    select 1 from public.ledger_sync_status n
+    where n.service = t.service and n.supersedes_db_instance_id = t.db_instance_id);
 
 create or replace view ledger_reporting.positions as
 select
@@ -332,8 +379,11 @@ select
   pre_capture, opportunity_id, market_identifier, market_ticker, entry_at,
   settled_at, status, expected_pnl, realized_pnl, pnl_basis, fee_usd, fee_status,
   source_changed_at, synced_at
-from public.ledger_positions
-where not deleted;
+from public.ledger_positions p
+where not p.deleted
+  and not exists (
+    select 1 from public.ledger_sync_status n
+    where n.service = p.service and n.supersedes_db_instance_id = p.db_instance_id);
 
 create or replace view ledger_reporting.venue_reconciliations as
 select run_id, venue, account_ref, interval_start, interval_end, reporting_tz, reporting_day,
@@ -354,7 +404,7 @@ from public.ledger_venue_reconciliations;
 --     the result depends on (the venue's orders and the ledger's in-day
 --     orders). Activity for other orders on other days does not withdraw it.
 --   mirror_current: every ledger source the check verified is still the
---     latest instance of its service, fully exported, not failing, last
+--     latest instance of its service, not superseded, fully exported, not failing, last
 --     succeeded within the check's max_source_age_seconds of now, and its
 --     mirrored live trade count equals the local trade count it reported. When false,
 --     an exporter has stopped or restarted and later corrections may be
@@ -413,6 +463,9 @@ cross join lateral (
            and s.last_success_at is not null
            and s.last_success_at >= s.last_attempt_at
            and s.snapshot_complete
+           and not exists (
+             select 1 from public.ledger_sync_status n
+             where n.service = s.service and n.supersedes_db_instance_id = s.db_instance_id)
            and s.pending_changes = 0
            and s.last_success_at >= now() - make_interval(secs => l.max_source_age_seconds::double precision)
            -- The mirror still holds every trade the source reports: a
@@ -422,10 +475,15 @@ cross join lateral (
            and s.local_trades_count = (
              select count(*) from public.ledger_trades t
              where t.service = s.service and t.db_instance_id = s.db_instance_id and not t.deleted)
+           -- No other live instance of the service attempted later. A
+           -- superseded generation never counts, even with a late status.
            and not exists (
              select 1 from public.ledger_sync_status newer
              where newer.service = s.service and newer.source_key <> s.source_key
-               and newer.last_attempt_at > s.last_attempt_at)))
+               and newer.last_attempt_at > s.last_attempt_at
+               and not exists (
+                 select 1 from public.ledger_sync_status n
+                 where n.service = newer.service and n.supersedes_db_instance_id = newer.db_instance_id))))
     as current
 ) cur;
 
@@ -442,6 +500,9 @@ with settled as (
          (p.settled_at at time zone 'America/Detroit')::date as settle_day_local
   from public.ledger_positions p
   where not p.deleted
+    and not exists (
+      select 1 from public.ledger_sync_status n
+      where n.service = p.service and n.supersedes_db_instance_id = p.db_instance_id)
     and p.run_mode = 'live'
     and p.account_ref is not null
     and p.status = 'settled'
@@ -479,8 +540,11 @@ select
   run_mode,
   (account_ref is null) as account_unknown,
   count(*) as settled_positions
-from public.ledger_positions
+from public.ledger_positions p
 where not deleted
+  and not exists (
+    select 1 from public.ledger_sync_status n
+    where n.service = p.service and n.supersedes_db_instance_id = p.db_instance_id)
   and status = 'settled'
   and settled_at is not null
   and (run_mode is distinct from 'live' or account_ref is null)

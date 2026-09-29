@@ -31,18 +31,21 @@ stays the source record, and venue records check completeness.
 
 ## How changes are captured and exported
 
-1. **Capture.** `LEDGER_CAPTURE_ENABLED=true` makes `TradeDB` install SQLite triggers. They append every insert, update and delete on `trades` and `positions` to `ledger_outbox`, inside the writer's own transaction. They are local only, with no network I/O. The install is one SQLite transaction. The first install, or any install that finds the epoch missing, records a new capture epoch and the maximum row ids at that moment. The triggers are never removed automatically.
+1. **Capture.** `LEDGER_CAPTURE_ENABLED=true` makes `TradeDB` install SQLite triggers. They append every insert, update and delete on `trades` and `positions` to `ledger_outbox`, inside the writer's own transaction. They are local only, with no network I/O. The install is one SQLite transaction. The first install, or any install that finds the triggers incomplete or the epoch missing, records a new capture epoch and the maximum row ids at that moment. It also records a new `db_instance_id` and keeps the old one as `previous_db_instance_id`, so each epoch is a separate mirror generation. The triggers are never removed automatically.
 2. **Export.** `LEDGER_SYNC_ENABLED=true` makes `continuous.py` start `ledger_sync.LedgerSyncWorker`, which runs `LedgerExporter.sync_once` every `LEDGER_SYNC_INTERVAL_SECONDS` (default 60).
    - It runs on its own daemon thread, independent of the scan loop, one sync at a time. It uses its own SQLite connection and is never on the event loop or in an order path.
    - It covers every `--mode`, including `--mode mm-pilot`. The `kalshi-mm-pilot` service runs `python scanner.py --continuous --mode mm-pilot --dry-run` (Railway start command, read 2026-09-29), and the pilot writes the same `TradeDB` as continuous mode.
    - At shutdown it stops after the MM pilot, then exports once more so the last rows are not left only in the local file. Shutdown waits at most 15 seconds for that export; a slower one finishes on the worker's own thread, which closes its SQLite connection only after the export ends, and the feed shutdown continues meanwhile.
    - A failure only logs a warning.
-3. **First sync of an epoch.** The exporter pages a full snapshot first, and it can resume after a restart. It then follows the outbox from where the snapshot began.
-4. **Versions.** Each record carries `source_version`, the highest outbox sequence number visible when the row was read in the same read transaction. The remote version guard ignores a lower version within the same epoch. That makes replays, retries and partial batches idempotent.
+3. **First sync of an epoch.** The exporter first publishes the generation's status row as incomplete, naming the id it replaces in `supersedes_db_instance_id`; if that write fails, nothing is pushed. It then pages a full snapshot, which can resume after a restart, and follows the outbox from where the snapshot began.
+   - From that status write on, the views drop every row of the superseded generation, including rows deleted locally while nothing was captured, which the old generation could never have tombstoned. The new generation reports `mirror_complete = false` until its snapshot and outbox are fully exported.
+   - A delayed write from the old generation can only reach the old generation's keys and status row, which stay excluded. A generation once superseded stays superseded.
+4. **Versions.** Each record carries `source_version`, the highest outbox sequence number visible when the row was read in the same read transaction. The remote version guard ignores a lower version. A `ledger_key` belongs to one epoch, and the guard refuses a write that carries another epoch. That makes replays, retries and partial batches idempotent.
+   - The status row has its own guard: it ignores a status whose `last_attempt_at` is older than the stored one, and refuses a change of instance or epoch.
 5. **Deletes** become tombstones (`deleted = true`). The remote guard keeps the stored venue, account, order id and time on a tombstone even if the upsert sends nulls, so a delete still invalidates venue checks. A replay of the same version leaves the stored row unchanged, including its provenance and `synced_at`.
 6. **Watermark.** The local watermark advances, and consumed outbox rows are pruned, only after every remote write succeeds. The watermark and the pruning commit together in one transaction. The status row gets `last_success_at` only on success.
 
-**Keys.** `ledger_key` is `arbgrid:<service>:<db_instance_id>:<table>:<id>`. `db_instance_id` is a random id stored in the DB file, so a recreated volume or a second service never collides. Venue and account are attributes, not part of the key: a deleted row no longer has them, and history has no account at all.
+**Keys.** `ledger_key` is `arbgrid:<service>:<db_instance_id>:<table>:<id>`. `db_instance_id` is a random id stored in the DB file and replaced with each new capture epoch, so a recreated volume, a second service or a re-snapshot never collides with earlier rows. Venue and account are attributes, not part of the key: a deleted row no longer has them, and history has no account at all.
 
 ## What a report may claim
 
@@ -110,7 +113,7 @@ The collector is read-only. Its transport allows only `GET` on `/portfolio/fills
 ### Reconciliation job (`venue_reconciliation.py`, `scripts/reconcile_venue_fills.py`)
 
 - **Reporting days.** Days are America/Detroit calendar days converted to UTC: 23 hours in March, 25 in November. The draft table enforces that `interval_start`/`interval_end` equal the local day's bounds.
-- **Ledger side.** It reads the Supabase mirror, never a local `trades.db`. It first verifies every mapped service's `ledger_sync_status`:
+- **Ledger side.** It reads the Supabase mirror, never a local `trades.db`. Instances a later capture generation supersedes are ignored, both their status rows and their ledger rows, as in the views. It first verifies every mapped service's `ledger_sync_status`:
   - present: `ledger_mirror_source_missing`
   - one DB instance throughout the interval: `ledger_mirror_source_changed`
   - capture began before the interval: `ledger_capture_not_covering_interval`
@@ -152,7 +155,7 @@ python scripts/reconcile_venue_fills.py --venue kalshi --day 2026-09-28 [--write
 
 **Known limits:**
 - Only order-level quantities are compared; the local ledger has no venue fill ids.
-- An order that fills across a day boundary shows as a quantity mismatch on both days.
+- An order that fills across a day boundary reconciles per day only when each fill has its own timestamped ledger row. A ledger row recorded inside the boundary ambiguity window leaves the day incomplete (`ledger_boundary_ambiguous`).
 - Fees are summed from the venue side only.
 - Settlement and position reconciliation do not exist yet.
 

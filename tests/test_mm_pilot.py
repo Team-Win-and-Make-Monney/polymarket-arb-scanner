@@ -2292,8 +2292,9 @@ class TestMMPilotInventorySkewQuoting:
 
         # Refresh with skewed local inventory
         placed_skewed = pilot.refresh_market(TICKER)
-        assert len(placed_skewed) == 2
+        assert len(placed_skewed) >= 1
         orders_skewed = {o["purpose"]: o for o in pilot.resting_orders(TICKER)}
+        assert len(orders_skewed) == 2
         spread_skewed = orders_skewed["quote_ask"]["price"] - orders_skewed["quote_bid"]["price"]
 
         # Skew spread must be strictly wider than flat baseline

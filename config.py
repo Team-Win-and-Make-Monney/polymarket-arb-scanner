@@ -851,6 +851,14 @@ MM_MIN_24H_VOLUME = _env_float("MM_MIN_24H_VOLUME", "0.0")
 MM_MAX_SPREAD_CENTS = _env_float("MM_MAX_SPREAD_CENTS", "0.0")
 MM_VOLUME_WEIGHT = _env_float("MM_VOLUME_WEIGHT", "0.20")
 
+# Queue Position Estimation & Microstructure Fill Probability
+MM_QUEUE_TRACKER_ENABLED = _env_bool("MM_QUEUE_TRACKER_ENABLED", "true")
+MM_QUEUE_PRESERVATION_ENABLED = _env_bool("MM_QUEUE_PRESERVATION_ENABLED", "true")
+MM_QUEUE_RESIZE_TOLERANCE = _env_float("MM_QUEUE_RESIZE_TOLERANCE", "0.20")
+MM_MAX_QUEUE_AHEAD = _env_int("MM_MAX_QUEUE_AHEAD", "100")
+MM_MIN_FILL_PROBABILITY = _env_float("MM_MIN_FILL_PROBABILITY", "0.05")
+MM_FILL_PROB_HORIZON_SEC = _env_float("MM_FILL_PROB_HORIZON_SEC", "30.0")
+
 
 # Kill switch / control plane (spec section 7). Fail closed: a cache older
 # than MM_CONTROLS_MAX_STALE_SECONDS means unknown operator intent = off.
@@ -1468,6 +1476,19 @@ def validate_config() -> list[str]:
     if MM_VOLUME_WEIGHT < 0:
         raise ConfigError(
             f"MM_VOLUME_WEIGHT={MM_VOLUME_WEIGHT} must be >= 0")
+
+    if MM_QUEUE_RESIZE_TOLERANCE < 0:
+        raise ConfigError(
+            f"MM_QUEUE_RESIZE_TOLERANCE={MM_QUEUE_RESIZE_TOLERANCE} must be >= 0")
+    if MM_MAX_QUEUE_AHEAD < 0:
+        raise ConfigError(
+            f"MM_MAX_QUEUE_AHEAD={MM_MAX_QUEUE_AHEAD} must be >= 0")
+    if not (0.0 <= MM_MIN_FILL_PROBABILITY <= 1.0):
+        raise ConfigError(
+            f"MM_MIN_FILL_PROBABILITY={MM_MIN_FILL_PROBABILITY} must be in [0, 1]")
+    if MM_FILL_PROB_HORIZON_SEC <= 0.0:
+        raise ConfigError(
+            f"MM_FILL_PROB_HORIZON_SEC={MM_FILL_PROB_HORIZON_SEC} must be > 0")
 
 
 

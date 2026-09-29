@@ -24,16 +24,20 @@ Provenance: ``run_mode`` is only ever the writer's own stamp or a row-intrinsic
 dry-run marker (status or order id). Everything else is ``unknown``; nothing
 here reads DRY_RUN or today's account configuration to label history.
 
-Isolation: the exporter uses its own SQLite connection and is run off the
-event loop by continuous.py; a failure never reaches order execution.
+Isolation: the exporter uses its own SQLite connection and runs on its own
+daemon thread (``LedgerSyncWorker``), started by continuous.py for any mode,
+including ``--mode mm-pilot`` where the Kalshi MM pilot writes the same
+trades.db. A failure only logs and never reaches order execution.
 Deterministic; no LLM.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -458,6 +462,97 @@ class LedgerExporter:
 
 
 # ---------------------------------------------------------------------------
+# Background runner
+# ---------------------------------------------------------------------------
+
+
+class LedgerSyncWorker:
+    """Runs one exporter on its own daemon thread at a fixed interval.
+
+    Independent of the scan loop and of every order path: a slow or failing
+    scan cycle, or the MM pilot's own thread, never delays or skips an export,
+    and an export failure only logs. At most one sync runs at a time, and the
+    exporter's SQLite reads use its own connection.
+    """
+
+    def __init__(self, exporter, interval_seconds: float, *, name: str = "ledger-sync"):
+        if (isinstance(interval_seconds, bool) or not isinstance(interval_seconds, (int, float))
+                or not math.isfinite(interval_seconds) or interval_seconds <= 0):
+            raise ValueError("interval_seconds must be a finite number > 0")
+        self._exporter = exporter
+        self._interval = float(interval_seconds)
+        self._name = name
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._run_lock = threading.Lock()
+        self.runs = 0
+        self.failures = 0
+        self.last_error: str | None = None
+        self.last_result: SyncResult | None = None
+
+    def run_once(self) -> bool:
+        """One export pass; True when it succeeded. Never raises."""
+        with self._run_lock:
+            try:
+                self.last_result = self._exporter.sync_once()
+                self.last_error = None
+                return True
+            except Exception as exc:
+                self.failures += 1
+                self.last_error = f"{type(exc).__name__}: {exc}"[:500]
+                logger.warning("Trade ledger Supabase sync failed (will retry): %s", exc)
+                return False
+            finally:
+                self.runs += 1
+
+    def _loop(self):
+        while not self._stop.is_set():
+            self.run_once()
+            self._stop.wait(self._interval)
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._loop, name=self._name, daemon=True)
+        self._thread.start()
+
+    @property
+    def alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def stop(self, timeout: float = 10.0, final_sync: bool = True) -> None:
+        """Stop the thread; then, if it exited, export once more so a tail
+        written just before shutdown is not left only in the local file."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout)
+            if self._thread.is_alive():
+                logger.warning("Trade ledger sync thread did not stop in %.0fs", timeout)
+                return
+        if final_sync:
+            self.run_once()
+        self._exporter.close()
+
+
+def start_ledger_sync_worker(db_path: str, *, capture_enabled: bool, interval_seconds: float,
+                             batch_size: int = 500, service: str | None = None,
+                             client_factory=None) -> LedgerSyncWorker:
+    """Build and start the exporter thread for one local trades.db. Raises when
+    it cannot run (capture off, no service identity, no client)."""
+    if not capture_enabled:
+        raise RuntimeError("LEDGER_SYNC_ENABLED requires LEDGER_CAPTURE_ENABLED")
+    if client_factory is None:
+        from supabase_sync import build_client_from_env as client_factory
+    client = client_factory()
+    if client is None:
+        raise RuntimeError("Supabase client unavailable (SUPABASE_URL / SUPABASE_SERVICE_KEY)")
+    exporter = LedgerExporter(client, db_path, service=service or service_name_from_env(), batch_size=batch_size)
+    worker = LedgerSyncWorker(exporter, interval_seconds)
+    worker.start()
+    return worker
+
+
+# ---------------------------------------------------------------------------
 # Venue reconciliation (pure; venue records come from read-only venue sources)
 # ---------------------------------------------------------------------------
 
@@ -494,7 +589,10 @@ def _parse_utc(value) -> datetime | None:
         return None
     if dt.tzinfo is None or dt.utcoffset() is None:
         return None
-    return dt.astimezone(timezone.utc)
+    try:
+        return dt.astimezone(timezone.utc)
+    except OverflowError:  # e.g. 0001-01-01T00:00+01:00 has no UTC instant
+        return None
 
 
 def reconcile_fills(venue_fills: list[dict], ledger_trades: list[dict], *, venue: str,

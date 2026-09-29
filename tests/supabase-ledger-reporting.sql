@@ -69,23 +69,26 @@ values
 insert into public.ledger_sync_status (source_key, source_system, service, db_instance_id, capture_epoch,
   snapshot_complete, pending_changes, local_trades_count, local_positions_count,
   last_attempt_at, last_success_at, last_error)
-values ('arbgrid:svc:db1', 'arbgrid', 'svc', 'db1', 'e2', true, 0, 1, 5,
-  '2026-09-29T00:00:00+00:00', '2026-09-29T00:00:00+00:00', null);
+values ('arbgrid:svc:db1', 'arbgrid', 'svc', 'db1', 'e2', true, 0, 1, 5, now(), now(), null);
 
 -- Reconciliation rows as the collector writes them (Detroit days).
 create or replace function pg_temp.recon(
   rid text, st text, d date, reasons jsonb default '[]', scope text default 'all_subaccounts',
   mirror_ok boolean default true, cov boolean default true, acct text default 'k1',
-  at timestamptz default clock_timestamp())
+  at timestamptz default clock_timestamp(), read_at timestamptz default null,
+  order_ids jsonb default '[]',
+  sources jsonb default '[{"service": "svc", "source_key": "arbgrid:svc:db1"}]',
+  max_age numeric default 3600)
 returns void language sql as $$
   insert into public.ledger_venue_reconciliations (run_id, venue, account_ref, interval_start, interval_end,
     reporting_tz, reporting_day, venue_source, coverage_scope, status, coverage_verified,
     ledger_mirror_verified, incomplete_reasons, venue_order_count, ledger_order_count, matched_order_count,
-    collector, collector_version, collected_at, checked_at)
+    collector, collector_version, collected_at, checked_at, ledger_read_started_at, ledger_order_ids,
+    ledger_sources, max_source_age_seconds)
   values (rid, 'kalshi', acct, d::timestamp at time zone 'America/Detroit',
     (d + 1)::timestamp at time zone 'America/Detroit', 'America/Detroit', d,
     'kalshi:fills:sha256:0123456789abcdef:' || scope, scope, st, cov, mirror_ok, reasons, 1, 1, 1,
-    'kalshi_fills', '1', at, at);
+    'kalshi_fills', '1', at, at, coalesce(read_at, at), order_ids, sources, max_age);
 $$;
 select pg_temp.recon('run-1', 'matched', '2026-09-28');
 reset role;
@@ -154,6 +157,30 @@ begin
     values ('bad-9', 'kalshi', 'k1', '2026-03-08T04:00:00+00', '2026-03-09T04:00:00+00', 'America/Detroit',
       '2026-03-08', 's', 'incomplete', '["x"]', 0, 0, 0);
     raise exception 'a reporting day with a DST-naive start was accepted';
+  exception when check_violation then null;
+  end;
+  begin
+    insert into public.ledger_venue_reconciliations (run_id, venue, account_ref, interval_start, interval_end,
+      venue_source, status, coverage_verified, ledger_mirror_verified, coverage_scope, venue_order_count,
+      ledger_order_count, matched_order_count, ledger_sources, max_source_age_seconds)
+    values ('bad-10', 'kalshi', 'k1', '2026-09-27T04:00:00+00', '2026-09-28T04:00:00+00', 's', 'matched', true,
+      true, 'all_subaccounts', 0, 0, 0, '[{"service": "svc", "source_key": "arbgrid:svc:db1"}]', 3600);
+    raise exception 'matched without a mirror read time was accepted';
+  exception when check_violation then null;
+  end;
+  begin
+    perform pg_temp.recon('bad-11', 'matched', '2026-09-27', sources => '[]');
+    raise exception 'matched without the ledger sources it relied on was accepted';
+  exception when check_violation then null;
+  end;
+  begin
+    perform pg_temp.recon('bad-12', 'matched', '2026-09-27', max_age => 0);
+    raise exception 'a non-positive source age was accepted';
+  exception when check_violation then null;
+  end;
+  begin
+    perform pg_temp.recon('bad-13', 'matched', '2026-09-27', order_ids => '{"o": 1}');
+    raise exception 'non-array order ids were accepted';
   exception when check_violation then null;
   end;
   begin
@@ -334,6 +361,188 @@ do $$ begin
   if not (select fills_reconciled_for_day and not account_wide_fills_reconciled
           from ledger_reporting.realized_pnl_daily where settle_day_local = '2026-09-28') then
     raise exception 'a subaccount check must reconcile only its own scope';
+  end if;
+end $$;
+
+-- ---------------------------------------------------------------------------
+-- Review fixes: read fence, targeted order ids, tombstones, source recency.
+-- Day 2026-09-15 (k1); no other fixture row is in its read window.
+-- ---------------------------------------------------------------------------
+create temp table t_marks (name text primary key, at timestamptz);
+grant all on t_marks to service_role;
+
+-- PostgREST-style tombstone that sends no provenance (explicit nulls): the
+-- stored row keeps its venue, order id and time.
+create or replace function pg_temp.upsert_bare_tombstone(k text, ver bigint)
+returns void language sql as $$
+  insert into public.ledger_trades (ledger_key, source_system, service, db_instance_id, source_table,
+    source_id, source_version, capture_epoch, deleted)
+  values (k, 'arbgrid', 'svc', 'db1', 'trades', split_part(k, ':', 5)::bigint, ver, 'e2', true)
+  on conflict (ledger_key) do update set
+    source_version = excluded.source_version, deleted = excluded.deleted, venue = excluded.venue,
+    account_ref = excluded.account_ref, order_id = excluded.order_id, recorded_at = excluded.recorded_at;
+$$;
+
+set role service_role;
+insert into public.ledger_trades (ledger_key, source_system, service, db_instance_id, source_table, source_id,
+  source_version, capture_epoch, venue, account_ref, run_mode, mode_evidence, recorded_at, status, fill_qty,
+  order_id)
+values
+  ('arbgrid:svc:db1:trades:20', 'arbgrid', 'svc', 'db1', 'trades', 20, 10, 'e2', 'kalshi', 'k1', 'live',
+   'writer_stamped', '2026-09-15T12:00:00+00', 'filled', 1, 'ord-in-window'),
+  ('arbgrid:svc:db1:trades:21', 'arbgrid', 'svc', 'db1', 'trades', 21, 10, 'e2', 'kalshi', 'k1', 'live',
+   'writer_stamped', '2026-09-01T12:00:00+00', 'filled', 2, 'ord-old-targeted'),
+  ('arbgrid:svc:db1:trades:22', 'arbgrid', 'svc', 'db1', 'trades', 22, 10, 'e2', 'kalshi', 'k1', 'live',
+   'writer_stamped', '2026-09-01T12:00:00+00', 'filled', 3, 'ord-old-unrelated');
+reset role;
+select pg_sleep(0.01);
+
+-- 1. A replay of the same version is not a change.
+insert into t_marks values ('before_replay', (select synced_at from public.ledger_trades
+                                               where source_id = 20));
+set role service_role;
+insert into public.ledger_trades (ledger_key, source_system, service, db_instance_id, source_table, source_id,
+  source_version, capture_epoch, venue, account_ref, run_mode, mode_evidence, recorded_at, status, fill_qty,
+  order_id)
+values ('arbgrid:svc:db1:trades:20', 'arbgrid', 'svc', 'db1', 'trades', 20, 10, 'e2', 'kalshi', 'k1', 'live',
+   'writer_stamped', '2026-09-15T12:00:00+00', 'filled', 1, 'ord-in-window')
+on conflict (ledger_key) do update set source_version = excluded.source_version, fill_qty = excluded.fill_qty;
+reset role;
+do $$ begin
+  if (select synced_at from public.ledger_trades where source_id = 20)
+     <> (select at from t_marks where name = 'before_replay') then
+    raise exception 'a same-version replay must not move synced_at';
+  end if;
+end $$;
+
+-- 2. A check whose mirror read started before a correction that landed
+--    before the check row was persisted is stale from the start.
+insert into t_marks values ('read_1', clock_timestamp());
+select pg_sleep(0.01);
+set role service_role;
+update public.ledger_trades set fill_qty = 1.5, source_version = 11 where source_id = 20;
+reset role;
+select pg_sleep(0.01);
+select pg_temp.recon('fence-1', 'matched', '2026-09-15', read_at => (select at from t_marks where name = 'read_1'),
+                     order_ids => '["ord-in-window", "ord-old-targeted"]');
+do $$ begin
+  if (select fills_verified or fills_matched_as_of is not null or not ledger_changed_since_check
+      from ledger_reporting.venue_reconciliation_days where reporting_day = '2026-09-15') then
+    raise exception 'a change between the mirror read and persistence must make the check stale';
+  end if;
+end $$;
+
+-- A clean re-check verifies the day, as of its read time.
+insert into t_marks values ('read_2', clock_timestamp());
+select pg_temp.recon('fence-2', 'matched', '2026-09-15', read_at => (select at from t_marks where name = 'read_2'),
+                     order_ids => '["ord-in-window", "ord-old-targeted"]');
+do $$ declare r record; begin
+  select * into r from ledger_reporting.venue_reconciliation_days where reporting_day = '2026-09-15';
+  if not r.fills_verified or not r.mirror_current
+     or r.fills_matched_as_of <> (select at from t_marks where name = 'read_2') then
+    raise exception 'a clean re-check must verify the day as of its read: %', r;
+  end if;
+end $$;
+
+-- 3. An out-of-window row the check did not use does not withdraw it...
+set role service_role;
+update public.ledger_trades set fill_qty = 4, source_version = 12 where source_id = 22;
+reset role;
+do $$ begin
+  if not (select fills_verified from ledger_reporting.venue_reconciliation_days
+          where reporting_day = '2026-09-15') then
+    raise exception 'an unrelated old order must not withdraw the check';
+  end if;
+end $$;
+-- ...but a correction to an out-of-window order the check compared does.
+set role service_role;
+update public.ledger_trades set fill_qty = 2.5, source_version = 12 where source_id = 21;
+reset role;
+do $$ begin
+  if (select fills_verified or not ledger_changed_since_check from ledger_reporting.venue_reconciliation_days
+      where reporting_day = '2026-09-15') then
+    raise exception 'a correction to a compared out-of-window order must make the check stale';
+  end if;
+end $$;
+
+-- 3b. The next day's trading on other orders does not withdraw the day.
+insert into t_marks values ('read_2b', clock_timestamp());
+select pg_temp.recon('fence-2b', 'matched', '2026-09-15', read_at => (select at from t_marks where name = 'read_2b'),
+                     order_ids => '["ord-in-window", "ord-old-targeted"]');
+set role service_role;
+insert into public.ledger_trades (ledger_key, source_system, service, db_instance_id, source_table, source_id,
+  source_version, capture_epoch, venue, account_ref, run_mode, mode_evidence, recorded_at, status, fill_qty,
+  order_id)
+values ('arbgrid:svc:db1:trades:23', 'arbgrid', 'svc', 'db1', 'trades', 23, 20, 'e2', 'kalshi', 'k1', 'live',
+   'writer_stamped', '2026-09-16T06:00:00+00', 'filled', 1, 'ord-next-day');
+reset role;
+do $$ begin
+  if not (select fills_verified from ledger_reporting.venue_reconciliation_days
+          where reporting_day = '2026-09-15') then
+    raise exception 'the next day''s trading on other orders must not withdraw the check';
+  end if;
+end $$;
+
+-- 4. A bare tombstone keeps provenance and withdraws a check that used the row.
+insert into t_marks values ('read_3', clock_timestamp());
+select pg_temp.recon('fence-3', 'matched', '2026-09-15', read_at => (select at from t_marks where name = 'read_3'),
+                     order_ids => '["ord-in-window", "ord-old-targeted"]');
+set role service_role;
+select pg_temp.upsert_bare_tombstone('arbgrid:svc:db1:trades:21', 13);
+reset role;
+do $$ declare r record; begin
+  select venue, order_id, account_ref, recorded_at, deleted into r
+  from public.ledger_trades where source_id = 21;
+  if not r.deleted or r.venue is distinct from 'kalshi' or r.order_id is distinct from 'ord-old-targeted'
+     or r.account_ref is distinct from 'k1' or r.recorded_at is null then
+    raise exception 'a tombstone must keep the row provenance: %', r;
+  end if;
+  if (select fills_verified from ledger_reporting.venue_reconciliation_days where reporting_day = '2026-09-15') then
+    raise exception 'deleting a compared row must make the check stale';
+  end if;
+end $$;
+
+-- 5. A source that stopped syncing leaves only an as-of claim.
+insert into t_marks values ('read_4', clock_timestamp());
+select pg_temp.recon('fence-4', 'matched', '2026-09-15', read_at => (select at from t_marks where name = 'read_4'),
+                     order_ids => '["ord-in-window", "ord-old-targeted"]');
+update public.ledger_sync_status set last_attempt_at = now() - interval '2 hours',
+  last_success_at = now() - interval '2 hours';
+do $$ declare r record; begin
+  select * into r from ledger_reporting.venue_reconciliation_days where reporting_day = '2026-09-15';
+  if r.fills_verified or r.mirror_current or r.fills_matched_as_of is null then
+    raise exception 'a silent source must leave only an as-of claim: %', r;
+  end if;
+end $$;
+update public.ledger_sync_status set last_attempt_at = now(), last_success_at = now();
+do $$ begin
+  if not (select fills_verified from ledger_reporting.venue_reconciliation_days
+          where reporting_day = '2026-09-15') then
+    raise exception 'a recovered source must restore the day';
+  end if;
+end $$;
+-- A newer instance of the service (redeploy without a volume) is not current.
+insert into public.ledger_sync_status (source_key, source_system, service, db_instance_id, capture_epoch,
+  snapshot_complete, pending_changes, local_trades_count, local_positions_count,
+  last_attempt_at, last_success_at, last_error)
+values ('arbgrid:svc:db9', 'arbgrid', 'svc', 'db9', 'e9', true, 0, 0, 0,
+  now() + interval '1 second', now() + interval '1 second', null);
+do $$ begin
+  if (select fills_verified or mirror_current from ledger_reporting.venue_reconciliation_days
+      where reporting_day = '2026-09-15') then
+    raise exception 'a replaced source instance must not stay current';
+  end if;
+end $$;
+delete from public.ledger_sync_status where source_key = 'arbgrid:svc:db9';
+
+-- 6. A tombstone for a row never exported with provenance (insert then
+--    delete between syncs) is unattributable, so it withdraws the check.
+set role service_role;
+select pg_temp.upsert_bare_tombstone('arbgrid:svc:db1:trades:30', 14);
+reset role;
+do $$ begin
+  if (select fills_verified from ledger_reporting.venue_reconciliation_days where reporting_day = '2026-09-15') then
+    raise exception 'an unattributable tombstone must make the check stale';
   end if;
 end $$;
 

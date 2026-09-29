@@ -34,6 +34,7 @@ LIVE = kalshi_fill_collector.LIVE_FILLS_PATH
 HIST = kalshi_fill_collector.HISTORICAL_FILLS_PATH
 CUTOFF = kalshi_fill_collector.CUTOFF_PATH
 MirrorReadError = venue_reconciliation.MirrorReadError
+MirrorChangedError = venue_reconciliation.MirrorChangedError
 PostgrestLedgerMirror = venue_reconciliation.PostgrestLedgerMirror
 check_mirror_sources = venue_reconciliation.check_mirror_sources
 reporting_day_bounds = venue_reconciliation.reporting_day_bounds
@@ -120,17 +121,37 @@ def _fixture_venue(cutoffs=None):
 class FakeMirror:
     """In-memory ledger mirror with PostgrestLedgerMirror's read interface."""
 
-    def __init__(self, status=None, counts=None, trades=None, fail=None):
+    def __init__(self, status=None, counts=None, trades=None, fail=None, after_rows=None):
         self.status = status if status is not None else []
         self.counts = counts or {}
         self.trades = trades or []
         self.fail = fail
+        self.after_rows = after_rows  # callable(mirror): a concurrent write after the rows are read
         self.order_lookups: list[list[str]] = []
+        self.status_reads = 0
+        self.changed_queries: list[dict] = []
 
     def status_rows(self, services):
         if self.fail:
             raise self.fail
+        self.status_reads += 1
         return [dict(r) for r in self.status if r["service"] in services]
+
+    def changed_since(self, venue, since, window_since, window_until, order_ids):
+        # window_* here are the reporting day's bounds.
+        ids = set(order_ids)
+        self.changed_queries.append({"since": since, "order_ids": sorted(ids)})
+        n = 0
+        for r in self.trades:
+            synced = r.get("synced_at")
+            if synced is None or datetime.fromisoformat(synced) < since:
+                continue
+            if not (r.get("venue") == venue or (r.get("deleted") and r.get("venue") is None)):
+                continue
+            at = r.get("recorded_at")
+            if at is None or window_since <= datetime.fromisoformat(at) < window_until or r.get("order_id") in ids:
+                n += 1
+        return n
 
     def live_counts(self, service, db_instance_id):
         return self.counts[f"arbgrid:{service}:{db_instance_id}"]
@@ -144,6 +165,8 @@ class FakeMirror:
             at = r.get("recorded_at")
             if at is None or since <= datetime.fromisoformat(at) < until:
                 out.append(r)
+        if self.after_rows:
+            self.after_rows(self)
         return out
 
     def ledger_trades_for_orders(self, venue, order_ids):
@@ -161,11 +184,11 @@ def _status(service, db="db1", success=None, **overrides):
     return row
 
 
-def _fresh_mirror(trades=None, **overrides):
+def _fresh_mirror(trades=None, after_rows=None, **overrides):
     status = [_status("arb-scanner", **overrides), _status("kalshi-mm-pilot", db="db2")]
     counts = {"arbgrid:arb-scanner:db1": {"trades": 3, "positions": 1},
               "arbgrid:kalshi-mm-pilot:db2": {"trades": 3, "positions": 1}}
-    return FakeMirror(status=status, counts=counts, trades=trades or [])
+    return FakeMirror(status=status, counts=counts, trades=trades or [], after_rows=after_rows)
 
 
 def _ledger(order_id, qty, recorded="2026-09-28T12:00:00+00:00", service="kalshi-mm-pilot", n=1, **extra):
@@ -309,6 +332,18 @@ class TestNormalization:
         for bad in ("2026-09-28T05:00:00", "not-a-time"):
             rec, problems = normalize_fill(_fill("f", "o", "1.00", bad), "a", "live")
             assert rec["filled_at"] is None and "venue_record_time_invalid" in problems
+
+    @pytest.mark.parametrize("ts", [10 ** 20, -(10 ** 20), 2 ** 63, 253402300800, -1])
+    def test_out_of_range_ts_is_an_explicit_problem_not_a_crash(self, ts):
+        raw = _fill("f1", "o1", "1.00", None, ts=ts)
+        del raw["created_time"]
+        rec, problems = normalize_fill(raw, "a", "live")
+        assert rec["filled_at"] is None and "venue_record_time_invalid" in problems
+
+    @pytest.mark.parametrize("created", ["0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-05:00"])
+    def test_created_time_without_a_utc_instant_is_invalid(self, created):
+        rec, problems = normalize_fill(_fill("f1", "o1", "1.00", created), "a", "live")
+        assert rec["filled_at"] is None and "venue_record_time_invalid" in problems
 
     def test_fill_id_and_legacy_trade_id_must_agree(self):
         _, problems = normalize_fill(_fill("f1", "o", "1.00", "2026-09-28T05:00:00Z", trade_id="f2"), "a", "live")
@@ -497,6 +532,26 @@ class TestCollectorIntegrity:
         _, col = self._collect([_fill("f0", "o0", "NaN", "2026-09-28T03:59:59.9Z")])
         assert col.gaps == []
 
+    def test_out_of_range_ts_makes_the_day_incomplete_not_a_crash(self):
+        raw = _fill("f1", "o1", "1.00", None, ts=10 ** 20)
+        del raw["created_time"]
+        _, col = self._collect([raw])
+        assert "venue_record_time_invalid" in col.gaps and col.coverage["complete"] is False
+
+    @pytest.mark.parametrize("kw", [
+        {"finality_lag_seconds": -1}, {"finality_lag_seconds": float("nan")},
+        {"finality_lag_seconds": float("inf")}, {"finality_lag_seconds": "900"},
+        {"backoff_seconds": -0.5}, {"backoff_seconds": float("nan")}, {"backoff_seconds": float("inf")},
+        {"max_attempts": 0}, {"max_attempts": True}, {"max_attempts": 1.5},
+        {"max_pages": 0}, {"cutoff_attempts": 0}, {"page_limit": 0}, {"page_limit": 1001},
+    ])
+    def test_invalid_settings_are_refused(self, kw):
+        with pytest.raises(ValueError):
+            _collector(FakeVenue(), **kw)
+
+    def test_zero_lag_and_zero_backoff_are_allowed(self):
+        _collector(FakeVenue(), finality_lag_seconds=0, backoff_seconds=0)
+
     def test_invalid_interval(self):
         venue = FakeVenue()
         col = _collector(venue).collect(DAY_END, DAY_START)
@@ -509,12 +564,12 @@ class TestCollectorIntegrity:
 
 
 class TestMirrorSources:
-    NOW = DAY_END + timedelta(hours=2)
+    NOW = DAY_END + timedelta(hours=1)
 
-    def _check(self, status, counts=None, services=("arb-scanner",)):
+    def _check(self, status, counts=None, services=("arb-scanner",), now=None, **kw):
         counts = counts if counts is not None else {r["source_key"]: {"trades": 3, "positions": 1} for r in status}
-        gaps, _ = check_mirror_sources(status, counts, services, DAY_START, DAY_END, now=self.NOW,
-                                       finality_lag_seconds=900)
+        gaps, _ = check_mirror_sources(status, counts, services, DAY_START, DAY_END, now=now or self.NOW,
+                                       finality_lag_seconds=kw.pop("finality_lag_seconds", 900), **kw)
         return gaps
 
     def test_fresh_complete_source_has_no_gaps(self):
@@ -545,6 +600,25 @@ class TestMirrorSources:
     def test_capture_started_inside_the_interval(self):
         row = _status("arb-scanner", capture_since=(DAY_START + timedelta(hours=3)).isoformat())
         assert "ledger_capture_not_covering_interval" in self._check([row])
+
+    def test_source_that_stopped_syncing_is_not_recent_even_for_an_old_day(self):
+        # Fresh past the day's end, but the exporter has been silent for two
+        # hours since: later corrections may be sitting unexported.
+        row = _status("arb-scanner")
+        later = DAY_END + timedelta(minutes=30) + timedelta(hours=2, seconds=1)
+        gaps = self._check([row], now=later)
+        assert gaps == {"ledger_mirror_source_not_recent"}
+        assert self._check([row], now=later, max_source_age_seconds=3 * 3600) == set()
+
+    @pytest.mark.parametrize("kw", [
+        {"finality_lag_seconds": -1}, {"finality_lag_seconds": float("nan")},
+        {"finality_lag_seconds": float("inf")}, {"finality_lag_seconds": True},
+        {"max_source_age_seconds": 0}, {"max_source_age_seconds": -5},
+        {"max_source_age_seconds": float("nan")}, {"max_source_age_seconds": float("inf")},
+    ])
+    def test_invalid_settings_are_refused(self, kw):
+        with pytest.raises(ValueError):
+            self._check([_status("arb-scanner")], **kw)
 
     def test_new_db_instance_during_interval(self):
         old = _status("arb-scanner", db="old", success=(DAY_START + timedelta(hours=1)).isoformat())
@@ -666,6 +740,105 @@ class TestRunReconciliation:
         assert rec["status"] == "matched", rec["incomplete_reasons"]
         assert rec["evidence"]["reporting_day_hours"] == 25
 
+    def test_record_names_what_the_result_depends_on(self):
+        mirror = _fresh_mirror(trades=[_ledger("o-old", 2.0, recorded="2026-09-20T12:00:00+00:00"),
+                                       _ledger("o2", 1.0, n=2)])
+        rec = _run([_fill("f1", "o-old", "2.00", "2026-09-28T05:00:00Z"),
+                    _fill("f2", "o2", "1.00", "2026-09-28T06:00:00Z")], mirror=mirror)
+        assert rec["status"] == "matched"
+        assert rec["ledger_order_ids"] == ["o-old", "o2"]
+        read_started = datetime.fromtimestamp(AFTER_DAY, timezone.utc) - venue_reconciliation.MIRROR_CLOCK_SKEW
+        assert rec["ledger_read_started_at"] == read_started.isoformat()
+        assert rec["ledger_sources"] == [{"service": "arb-scanner", "source_key": "arbgrid:arb-scanner:db1"},
+                                         {"service": "kalshi-mm-pilot", "source_key": "arbgrid:kalshi-mm-pilot:db2"}]
+        assert rec["max_source_age_seconds"] == 3600
+        assert mirror.status_reads == 2   # fenced: before and after the rows
+        assert mirror.changed_queries[0]["order_ids"] == ["o-old", "o2"]
+
+    def test_source_status_moving_during_the_read_is_incomplete(self):
+        def export_ran(m):
+            m.status[1]["last_success_at"] = m.status[1]["last_attempt_at"] = (
+                DAY_END + timedelta(minutes=45)).isoformat()
+        rec = _run(mirror=_fresh_mirror(after_rows=export_ran))
+        assert rec["status"] == "incomplete"
+        assert rec["incomplete_reasons"] == ["ledger_mirror_changed_during_read"]
+        assert not rec["ledger_mirror_verified"]
+
+    def test_row_written_during_the_read_is_incomplete(self):
+        # Same count, same status (the exporter's status write has not landed
+        # yet), but an in-scope row was rewritten while pages were read.
+        def correction(m):
+            m.trades[0]["fill_qty"] = 5.0
+            m.trades[0]["synced_at"] = datetime.fromtimestamp(AFTER_DAY, timezone.utc).isoformat()
+        mirror = _fresh_mirror(trades=[_ledger("o1", 1.0, synced_at="2026-09-28T13:00:00+00:00")],
+                               after_rows=correction)
+        rec = _run([_fill("f1", "o1", "1.00", "2026-09-28T05:00:00Z")], mirror=mirror)
+        assert rec["status"] == "incomplete"
+        assert "ledger_mirror_changed_during_read" in rec["incomplete_reasons"]
+
+    def test_out_of_window_order_rewritten_during_the_read_is_incomplete(self):
+        def correction(m):
+            m.trades[0]["synced_at"] = datetime.fromtimestamp(AFTER_DAY, timezone.utc).isoformat()
+        mirror = _fresh_mirror(trades=[_ledger("o-old", 2.0, recorded="2026-09-10T12:00:00+00:00")],
+                               after_rows=correction)
+        rec = _run([_fill("f1", "o-old", "2.00", "2026-09-28T05:00:00Z")], mirror=mirror)
+        assert "ledger_mirror_changed_during_read" in rec["incomplete_reasons"]
+
+    def test_tombstone_without_venue_written_during_the_read_is_incomplete(self):
+        def delete(m):
+            m.trades.append({"ledger_key": "arbgrid:kalshi-mm-pilot:db:trades:9", "service": "kalshi-mm-pilot",
+                             "deleted": True, "venue": None, "recorded_at": None,
+                             "synced_at": datetime.fromtimestamp(AFTER_DAY, timezone.utc).isoformat()})
+        rec = _run(mirror=_fresh_mirror(after_rows=delete))
+        assert "ledger_mirror_changed_during_read" in rec["incomplete_reasons"]
+
+    def test_next_days_activity_on_other_orders_is_not_a_change(self):
+        # Trading continues after midnight: a new order logged the next day,
+        # inside the read window but not part of this day's result, is written
+        # while the check reads. It must not make the day incomplete.
+        def todays_trade(m):
+            m.trades.append(_ledger("o-today", 1.0, recorded="2026-09-29T04:30:00+00:00", n=7,
+                                    synced_at=datetime.fromtimestamp(AFTER_DAY, timezone.utc).isoformat()))
+        mirror = _fresh_mirror(trades=[_ledger("o1", 1.0)], after_rows=todays_trade)
+        rec = _run([_fill("f1", "o1", "1.00", "2026-09-28T05:00:00Z")], mirror=mirror)
+        assert rec["status"] == "matched", rec["incomplete_reasons"]
+        assert rec["ledger_order_ids"] == ["o1"]
+
+    def test_in_day_ledger_order_is_a_dependency_even_without_a_venue_fill(self):
+        rec = _run(mirror=_fresh_mirror(trades=[_ledger("o-ledger-only", 1.0)]))
+        assert rec["status"] == "mismatched" and rec["ledger_order_ids"] == ["o-ledger-only"]
+
+    def test_write_before_the_read_started_is_not_a_change(self):
+        mirror = _fresh_mirror(trades=[_ledger("o1", 1.0, synced_at="2026-09-29T04:20:00+00:00")])
+        rec = _run([_fill("f1", "o1", "1.00", "2026-09-28T05:00:00Z")], mirror=mirror)
+        assert rec["status"] == "matched"
+
+    def test_mirror_count_moving_between_pages_is_incomplete(self):
+        rec = _run(mirror=FakeMirror(fail=MirrorChangedError("ledger_trades: row count moved")))
+        assert rec["status"] == "incomplete"
+        assert "ledger_mirror_changed_during_read" in rec["incomplete_reasons"]
+
+    def test_collector_crash_still_writes_an_incomplete_row(self):
+        class Boom:
+            def collect(self, start, end):
+                raise OverflowError("date value out of range")
+        scope = _scope()
+        rec = run_reconciliation(Boom(), scope, _fresh_mirror(), DAY, venue="kalshi", clock=lambda: AFTER_DAY)
+        assert rec["status"] == "incomplete" and not rec["coverage_verified"]
+        assert "venue_collector_error" in rec["incomplete_reasons"]
+        json.dumps(rec)
+
+    @pytest.mark.parametrize("kw", [
+        {"finality_lag_seconds": -900}, {"finality_lag_seconds": float("nan")},
+        {"max_source_age_seconds": 0}, {"max_source_age_seconds": float("inf")},
+    ])
+    def test_invalid_settings_fail_before_any_read(self, kw):
+        venue = FakeVenue()
+        mirror = _fresh_mirror()
+        with pytest.raises(ValueError):
+            _run(venue=venue, mirror=mirror, **kw)
+        assert venue.calls == [] and mirror.status_reads == 0
+
     def test_record_is_json_serializable_and_pnl_is_not_claimed(self):
         rec = _run()
         json.dumps(rec)
@@ -719,11 +892,11 @@ class TestPostgrestLedgerMirror:
 
     def test_pages_until_the_exact_count(self):
         session = _Session([_Resp(body=[{"ledger_key": "a"}, {"ledger_key": "b"}], content_range="0-1/3"),
-                            _Resp(body=[{"ledger_key": "c"}])])
+                            _Resp(body=[{"ledger_key": "c"}], content_range="2-2/3")])
         mirror = PostgrestLedgerMirror(self.URL, "k", session=session, page_size=2)
         rows = mirror.status_rows(["arb-scanner"])
         assert [r["ledger_key"] for r in rows] == ["a", "b", "c"]
-        assert session.gets[0]["headers"]["Prefer"] == "count=exact"
+        assert all(g["headers"]["Prefer"] == "count=exact" for g in session.gets)
         assert session.gets[1]["params"]["offset"] == 2
         assert all(g["allow_redirects"] is False for g in session.gets)
 
@@ -733,6 +906,36 @@ class TestPostgrestLedgerMirror:
         mirror = PostgrestLedgerMirror(self.URL, "k", session=session)
         with pytest.raises(MirrorReadError):
             mirror.ledger_trades_for_orders("kalshi", ["o1"])
+
+    def test_total_moving_between_pages_is_a_change(self):
+        # A same-size update would not move the total, but an insert or delete
+        # between pages shifts offsets: the pages may mix two states.
+        session = _Session([_Resp(body=[{"k": 1}, {"k": 2}], content_range="0-1/3"),
+                            _Resp(body=[{"k": 3}, {"k": 4}], content_range="2-3/4")])
+        mirror = PostgrestLedgerMirror(self.URL, "k", session=session, page_size=2)
+        with pytest.raises(MirrorChangedError):
+            mirror.ledger_trades_for_orders("kalshi", ["o1"])
+
+    def test_missing_count_on_a_later_page_is_an_error(self):
+        session = _Session([_Resp(body=[{"k": 1}, {"k": 2}], content_range="0-1/3"), _Resp(body=[{"k": 3}])])
+        mirror = PostgrestLedgerMirror(self.URL, "k", session=session, page_size=2)
+        with pytest.raises(MirrorReadError):
+            mirror.status_rows(["a"])
+
+    def test_changed_since_counts_window_undated_orders_and_venueless_tombstones(self):
+        session = _Session([_Resp(body=[], content_range="*/0"), _Resp(body=[], content_range="0-0/2")])
+        mirror = PostgrestLedgerMirror(self.URL, "k", session=session)
+        since = DAY_END + timedelta(minutes=58)
+        n = mirror.changed_since("kalshi", since, DAY_START, DAY_END, ["o2", "o1"])
+        assert n == 2
+        first, second = (g["params"] for g in session.gets)
+        assert first["synced_at"] == second["synced_at"] == f"gte.{since.isoformat()}"
+        venue_clause = 'or(venue.eq."kalshi",and(deleted.is.true,venue.is.null))'
+        assert first["and"] == (
+            f'({venue_clause},or(and(recorded_at.gte."{DAY_START.isoformat()}",'
+            f'recorded_at.lt."{DAY_END.isoformat()}"),recorded_at.is.null))')
+        assert second["and"] == f'({venue_clause},order_id.in.("o1","o2"))'
+        assert all(g["headers"]["Prefer"] == "count=exact" for g in session.gets)
 
     def test_missing_exact_count_is_an_error(self):
         mirror = PostgrestLedgerMirror(self.URL, "k", session=_Session([_Resp(body=[])]))
@@ -749,7 +952,7 @@ class TestPostgrestLedgerMirror:
         mirror = PostgrestLedgerMirror(self.URL, "k", session=session)
         mirror.ledger_trades("kalshi", DAY_START, DAY_END)
         assert session.gets[0]["params"]["and"] == (
-            f"(recorded_at.gte.{DAY_START.isoformat()},recorded_at.lt.{DAY_END.isoformat()})")
+            f'(recorded_at.gte."{DAY_START.isoformat()}",recorded_at.lt."{DAY_END.isoformat()}")')
         assert session.gets[1]["params"]["recorded_at"] == "is.null"
         assert venue_reconciliation._in_list(['a"b', "c"]) == 'in.("a\\"b","c")'
 
@@ -796,6 +999,20 @@ class TestCli:
         monkeypatch.delenv("LEDGER_KALSHI_SCOPE", raising=False)
         assert self._main()(["--day", "2026-09-28"]) == 2
         assert "LEDGER_KALSHI_SCOPE" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("name,value", [
+        ("LEDGER_RECON_FINALITY_SECONDS", "-900"), ("LEDGER_RECON_FINALITY_SECONDS", "nan"),
+        ("LEDGER_RECON_FINALITY_SECONDS", "inf"), ("LEDGER_RECON_FINALITY_SECONDS", "soon"),
+        ("LEDGER_RECON_MAX_SOURCE_AGE_SECONDS", "0"), ("LEDGER_RECON_MAX_SOURCE_AGE_SECONDS", "-1"),
+        ("LEDGER_RECON_MAX_SOURCE_AGE_SECONDS", "Infinity"),
+    ])
+    def test_invalid_timing_settings_refuse_to_run(self, monkeypatch, capsys, name, value):
+        monkeypatch.setenv("LEDGER_KALSHI_SCOPE", json.dumps(SCOPE_RAW))
+        monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+        monkeypatch.setenv("SUPABASE_SERVICE_KEY", "not-a-real-key")
+        monkeypatch.setenv(name, value)
+        assert self._main()(["--day", "2026-09-28"]) == 2
+        assert name in capsys.readouterr().err
 
     def test_missing_supabase_refuses_to_run(self, monkeypatch, capsys):
         monkeypatch.setenv("LEDGER_KALSHI_SCOPE", json.dumps(SCOPE_RAW))

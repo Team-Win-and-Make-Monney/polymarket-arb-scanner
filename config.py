@@ -1078,7 +1078,8 @@ OPP_SYNC_ENABLED = _env_bool("OPP_SYNC_ENABLED", "false")
 # (LEDGER_SERVICE_NAME or Railway's RAILWAY_SERVICE_NAME).
 LEDGER_CAPTURE_ENABLED = _env_bool("LEDGER_CAPTURE_ENABLED", "false")
 LEDGER_SYNC_ENABLED = _env_bool("LEDGER_SYNC_ENABLED", "false")
-LEDGER_SYNC_EVERY_N_SCANS = _env_int("LEDGER_SYNC_EVERY_N_SCANS", "5")
+# Seconds between exports; the exporter runs on its own thread, not the scan loop.
+LEDGER_SYNC_INTERVAL_SECONDS = _env_float("LEDGER_SYNC_INTERVAL_SECONDS", "60")
 LEDGER_SYNC_BATCH_SIZE = _env_int("LEDGER_SYNC_BATCH_SIZE", "500")
 
 # Paper-trading window tracker (paper_record.py). PAPER_WINDOW_START is an ISO
@@ -1417,6 +1418,7 @@ def validate_config() -> list[str]:
         "LIP_MAX_MARKETS": LIP_MAX_MARKETS,
         "LIP_SELECT_INTERVAL": LIP_SELECT_INTERVAL,
         "LIP_DEPTH_PROBE_LIMIT": LIP_DEPTH_PROBE_LIMIT,
+        "LEDGER_SYNC_INTERVAL_SECONDS": LEDGER_SYNC_INTERVAL_SECONDS,
         # Plan 10 — Kalshi MM pilot keys
         "MM_FILL_POLL_SECONDS": MM_FILL_POLL_SECONDS,
         "MM_HEDGE_MAX_LATENCY_SECONDS": MM_HEDGE_MAX_LATENCY_SECONDS,

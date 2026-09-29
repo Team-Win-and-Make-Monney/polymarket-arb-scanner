@@ -16,7 +16,11 @@ Environment:
                         existing Kalshi credential (read endpoints only)
   SUPABASE_URL + SUPABASE_SERVICE_KEY
                         existing backend credential for the mirror
-  LEDGER_RECON_FINALITY_SECONDS  default 900
+  LEDGER_RECON_FINALITY_SECONDS  seconds after a day ends before it is checked
+                                 (default 900; finite, >= 0)
+  LEDGER_RECON_MAX_SOURCE_AGE_SECONDS
+                                 a ledger source must have exported successfully
+                                 within this many seconds (default 3600; finite, > 0)
 
 Examples:
   # Print the key fingerprint to put in LEDGER_KALSHI_SCOPE (no network)
@@ -30,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 from datetime import date, datetime, timedelta
@@ -46,13 +51,30 @@ from kalshi_fill_collector import (  # noqa: E402
     parse_kalshi_scope,
     read_only_transport,
 )
-from venue_reconciliation import REPORTING_TZ, PostgrestLedgerMirror, run_reconciliation  # noqa: E402
+from venue_reconciliation import (  # noqa: E402
+    DEFAULT_MAX_SOURCE_AGE_SECONDS,
+    REPORTING_TZ,
+    PostgrestLedgerMirror,
+    run_reconciliation,
+)
 
 logger = logging.getLogger("reconcile_venue_fills")
 
 
 def _yesterday_local() -> date:
     return (datetime.now(ZoneInfo(REPORTING_TZ)) - timedelta(days=1)).date()
+
+
+def _env_seconds(name: str, default: float, *, positive: bool) -> float:
+    """A finite, non-negative (or positive) number of seconds from the environment."""
+    raw = os.getenv(name)
+    try:
+        value = float(raw) if raw not in (None, "") else float(default)
+    except ValueError:
+        raise ValueError(f"{name} is not a number") from None
+    if not math.isfinite(value) or value < 0 or (positive and value == 0):
+        raise ValueError(f"{name} must be finite and {'> 0' if positive else '>= 0'}")
+    return value
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -80,6 +102,12 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, json.JSONDecodeError) as exc:
         print(f"LEDGER_KALSHI_SCOPE is missing or invalid: {exc}", file=sys.stderr)
         return 2
+    try:
+        lag = _env_seconds("LEDGER_RECON_FINALITY_SECONDS", 900, positive=False)
+        max_age = _env_seconds("LEDGER_RECON_MAX_SOURCE_AGE_SECONDS", DEFAULT_MAX_SOURCE_AGE_SECONDS, positive=True)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     url, key = os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY")
     if not url or not key:
         print("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set", file=sys.stderr)
@@ -91,12 +119,12 @@ def main(argv: list[str] | None = None) -> int:
     if client is None:
         print("Kalshi credentials missing or authentication failed", file=sys.stderr)
         return 2
-    lag = int(os.getenv("LEDGER_RECON_FINALITY_SECONDS", "900"))
     collector = KalshiFillCollector(read_only_transport(client), client.api_key_id, scope,
                                     finality_lag_seconds=lag)
     mirror = PostgrestLedgerMirror(url, key)
     day = args.day or _yesterday_local()
-    record = run_reconciliation(collector, scope, mirror, day, venue=args.venue, finality_lag_seconds=lag)
+    record = run_reconciliation(collector, scope, mirror, day, venue=args.venue, finality_lag_seconds=lag,
+                                max_source_age_seconds=max_age)
     print(json.dumps(record, indent=2, sort_keys=True, default=str))
     if args.write:
         mirror.write_reconciliation(record)

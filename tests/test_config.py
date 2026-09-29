@@ -245,6 +245,12 @@ class TestValidateConfig:
             _reload_config()
 
     @pytest.mark.parametrize("bad_val", ["0", "-1", "inf", "-inf", "nan"])
+    def test_ledger_sync_interval_rejects_non_positive_and_non_finite(self, monkeypatch, bad_val):
+        monkeypatch.setenv("LEDGER_SYNC_INTERVAL_SECONDS", bad_val)
+        with pytest.raises(ValueError, match="LEDGER_SYNC_INTERVAL_SECONDS.*must be > 0"):
+            _reload_config()
+
+    @pytest.mark.parametrize("bad_val", ["0", "-1", "inf", "-inf", "nan"])
     def test_ws_orderbook_max_age_seconds_rejects_non_positive_and_non_finite(self, monkeypatch, bad_val):
         monkeypatch.setenv("WS_ORDERBOOK_MAX_AGE_SECONDS", bad_val)
         with pytest.raises(ValueError, match="WS_ORDERBOOK_MAX_AGE_SECONDS.*must be > 0"):

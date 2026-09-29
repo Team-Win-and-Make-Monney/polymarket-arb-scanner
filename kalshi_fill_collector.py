@@ -180,6 +180,25 @@ def read_only_transport(client):
 # ---------------------------------------------------------------------------
 
 
+# Unix seconds datetime can represent in UTC: [1970-01-01, 9999-12-31T23:59:59].
+_MIN_TS = 0
+_MAX_TS = 253402300800
+
+
+def _finite_number(name: str, value, *, minimum: float, allow_equal: bool = True) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number")
+    if value < minimum or (not allow_equal and value == minimum):
+        raise ValueError(f"{name} must be {'>=' if allow_equal else '>'} {minimum}")
+    return value
+
+
+def _positive_int(name: str, value) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
 def parse_count_fp(value) -> Decimal | None:
     """Finite, positive fixed-point contract count with at most 2 decimals, else None."""
     if not isinstance(value, str):
@@ -214,6 +233,10 @@ def normalize_fill(raw: dict, account_ref: str, tier: str) -> tuple[dict, set[st
     created = _parse_utc(raw.get("created_time")) if raw.get("created_time") is not None else None
     ts = raw.get("ts")
     ts_ok = isinstance(ts, int) and not isinstance(ts, bool)
+    if ts_ok and not _MIN_TS <= ts < _MAX_TS:
+        # Out of datetime range: an explicit problem, never a crash.
+        problems.add("venue_record_time_invalid")
+        ts_ok = False
     filled_at = None
     if raw.get("created_time") is not None and created is None:
         problems.add("venue_record_time_invalid")
@@ -272,17 +295,18 @@ class KalshiFillCollector:
                  page_limit: int = MAX_PAGE_LIMIT, max_pages: int = 200, max_attempts: int = 3,
                  backoff_seconds: float = 1.0, cutoff_attempts: int = 2,
                  finality_lag_seconds: int = 900, sleep=time.sleep, clock=time.time):
-        if not 1 <= page_limit <= MAX_PAGE_LIMIT:
+        if _positive_int("page_limit", page_limit) > MAX_PAGE_LIMIT:
             raise ValueError(f"page_limit must be 1..{MAX_PAGE_LIMIT}")
         self._get_json = get_json
         self._fingerprint = key_fingerprint(api_key_id) if api_key_id else None
         self._scope = scope
         self._page_limit = page_limit
-        self._max_pages = max(1, max_pages)
-        self._max_attempts = max(1, max_attempts)
-        self._backoff = backoff_seconds
-        self._cutoff_attempts = max(1, cutoff_attempts)
-        self._finality_lag = finality_lag_seconds
+        self._max_pages = _positive_int("max_pages", max_pages)
+        self._max_attempts = _positive_int("max_attempts", max_attempts)
+        self._backoff = _finite_number("backoff_seconds", backoff_seconds, minimum=0)
+        self._cutoff_attempts = _positive_int("cutoff_attempts", cutoff_attempts)
+        # A negative lag would let an unfinished interval pass as final.
+        self._finality_lag = _finite_number("finality_lag_seconds", finality_lag_seconds, minimum=0)
         self._sleep = sleep
         self._clock = clock
 

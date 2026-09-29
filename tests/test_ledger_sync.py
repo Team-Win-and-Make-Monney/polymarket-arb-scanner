@@ -7,6 +7,8 @@ source_version is lower than the stored one (same capture epoch) is ignored.
 
 import os
 import sys
+import threading
+import time
 from decimal import Decimal
 
 import pytest
@@ -572,3 +574,122 @@ class TestRemoteSchemaContract:
         rec = TestReconcileFills()
         for out in (rec._run(), rec._run(account_ref=None), rec._run(venue=[dict(rec.VENUE[0], qty=9)])):
             assert set(out) <= cols, set(out) - cols
+
+
+class _ScriptedExporter:
+    """sync_once stand-in: records the thread and concurrency of each call."""
+
+    def __init__(self, outcomes=None, delay=0.0):
+        self.outcomes = list(outcomes or [])
+        self.delay = delay
+        self.calls = 0
+        self.threads: list[str] = []
+        self.active = 0
+        self.max_active = 0
+        self.closed = False
+        self.ran = threading.Event()
+        self._lock = threading.Lock()
+
+    def sync_once(self):
+        with self._lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            self.calls += 1
+            self.threads.append(threading.current_thread().name)
+            time.sleep(self.delay)
+            outcome = self.outcomes.pop(0) if self.outcomes else "ok"
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        finally:
+            with self._lock:
+                self.active -= 1
+            self.ran.set()
+
+    def close(self):
+        self.closed = True
+
+
+class TestLedgerSyncWorker:
+    @pytest.mark.parametrize("interval", [0, -1, float("nan"), float("inf"), True, "60"])
+    def test_invalid_interval_is_refused(self, interval):
+        with pytest.raises(ValueError):
+            ledger_sync.LedgerSyncWorker(_ScriptedExporter(), interval)
+
+    def test_runs_on_its_own_thread_repeatedly_and_survives_failures(self):
+        exporter = _ScriptedExporter(outcomes=[RuntimeError("503"), "ok", "ok"])
+        worker = ledger_sync.LedgerSyncWorker(exporter, 0.01)
+        worker.start()
+        deadline = time.monotonic() + 5
+        while exporter.calls < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        worker.stop(final_sync=False)
+        assert exporter.calls >= 3
+        assert set(exporter.threads) == {"ledger-sync"}
+        assert worker.failures == 1 and worker.last_error is None
+        assert exporter.closed and not worker.alive
+
+    def test_never_runs_two_syncs_at_once(self):
+        exporter = _ScriptedExporter(delay=0.05)
+        worker = ledger_sync.LedgerSyncWorker(exporter, 0.001)
+        worker.start()
+        extra = [threading.Thread(target=worker.run_once) for _ in range(4)]
+        for t in extra:
+            t.start()
+        for t in extra:
+            t.join()
+        worker.stop(final_sync=False)
+        assert exporter.max_active == 1
+
+    def test_stop_exports_the_final_tail_then_closes(self):
+        exporter = _ScriptedExporter()
+        worker = ledger_sync.LedgerSyncWorker(exporter, 3600)
+        worker.start()
+        assert exporter.ran.wait(5)
+        worker.stop()
+        assert exporter.calls == 2 and exporter.closed
+
+    def test_stuck_thread_is_not_closed_under_it(self):
+        exporter = _ScriptedExporter(delay=0.5)
+        worker = ledger_sync.LedgerSyncWorker(exporter, 3600)
+        worker.start()
+        worker.stop(timeout=0.01)
+        assert not exporter.closed and exporter.calls == 1
+
+    def test_start_requires_capture_and_a_client(self, tmp_path):
+        path = str(tmp_path / "t.db")
+        with pytest.raises(RuntimeError, match="LEDGER_CAPTURE_ENABLED"):
+            ledger_sync.start_ledger_sync_worker(path, capture_enabled=False, interval_seconds=60,
+                                                 service="svc", client_factory=FakeRemote)
+        with pytest.raises(RuntimeError, match="Supabase client unavailable"):
+            ledger_sync.start_ledger_sync_worker(path, capture_enabled=True, interval_seconds=60,
+                                                 service="svc", client_factory=lambda: None)
+
+    def test_started_worker_exports_rows_off_the_caller_thread(self, ledger):
+        tdb, _, _, path = ledger
+        tid = _trade(tdb, status="filled", run_mode="live", fill_qty=2.0, order_id="o-1")
+        remote = FakeRemote()
+        worker = ledger_sync.start_ledger_sync_worker(path, capture_enabled=True, interval_seconds=3600,
+                                                      service="arb-scanner", client_factory=lambda: remote)
+        try:
+            deadline = time.monotonic() + 5
+            while worker.runs < 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert worker.last_error is None
+            rows = remote.rows("ledger_trades")
+            assert [(r["source_id"], r["fill_qty"], r["run_mode"]) for r in rows] == [(tid, 2.0, "live")]
+            assert remote.tables["ledger_sync_status"]
+        finally:
+            worker.stop(final_sync=False)
+
+    def test_continuous_mode_runs_the_worker_for_every_mode(self):
+        # The exporter is started once at init (any --mode, including
+        # mm-pilot) and stopped after the pilot at shutdown, not tied to scans.
+        src = open(os.path.join(os.path.dirname(__file__), "..", "continuous.py")).read()
+        init = src.index("start_ledger_sync_worker(")
+        pilot_start = src.index("if (config.MM_KALSHI_PILOT_ENABLED")
+        assert init < pilot_start
+        assert "scan_count % max(1, config.LEDGER_SYNC" not in src
+        cleanup = src.index("_ledger_sync_worker.stop")
+        assert src.index('logger.info("Stopping Kalshi MM pilot...")') < cleanup

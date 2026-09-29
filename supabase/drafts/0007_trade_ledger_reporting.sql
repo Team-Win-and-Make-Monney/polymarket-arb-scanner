@@ -155,6 +155,14 @@ create table if not exists public.ledger_venue_reconciliations (
   collector_version   text,
   collected_at        timestamptz,
   ledger_mirror_verified boolean not null default false,
+  -- What a result depends on, so ledger_reporting.venue_reconciliation_days
+  -- can withdraw it later: the mirror read start (backdated for clock skew),
+  -- every order id the check compared, and the ledger sources it verified.
+  ledger_read_started_at timestamptz,
+  ledger_order_ids    jsonb not null default '[]'::jsonb check (jsonb_typeof(ledger_order_ids) = 'array'),
+  ledger_sources      jsonb not null default '[]'::jsonb check (jsonb_typeof(ledger_sources) = 'array'),
+  max_source_age_seconds numeric check (max_source_age_seconds is null
+                        or (max_source_age_seconds > 0 and max_source_age_seconds <> 'Infinity'::numeric)),
   evidence            jsonb not null default '{}'::jsonb,  -- pages, cutoffs, sources checked
   checked_at          timestamptz not null default now(),
   constraint ledger_recon_interval_valid
@@ -169,6 +177,8 @@ create table if not exists public.ledger_venue_reconciliations (
   constraint ledger_recon_matched_is_verified
     check (status <> 'matched' or (
       coverage_verified and ledger_mirror_verified and coverage_scope is not null
+      and ledger_read_started_at is not null and jsonb_array_length(ledger_sources) > 0
+      and max_source_age_seconds is not null
       and account_ref is not null and venue_source is not null
       and interval_start is not null and interval_end is not null
       and incomplete_reasons = '[]'::jsonb
@@ -191,10 +201,29 @@ language plpgsql
 set search_path = ''
 as $$
 begin
-  if tg_op = 'UPDATE'
-     and new.capture_epoch = old.capture_epoch
-     and new.source_version < old.source_version then
-    return null;  -- keep the stored, newer row
+  if tg_op = 'UPDATE' then
+    if new.capture_epoch = old.capture_epoch and new.source_version < old.source_version then
+      return null;  -- keep the stored, newer row
+    end if;
+    if new.capture_epoch = old.capture_epoch and new.source_version = old.source_version
+       and new.deleted = old.deleted then
+      -- A replay of the same version carries the same content: not a change,
+      -- so it must not make earlier venue checks look stale.
+      new.synced_at := old.synced_at;
+      return new;
+    end if;
+    if new.deleted then
+      -- A tombstone keeps the provenance the row had, so a delete still
+      -- invalidates venue checks that relied on it.
+      new.venue := coalesce(new.venue, old.venue);
+      new.account_ref := coalesce(new.account_ref, old.account_ref);
+      if tg_table_name = 'ledger_trades' then
+        new.order_id := coalesce(new.order_id, old.order_id);
+        new.recorded_at := coalesce(new.recorded_at, old.recorded_at);
+      else
+        new.settled_at := coalesce(new.settled_at, old.settled_at);
+      end if;
+    end if;
   end if;
   new.synced_at := now();
   return new;
@@ -307,16 +336,26 @@ select run_id, venue, account_ref, interval_start, interval_end, reporting_tz, r
        incomplete_reasons, venue_order_count, ledger_order_count, matched_order_count,
        venue_records_out_of_interval, missing_in_ledger, missing_in_venue, qty_mismatch,
        venue_fees_usd, fees_complete, collector, collector_version, collected_at,
+       ledger_read_started_at, ledger_order_ids, ledger_sources, max_source_age_seconds,
        checked_at, evidence
 from public.ledger_venue_reconciliations;
 
 -- Latest check per venue, account and local reporting day. A day with no
 -- check has NO row: absence is unknown, never zero.
---   fills_verified: the latest check is 'matched' (verified venue coverage and
---     verified ledger mirror) and no mirrored ledger row for that venue and
---     account changed after the check within the window the check read
---     (2 days before to 1 day after the day). A later ledger correction makes
---     the check stale until it is re-run.
+--   ledger_changed_since_check: a mirrored ledger row the check depended on
+--     was written at or after the check's mirror read started: same venue (or
+--     a tombstone that never carried one) and account (or unknown account),
+--     and either recorded inside the day, undated, or one of the order ids
+--     the result depends on (the venue's orders and the ledger's in-day
+--     orders). Activity for other orders on other days does not withdraw it.
+--   mirror_current: every ledger source the check verified is still the
+--     latest instance of its service, fully exported, not failing, and last
+--     succeeded within the check's max_source_age_seconds of now. When false,
+--     an exporter has stopped or restarted and later corrections may be
+--     unexported, so the result is historical only.
+--   fills_matched_as_of: the mirror read time of a 'matched' check nothing
+--     has changed since; a historical, as-of claim.
+--   fills_verified: fills_matched_as_of is set AND mirror_current.
 --   account_wide: the venue coverage was for all subaccounts. A check made
 --     with a subaccount-restricted key covers that subaccount only.
 -- Fills only: fees, settlements and positions are not reconciled here.
@@ -332,22 +371,46 @@ select
   l.run_id, l.status, l.coverage_scope, (l.coverage_scope = 'all_subaccounts') as account_wide,
   l.coverage_verified, l.ledger_mirror_verified, l.incomplete_reasons,
   l.venue_order_count, l.ledger_order_count, l.matched_order_count,
-  l.venue_fees_usd, l.fees_complete, l.collected_at, l.checked_at,
+  l.venue_fees_usd, l.fees_complete, l.collected_at, l.checked_at, l.ledger_read_started_at,
   stale.changed as ledger_changed_since_check,
-  (l.status = 'matched' and not stale.changed) as fills_verified,
+  cur.current as mirror_current,
+  case when l.status = 'matched' and not stale.changed then l.ledger_read_started_at end
+    as fills_matched_as_of,
+  (l.status = 'matched' and not stale.changed and cur.current) as fills_verified,
   false as pnl_verified
 from latest l
 cross join lateral (
   select exists (
     select 1 from public.ledger_trades t
-    where t.venue = l.venue
+    where (t.venue = l.venue or (t.deleted and t.venue is null))
       and (t.account_ref = l.account_ref or t.account_ref is null)
-      and t.synced_at > l.checked_at
+      and t.synced_at >= coalesce(l.ledger_read_started_at, l.checked_at)
       and (t.recorded_at is null
-           or (t.recorded_at >= l.interval_start - interval '2 days'
-               and t.recorded_at < l.interval_end + interval '1 day'))
+           or (t.recorded_at >= l.interval_start and t.recorded_at < l.interval_end)
+           or l.ledger_order_ids ? t.order_id)
   ) as changed
-) stale;
+) stale
+cross join lateral (
+  select jsonb_array_length(l.ledger_sources) > 0
+     and l.max_source_age_seconds is not null
+     and not exists (
+       select 1 from jsonb_array_elements(l.ledger_sources) src
+       where not exists (
+         select 1 from public.ledger_sync_status s
+         where s.source_key = src->>'source_key'
+           and s.service = src->>'service'
+           and s.last_error is null
+           and s.last_success_at is not null
+           and s.last_success_at >= s.last_attempt_at
+           and s.snapshot_complete
+           and s.pending_changes = 0
+           and s.last_success_at >= now() - make_interval(secs => l.max_source_age_seconds::double precision)
+           and not exists (
+             select 1 from public.ledger_sync_status newer
+             where newer.service = s.service and newer.source_key <> s.source_key
+               and newer.last_attempt_at > s.last_attempt_at)))
+    as current
+) cur;
 
 -- Engine-computed realized PnL of live, settled positions per America/Detroit
 -- day, venue and account label. A day with no settled live position has NO
@@ -381,6 +444,7 @@ select
   false as pnl_verified,
   bool_and(coalesce(src.mirror_complete, false)) as mirror_complete_now,
   coalesce(bool_or(d.fills_verified), false) as fills_reconciled_for_day,
+  max(d.fills_matched_as_of) as fills_matched_as_of,
   coalesce(bool_or(d.fills_verified and d.account_wide), false) as account_wide_fills_reconciled
 from settled s
 left join ledger_reporting.sources src

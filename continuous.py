@@ -1629,19 +1629,18 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
         logger.warning("Opportunity Supabase sync init failed: %s", exc)
 
     # Mirror the trade ledger (trades/positions incl. settlements, corrections
-    # and deletes) to Supabase for reporting. Opt-in; failures only log.
-    _ledger_sync = None
-    _ledger_sync_inflight = False
+    # and deletes) to Supabase for reporting. Opt-in; failures only log. The
+    # exporter runs on its own thread, so it also covers --mode mm-pilot,
+    # where the Kalshi MM pilot writes this same trades.db.
+    _ledger_sync_worker = None
     try:
         if config.LEDGER_SYNC_ENABLED:
-            from ledger_sync import LedgerExporter, service_name_from_env
-            from supabase_sync import build_client_from_env
-            if not config.LEDGER_CAPTURE_ENABLED:
-                raise RuntimeError("LEDGER_SYNC_ENABLED requires LEDGER_CAPTURE_ENABLED")
-            _ledger_sync = LedgerExporter(
-                build_client_from_env(), db.db_path, service=service_name_from_env(),
+            from ledger_sync import start_ledger_sync_worker
+            _ledger_sync_worker = start_ledger_sync_worker(
+                db.db_path, capture_enabled=config.LEDGER_CAPTURE_ENABLED,
+                interval_seconds=config.LEDGER_SYNC_INTERVAL_SECONDS,
                 batch_size=config.LEDGER_SYNC_BATCH_SIZE)
-            logger.info("Trade ledger Supabase sync active")
+            logger.info("Trade ledger Supabase sync active (every %.0fs)", config.LEDGER_SYNC_INTERVAL_SECONDS)
     except Exception as exc:
         logger.warning("Trade ledger Supabase sync init failed (sync disabled): %s", exc)
 
@@ -2914,24 +2913,6 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                             _opp_sync_inflight = False
                     asyncio.ensure_future(_run_opp_sync())
 
-                nonlocal _ledger_sync_inflight
-                if (_ledger_sync and not _ledger_sync_inflight
-                        and scan_count % max(1, config.LEDGER_SYNC_EVERY_N_SCANS) == 0):
-                    # Same isolation as the opportunity mirror: HTTP and SQLite
-                    # reads run in a worker thread, never on the event loop or
-                    # in an order path, and a failure only logs.
-                    _ledger_sync_inflight = True
-                    async def _run_ledger_sync():
-                        nonlocal _ledger_sync_inflight
-                        try:
-                            loop = asyncio.get_event_loop()
-                            await loop.run_in_executor(None, _ledger_sync.sync_once)
-                        except Exception as exc:
-                            logger.warning("Trade ledger Supabase sync failed (will retry): %s", exc)
-                        finally:
-                            _ledger_sync_inflight = False
-                    asyncio.ensure_future(_run_ledger_sync())
-
                 if scan_count % 5 == 0 and notifier:
                     try:
                         _check_platform_balance(
@@ -3438,6 +3419,10 @@ def run_continuous(args, min_profit, kalshi_client, kalshi_api_key_id,
                             "MM pilot thread remains alive after forced "
                             "stop; cancellation retries exhausted or venue "
                             "call still blocked.")
+
+        # After the pilot has stopped writing: export the final tail, then stop.
+        if _ledger_sync_worker is not None:
+            await asyncio.get_running_loop().run_in_executor(None, _ledger_sync_worker.stop)
 
         logger.info("Stopping WebSocket feeds...")
         feed_manager.stop()

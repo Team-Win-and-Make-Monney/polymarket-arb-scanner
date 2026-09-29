@@ -32,12 +32,14 @@ stays the source record, and venue records check completeness.
 ## How changes are captured and exported
 
 1. **Capture.** `LEDGER_CAPTURE_ENABLED=true` makes `TradeDB` install SQLite triggers. They append every insert, update and delete on `trades` and `positions` to `ledger_outbox`, inside the writer's own transaction. They are local only, with no network I/O. The first install records a capture epoch and the maximum row ids at that moment. The triggers are never removed automatically.
-2. **Export.** `LEDGER_SYNC_ENABLED=true` starts `ledger_sync.LedgerExporter` in `continuous.py`, every `LEDGER_SYNC_EVERY_N_SCANS` scans.
-   - It runs on a worker thread through `run_in_executor`, with an in-flight guard. It uses its own SQLite connection and is never on the event loop or in an order path.
+2. **Export.** `LEDGER_SYNC_ENABLED=true` makes `continuous.py` start `ledger_sync.LedgerSyncWorker`, which runs `LedgerExporter.sync_once` every `LEDGER_SYNC_INTERVAL_SECONDS` (default 60).
+   - It runs on its own daemon thread, independent of the scan loop, one sync at a time. It uses its own SQLite connection and is never on the event loop or in an order path.
+   - It covers every `--mode`, including `--mode mm-pilot`. The `kalshi-mm-pilot` service runs `python scanner.py --continuous --mode mm-pilot --dry-run` (Railway start command, read 2026-09-29), and the pilot writes the same `TradeDB` as continuous mode.
+   - At shutdown it stops after the MM pilot, then exports once more so the last rows are not left only in the local file.
    - A failure only logs a warning.
 3. **First sync of an epoch.** The exporter pages a full snapshot first, and it can resume after a restart. It then follows the outbox from where the snapshot began.
 4. **Versions.** Each record carries `source_version`, the highest outbox sequence number visible when the row was read in the same read transaction. The remote version guard ignores a lower version within the same epoch. That makes replays, retries and partial batches idempotent.
-5. **Deletes** become tombstones (`deleted = true`) that keep the row's last known state.
+5. **Deletes** become tombstones (`deleted = true`). The remote guard keeps the stored venue, account, order id and time on a tombstone even if the upsert sends nulls, so a delete still invalidates venue checks. A replay of the same version does not move `synced_at`.
 6. **Watermark.** The local watermark advances, and consumed outbox rows are pruned, only after every remote write succeeds. The status row gets `last_success_at` only on success.
 
 **Keys.** `ledger_key` is `arbgrid:<service>:<db_instance_id>:<table>:<id>`. `db_instance_id` is a random id stored in the DB file, so a recreated volume or a second service never collides. Venue and account are attributes, not part of the key: a deleted row no longer has them, and history has no account at all.
@@ -45,7 +47,13 @@ stays the source record, and venue records check completeness.
 ## What a report may claim
 
 - **One service's DB file** (`ledger_reporting.sources.mirror_complete`): the latest export succeeded, the snapshot is complete, no captured change is pending, and the mirror's row counts equal the local counts. This says nothing about an account.
-- **Zero fills for an account and day.** This needs `ledger_reporting.venue_reconciliation_days.fills_verified = true` for that venue, account and America/Detroit day. The check behind it covered the venue completely, verified the mirrors of every mapped service, and no mirrored ledger row changed afterwards. Otherwise the value is null or unverified. A missing row in either view means no data, not zero.
+- **Zero fills for an account and day.** This needs `ledger_reporting.venue_reconciliation_days.fills_verified = true` for that venue, account and America/Detroit day. That means:
+  - the check covered the venue completely and verified the mirrors of every mapped service;
+  - no mirrored row it depended on was written at or after its mirror read began; and
+  - every ledger source it verified is still current: the latest instance of its service, fully exported, and successful within `max_source_age_seconds` of now.
+
+  Otherwise the value is null or unverified. A missing row in either view means no data, not zero.
+- **As-of claims.** When the check is still unchanged but a source has stopped or been replaced, `fills_matched_as_of` keeps the mirror read time and `mirror_current` is false. A report may say "matched as of <time>", not "verified".
 - **Account-wide.** Only when `account_wide = true`, meaning the check covered all subaccounts. A check made with a subaccount-restricted key covers that subaccount only.
 - **Realized PnL** stays `pnl_verified = false`. Fills reconciliation does not cover fees, settlements or positions, and nothing reconciles those yet.
 
@@ -109,11 +117,24 @@ The collector is read-only. Its transport allows only `GET` on `/portfolio/fills
   - latest export succeeded: `ledger_mirror_sync_failing`
   - snapshot complete and nothing pending: `ledger_mirror_incomplete`
   - last success after the day plus the finality lag: `ledger_mirror_stale`
+  - last success within `LEDGER_RECON_MAX_SOURCE_AGE_SECONDS` (default 3600) of now, even for an old day: `ledger_mirror_source_not_recent`
   - mirror row counts equal the local counts: `ledger_mirror_count_mismatch`
-- **Reads.** Every mirror read is paged with an exact count. A short or capped read is `ledger_mirror_read_truncated`. Rows for the account written by a service outside the mapping make the check incomplete (`ledger_unmapped_source`).
+- **Reads.** Every mirror page is read with an exact count. A short or capped read is `ledger_mirror_read_truncated`. Rows for the account written by a service outside the mapping make the check incomplete (`ledger_unmapped_source`).
+- **Read fence.** Any of these makes the check `ledger_mirror_changed_during_read`:
+  - the exact total changes between pages;
+  - any source status field (instance, epoch, watermark, pending, counts, attempt and success times, error) differs between the reads before and after the rows;
+  - an in-scope row has `synced_at` at or after the read start. In scope means this venue (or a tombstone without one), and in the read window, undated, or one of the compared order ids.
+
+  The read start is the job's clock minus a 120-second skew allowance.
 - **Empty or stale mirrors.** An empty, stale or truncated mirror can never yield a reconciled zero.
-- **Rows.** Each run writes one row, keyed by `run_id` so a retry is idempotent. It records the gaps, `coverage_scope`, `ledger_mirror_verified` and an `evidence` object: pages, cutoffs, retries, duplicates and the sources checked. Re-runs add rows, and the latest check per day wins.
-- **Staleness.** `venue_reconciliation_days` marks a check stale when a mirrored ledger row for that venue and account changes after it, for example a fill correction. The day is then no longer verified until the check is re-run.
+- **Rows.** Each run writes one row, keyed by `run_id` so a retry is idempotent. It records:
+  - the gaps, `coverage_scope` and `ledger_mirror_verified`;
+  - what the result depends on: `ledger_read_started_at`, `ledger_order_ids`, `ledger_sources` and `max_source_age_seconds`;
+  - an `evidence` object: pages, cutoffs, retries, duplicates and the sources checked.
+
+  Re-runs add rows, and the latest check per day wins. A collector exception still writes an `incomplete` row (`venue_collector_error`), so an older match never stands unchallenged.
+- **Staleness.** `venue_reconciliation_days` marks a check stale when a row it depended on is written at or after `ledger_read_started_at`. That includes changes between the read and the row being stored, corrections to compared orders logged outside the window, and deletes. The day is then no longer verified until the check is re-run.
+- **Bounded settings.** `LEDGER_RECON_FINALITY_SECONDS` must be finite and ≥ 0, and `LEDGER_RECON_MAX_SOURCE_AGE_SECONDS` finite and > 0; otherwise the script exits 2. The collector also refuses non-finite or negative backoff and non-positive retry, page and cutoff counts. A fill `ts` outside the datetime range is `venue_record_time_invalid`, not a crash.
 - **Writer change.** The MM pilot now records `fill_qty` (contracts) on each fill row, so its orders can be compared. Older pilot rows have no quantity and reconcile as incomplete.
 
 Run it as its own process with the existing credentials. It prints JSON and writes only with `--write`:
@@ -139,8 +160,8 @@ python scripts/reconcile_venue_fills.py --venue kalshi --day 2026-09-28 [--write
 ## Verification (local)
 
 ```sh
-pytest tests/test_ledger_sync.py -v
-pytest tests/test_venue_reconciliation.py -v
+pytest tests/test_ledger_sync.py tests/test_venue_reconciliation.py -v
+pytest tests/test_mm_pilot.py -k ledger_mirror -v
 # Disposable Postgres, as postgres, with NOLOGIN anon/authenticated and
 # service_role (BYPASSRLS, as on Supabase) created:
 bash tests/supabase-ledger-reporting.sh

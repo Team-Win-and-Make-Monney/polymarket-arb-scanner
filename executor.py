@@ -385,6 +385,10 @@ class ArbitrageExecutor:
             self._balance_cache_type = opp_type
         return balances
 
+    def _ledger_run_mode(self) -> str:
+        """Mode this executor asserts on ledger rows it writes (see db.RUN_MODES)."""
+        return "paper" if self.dry_run else "live"
+
     def invalidate_balance_cache(self):
         """Clear the balance cache after a trade fills or position changes."""
         self._balance_cache = {}
@@ -3226,6 +3230,7 @@ class ArbitrageExecutor:
                 size=leg.get("size", size),
                 status="dry_run",
                 outcome=leg.get("outcome") or leg.get("token"),
+                run_mode="paper",
             )
 
         logger.info(f"[DRY RUN] Logged opportunity #{opp_id} with {len(legs)} legs.")
@@ -3304,6 +3309,7 @@ class ArbitrageExecutor:
                 size=leg_size,
                 status="pending",
                 outcome=leg.get("outcome") or leg.get("token"),
+                run_mode=self._ledger_run_mode(),
             )
             leg["_trade_id"] = trade_id
 
@@ -3399,6 +3405,7 @@ class ArbitrageExecutor:
                 platform=platform,
                 expected_pnl=opportunity.get("net_profit", 0),
                 market_ticker=_derive_market_ticker(opportunity, legs),
+                run_mode=self._ledger_run_mode(),
             )
             # Invalidate balance cache after a successful trade
             self.invalidate_balance_cache()
@@ -3544,6 +3551,7 @@ class ArbitrageExecutor:
                 size=leg.get("size", size),
                 status="pending",
                 outcome=leg.get("outcome") or leg.get("token"),
+                run_mode=self._ledger_run_mode(),
             )
             leg["_trade_id"] = trade_id
 
@@ -3588,6 +3596,7 @@ class ArbitrageExecutor:
                 platform=platform,
                 expected_pnl=opportunity.get("net_profit", 0),
                 market_ticker=_derive_market_ticker(opportunity, legs),
+                run_mode=self._ledger_run_mode(),
             )
             self._notify_trade(opportunity, legs, size, success=True)
         else:

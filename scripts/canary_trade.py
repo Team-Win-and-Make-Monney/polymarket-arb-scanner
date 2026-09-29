@@ -271,6 +271,7 @@ def main() -> int:
                     price=leg.get("price", 0),
                     size=CANARY_MAX_TRADE_SIZE,
                     status="paper_near_miss",
+                    run_mode="paper",
                 )
             summary.append({
                 "market": opp.get("market"),

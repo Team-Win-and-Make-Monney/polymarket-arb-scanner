@@ -1071,6 +1071,16 @@ RESOLUTION_SNIPE_WINDOW_HOURS = _env_float("RESOLUTION_SNIPE_WINDOW_HOURS", "48"
 # Mirror paper opportunities to Supabase (supabase_sync.OpportunitySync).
 OPP_SYNC_ENABLED = _env_bool("OPP_SYNC_ENABLED", "false")
 
+# Trade-ledger reporting mirror (ledger_sync.py, docs/LEDGER-REPORTING.md).
+# Capture installs SQLite outbox triggers on trades/positions (local only, read
+# by db.TradeDB from the same env var). Sync pushes captured changes to
+# Supabase off the event loop; it requires capture and a service identity
+# (LEDGER_SERVICE_NAME or Railway's RAILWAY_SERVICE_NAME).
+LEDGER_CAPTURE_ENABLED = _env_bool("LEDGER_CAPTURE_ENABLED", "false")
+LEDGER_SYNC_ENABLED = _env_bool("LEDGER_SYNC_ENABLED", "false")
+LEDGER_SYNC_EVERY_N_SCANS = _env_int("LEDGER_SYNC_EVERY_N_SCANS", "5")
+LEDGER_SYNC_BATCH_SIZE = _env_int("LEDGER_SYNC_BATCH_SIZE", "500")
+
 # Paper-trading window tracker (paper_record.py). PAPER_WINDOW_START is an ISO
 # UTC timestamp (e.g. "2026-07-21T20:30:00Z"); empty disables the tracker.
 # Validated here at import so a malformed timestamp fails loudly instead of

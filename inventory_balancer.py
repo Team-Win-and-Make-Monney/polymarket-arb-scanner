@@ -565,6 +565,7 @@ class InventoryBalancer:
                                 fill_price=price,
                                 order_id=order_id,
                                 outcome=outcome,
+                                run_mode="paper",
                             )
                     except Exception as e:
                         logger.debug("Failed to record dry-run rebalance in trade_db: %s", e)
@@ -654,6 +655,7 @@ class InventoryBalancer:
                                         fill_price=price,
                                         order_id=order_id,
                                         outcome=outcome,
+                                        run_mode="live",
                                     )
                             except Exception as e:
                                 logger.debug("TradeDB error during live rebalance: %s", e)
@@ -750,6 +752,7 @@ class InventoryBalancer:
                                         fill_price=price,
                                         order_id=order_id,
                                         outcome=outcome,
+                                        run_mode="live",
                                     )
                             except Exception as e:
                                 logger.debug("TradeDB error during live Polymarket rebalance: %s", e)

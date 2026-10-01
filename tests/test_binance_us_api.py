@@ -89,6 +89,26 @@ class TestBinanceUSReadOnly:
         assert "PRIVATE" not in str(error.value)
         assert error.value.__suppress_context__ is True
 
+    @pytest.mark.parametrize("failure", ["credentials", "timestamp", "network", "balances"])
+    def test_signed_account_cli_failure_is_sanitized_and_not_retried(self, http_get, capsys, failure):
+        failures = {
+            "credentials": self.response({"code": -2015, "msg": "PRIVATE_KEY"}, 401),
+            "timestamp": self.response({"code": -1021, "msg": "PRIVATE_SIGNED_URL"}, 400),
+            "network": requests.ConnectionError("https://api.binance.us/?signature=PRIVATE"),
+            "balances": self.response({"balances": [{"asset": "USD", "free": "PRIVATE", "locked": "0"}]}),
+        }
+        http_get.side_effect = [self.response({"serverTime": 1790870400000}), failures[failure]]
+        with patch.object(api, "load_auth", return_value=("k" * 64, "s" * 64)):
+            assert api.main(["--source", "env"]) == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.strip()
+        assert all(value not in captured.err for value in ("PRIVATE", "signature=", "k" * 64, "s" * 64))
+        assert http_get.call_count == 2
+        assert http_get.call_args_list[0].args == ("https://api.binance.us/api/v3/time",)
+        assert http_get.call_args_list[1].args == ("https://api.binance.us/api/v3/account",)
+        assert all(call.kwargs["allow_redirects"] is False for call in http_get.call_args_list)
+
     @pytest.mark.parametrize("payload", [{}, {"serverTime": True}, {"serverTime": "123"}, {"serverTime": -1}])
     def test_bad_time_prevents_account_request(self, http_get, payload):
         http_get.return_value = self.response(payload)
